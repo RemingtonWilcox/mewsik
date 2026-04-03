@@ -1,4 +1,5 @@
 node_modules
+.superpowers
 src-tauri/target
 sidecar/dist
 test-results
