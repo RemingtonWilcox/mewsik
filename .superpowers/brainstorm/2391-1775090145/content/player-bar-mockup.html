@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Player Bar & Radio — Before/After</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a1a; color: #f5f5f5; font-family: -apple-system, 'Inter', sans-serif; padding: 2rem; }
+  h2 { font-size: 1.4rem; margin-bottom: 0.5rem; color: #fff; }
+  .subtitle { color: #888; font-size: 0.9rem; margin-bottom: 2rem; }
+  .section { margin-bottom: 3rem; }
+  .label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.12em; color: #666; margin-bottom: 0.75rem; }
+
+  /* ── Player Bar Mockups ── */
+  .player-bar {
+    display: grid;
+    align-items: center;
+    gap: 1rem;
+    padding: 0 1rem;
+    border-top: 1px solid;
+    width: 100%;
+    border-radius: 0;
+  }
+
+  .player-bar.before {
+    grid-template-columns: minmax(0,1fr) minmax(18rem,38rem) auto;
+    height: 80px;
+    background: rgba(26,26,26,0.95);
+    border-color: rgba(58,58,82,0.5);
+  }
+
+  .player-bar.after {
+    grid-template-columns: minmax(0,1fr) minmax(18rem,40rem) auto;
+    height: 88px;
+    background: oklch(0.18 0.005 285);
+    border-color: rgba(80,80,110,0.4);
+    box-shadow: 0 -4px 24px rgba(0,0,0,0.3);
+  }
+
+  /* Track info */
+  .track-info { display: flex; align-items: center; gap: 0.75rem; min-width: 0; }
+  .album-art {
+    border-radius: 6px;
+    background: #2a2a3a;
+    display: flex; align-items: center; justify-content: center;
+    color: #555; font-size: 0.7rem; flex-shrink: 0;
+  }
+  .before .album-art { width: 48px; height: 48px; }
+  .after .album-art { width: 56px; height: 56px; }
+  .track-text { min-width: 0; }
+  .track-title { font-size: 0.875rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .track-artist { font-size: 0.75rem; color: #a3a3a3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .after .track-title { font-size: 0.9rem; }
+  .after .track-artist { margin-top: 2px; }
+
+  /* Controls */
+  .controls-area { display: flex; flex-direction: column; align-items: center; gap: 4px; min-width: 0; }
+  .control-buttons { display: flex; align-items: center; gap: 4px; }
+  .ctrl-btn {
+    width: 32px; height: 32px; border-radius: 50%; border: none;
+    background: transparent; color: #ccc; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.75rem;
+  }
+  .ctrl-btn.play {
+    width: 36px; height: 36px; background: #fff; color: #111;
+  }
+  .after .ctrl-btn.play {
+    background: oklch(0.75 0.18 160); color: #111;
+  }
+
+  /* Scrubber */
+  .scrubber-row { display: flex; align-items: center; gap: 0.5rem; width: 100%; }
+  .time { font-size: 0.7rem; color: #888; width: 2.5rem; font-variant-numeric: tabular-nums; }
+  .time.right { text-align: right; }
+
+  .scrubber {
+    flex: 1; height: 28px; border-radius: 10px; border: 1px solid;
+    padding: 0 10px; display: flex; align-items: flex-end; gap: 1px;
+    position: relative; overflow: hidden;
+  }
+  .before .scrubber {
+    background: rgba(40,40,60,0.3);
+    border-color: rgba(58,58,82,0.4);
+  }
+  .after .scrubber {
+    background: rgba(40,40,60,0.5);
+    border-color: rgba(80,80,110,0.5);
+  }
+  .peak {
+    flex: 1; border-radius: 2px; min-width: 0;
+    transition: background 0.1s;
+  }
+  .before .peak.active { background: oklch(0.75 0.18 160); }
+  .before .peak.inactive { background: rgba(250,250,250,0.12); }
+  .after .peak.active { background: oklch(0.78 0.2 160); box-shadow: 0 0 6px rgba(74,222,128,0.25); }
+  .after .peak.inactive { background: rgba(250,250,250,0.22); }
+
+  .status-label {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.16em;
+    color: #666; text-align: center;
+  }
+
+  /* Volume */
+  .volume-area { display: flex; align-items: center; gap: 0.5rem; justify-content: flex-end; }
+  .vol-icon { width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 0.7rem; }
+  .vol-track { width: 96px; height: 4px; border-radius: 2px; position: relative; }
+  .before .vol-track { background: rgba(255,255,255,0.08); }
+  .after .vol-track { background: rgba(255,255,255,0.2); }
+  .vol-fill { position: absolute; top: 0; left: 0; height: 100%; border-radius: 2px; width: 65%; }
+  .before .vol-fill { background: oklch(0.75 0.18 160); }
+  .after .vol-fill { background: oklch(0.78 0.2 160); }
+  .vol-thumb {
+    position: absolute; top: 50%; transform: translate(-50%, -50%);
+    width: 12px; height: 12px; border-radius: 50%; border: 2px solid #fff;
+  }
+  .before .vol-thumb { left: 65%; background: oklch(0.75 0.18 160); opacity: 0.6; }
+  .after .vol-thumb { left: 65%; background: oklch(0.78 0.2 160); opacity: 1; box-shadow: 0 0 8px rgba(74,222,128,0.3); }
+
+  /* ── Toast comparison ── */
+  .toast-demo { position: relative; height: 120px; background: #111; border-radius: 12px; overflow: hidden; border: 1px solid #2a2a3a; }
+  .toast-box {
+    position: absolute; padding: 0.6rem 1rem; border-radius: 8px;
+    font-size: 0.8rem; border: 1px solid #3a3a52;
+    display: flex; align-items: center; gap: 0.5rem;
+  }
+  .toast-box .dot { width: 8px; height: 8px; border-radius: 50%; background: oklch(0.75 0.18 160); }
+  .before .toast-box { background: #2b2b2b; bottom: 10px; right: 16px; }
+  .after .toast-box { background: #2b2b2b; bottom: 100px; right: 16px; }
+  .mini-player {
+    position: absolute; bottom: 0; left: 0; right: 0; height: 60px;
+    background: oklch(0.18 0.005 285); border-top: 1px solid #3a3a52;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.7rem; color: #666;
+  }
+
+  /* ── Radio Browser Mockups ── */
+  .favorites-scroll {
+    display: flex; gap: 0.75rem; overflow-x: auto; padding: 0.5rem 0;
+    scrollbar-width: thin; scrollbar-color: rgba(255,255,255,0.15) transparent;
+  }
+  .fav-card {
+    flex-shrink: 0; width: 140px; padding: 0.75rem;
+    background: #2b2b2b; border-radius: 10px; border: 1px solid #3a3a52;
+    display: flex; flex-direction: column; align-items: center; gap: 0.5rem;
+    cursor: pointer; transition: border-color 0.2s, background 0.2s;
+  }
+  .fav-card:hover { border-color: oklch(0.75 0.18 160 / 0.5); background: #2f2f3f; }
+  .fav-icon {
+    width: 48px; height: 48px; border-radius: 8px; background: #3a3a4a;
+    display: flex; align-items: center; justify-content: center;
+    color: #888; font-size: 1.2rem; position: relative;
+  }
+  .fav-play {
+    position: absolute; inset: 0; border-radius: 8px;
+    background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center;
+    opacity: 0; transition: opacity 0.2s; color: #fff; font-size: 1rem;
+  }
+  .fav-card:hover .fav-play { opacity: 1; }
+  .fav-name { font-size: 0.75rem; font-weight: 500; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .fav-meta { font-size: 0.65rem; color: #888; }
+
+  .station-row {
+    display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem;
+    background: #2b2b2b; border-radius: 8px; border: 1px solid #3a3a52;
+    margin-bottom: 0.5rem; transition: border-color 0.2s;
+  }
+  .station-row:hover { border-color: rgba(80,80,110,0.6); }
+  .station-play-btn {
+    width: 40px; height: 40px; border-radius: 50%; flex-shrink: 0;
+    background: oklch(0.75 0.18 160); color: #111; border: none;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; font-size: 0.9rem;
+  }
+  .station-icon {
+    width: 40px; height: 40px; border-radius: 8px; background: #3a3a4a;
+    display: flex; align-items: center; justify-content: center;
+    color: #888; font-size: 0.9rem; flex-shrink: 0;
+  }
+  .station-info { flex: 1; min-width: 0; }
+  .station-name { font-size: 0.875rem; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .station-meta { font-size: 0.75rem; color: #888; margin-top: 2px; }
+  .station-action { flex-shrink: 0; width: 32px; height: 32px; border-radius: 6px; border: none; background: transparent; color: #aaa; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 900px) { .split { grid-template-columns: 1fr; } }
+
+  .mockup { border: 1px solid #2a2a3a; border-radius: 12px; overflow: hidden; }
+  .mockup-header { padding: 0.6rem 1rem; background: rgba(255,255,255,0.03); border-bottom: 1px solid #2a2a3a; font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 0.1em; }
+  .mockup-body { padding: 1rem; background: #111; }
+</style>
+</head>
+<body>
+
+<h2>Player Bar — Before vs After</h2>
+<p class="subtitle">Taller, lifted background, brighter waveform, visible volume track, no status labels</p>
+
+<div class="split" style="margin-bottom:3rem;">
+  <div class="mockup">
+    <div class="mockup-header">Before — Current</div>
+    <div class="mockup-body" style="padding:0;background:#1a1a1a;">
+      <div class="player-bar before">
+        <div class="track-info">
+          <div class="album-art">art</div>
+          <div class="track-text">
+            <div class="track-title">A Really Long Song Title That Goes On</div>
+            <div class="track-artist">Artist Name</div>
+          </div>
+        </div>
+        <div class="controls-area">
+          <div class="control-buttons">
+            <div class="ctrl-btn">⇄</div>
+            <div class="ctrl-btn">⏮</div>
+            <div class="ctrl-btn play">▶</div>
+            <div class="ctrl-btn">⏭</div>
+            <div class="ctrl-btn">🔁</div>
+          </div>
+          <div class="scrubber-row">
+            <span class="time right">1:24</span>
+            <div class="scrubber">
+              <script>
+                // Generate peaks for before
+                (function(){
+                  const c = document.currentScript.parentElement;
+                  for(let i=0;i<60;i++){
+                    const d = document.createElement('div');
+                    d.className = 'peak ' + (i < 22 ? 'active' : 'inactive');
+                    d.style.height = Math.max(18, Math.random()*100) + '%';
+                    c.appendChild(d);
+                  }
+                })();
+              </script>
+            </div>
+            <span class="time">3:47</span>
+          </div>
+          <div class="status-label">Waveform seek</div>
+        </div>
+        <div class="volume-area">
+          <div class="vol-icon">🔊</div>
+          <div class="vol-track">
+            <div class="vol-fill"></div>
+            <div class="vol-thumb"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">After — Proposed</div>
+    <div class="mockup-body" style="padding:0;background:#1a1a1a;">
+      <div class="player-bar after">
+        <div class="track-info">
+          <div class="album-art">art</div>
+          <div class="track-text">
+            <div class="track-title">A Really Long Song Title That Goes On</div>
+            <div class="track-artist">Artist Name</div>
+          </div>
+        </div>
+        <div class="controls-area">
+          <div class="control-buttons">
+            <div class="ctrl-btn">⇄</div>
+            <div class="ctrl-btn">⏮</div>
+            <div class="ctrl-btn play">▶</div>
+            <div class="ctrl-btn">⏭</div>
+            <div class="ctrl-btn">🔁</div>
+          </div>
+          <div class="scrubber-row">
+            <span class="time right">1:24</span>
+            <div class="scrubber">
+              <script>
+                (function(){
+                  const c = document.currentScript.parentElement;
+                  for(let i=0;i<60;i++){
+                    const d = document.createElement('div');
+                    d.className = 'peak ' + (i < 22 ? 'active' : 'inactive');
+                    d.style.height = Math.max(18, Math.random()*100) + '%';
+                    c.appendChild(d);
+                  }
+                })();
+              </script>
+            </div>
+            <span class="time">3:47</span>
+          </div>
+        </div>
+        <div class="volume-area">
+          <div class="vol-icon">🔊</div>
+          <div class="vol-track">
+            <div class="vol-fill"></div>
+            <div class="vol-thumb"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2>Toast Notification — Before vs After</h2>
+<p class="subtitle">Toasts move above the player bar instead of overlapping controls</p>
+
+<div class="split" style="margin-bottom:3rem;">
+  <div class="mockup before">
+    <div class="mockup-header">Before — Overlaps player</div>
+    <div class="mockup-body" style="padding:0;position:relative;height:120px;">
+      <div class="toast-box" style="background:#2b2b2b;bottom:10px;right:16px;position:absolute;">
+        <div class="dot"></div> Playing: Song Title
+      </div>
+      <div class="mini-player">▶ Player controls here</div>
+    </div>
+  </div>
+  <div class="mockup after">
+    <div class="mockup-header">After — Above player bar</div>
+    <div class="mockup-body" style="padding:0;position:relative;height:120px;">
+      <div class="toast-box" style="background:#2b2b2b;bottom:70px;right:16px;position:absolute;">
+        <div class="dot"></div> Playing: Song Title
+      </div>
+      <div class="mini-player">▶ Player controls here</div>
+    </div>
+  </div>
+</div>
+
+<h2>Radio Browser — Hybrid Layout</h2>
+<p class="subtitle">Favorites as horizontal scroll cards, search results as cleaner list</p>
+
+<div class="mockup" style="margin-bottom:2rem;">
+  <div class="mockup-header">Proposed — Favorites Row + Search List</div>
+  <div class="mockup-body">
+    <div style="font-size:0.8rem;font-weight:600;margin-bottom:0.5rem;color:#ccc;">Favorites</div>
+    <div class="favorites-scroll">
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">BBC Radio 1</div>
+        <div class="fav-meta">UK · 128kbps</div>
+      </div>
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">KEXP 90.3 FM</div>
+        <div class="fav-meta">US · 256kbps</div>
+      </div>
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">FIP Radio</div>
+        <div class="fav-meta">FR · MP3</div>
+      </div>
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">Jazz FM London</div>
+        <div class="fav-meta">UK · AAC</div>
+      </div>
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">NTS Radio Live 1</div>
+        <div class="fav-meta">UK · 192kbps</div>
+      </div>
+      <div class="fav-card">
+        <div class="fav-icon">📻<div class="fav-play">▶</div></div>
+        <div class="fav-name">SomaFM Groove Salad</div>
+        <div class="fav-meta">US · MP3</div>
+      </div>
+    </div>
+
+    <div style="font-size:0.8rem;font-weight:600;margin:1.25rem 0 0.5rem;color:#ccc;">Search Results</div>
+    <div>
+      <div class="station-row">
+        <div class="station-play-btn">▶</div>
+        <div class="station-icon">📻</div>
+        <div class="station-info">
+          <div class="station-name">Lofi Hip Hop Radio — Beats to Relax/Study To</div>
+          <div class="station-meta">US · MP3 · 128kbps</div>
+        </div>
+        <div class="station-action">♡</div>
+      </div>
+      <div class="station-row">
+        <div class="station-play-btn">▶</div>
+        <div class="station-icon">📻</div>
+        <div class="station-info">
+          <div class="station-name">Chillhop Music</div>
+          <div class="station-meta">NL · AAC · 256kbps</div>
+        </div>
+        <div class="station-action">♡</div>
+      </div>
+      <div class="station-row">
+        <div class="station-play-btn">▶</div>
+        <div class="station-icon">📻</div>
+        <div class="station-info">
+          <div class="station-name">Deep House Amsterdam Radio</div>
+          <div class="station-meta">NL · MP3 · 320kbps</div>
+        </div>
+        <div class="station-action">♡</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div style="text-align:center;padding:1.5rem;color:#888;font-size:0.85rem;">
+  Does this direction feel right? Let me know in the terminal if anything needs tweaking, or if this is good to go.
+</div>
+
+</body>
+</html>

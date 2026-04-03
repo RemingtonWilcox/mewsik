@@ -1,0 +1,116 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: oklch(0.145 0 0);
+  --color-foreground: oklch(0.985 0 0);
+  --color-card: oklch(0.17 0 0);
+  --color-card-foreground: oklch(0.985 0 0);
+  --color-popover: oklch(0.17 0 0);
+  --color-popover-foreground: oklch(0.985 0 0);
+  --color-primary: oklch(0.75 0.18 160);
+  --color-primary-foreground: oklch(0.145 0 0);
+  --color-secondary: oklch(0.25 0.005 285);
+  --color-secondary-foreground: oklch(0.985 0 0);
+  --color-muted: oklch(0.25 0.005 285);
+  --color-muted-foreground: oklch(0.65 0 0);
+  --color-accent: oklch(0.25 0.005 285);
+  --color-accent-foreground: oklch(0.985 0 0);
+  --color-destructive: oklch(0.55 0.2 27);
+  --color-destructive-foreground: oklch(0.985 0 0);
+  --color-border: oklch(0.33 0.005 285);
+  --color-input: oklch(0.3 0.005 285);
+  --color-ring: oklch(0.75 0.18 160);
+  --color-sidebar: oklch(0.13 0 0);
+  --color-sidebar-foreground: oklch(0.985 0 0);
+  --color-sidebar-primary: oklch(0.75 0.18 160);
+  --color-sidebar-primary-foreground: oklch(0.145 0 0);
+  --color-sidebar-accent: oklch(0.22 0.005 285);
+  --color-sidebar-accent-foreground: oklch(0.985 0 0);
+  --color-sidebar-border: oklch(0.25 0.005 285);
+  --color-sidebar-ring: oklch(0.75 0.18 160);
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* Scrollbar styling */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: oklch(0.35 0 0);
+    border-radius: 3px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: oklch(0.45 0 0);
+  }
+
+  /* Firefox scrollbar */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: oklch(0.35 0 0) transparent;
+  }
+
+  /* Volume slider - gray track, green filled range, visible thumb */
+  [data-slot="slider-track"] {
+    background-color: #4a4a5a !important;
+  }
+  [data-slot="slider-range"] {
+    background-color: oklch(0.75 0.18 160) !important;
+  }
+  [data-slot="slider-thumb"] {
+    background-color: white !important;
+    width: 14px !important;
+    height: 14px !important;
+    border: 2px solid white !important;
+  }
+
+  /* Library table - force cells to respect column widths */
+  .table-fixed td,
+  .table-fixed th {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* Sidebar nav - no background on items, only active gets green */
+  [data-slot="sidebar-menu-button"] {
+    background-color: transparent !important;
+    color: oklch(0.7 0 0) !important;
+  }
+  [data-slot="sidebar-menu-button"]:hover {
+    color: oklch(0.9 0 0) !important;
+    background-color: transparent !important;
+  }
+  [data-slot="sidebar-menu-button"][data-active="true"] {
+    background-color: oklch(0.75 0.18 160 / 0.12) !important;
+    color: oklch(0.75 0.18 160) !important;
+    font-weight: 500;
+  }
+}

@@ -1,0 +1,8 @@
+{"type":"server-started","port":55680,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:55680","screen_dir":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content","state_dir":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/state"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-preview.html"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-v2.html"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-v3.html"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-v4.html"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-v5-traced.html"}
+{"type":"screen-added","file":"/Users/remington/Documents/VIBECODE/mewsik/.superpowers/brainstorm/55526-1775127113/content/logo-v5-fixed.html"}
+{"type":"server-stopped","reason":"idle timeout"}

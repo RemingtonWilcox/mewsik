@@ -1,0 +1,19 @@
+{
+  "name": "mewsik-sidecar",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.cjs"
+  },
+  "dependencies": {
+    "bandcamp-fetch": "^3.0.0",
+    "soundcloud-fetch": "^1.2.0",
+    "youtubei.js": "^17.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  }
+}
