@@ -24,6 +24,10 @@
 - **Playlists** - Create and manage playlists from any source
 - **Keyboard shortcuts** - `Cmd+K` for quick search, `Space` for play/pause
 
+## Screenshot
+
+<img src="docs/screenshot.png" alt="mewsik screenshot" width="800">
+
 ## Install
 
 ### macOS (Apple Silicon)
