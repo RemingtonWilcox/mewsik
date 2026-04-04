@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -29,6 +30,17 @@ pub struct ExternalSearchResult {
     pub cover_art_url: Option<String>,
     pub source_url: Option<String>,
     pub play_count: Option<u64>,
+    #[serde(default)]
+    pub is_saved: bool,
+    #[serde(default)]
+    pub is_downloaded: bool,
+    pub recording_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalSearchPage {
+    pub items: Vec<ExternalSearchResult>,
+    pub has_more: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,6 +82,7 @@ struct ExternalSearchCompleteEvent {
 pub struct ExternalSearchRuntime {
     latest_generation: AtomicU64,
     cache: Mutex<HashMap<String, CachedExternalSearch>>,
+    inflight_preresolve: Mutex<HashSet<String>>,
 }
 
 impl Default for ExternalSearchRuntime {
@@ -77,6 +90,7 @@ impl Default for ExternalSearchRuntime {
         Self {
             latest_generation: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
+            inflight_preresolve: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -124,6 +138,15 @@ impl ExternalSearchRuntime {
             },
         );
     }
+
+    fn begin_preresolve(&self, cache_key: &str) -> bool {
+        let mut inflight = self.inflight_preresolve.lock();
+        inflight.insert(cache_key.to_string())
+    }
+
+    fn finish_preresolve(&self, cache_key: &str) {
+        self.inflight_preresolve.lock().remove(cache_key);
+    }
 }
 
 fn normalize_query(value: &str) -> String {
@@ -149,6 +172,54 @@ fn search_cache_key(query: &str) -> Option<String> {
     } else {
         Some(format!("all:{normalized}"))
     }
+}
+
+fn recording_has_local_file(db: &DbPool, recording_id: &str) -> bool {
+    if let Ok(Some(source)) = queries::get_best_source(db, recording_id) {
+        if let Some(path) = source.file_path.as_deref() {
+            if Path::new(path).exists() {
+                return true;
+            }
+        }
+    }
+
+    if let Ok(Some(download)) =
+        queries::get_latest_completed_download_for_recording(db, recording_id)
+    {
+        if let Some(path) = download.file_path.as_deref() {
+            return Path::new(path).exists();
+        }
+    }
+
+    false
+}
+
+fn enrich_external_result(db: &DbPool, mut result: ExternalSearchResult) -> ExternalSearchResult {
+    let Some(existing) = queries::find_source_by_provider_id(db, &result.source, &result.source_id)
+        .ok()
+        .flatten()
+    else {
+        return result;
+    };
+
+    result.recording_id = Some(existing.recording_id.clone());
+    result.is_saved = queries::get_recording(db, &existing.recording_id)
+        .ok()
+        .flatten()
+        .map(|recording| recording.is_in_library)
+        .unwrap_or(false);
+    result.is_downloaded = recording_has_local_file(db, &existing.recording_id);
+    result
+}
+
+fn enrich_external_results(
+    db: &DbPool,
+    results: Vec<ExternalSearchResult>,
+) -> Vec<ExternalSearchResult> {
+    results
+        .into_iter()
+        .map(|result| enrich_external_result(db, result))
+        .collect()
 }
 
 fn source_priority(source: &str) -> i64 {
@@ -314,21 +385,22 @@ fn cached_stream_snapshot(
     })
 }
 
-fn spawn_preresolve_for_top_results(
+fn spawn_preresolve_for_results(
     sidecar: Arc<SidecarManager>,
     stream_cache: StreamCache,
     search_runtime: Arc<ExternalSearchRuntime>,
     generation: u64,
     results: &[ExternalSearchResult],
+    limit: usize,
 ) {
-    let top5: Vec<(String, String)> = results
+    let targets: Vec<(String, String)> = results
         .iter()
-        .take(5)
+        .take(limit)
         .map(|result| (result.source.clone(), result.source_id.clone()))
         .collect();
 
     std::thread::spawn(move || {
-        for (source, source_id) in top5 {
+        for (source, source_id) in targets {
             if !search_runtime.is_current(generation) {
                 break;
             }
@@ -345,10 +417,15 @@ fn spawn_preresolve_for_top_results(
                 }
             }
 
+            if !search_runtime.begin_preresolve(&cache_key) {
+                continue;
+            }
+
             let method = format!("{}.resolve_stream", source);
             match sidecar.call(&method, json!({ "source_id": source_id })) {
                 Ok(result) => {
                     if !search_runtime.is_current(generation) {
+                        search_runtime.finish_preresolve(&cache_key);
                         break;
                     }
 
@@ -397,7 +474,7 @@ fn spawn_preresolve_for_top_results(
                             needs_refresh,
                             cached_at: Instant::now(),
                         };
-                        cache_insert(&stream_cache, cache_key, entry);
+                        cache_insert(&stream_cache, cache_key.clone(), entry);
                     }
                 }
                 Err(err) => {
@@ -409,6 +486,8 @@ fn spawn_preresolve_for_top_results(
                     );
                 }
             }
+
+            search_runtime.finish_preresolve(&cache_key);
         }
     });
 }
@@ -543,24 +622,38 @@ fn ensure_external_recording_inner(
 
 #[tauri::command]
 pub fn search_external(
+    db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     query: String,
     source: String,
-) -> Result<Vec<ExternalSearchResult>, String> {
+    page: Option<usize>,
+) -> Result<ExternalSearchPage, String> {
     sidecar.start()?;
     let method = format!("{}.search", source);
-    let result = sidecar.call(&method, json!({ "query": query, "page": 0 }))?;
+    let result = sidecar.call(
+        &method,
+        json!({ "query": query, "page": page.unwrap_or(0) }),
+    )?;
 
     let items: Vec<ExternalSearchResult> =
         serde_json::from_value(result.get("items").cloned().unwrap_or_default())
             .unwrap_or_default();
+    let has_more = result
+        .get("has_more")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let items = enrich_external_results(&db, items);
 
-    Ok(rank_external_results(&query, items))
+    Ok(ExternalSearchPage {
+        items: rank_external_results(&query, items),
+        has_more,
+    })
 }
 
 #[tauri::command]
 pub fn search_all_sources(
     app: tauri::AppHandle,
+    db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     cache: State<'_, StreamCache>,
     search_runtime: State<'_, Arc<ExternalSearchRuntime>>,
@@ -568,6 +661,7 @@ pub fn search_all_sources(
 ) -> Result<Vec<ExternalSearchResult>, String> {
     let generation = search_runtime.next_generation();
     if let Some(cached_results) = search_runtime.get_cached_results(&query) {
+        let cached_results = enrich_external_results(&db, cached_results);
         let _ = app.emit(
             "external-search-complete",
             ExternalSearchCompleteEvent {
@@ -575,12 +669,13 @@ pub fn search_all_sources(
                 results: cached_results.clone(),
             },
         );
-        spawn_preresolve_for_top_results(
+        spawn_preresolve_for_results(
             Arc::clone(sidecar.inner()),
             Arc::clone(&*cache),
             Arc::clone(search_runtime.inner()),
             generation,
             &cached_results,
+            5,
         );
         return Ok(cached_results);
     }
@@ -613,6 +708,7 @@ pub fn search_all_sources(
     for (source, payload) in rx {
         match payload {
             Ok(items) => {
+                let items = enrich_external_results(&db, items);
                 let _ = app.emit(
                     "external-search-partial",
                     ExternalSearchPartialEvent {
@@ -620,6 +716,15 @@ pub fn search_all_sources(
                         source,
                         results: items.clone(),
                     },
+                );
+                let warm_candidates = rank_external_results(&query, items.clone());
+                spawn_preresolve_for_results(
+                    Arc::clone(sidecar.inner()),
+                    Arc::clone(&*cache),
+                    Arc::clone(search_runtime.inner()),
+                    generation,
+                    &warm_candidates,
+                    2,
                 );
                 all_results.extend(items);
             }
@@ -636,12 +741,13 @@ pub fn search_all_sources(
             results: ranked.clone(),
         },
     );
-    spawn_preresolve_for_top_results(
+    spawn_preresolve_for_results(
         Arc::clone(sidecar.inner()),
         Arc::clone(&*cache),
         Arc::clone(search_runtime.inner()),
         generation,
         &ranked,
+        5,
     );
 
     Ok(ranked)
@@ -735,6 +841,9 @@ mod tests {
             cover_art_url: Some("https://example.com/cover.jpg".to_string()),
             source_url: None,
             play_count: None,
+            is_saved: false,
+            is_downloaded: false,
+            recording_id: None,
         }
     }
 

@@ -8,6 +8,7 @@
   "permissions": [
     "core:default",
     "dialog:allow-open",
+    "drag:allow-start-drag",
     "shell:allow-open"
   ]
 }

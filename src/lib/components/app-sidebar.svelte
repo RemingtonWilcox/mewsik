@@ -27,7 +27,10 @@
 	import { goto } from '$app/navigation';
 	import * as api from '$lib/api/tauri';
 	import { toast } from 'svelte-sonner';
+	import { useActiveDownloads } from '$lib/state/downloads.svelte';
 	import type { Playlist } from '$lib/types';
+
+	const activeDownloads = useActiveDownloads();
 
 	let playlists = $state<Playlist[]>([]);
 
@@ -73,9 +76,9 @@
 
 <Sidebar>
 	<SidebarHeader>
-		<a href="/" class="flex items-center gap-3 px-3 py-4">
-			<Logo size={48} class="text-primary" />
-			<span class="text-xl font-bold tracking-tight">mewsik</span>
+		<a href="/" class="flex items-center gap-3 px-3 py-5">
+			<Logo size={56} class="shrink-0 text-primary" />
+			<span class="text-2xl font-bold tracking-tight">mewsik</span>
 		</a>
 	</SidebarHeader>
 
@@ -93,6 +96,9 @@
 									<a href={item.href} {...props}>
 										<item.icon class="size-4" />
 										<span>{item.label}</span>
+										{#if item.href === '/downloads' && activeDownloads.count > 0}
+											<span class="ml-auto rounded-full bg-primary px-1.5 py-0.5 text-[10px] font-bold leading-none text-primary-foreground">{activeDownloads.count}</span>
+										{/if}
 									</a>
 								{/snippet}
 							</SidebarMenuButton>

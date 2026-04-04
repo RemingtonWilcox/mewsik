@@ -53,7 +53,11 @@ pub fn get_artist_tracks(
     let mut stmt = conn.prepare(
         "SELECT r.id, r.title, a.name, a.id, al.title, al.id, r.duration_ms, r.cover_art_path, r.cover_art_url, r.genre, r.year,
                 COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local'),
-                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL)
+                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL),
+                COALESCE(
+                    (SELECT ts.file_path FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1),
+                    (SELECT d.file_path FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1)
+                )
          FROM recordings r
          JOIN recording_artists ra ON ra.recording_id = r.id AND ra.artist_id = ?1
          LEFT JOIN artists a ON a.id = ra.artist_id
@@ -80,6 +84,7 @@ pub fn get_artist_tracks(
                 year: row.get(10)?,
                 source: row.get(11)?,
                 is_downloaded: row.get::<_, bool>(12)?,
+                local_file_path: row.get(13)?,
                 playlist_track_id: None,
                 playlist_position: None,
             })
@@ -98,7 +103,11 @@ pub fn get_album_tracks(
     let mut stmt = conn.prepare(
         "SELECT r.id, r.title, COALESCE(a.name, 'Unknown Artist'), COALESCE(a.id, ''), al.title, al.id, r.duration_ms, r.cover_art_path, r.cover_art_url, r.genre, r.year,
                 COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local'),
-                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL)
+                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL),
+                COALESCE(
+                    (SELECT ts.file_path FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1),
+                    (SELECT d.file_path FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1)
+                )
          FROM album_tracks at2
          JOIN recordings r ON r.id = at2.recording_id
          JOIN albums al ON al.id = at2.album_id
@@ -123,6 +132,7 @@ pub fn get_album_tracks(
                 year: row.get(10)?,
                 source: row.get(11)?,
                 is_downloaded: row.get::<_, bool>(12)?,
+                local_file_path: row.get(13)?,
                 playlist_track_id: None,
                 playlist_position: None,
             })

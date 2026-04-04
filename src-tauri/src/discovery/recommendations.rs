@@ -120,6 +120,27 @@ impl RecommendationEngine {
                         ),
                         'local'
                     ),
+                    COALESCE(
+                        (
+                            SELECT ts.file_path
+                            FROM track_sources ts
+                            WHERE ts.recording_id = r.id
+                              AND ts.is_available = 1
+                              AND ts.file_path IS NOT NULL
+                            ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END,
+                                     ts.quality_score DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT d.file_path
+                            FROM downloads d
+                            WHERE d.recording_id = r.id
+                              AND d.status = 'completed'
+                              AND d.file_path IS NOT NULL
+                            ORDER BY d.updated_at DESC
+                            LIMIT 1
+                        )
+                    ),
                     (
                         COALESCE(artist_affinity.play_count, 0) * 5.0 +
                         COALESCE(genre_affinity.play_count, 0) * 3.0 +
@@ -209,6 +230,27 @@ impl RecommendationEngine {
                         ),
                         'local'
                     ),
+                    COALESCE(
+                        (
+                            SELECT ts.file_path
+                            FROM track_sources ts
+                            WHERE ts.recording_id = r.id
+                              AND ts.is_available = 1
+                              AND ts.file_path IS NOT NULL
+                            ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END,
+                                     ts.quality_score DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT d.file_path
+                            FROM downloads d
+                            WHERE d.recording_id = r.id
+                              AND d.status = 'completed'
+                              AND d.file_path IS NOT NULL
+                            ORDER BY d.updated_at DESC
+                            LIMIT 1
+                        )
+                    ),
                     (
                         COUNT(ph.id) * 3.5 +
                         MIN(julianday('now') - julianday(MAX(ph.started_at)), 365) / 5.0 +
@@ -286,6 +328,27 @@ impl RecommendationEngine {
                             LIMIT 1
                         ),
                         'local'
+                    ),
+                    COALESCE(
+                        (
+                            SELECT ts.file_path
+                            FROM track_sources ts
+                            WHERE ts.recording_id = r.id
+                              AND ts.is_available = 1
+                              AND ts.file_path IS NOT NULL
+                            ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END,
+                                     ts.quality_score DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT d.file_path
+                            FROM downloads d
+                            WHERE d.recording_id = r.id
+                              AND d.status = 'completed'
+                              AND d.file_path IS NOT NULL
+                            ORDER BY d.updated_at DESC
+                            LIMIT 1
+                        )
                     )
                 FROM recordings r
                 LEFT JOIN recording_artists ra
@@ -393,6 +456,27 @@ impl RecommendationEngine {
                             LIMIT 1
                         ),
                         'local'
+                    ),
+                    COALESCE(
+                        (
+                            SELECT ts.file_path
+                            FROM track_sources ts
+                            WHERE ts.recording_id = r.id
+                              AND ts.is_available = 1
+                              AND ts.file_path IS NOT NULL
+                            ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END,
+                                     ts.quality_score DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT d.file_path
+                            FROM downloads d
+                            WHERE d.recording_id = r.id
+                              AND d.status = 'completed'
+                              AND d.file_path IS NOT NULL
+                            ORDER BY d.updated_at DESC
+                            LIMIT 1
+                        )
                     )
                 FROM play_history ph
                 JOIN recordings r ON r.id = ph.recording_id
@@ -494,7 +578,7 @@ fn artist_bucket(track: &LibraryTrack) -> String {
 fn map_candidate_row(row: &Row<'_>) -> rusqlite::Result<RecommendationCandidate> {
     Ok(RecommendationCandidate {
         track: map_library_track_row(row)?,
-        score: row.get(12)?,
+        score: row.get(13)?,
     })
 }
 
@@ -512,6 +596,7 @@ fn map_library_track_row(row: &Row<'_>) -> rusqlite::Result<LibraryTrack> {
         genre: row.get(9)?,
         year: row.get(10)?,
         source: row.get(11)?,
+        local_file_path: row.get(12)?,
         is_downloaded: false,
         playlist_track_id: None,
         playlist_position: None,

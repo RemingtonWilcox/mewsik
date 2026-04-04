@@ -43,9 +43,13 @@ interface TrackMetadata {
 }
 
 export class YouTubeProvider {
+  private static readonly SEARCH_CACHE_LIMIT = 8;
+  private static readonly SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+
   private yt: Innertube | null = null;
   private healthy = true;
   private failCount = 0;
+  private searchPageCache = new Map<string, { pages: any[]; cachedAt: number }>();
 
   private async getClient(): Promise<Innertube> {
     if (!this.yt) {
@@ -64,51 +68,95 @@ export class YouTubeProvider {
 
   async search(query: string, page: number): Promise<{ items: SearchResult[]; has_more: boolean }> {
     try {
-      const yt = await this.getClient();
-      const results = await yt.music.search(query, { type: 'song' });
-      const items: SearchResult[] = [];
-
-      const contents = results.contents;
-      if (contents) {
-        for (const shelf of contents) {
-          if ('contents' in shelf) {
-            for (const item of (shelf as any).contents || []) {
-              if (item.type === 'MusicResponsiveListItem') {
-                const videoId = item.id || item.overlay?.content?.video_id;
-                if (!videoId) continue;
-
-                const title = item.title?.toString() || item.flex_columns?.[0]?.title?.toString() || 'Unknown';
-                const artist = item.artists?.[0]?.name || item.flex_columns?.[1]?.title?.toString() || 'Unknown';
-                const album = item.album?.name || null;
-                const durationText = item.duration?.text || item.duration?.seconds;
-                const durationMs = typeof durationText === 'number' ? durationText * 1000 : parseDuration(durationText);
-                const thumbnail = item.thumbnails?.[0]?.url || item.thumbnail?.contents?.[0]?.url || null;
-
-                items.push({
-                  source: 'youtube',
-                  source_id: videoId,
-                  title,
-                  artist,
-                  album,
-                  duration_ms: durationMs,
-                  cover_art_url: thumbnail,
-                  source_url: `https://music.youtube.com/watch?v=${videoId}`,
-                  play_count: parseCountText(item.views ?? item.view_count ?? item.subtitle?.toString()),
-                });
-              }
-            }
-          }
-        }
+      const results = await this.getVideoSearchPage(query, page);
+      if (!results) {
+        return { items: [], has_more: false };
       }
+
+      const items = dedupeSearchResults(
+        (results.videos as any[]).map((video) => {
+          const videoId = video.video_id || video.id;
+          if (!videoId) return null;
+
+          return {
+            source: 'youtube',
+            source_id: videoId,
+            title: video.title?.toString?.() || 'Unknown',
+            artist: video.author?.name || video.byline_text?.toString?.() || 'Unknown',
+            album: null,
+            duration_ms:
+              typeof video.duration?.seconds === 'number'
+                ? video.duration.seconds * 1000
+                : parseDuration(video.length_text?.toString?.() || video.duration?.text),
+            cover_art_url: video.best_thumbnail?.url || video.thumbnails?.[0]?.url || null,
+            source_url: `https://www.youtube.com/watch?v=${videoId}`,
+            play_count: parseCountText(video.view_count?.toString?.() || video.short_view_count?.toString?.()),
+          } satisfies SearchResult;
+        })
+      );
 
       this.failCount = 0;
       this.healthy = true;
 
-      return { items, has_more: items.length >= 20 };
+      return { items, has_more: results.has_continuation };
     } catch (err) {
       this.failCount++;
       if (this.failCount >= 3) this.healthy = false;
       throw err;
+    }
+  }
+
+  private async getVideoSearchPage(query: string, page: number): Promise<any | null> {
+    const yt = await this.getClient();
+    const cacheKey = normalizeSearchKey(query);
+    let cachedPages = this.getCachedSearchPages(cacheKey);
+    if (!cachedPages) {
+      cachedPages = [await yt.search(query, { type: 'video' })];
+      this.setCachedSearchPages(cacheKey, cachedPages);
+    }
+
+    while (cachedPages.length <= page) {
+      const current = cachedPages[cachedPages.length - 1];
+      if (!current?.has_continuation) {
+        return null;
+      }
+      cachedPages.push(await current.getContinuation());
+      this.setCachedSearchPages(cacheKey, cachedPages);
+    }
+
+    return cachedPages[page] ?? null;
+  }
+
+  private getCachedSearchPages(queryKey: string): any[] | null {
+    const entry = this.searchPageCache.get(queryKey);
+    if (!entry) return null;
+    if (Date.now() - entry.cachedAt > YouTubeProvider.SEARCH_CACHE_TTL_MS) {
+      this.searchPageCache.delete(queryKey);
+      return null;
+    }
+
+    this.searchPageCache.delete(queryKey);
+    this.searchPageCache.set(queryKey, {
+      pages: entry.pages,
+      cachedAt: Date.now(),
+    });
+    return entry.pages;
+  }
+
+  private setCachedSearchPages(queryKey: string, pages: any[]): void {
+    if (this.searchPageCache.has(queryKey)) {
+      this.searchPageCache.delete(queryKey);
+    }
+
+    this.searchPageCache.set(queryKey, {
+      pages,
+      cachedAt: Date.now(),
+    });
+
+    while (this.searchPageCache.size > YouTubeProvider.SEARCH_CACHE_LIMIT) {
+      const oldestKey = this.searchPageCache.keys().next().value;
+      if (!oldestKey) break;
+      this.searchPageCache.delete(oldestKey);
     }
   }
 
@@ -190,6 +238,24 @@ function parseDuration(text: string | undefined): number | null {
   if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000;
   if (parts.length === 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
   return null;
+}
+
+function normalizeSearchKey(query: string): string {
+  return query.trim().toLowerCase();
+}
+
+function dedupeSearchResults(results: Array<SearchResult | null>): SearchResult[] {
+  const seen = new Set<string>();
+  const deduped: SearchResult[] = [];
+
+  for (const result of results) {
+    if (!result) continue;
+    if (seen.has(result.source_id)) continue;
+    seen.add(result.source_id);
+    deduped.push(result);
+  }
+
+  return deduped;
 }
 
 function parseCountText(text: string | undefined): number | null {

@@ -4,9 +4,12 @@
 	import { Button } from '$lib/components/ui/button';
 	import { usePlayer, formatTime } from '$lib/state/player.svelte';
 	import type { LibraryTrack } from '$lib/types';
+	import { startDrag } from '@crabnebula/tauri-plugin-drag';
 	import * as api from '$lib/api/tauri';
 	import { toast } from 'svelte-sonner';
 
+	const DRAG_PREVIEW_ICON =
+		'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+cqXcAAAAASUVORK5CYII=';
 	let downloadingIds = $state<Set<string>>(new Set());
 
 	async function downloadTrack(track: LibraryTrack) {
@@ -72,6 +75,30 @@
 	function isPlaylistBusy(track: LibraryTrack) {
 		return playlistActions?.busyTrackId === (track.playlist_track_id ?? track.id);
 	}
+
+	function canDragOut(track: LibraryTrack) {
+		return Boolean(track.local_file_path);
+	}
+
+	async function handleDragStart(event: DragEvent, track: LibraryTrack) {
+		const filePath = track.local_file_path;
+		if (!filePath) {
+			event.preventDefault();
+			return;
+		}
+
+		try {
+			await startDrag({
+				item: [filePath],
+				icon: DRAG_PREVIEW_ICON,
+				mode: 'copy'
+			});
+		} catch (error) {
+			event.preventDefault();
+			const message = error instanceof Error ? error.message : String(error);
+			toast.error(`Drag failed: ${message}`);
+		}
+	}
 </script>
 
 <div class="w-full overflow-hidden">
@@ -94,10 +121,22 @@
 				{@const isCurrent = player.state.current_recording_id === track.id}
 				{@const isBuffering = isCurrent && player.state.is_buffering}
 				<div
-					class="grid cursor-pointer items-center gap-3 rounded-md px-2 py-1.5 hover:bg-muted/50"
+					class={`grid items-center gap-3 rounded-md px-2 py-1.5 hover:bg-muted/50 ${
+						canDragOut(track) ? 'cursor-grab active:cursor-grabbing' : 'cursor-pointer'
+					}`}
 					style="grid-template-columns: 48px 1fr 20% 20% 64px{playlistActions ? ' 100px' : ''};"
 					ondblclick={() => playTrack(i)}
+					onkeydown={(event) => {
+						if (event.key === 'Enter' || event.key === ' ') {
+							event.preventDefault();
+							playTrack(i);
+						}
+					}}
+					ondragstart={(event) => void handleDragStart(event, track)}
+					draggable={canDragOut(track)}
 					role="row"
+					tabindex="0"
+					title={canDragOut(track) ? 'Drag to copy this file into other apps' : undefined}
 				>
 					<!-- Play button -->
 					<div>

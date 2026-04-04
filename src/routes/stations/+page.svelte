@@ -6,20 +6,22 @@
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import * as api from '$lib/api/tauri';
 	import type { RadioBrowserStation } from '$lib/api/tauri';
-	import type { Station } from '$lib/types';
+	import type { Station, StationHealthResult } from '$lib/types';
 	import { usePlayer } from '$lib/state/player.svelte';
 	import { toast } from 'svelte-sonner';
-	import { Radio, Search, Heart, HeartOff, Play, Square, Globe, LoaderCircle, RefreshCw } from '@lucide/svelte';
+	import { Radio, Search, Heart, HeartOff, Play, Square, Globe, LoaderCircle, RefreshCw, X } from '@lucide/svelte';
 
 	const player = usePlayer();
 
 	const genres = [
 		'DnB', 'Hip Hop', 'Techno', 'House', 'Jazz', 'Lo-fi',
 		'Ambient', 'Classical', 'Rock', 'Metal', 'Reggae', 'Soul',
-		'R&B', 'Pop', 'Trance', 'Chillout', 'Latin', 'Blues'
+		'R&B', 'Pop', 'Trance', 'Chillout', 'Latin', 'Blues',
+		'News', 'Talk Radio', 'Sports'
 	];
 
 	let query = $state('');
+	let searchMode = $state<'name' | 'tag'>('name');
 	let results = $state<RadioBrowserStation[]>([]);
 	let favorites = $state<Station[]>([]);
 	let savedStationIds = $state<Set<string>>(new Set());
@@ -28,7 +30,9 @@
 	let favoritesError = $state('');
 	let searchError = $state('');
 	let searchRequest = 0;
+	let stationHealthRequest = 0;
 	let verifyingStations = $state(false);
+	let searchHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 
 	$effect(() => {
 		loadFavorites();
@@ -51,10 +55,15 @@
 		if (trimmedQuery.length > 1) {
 			searchError = '';
 			const requestId = ++searchRequest;
-			debounceTimer = setTimeout(() => void searchStations(trimmedQuery, requestId), 300);
+			debounceTimer = setTimeout(
+				() => void searchStations(trimmedQuery, requestId, searchMode),
+				300
+			);
 		} else {
 			searchRequest += 1;
+			stationHealthRequest += 1;
 			results = [];
+			searchHealthByUrl = {};
 			searchError = '';
 			searching = false;
 		}
@@ -62,18 +71,25 @@
 		return () => clearTimeout(debounceTimer);
 	});
 
-	async function searchStations(searchQuery = query.trim(), requestId = ++searchRequest) {
+	async function searchStations(
+		searchQuery = query.trim(),
+		requestId = ++searchRequest,
+		mode: 'name' | 'tag' = searchMode
+	) {
 		if (!searchQuery) return;
 		searching = true;
 		try {
-			const nextResults = await api.searchRadioStations(searchQuery);
+			const nextResults = await api.searchRadioStations(searchQuery, mode);
 			if (requestId === searchRequest) {
 				results = nextResults;
+				searchHealthByUrl = {};
 				searchError = '';
+				void verifySearchResults(nextResults, requestId);
 			}
 		} catch (e) {
 			if (requestId === searchRequest) {
 				results = [];
+				searchHealthByUrl = {};
 				searchError = `Failed to search stations${e ? `: ${e}` : ''}`;
 			}
 		} finally {
@@ -187,24 +203,86 @@
 		}
 	}
 
+	function searchStationHealth(url: string): StationHealthResult['status'] | null {
+		return searchHealthByUrl[url] ?? null;
+	}
+
+	function searchStationHealthLabel(url: string): string | null {
+		switch (searchStationHealth(url)) {
+			case 'stale':
+				return 'Station check warning';
+			case 'dead':
+				return 'Station may be offline';
+			default:
+				return null;
+		}
+	}
+
+	async function verifySearchResults(
+		stations = results,
+		requestId = ++stationHealthRequest
+	) {
+		const urls = [...new Set(stations.map((station) => station.url).filter(Boolean))];
+		if (urls.length === 0) {
+			searchHealthByUrl = {};
+			return;
+		}
+
+		try {
+			const verified = await api.verifyStationUrls(urls);
+			if (requestId !== stationHealthRequest) {
+				return;
+			}
+
+			searchHealthByUrl = Object.fromEntries(
+				verified.map((result) => [result.url, result.status] as const)
+			);
+		} catch {
+			// Search-result verification is advisory; don't interrupt search UX.
+		}
+	}
+
+	function clearSearch() {
+		query = '';
+		searchMode = 'name';
+		results = [];
+		searchHealthByUrl = {};
+		searchError = '';
+		searching = false;
+		searchRequest += 1;
+		stationHealthRequest += 1;
+	}
+
+	function searchGenre(genre: string) {
+		searchMode = 'name';
+		query = genre;
+	}
+
 	async function verifyStations() {
 		if (verifyingStations) return;
 
 		verifyingStations = true;
-		toast.info('Checking favorite stations...');
+		toast.info('Checking visible stations...');
 		try {
-			const results = await api.verifyFavoriteStations();
-			const deadCount = results.filter((result: any) => result.status === 'dead').length;
-			const staleCount = results.filter((result: any) => result.status === 'stale').length;
-			const okCount = results.filter((result: any) => result.status === 'ok').length;
+			const [favoriteResults, visibleResults] = await Promise.all([
+				api.verifyFavoriteStations(),
+				results.length > 0 ? api.verifyStationUrls(results.map((station) => station.url)) : Promise.resolve([])
+			]);
+			searchHealthByUrl = Object.fromEntries(
+				visibleResults.map((result) => [result.url, result.status] as const)
+			);
+			const combinedResults = [...favoriteResults, ...visibleResults];
+			const deadCount = combinedResults.filter((result) => result.status === 'dead').length;
+			const staleCount = combinedResults.filter((result) => result.status === 'stale').length;
+			const okCount = combinedResults.filter((result) => result.status === 'ok').length;
 			await loadFavorites();
 
 			if (deadCount > 0 || staleCount > 0) {
 				toast.warning(
-					`Station check: ${okCount} ok, ${staleCount} stale, ${deadCount} offline`
+					`Station check: ${okCount} ok, ${staleCount} warning, ${deadCount} offline`
 				);
 			} else {
-				toast.success(`All ${okCount} stations are healthy`);
+				toast.success(`All ${okCount} visible stations are healthy`);
 			}
 		} catch (error) {
 			toast.error(`Verify failed: ${error}`);
@@ -222,22 +300,32 @@
 			<Search class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
 			<Input
 				placeholder="Search 30,000+ stations..."
-				class="pl-10"
+				class="pl-10 pr-10"
 				bind:value={query}
+				oninput={() => { searchMode = 'name'; }}
 			/>
+			{#if query.length > 0}
+				<button
+					class="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
+					onclick={clearSearch}
+					aria-label="Clear station search"
+				>
+					<X class="size-4" />
+				</button>
+			{/if}
 		</div>
 		<Button
-			variant="outline"
-			class="shrink-0"
+			variant="ghost"
+			size="icon"
+			class="size-9 shrink-0"
 			disabled={verifyingStations}
 			onclick={verifyStations}
+			title="Verify stations"
 		>
 			{#if verifyingStations}
-				<LoaderCircle class="size-4 animate-spin" />
-				Verifying
+				<LoaderCircle class="size-4 animate-spin text-primary" />
 			{:else}
 				<RefreshCw class="size-4" />
-				Verify Favorites
 			{/if}
 		</Button>
 	</div>
@@ -248,7 +336,7 @@
 			{#each genres as genre}
 				<button
 					class="rounded-full border border-border bg-card px-3 py-1 text-xs font-medium transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary"
-					onclick={() => { query = genre; }}
+					onclick={() => searchGenre(genre)}
 				>
 					{genre}
 				</button>
@@ -261,7 +349,7 @@
 		<Card class="border-dashed">
 			<CardContent class="py-6 text-sm text-destructive">{favoritesError}</CardContent>
 		</Card>
-	{:else if favorites.length > 0 && results.length === 0}
+	{:else if favorites.length > 0 && results.length === 0 && query.trim().length <= 1 && !searching}
 		<div>
 			<h2 class="mb-3 text-lg font-semibold">Favorites</h2>
 			<div class="flex flex-col gap-2">
@@ -338,9 +426,9 @@
 		</Card>
 	{:else if results.length > 0}
 		<div class="flex flex-col gap-2">
-			{#each results as station}
-				<Card class="transition-colors hover:border-border hover:bg-muted/50">
-					<CardContent class="flex min-w-0 items-center gap-3 p-3">
+			{#each results.filter(s => searchStationHealth(s.url) !== 'dead') as station}
+				<Card class="transition-colors hover:border-border hover:bg-muted/50" style="overflow: hidden;">
+					<CardContent class="flex items-center gap-3 p-3" style="min-width: 0; overflow: hidden;">
 						<button
 							class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90"
 							onclick={() => playSearchResult(station)}
@@ -363,6 +451,11 @@
 						<div class="min-w-0 flex-1 overflow-hidden">
 							<div class="flex min-w-0 items-center gap-2">
 								<p class="truncate text-sm font-medium">{station.name}</p>
+								{#if searchStationHealth(station.url)}
+									<span
+										class={`size-2 shrink-0 rounded-full ${searchStationHealth(station.url) === 'dead' ? 'bg-zinc-500' : searchStationHealth(station.url) === 'stale' ? 'bg-amber-400' : 'bg-emerald-400'}`}
+									></span>
+								{/if}
 								{#if isStationActive(station.url)}
 									{#if player.state.is_buffering}
 										<LoaderCircle class="size-3 shrink-0 animate-spin text-primary" />
@@ -376,6 +469,11 @@
 									.filter(Boolean)
 									.join(' · ')}
 							</p>
+							{#if searchStationHealthLabel(station.url)}
+								<p class={`mt-1 truncate text-[11px] ${searchStationHealth(station.url) === 'dead' ? 'text-zinc-400' : 'text-amber-500'}`}>
+									{searchStationHealthLabel(station.url)}
+								</p>
+							{/if}
 						</div>
 
 						<Button variant="ghost" size="icon" class="size-8 shrink-0" onclick={() => saveToFavorites(station)} title="Save to favorites">

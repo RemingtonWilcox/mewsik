@@ -4,10 +4,10 @@ use crate::db::{
     models::{Download, TrackSource},
     queries, DbPool,
 };
+use crate::external_tools::{find_binary, format_ffmpeg_headers};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
-use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -106,45 +106,6 @@ fn infer_extension(entry: &QueueEntry) -> String {
     }
 }
 
-fn candidate_binary_paths(binary_name: &str) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    if let Some(path_var) = env::var_os("PATH") {
-        candidates.extend(env::split_paths(&path_var).map(|dir| dir.join(binary_name)));
-    }
-
-    candidates.extend([
-        PathBuf::from(format!("/opt/homebrew/bin/{binary_name}")),
-        PathBuf::from(format!("/usr/local/bin/{binary_name}")),
-        PathBuf::from(format!("/usr/bin/{binary_name}")),
-    ]);
-
-    candidates
-}
-
-fn find_binary(binary_name: &str) -> Option<PathBuf> {
-    candidate_binary_paths(binary_name)
-        .into_iter()
-        .find(|path| path.is_file())
-}
-
-fn format_ffmpeg_headers(headers: &HashMap<String, String>) -> Option<String> {
-    if headers.is_empty() {
-        return None;
-    }
-
-    let mut lines = String::new();
-    for (key, value) in headers {
-        let sanitized_value = value.replace(['\r', '\n'], " ");
-        lines.push_str(key);
-        lines.push_str(": ");
-        lines.push_str(&sanitized_value);
-        lines.push_str("\r\n");
-    }
-
-    Some(lines)
-}
-
 fn infer_file_format_from_path(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -158,6 +119,33 @@ fn managed_download_metadata(original_source: &str) -> String {
         "original_source": original_source
     })
     .to_string()
+}
+
+fn source_is_managed_download(source: &TrackSource) -> bool {
+    source
+        .metadata_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .and_then(|value| {
+            value
+                .get("managed_download")
+                .and_then(|flag| flag.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn remove_managed_download_source_for_path(db: &DbPool, file_path: &str) -> Result<(), String> {
+    let Some(source) =
+        queries::find_source_by_file_path(db, file_path).map_err(|e| e.to_string())?
+    else {
+        return Ok(());
+    };
+
+    if source_is_managed_download(&source) {
+        queries::delete_track_source(db, &source.id).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
 }
 
 fn upsert_download_source(
@@ -537,6 +525,54 @@ pub fn sync_completed_download_sources(db: &DbPool) -> Result<(), String> {
                 upsert_download_source(db, recording_id, &download.source, Path::new(file_path));
         }
     }
+    Ok(())
+}
+
+pub fn prune_missing_downloads(db: &DbPool) -> Result<(), String> {
+    let downloads = queries::get_downloads(db).map_err(|e| e.to_string())?;
+    for download in downloads {
+        if download.status != "completed" {
+            continue;
+        }
+
+        let Some(file_path) = download.file_path.as_deref() else {
+            continue;
+        };
+
+        if Path::new(file_path).exists() {
+            continue;
+        }
+
+        let _ = remove_managed_download_source_for_path(db, file_path);
+        queries::delete_download(db, &download.id).map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+pub fn delete_download_entry(db: &DbPool, download_id: &str) -> Result<(), String> {
+    let Some(download) = queries::get_download_by_id(db, download_id).map_err(|e| e.to_string())?
+    else {
+        return Err("Download no longer exists".to_string());
+    };
+
+    if matches!(
+        download.status.as_str(),
+        "pending" | "downloading" | "processing"
+    ) {
+        return Err("Active downloads must be cancelled first".to_string());
+    }
+
+    if let Some(file_path) = download.file_path.as_deref() {
+        let path = Path::new(file_path);
+        if path.exists() {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("Failed to delete downloaded file: {}", e))?;
+        }
+        let _ = remove_managed_download_source_for_path(db, file_path);
+    }
+
+    queries::delete_download(db, download_id).map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -1,11 +1,13 @@
 use crate::audio::engine::AudioEvent;
 use crate::config::AppConfig;
+use crate::external_tools::{find_binary, format_ffmpeg_headers};
 use crossbeam_channel::Sender;
 use parking_lot::{Condvar, Mutex};
 use rodio::{Decoder, Source};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -396,6 +398,162 @@ fn spawn_download_worker(
     Ok(())
 }
 
+fn spawn_ffmpeg_transcode_worker(
+    url: String,
+    headers: HashMap<String, String>,
+    seek_position_ms: Option<u64>,
+    mut writer: File,
+    shared: Arc<SharedBufferedFile>,
+    playback_session: Arc<AtomicU64>,
+    session_id: u64,
+    event_tx: Sender<AudioEvent>,
+    label: String,
+) -> Result<(), String> {
+    let ffmpeg = find_binary("ffmpeg").ok_or_else(|| {
+        "ffmpeg is required for progressive YouTube playback but was not found".to_string()
+    })?;
+
+    std::thread::Builder::new()
+        .name("ffmpeg-stream-transcode".to_string())
+        .spawn(move || {
+            let mut command = Command::new(ffmpeg);
+            command
+                .arg("-hide_banner")
+                .arg("-loglevel")
+                .arg("error")
+                .arg("-nostdin");
+
+            if let Some(headers) = format_ffmpeg_headers(&headers) {
+                command.arg("-headers").arg(headers);
+            }
+
+            if let Some(seek_ms) = seek_position_ms {
+                command
+                    .arg("-ss")
+                    .arg(format!("{:.3}", seek_ms as f64 / 1000.0));
+            }
+
+            command
+                .arg("-reconnect")
+                .arg("1")
+                .arg("-reconnect_streamed")
+                .arg("1")
+                .arg("-reconnect_delay_max")
+                .arg("2")
+                .arg("-i")
+                .arg(&url)
+                .arg("-vn")
+                .arg("-codec:a")
+                .arg("libmp3lame")
+                .arg("-q:a")
+                .arg("4")
+                .arg("-f")
+                .arg("mp3")
+                .arg("pipe:1")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(err) => {
+                    let message = format!("Failed to start ffmpeg: {}", err);
+                    shared.fail(message.clone());
+                    let _ = event_tx.send(AudioEvent::Error(format!(
+                        "{} failed before playback: {}",
+                        label, err
+                    )));
+                    return;
+                }
+            };
+
+            let Some(mut stdout) = child.stdout.take() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                let message = "Failed to capture ffmpeg audio output".to_string();
+                shared.fail(message.clone());
+                let _ = event_tx.send(AudioEvent::Error(format!("{} failed: {}", label, message)));
+                return;
+            };
+
+            let stderr_reader = child.stderr.take().map(|mut stderr| {
+                std::thread::spawn(move || {
+                    let mut output = String::new();
+                    let _ = stderr.read_to_string(&mut output);
+                    output
+                })
+            });
+
+            let mut chunk = [0u8; 64 * 1024];
+            loop {
+                if playback_session.load(Ordering::SeqCst) != session_id {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    shared.cancel();
+                    return;
+                }
+
+                match stdout.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => {
+                        if let Err(err) = writer.write_all(&chunk[..bytes_read]) {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            let message = format!("Failed to write ffmpeg stream buffer: {}", err);
+                            shared.fail(message.clone());
+                            let _ = event_tx
+                                .send(AudioEvent::Error(format!("{} failed: {}", label, message)));
+                            return;
+                        }
+                        shared.append_bytes(bytes_read as u64);
+                    }
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let message = format!("Failed to read ffmpeg audio output: {}", err);
+                        shared.fail(message.clone());
+                        let _ = event_tx
+                            .send(AudioEvent::Error(format!("{} failed: {}", label, message)));
+                        return;
+                    }
+                }
+            }
+
+            let status = child.wait();
+            let stderr_output = stderr_reader
+                .and_then(|handle| handle.join().ok())
+                .unwrap_or_default();
+
+            if playback_session.load(Ordering::SeqCst) != session_id {
+                shared.cancel();
+                return;
+            }
+
+            match status {
+                Ok(status) if status.success() => shared.finish(),
+                Ok(_) => {
+                    let details = stderr_output.trim();
+                    let message = if details.is_empty() {
+                        "ffmpeg exited before producing a complete audio stream".to_string()
+                    } else {
+                        format!("ffmpeg failed to transcode the stream: {}", details)
+                    };
+                    shared.fail(message.clone());
+                    let _ =
+                        event_tx.send(AudioEvent::Error(format!("{} failed: {}", label, message)));
+                }
+                Err(err) => {
+                    let message = format!("Failed to wait for ffmpeg: {}", err);
+                    shared.fail(message.clone());
+                    let _ =
+                        event_tx.send(AudioEvent::Error(format!("{} failed: {}", label, message)));
+                }
+            }
+        })
+        .map_err(|e| format!("Failed to spawn ffmpeg stream worker: {}", e))?;
+
+    Ok(())
+}
+
 pub fn fetch_http_audio_bytes(
     url: &str,
     headers: &HashMap<String, String>,
@@ -449,31 +607,11 @@ pub fn fetch_http_audio_bytes(
     Ok(bytes)
 }
 
-pub fn prepare_http_audio_source(
-    url: String,
-    headers: HashMap<String, String>,
-    playback_session: Arc<AtomicU64>,
-    session_id: u64,
+fn prepare_buffered_decoder(
+    shared: Arc<SharedBufferedFile>,
     initial_buffer_bytes: usize,
     is_live: bool,
-    event_tx: Sender<AudioEvent>,
-    label: String,
 ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
-    let (writer, reader) = create_unlinked_stream_file()?;
-    let shared = Arc::new(SharedBufferedFile::new(reader));
-
-    spawn_download_worker(
-        url,
-        headers,
-        writer,
-        Arc::clone(&shared),
-        playback_session,
-        session_id,
-        is_live,
-        event_tx,
-        label,
-    )?;
-
     let minimum_threshold = if is_live { 16 * 1024 } else { 64 * 1024 };
     let base_threshold = initial_buffer_bytes.max(minimum_threshold);
     let mut thresholds = if is_live {
@@ -523,4 +661,60 @@ pub fn prepare_http_audio_source(
     }
 
     Err(last_error.unwrap_or_else(|| "Timed out preparing audio stream".to_string()))
+}
+
+pub fn prepare_http_audio_source(
+    url: String,
+    headers: HashMap<String, String>,
+    playback_session: Arc<AtomicU64>,
+    session_id: u64,
+    initial_buffer_bytes: usize,
+    is_live: bool,
+    event_tx: Sender<AudioEvent>,
+    label: String,
+) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
+    let (writer, reader) = create_unlinked_stream_file()?;
+    let shared = Arc::new(SharedBufferedFile::new(reader));
+
+    spawn_download_worker(
+        url,
+        headers,
+        writer,
+        Arc::clone(&shared),
+        playback_session,
+        session_id,
+        is_live,
+        event_tx,
+        label,
+    )?;
+
+    prepare_buffered_decoder(shared, initial_buffer_bytes, is_live)
+}
+
+pub fn prepare_ffmpeg_audio_source(
+    url: String,
+    headers: HashMap<String, String>,
+    seek_position_ms: Option<u64>,
+    playback_session: Arc<AtomicU64>,
+    session_id: u64,
+    initial_buffer_bytes: usize,
+    event_tx: Sender<AudioEvent>,
+    label: String,
+) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
+    let (writer, reader) = create_unlinked_stream_file()?;
+    let shared = Arc::new(SharedBufferedFile::new(reader));
+
+    spawn_ffmpeg_transcode_worker(
+        url,
+        headers,
+        seek_position_ms,
+        writer,
+        Arc::clone(&shared),
+        playback_session,
+        session_id,
+        event_tx,
+        label,
+    )?;
+
+    prepare_buffered_decoder(shared, initial_buffer_bytes, false)
 }

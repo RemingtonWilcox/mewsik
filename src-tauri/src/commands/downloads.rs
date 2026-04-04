@@ -8,6 +8,7 @@ use tauri::State;
 
 #[tauri::command]
 pub fn get_downloads(db: State<'_, DbPool>) -> Result<Vec<Download>, String> {
+    let _ = download::prune_missing_downloads(&db);
     let _ = download::sync_completed_download_sources(&db);
     download::get_all_downloads(&db)
 }
@@ -44,6 +45,16 @@ pub fn cancel_download(
     } else {
         Err("Download is no longer active".to_string())
     }
+}
+
+#[tauri::command]
+pub fn delete_download(
+    db: State<'_, DbPool>,
+    downloads: State<'_, Arc<DownloadManager>>,
+    download_id: String,
+) -> Result<(), String> {
+    downloads.cancel(&download_id);
+    download::delete_download_entry(&db, &download_id)
 }
 
 #[tauri::command]

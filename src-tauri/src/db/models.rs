@@ -151,6 +151,7 @@ pub struct LibraryTrack {
     pub year: Option<i32>,
     pub source: String,
     pub is_downloaded: bool,
+    pub local_file_path: Option<String>,
     pub playlist_track_id: Option<String>,
     pub playlist_position: Option<f64>,
 }

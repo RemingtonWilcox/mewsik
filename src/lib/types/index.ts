@@ -98,7 +98,8 @@ export interface Station {
 }
 
 export interface StationHealthResult {
-	station_id: string;
+	station_id: string | null;
+	url: string;
 	status: 'ok' | 'stale' | 'dead';
 	last_checked_at: string | null;
 }
@@ -142,6 +143,7 @@ export interface LibraryTrack {
 	year: number | null;
 	source: SourceType;
 	is_downloaded: boolean;
+	local_file_path: string | null;
 	playlist_track_id?: string | null;
 	playlist_position?: number | null;
 }

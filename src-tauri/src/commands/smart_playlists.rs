@@ -93,7 +93,11 @@ pub fn evaluate_smart_playlist(
     let conn = db.lock();
     let query = format!(
         "SELECT r.id, r.title, COALESCE(a.name, 'Unknown Artist'), COALESCE(a.id, ''), al.title, al.id, r.duration_ms, r.cover_art_path, r.cover_art_url, r.genre, r.year,
-                COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local')
+                COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local'),
+                COALESCE(
+                    (SELECT ts.file_path FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1),
+                    (SELECT d.file_path FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1)
+                )
          FROM recordings r
          LEFT JOIN recording_artists ra ON ra.recording_id = r.id AND ra.role = 'primary' AND ra.position = 0
          LEFT JOIN artists a ON a.id = ra.artist_id
@@ -123,6 +127,7 @@ pub fn evaluate_smart_playlist(
                 year: row.get(10)?,
                 source: row.get(11)?,
                 is_downloaded: false,
+                local_file_path: row.get(12)?,
                 playlist_track_id: None,
                 playlist_position: None,
             })

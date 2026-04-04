@@ -6,6 +6,7 @@ mod config;
 mod db;
 mod discovery;
 mod download;
+mod external_tools;
 mod keychain;
 mod metadata;
 mod sources;
@@ -49,6 +50,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_drag::init())
         .plugin(tauri_plugin_shell::init())
         .setup(move |app| {
             if cfg!(debug_assertions) {
@@ -134,12 +136,15 @@ pub fn run() {
             commands::downloads::get_downloads,
             commands::downloads::download_recording,
             commands::downloads::cancel_download,
+            commands::downloads::delete_download,
             commands::downloads::reveal_download_path,
             // Stations
             commands::stations::search_radio_stations,
+            commands::stations::search_radio_stations_advanced,
             commands::stations::save_station,
             commands::stations::get_favorite_stations,
             commands::stations::verify_favorite_stations,
+            commands::stations::verify_station_urls,
             commands::stations::toggle_station_favorite,
             commands::stations::play_station,
             commands::stations::play_station_search_result,

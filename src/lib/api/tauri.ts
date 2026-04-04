@@ -211,6 +211,14 @@ export interface ExternalSearchResult {
 	cover_art_url: string | null;
 	source_url: string | null;
 	play_count: number | null;
+	is_saved: boolean;
+	is_downloaded: boolean;
+	recording_id: string | null;
+}
+
+export interface ExternalSearchPage {
+	items: ExternalSearchResult[];
+	has_more: boolean;
 }
 
 export interface ExternalSearchPartialEvent {
@@ -236,8 +244,12 @@ async function listenDesktopEvent<T>(
 	return listen<T>(event, (tauriEvent) => handler(tauriEvent.payload));
 }
 
-export const searchExternal = (query: string, source: string) =>
-	safeInvoke<ExternalSearchResult[]>('search_external', { query, source }, []);
+export const searchExternal = (query: string, source: string, page = 0) =>
+	safeInvoke<ExternalSearchPage>(
+		'search_external',
+		{ query, source, page },
+		{ items: [], has_more: false }
+	);
 
 export const searchAllSources = (query: string) =>
 	safeInvoke<ExternalSearchResult[]>('search_all_sources', { query }, []);
@@ -320,6 +332,8 @@ export const downloadRecording = (recordingId: string) =>
 	safeInvoke<string>('download_recording', { recordingId });
 export const cancelDownload = (downloadId: string) =>
 	safeInvoke('cancel_download', { downloadId });
+export const deleteDownload = (downloadId: string) =>
+	safeInvoke('delete_download', { downloadId });
 export const revealDownloadPath = (path: string) =>
 	safeInvoke('reveal_download_path', { path });
 
@@ -346,8 +360,12 @@ export interface RadioBrowserStation {
 	stationuuid: string;
 }
 
-export const searchRadioStations = (query: string) =>
-	safeInvoke<RadioBrowserStation[]>('search_radio_stations', { query }, []);
+export const searchRadioStations = (query: string, mode: 'name' | 'tag' = 'name') =>
+	safeInvoke<RadioBrowserStation[]>(
+		mode === 'name' ? 'search_radio_stations' : 'search_radio_stations_advanced',
+		mode === 'name' ? { query } : { query, mode },
+		[]
+	);
 
 export const saveStation = (
 	name: string,
@@ -378,6 +396,8 @@ export const getFavoriteStations = () => safeInvoke<Station[]>('get_favorite_sta
 
 export const verifyFavoriteStations = () =>
 	safeInvoke<StationHealthResult[]>('verify_favorite_stations', undefined, []);
+export const verifyStationUrls = (urls: string[]) =>
+	safeInvoke<StationHealthResult[]>('verify_station_urls', { urls }, []);
 export const toggleStationFavorite = (stationId: string) =>
 	safeInvoke<boolean>('toggle_station_favorite', { stationId });
 

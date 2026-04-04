@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
+use tokio::task::JoinSet;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RadioBrowserStation {
@@ -23,9 +24,16 @@ pub struct RadioBrowserStation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationHealthResult {
-    pub station_id: String,
+    pub station_id: Option<String>,
+    pub url: String,
     pub status: String,
     pub last_checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationVerifyTarget {
+    pub station_id: Option<String>,
+    pub url: String,
 }
 
 const STATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -246,24 +254,102 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bo
     false
 }
 
+fn build_station_health_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(STATION_PROBE_TIMEOUT)
+        .connect_timeout(STATION_PROBE_TIMEOUT)
+        .user_agent("mewsik/0.1.0")
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .build()
+        .map_err(|e| format!("Failed to build station health client: {}", e))
+}
+
+async fn probe_station_targets(
+    client: &reqwest::Client,
+    targets: Vec<StationVerifyTarget>,
+) -> Result<Vec<(StationVerifyTarget, bool)>, String> {
+    let mut probes = JoinSet::new();
+    for target in targets {
+        let client = client.clone();
+        probes.spawn(async move {
+            let is_healthy = probe_station_stream(&client, &target.url).await;
+            (target, is_healthy)
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(result) = probes.join_next().await {
+        results.push(result.map_err(|err| format!("Station verification task failed: {}", err))?);
+    }
+
+    Ok(results)
+}
+
+async fn verify_station_urls_inner(urls: Vec<String>) -> Result<Vec<StationHealthResult>, String> {
+    let mut deduped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for url in urls {
+        let trimmed = url.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+        deduped.push(StationVerifyTarget {
+            station_id: None,
+            url: trimmed.to_string(),
+        });
+    }
+
+    if deduped.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let client = build_station_health_client()?;
+    let verified = probe_station_targets(&client, deduped).await?;
+    let checked_at = queries::now();
+
+    Ok(verified
+        .into_iter()
+        .map(|(target, is_healthy)| StationHealthResult {
+            station_id: target.station_id,
+            url: target.url,
+            status: if is_healthy { "ok" } else { "dead" }.to_string(),
+            last_checked_at: Some(checked_at.clone()),
+        })
+        .collect())
+}
+
 async fn verify_favorite_stations_inner(db: &DbPool) -> Result<Vec<StationHealthResult>, String> {
     let stations = queries::get_favorite_stations(db).map_err(|e| e.to_string())?;
     if stations.is_empty() {
         return Ok(Vec::new());
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(STATION_PROBE_TIMEOUT)
-        .connect_timeout(STATION_PROBE_TIMEOUT)
-        .user_agent("mewsik/0.1.0")
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()
-        .map_err(|e| format!("Failed to build station health client: {}", e))?;
+    let client = build_station_health_client()?;
+    let verified = probe_station_targets(
+        &client,
+        stations
+            .iter()
+            .map(|station| StationVerifyTarget {
+                station_id: Some(station.id.clone()),
+                url: station.url.clone(),
+            })
+            .collect(),
+    )
+    .await?;
+
+    let mut health_by_station_id = std::collections::HashMap::new();
+    for (target, is_healthy) in verified {
+        if let Some(station_id) = target.station_id {
+            health_by_station_id.insert(station_id, (target.url, is_healthy));
+        }
+    }
 
     let mut results = Vec::with_capacity(stations.len());
     for station in stations {
         let checked_at = queries::now();
-        let is_healthy = probe_station_stream(&client, &station.url).await;
+        let (url, is_healthy) = health_by_station_id
+            .remove(&station.id)
+            .unwrap_or((station.url.clone(), false));
 
         let next_fail_count = if is_healthy {
             0
@@ -275,7 +361,8 @@ async fn verify_favorite_stations_inner(db: &DbPool) -> Result<Vec<StationHealth
             .map_err(|e| e.to_string())?;
 
         results.push(StationHealthResult {
-            station_id: station.id,
+            station_id: Some(station.id),
+            url,
             status: station_health_status(next_fail_count).to_string(),
             last_checked_at: Some(checked_at),
         });
@@ -358,8 +445,20 @@ fn upsert_station(
 
 #[tauri::command]
 pub async fn search_radio_stations(query: String) -> Result<Vec<RadioBrowserStation>, String> {
+    search_radio_stations_with_mode(query, None).await
+}
+
+async fn search_radio_stations_with_mode(
+    query: String,
+    mode: Option<String>,
+) -> Result<Vec<RadioBrowserStation>, String> {
+    let endpoint = match mode.as_deref() {
+        Some("tag") => "bytag",
+        _ => "byname",
+    };
     let url = format!(
-        "https://de1.api.radio-browser.info/json/stations/byname/{}?limit=50&order=clickcount&reverse=true",
+        "https://de1.api.radio-browser.info/json/stations/{}/{}?limit=50&order=clickcount&reverse=true",
+        endpoint,
         urlencoding::encode(&query)
     );
 
@@ -373,6 +472,14 @@ pub async fn search_radio_stations(query: String) -> Result<Vec<RadioBrowserStat
         .map_err(|e| format!("Failed to parse radio stations: {}", e))?;
 
     Ok(stations)
+}
+
+#[tauri::command]
+pub async fn search_radio_stations_advanced(
+    query: String,
+    mode: Option<String>,
+) -> Result<Vec<RadioBrowserStation>, String> {
+    search_radio_stations_with_mode(query, mode).await
 }
 
 #[tauri::command]
@@ -417,6 +524,11 @@ pub async fn verify_favorite_stations(
 ) -> Result<Vec<StationHealthResult>, String> {
     let db = db.inner().clone();
     verify_favorite_stations_inner(&db).await
+}
+
+#[tauri::command]
+pub async fn verify_station_urls(urls: Vec<String>) -> Result<Vec<StationHealthResult>, String> {
+    verify_station_urls_inner(urls).await
 }
 
 #[tauri::command]

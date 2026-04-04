@@ -7,7 +7,8 @@
 		LoaderCircle,
 		FolderOpen,
 		RotateCcw,
-		CircleSlash
+		CircleSlash,
+		Trash2
 	} from '@lucide/svelte';
 	import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
@@ -49,6 +50,7 @@
 			await api.revealDownloadPath(path);
 		} catch (e) {
 			toast.error(`Failed to reveal download: ${e}`);
+			await loadDownloads();
 		} finally {
 			const { [downloadId]: _removed, ...rest } = actioning;
 			actioning = rest;
@@ -79,6 +81,21 @@
 			await loadDownloads();
 		} catch (e) {
 			toast.error(`Failed to cancel download: ${e}`);
+		} finally {
+			const { [item.id]: _removed, ...rest } = actioning;
+			actioning = rest;
+		}
+	}
+
+	async function deleteDownloadItem(item: DownloadItem) {
+		if (actioning[item.id]) return;
+		actioning = { ...actioning, [item.id]: true };
+		try {
+			await api.deleteDownload(item.id);
+			toast.success('Download removed');
+			await loadDownloads();
+		} catch (e) {
+			toast.error(`Failed to delete download: ${e}`);
 		} finally {
 			const { [item.id]: _removed, ...rest } = actioning;
 			actioning = rest;
@@ -188,6 +205,17 @@
 								onclick={() => retryDownload(item)}
 							>
 								<RotateCcw class="size-4" />
+							</Button>
+						{/if}
+						{#if !isActive}
+							<Button
+								variant="ghost"
+								size="icon"
+								class="size-8 text-destructive hover:text-destructive"
+								disabled={Boolean(actioning[item.id])}
+								onclick={() => deleteDownloadItem(item)}
+							>
+								<Trash2 class="size-4" />
 							</Button>
 						{/if}
 					</div>

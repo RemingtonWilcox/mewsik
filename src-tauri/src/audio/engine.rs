@@ -25,8 +25,8 @@ use symphonia::core::probe::Hint;
 pub enum AudioCommand {
     PlayFile(String, String), // recording_id, file_path
     PlayEntry(QueueEntry),
-    PlayFetchedRemote(QueueEntry, Vec<u8>, u64),
-    PlayPreparedRemote(QueueEntry, Box<dyn Source<Item = i16> + Send>, u64),
+    PlayFetchedRemote(QueueEntry, Vec<u8>, u64, u64),
+    PlayPreparedRemote(QueueEntry, Box<dyn Source<Item = i16> + Send>, u64, u64),
     PlayUrl(String, String, String, Option<String>), // station_id, url, name, favicon
     PlayPreparedRadio(
         String,
@@ -125,10 +125,6 @@ impl AudioEngine {
     }
 
     fn should_prefer_full_fetch(entry: &QueueEntry) -> bool {
-        if entry.source == "youtube" {
-            return true;
-        }
-
         entry
             .stream_mime_type
             .as_deref()
@@ -290,11 +286,14 @@ impl AudioEngine {
         entry: &QueueEntry,
         source: Box<dyn Source<Item = i16> + Send>,
         can_seek: bool,
+        position_reports_relative: bool,
+        initial_position_ms: u64,
         state: &Arc<Mutex<PlaybackState>>,
         event_tx: &Sender<AudioEvent>,
         db: &DbPool,
         play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
+        current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
@@ -310,7 +309,8 @@ impl AudioEngine {
             sink.pause();
             *play_started = None;
         }
-        *position_offset_ms = 0;
+        *position_offset_ms = initial_position_ms;
+        *current_position_reports_relative = position_reports_relative;
         *current_play_id =
             db::queries::record_play(db, Some(&entry.recording_id), Some(&entry.source), None).ok();
         *playback_kind = PlaybackKind::Queue;
@@ -324,7 +324,7 @@ impl AudioEngine {
         s.current_artist = Some(entry.artist.clone());
         s.current_album_art = entry.cover_art.clone();
         s.current_source_url = entry.source_url.clone();
-        s.position_ms = 0;
+        s.position_ms = initial_position_ms;
         s.duration_ms = entry.duration_ms.unwrap_or(0) as u64;
         s.source = Some(entry.source.clone());
         let state_clone = s.clone();
@@ -344,6 +344,7 @@ impl AudioEngine {
         db: &DbPool,
         play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
+        current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
@@ -360,6 +361,7 @@ impl AudioEngine {
             *play_started = None;
         }
         *position_offset_ms = 0;
+        *current_position_reports_relative = false;
         if current_play_id.is_none() {
             *current_play_id =
                 db::queries::record_play(db, None, Some("radio"), Some(station_id)).ok();
@@ -383,6 +385,60 @@ impl AudioEngine {
         let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
     }
 
+    fn prepare_youtube_remote_playback(
+        queued_entry: QueueEntry,
+        url: String,
+        headers: HashMap<String, String>,
+        cmd_tx: Sender<AudioCommand>,
+        event_tx: Sender<AudioEvent>,
+        playback_session: Arc<AtomicU64>,
+        session_id: u64,
+        seek_position_ms: u64,
+    ) {
+        match http_stream::prepare_ffmpeg_audio_source(
+            url.clone(),
+            headers.clone(),
+            (seek_position_ms > 0).then_some(seek_position_ms),
+            Arc::clone(&playback_session),
+            session_id,
+            96 * 1024,
+            event_tx.clone(),
+            format!("Track {}", queued_entry.title),
+        ) {
+            Ok(source) => {
+                let _ = cmd_tx.send(AudioCommand::PlayPreparedRemote(
+                    queued_entry,
+                    source,
+                    session_id,
+                    seek_position_ms,
+                ));
+            }
+            Err(stream_err) => {
+                log::warn!(
+                    "ffmpeg YouTube stream setup failed, falling back to full fetch: {}",
+                    stream_err
+                );
+                match Self::fetch_remote_audio(&url, &headers) {
+                    Ok(bytes) => {
+                        let _ = cmd_tx.send(AudioCommand::PlayFetchedRemote(
+                            queued_entry,
+                            bytes,
+                            session_id,
+                            seek_position_ms,
+                        ));
+                    }
+                    Err(fetch_err) => {
+                        if playback_session.load(Ordering::SeqCst) != session_id {
+                            return;
+                        }
+                        let _ = cmd_tx.send(AudioCommand::Stop);
+                        let _ = event_tx.send(AudioEvent::Error(fetch_err));
+                    }
+                }
+            }
+        }
+    }
+
     fn play_queue_entry(
         sink: &Sink,
         entry: &QueueEntry,
@@ -393,6 +449,7 @@ impl AudioEngine {
         playback_session: &Arc<AtomicU64>,
         play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
+        current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
@@ -404,7 +461,9 @@ impl AudioEngine {
             db,
             play_started,
             position_offset_ms,
+            current_position_reports_relative,
             current_play_id,
+            *awaiting_source,
         );
         *desired_playing = true;
 
@@ -450,11 +509,26 @@ impl AudioEngine {
             let event_tx = event_tx.clone();
             let playback_session = Arc::clone(playback_session);
             let prefer_full_fetch = Self::should_prefer_full_fetch(entry);
+            let use_ffmpeg_stream = queued_entry.source == "youtube";
             let stream_mime_type = entry.stream_mime_type.clone();
 
             std::thread::Builder::new()
                 .name("remote-track-prepare".to_string())
                 .spawn(move || {
+                    if use_ffmpeg_stream {
+                        Self::prepare_youtube_remote_playback(
+                            queued_entry,
+                            url,
+                            headers,
+                            cmd_tx,
+                            event_tx,
+                            playback_session,
+                            session_id,
+                            0,
+                        );
+                        return;
+                    }
+
                     if prefer_full_fetch {
                         log::info!(
                             "Using full-fetch playback path for {} ({}) with MIME {:?}",
@@ -468,6 +542,7 @@ impl AudioEngine {
                                     queued_entry,
                                     bytes,
                                     session_id,
+                                    0,
                                 ));
                             }
                             Err(fetch_err) => {
@@ -496,6 +571,7 @@ impl AudioEngine {
                                 queued_entry,
                                 source,
                                 session_id,
+                                0,
                             ));
                         }
                         Err(stream_err) => {
@@ -509,6 +585,7 @@ impl AudioEngine {
                                         queued_entry,
                                         bytes,
                                         session_id,
+                                        0,
                                     ));
                                 }
                                 Err(fetch_err) => {
@@ -577,6 +654,7 @@ impl AudioEngine {
         let mut queue = PlayQueue::new();
         let mut play_started: Option<Instant> = None;
         let mut position_offset_ms: u64 = 0;
+        let mut current_position_reports_relative = false;
         let mut current_play_id: Option<String> = None;
         let mut last_position_update = Instant::now();
         let mut playback_kind = PlaybackKind::Idle;
@@ -593,7 +671,9 @@ impl AudioEngine {
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
+                        awaiting_source,
                     );
                     awaiting_source = false;
                     desired_playing = true;
@@ -607,6 +687,7 @@ impl AudioEngine {
                                     sink.play();
                                     play_started = Some(Instant::now());
                                     position_offset_ms = 0;
+                                    current_position_reports_relative = false;
 
                                     // Get recording info from DB
                                     let rec = db::queries::get_recording(&db, &recording_id)
@@ -674,6 +755,7 @@ impl AudioEngine {
                         &playback_session,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
                         &mut playback_kind,
                         &mut awaiting_source,
@@ -682,7 +764,12 @@ impl AudioEngine {
                         let _ = event_tx.send(AudioEvent::Error(err));
                     }
                 }
-                Ok(AudioCommand::PlayFetchedRemote(entry, bytes, session_id)) => {
+                Ok(AudioCommand::PlayFetchedRemote(
+                    entry,
+                    bytes,
+                    session_id,
+                    initial_position_ms,
+                )) => {
                     if playback_session.load(Ordering::SeqCst) != session_id {
                         continue;
                     }
@@ -692,6 +779,9 @@ impl AudioEngine {
                         Ok((source, can_seek)) => {
                             sink.stop();
                             sink.append(source);
+                            if initial_position_ms > 0 {
+                                let _ = sink.try_seek(Duration::from_millis(initial_position_ms));
+                            }
                             if desired_playing {
                                 sink.play();
                                 play_started = Some(Instant::now());
@@ -700,6 +790,7 @@ impl AudioEngine {
                                 sink.pause();
                             }
                             position_offset_ms = 0;
+                            current_position_reports_relative = false;
                             current_play_id = db::queries::record_play(
                                 &db,
                                 Some(&entry.recording_id),
@@ -718,7 +809,7 @@ impl AudioEngine {
                             s.current_artist = Some(entry.artist.clone());
                             s.current_album_art = entry.cover_art.clone();
                             s.current_source_url = entry.source_url.clone();
-                            s.position_ms = 0;
+                            s.position_ms = initial_position_ms;
                             s.duration_ms = entry.duration_ms.unwrap_or(0) as u64;
                             s.source = Some(entry.source.clone());
                             let state_clone = s.clone();
@@ -730,7 +821,12 @@ impl AudioEngine {
                         }
                     }
                 }
-                Ok(AudioCommand::PlayPreparedRemote(entry, source, session_id)) => {
+                Ok(AudioCommand::PlayPreparedRemote(
+                    entry,
+                    source,
+                    session_id,
+                    initial_position_ms,
+                )) => {
                     if playback_session.load(Ordering::SeqCst) != session_id {
                         continue;
                     }
@@ -738,12 +834,15 @@ impl AudioEngine {
                         &sink,
                         &entry,
                         source,
-                        entry.can_seek,
+                        entry.can_seek || entry.source == "youtube",
+                        entry.source == "youtube",
+                        initial_position_ms,
                         &state,
                         &event_tx,
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
                         &mut playback_kind,
                         &mut awaiting_source,
@@ -757,7 +856,9 @@ impl AudioEngine {
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
+                        awaiting_source,
                     );
                     queue.clear();
                     Self::sync_queue_state(&queue, &queue_items);
@@ -857,6 +958,7 @@ impl AudioEngine {
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
                         &mut playback_kind,
                         &mut awaiting_source,
@@ -866,11 +968,16 @@ impl AudioEngine {
                 Ok(AudioCommand::Pause) => {
                     desired_playing = false;
                     sink.pause();
-                    position_offset_ms = Self::current_position_ms(&sink);
+                    let position_ms = Self::playback_position_ms(
+                        &sink,
+                        position_offset_ms,
+                        current_position_reports_relative,
+                        awaiting_source,
+                    );
                     play_started = None;
                     let mut s = state.lock();
                     s.is_playing = false;
-                    s.position_ms = position_offset_ms;
+                    s.position_ms = position_ms;
                     let state_clone = s.clone();
                     drop(s);
                     let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
@@ -903,13 +1010,16 @@ impl AudioEngine {
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
+                        awaiting_source,
                     );
                     awaiting_source = false;
                     desired_playing = false;
                     playback_kind = PlaybackKind::Idle;
                     play_started = None;
                     position_offset_ms = 0;
+                    current_position_reports_relative = false;
                     let mut s = state.lock();
                     *s = PlaybackState::default();
                     s.volume = sink.volume();
@@ -918,6 +1028,68 @@ impl AudioEngine {
                     let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                 }
                 Ok(AudioCommand::Seek(ms)) => {
+                    let current_entry = if playback_kind == PlaybackKind::Queue {
+                        queue.current().cloned()
+                    } else {
+                        None
+                    };
+                    if let Some(entry) = current_entry {
+                        if entry.source == "youtube"
+                            && entry.file_path.is_none()
+                            && entry.source_url.is_some()
+                        {
+                            let url = entry.source_url.clone().unwrap_or_default();
+                            let headers = entry.source_headers.clone();
+                            let resume_after_seek = state.lock().is_playing;
+                            let session_id = Self::reset_playback_session(
+                                &sink,
+                                &playback_session,
+                                &db,
+                                &mut play_started,
+                                &mut position_offset_ms,
+                                &mut current_position_reports_relative,
+                                &mut current_play_id,
+                                awaiting_source,
+                            );
+                            awaiting_source = true;
+                            desired_playing = resume_after_seek;
+                            play_started = None;
+                            position_offset_ms = ms;
+                            current_position_reports_relative = true;
+
+                            {
+                                let mut s = state.lock();
+                                s.is_playing = false;
+                                s.is_buffering = true;
+                                s.can_seek = true;
+                                s.position_ms = ms;
+                                let state_clone = s.clone();
+                                drop(s);
+                                let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                            }
+
+                            let cmd_tx_clone = cmd_tx.clone();
+                            let event_tx_clone = event_tx.clone();
+                            let playback_session_ref = Arc::clone(&playback_session);
+                            std::thread::Builder::new()
+                                .name("youtube-seek-prepare".to_string())
+                                .spawn(move || {
+                                    Self::prepare_youtube_remote_playback(
+                                        entry,
+                                        url,
+                                        headers,
+                                        cmd_tx_clone,
+                                        event_tx_clone,
+                                        playback_session_ref,
+                                        session_id,
+                                        ms,
+                                    );
+                                })
+                                .ok();
+                            continue;
+                        }
+                    }
+
                     if !state.lock().can_seek {
                         let _ = event_tx.send(AudioEvent::Error(
                             "Seeking is not available for this stream".to_string(),
@@ -926,7 +1098,7 @@ impl AudioEngine {
                     }
                     match sink.try_seek(Duration::from_millis(ms)) {
                         Ok(()) => {
-                            position_offset_ms = ms;
+                            current_position_reports_relative = false;
                             desired_playing = state.lock().is_playing;
                             play_started = if state.lock().is_playing {
                                 Some(Instant::now())
@@ -975,6 +1147,7 @@ impl AudioEngine {
                             &playback_session,
                             &mut play_started,
                             &mut position_offset_ms,
+                            &mut current_position_reports_relative,
                             &mut current_play_id,
                             &mut playback_kind,
                             &mut awaiting_source,
@@ -986,7 +1159,12 @@ impl AudioEngine {
                 }
                 Ok(AudioCommand::Prev) => {
                     // If we're more than 3 seconds in, restart current track
-                    let pos = Self::current_position_ms(&sink);
+                    let pos = Self::playback_position_ms(
+                        &sink,
+                        position_offset_ms,
+                        current_position_reports_relative,
+                        awaiting_source,
+                    );
                     if pos > 3000 {
                         // Restart current track
                         if let Some(entry) = queue.current() {
@@ -1000,6 +1178,7 @@ impl AudioEngine {
                                 &playback_session,
                                 &mut play_started,
                                 &mut position_offset_ms,
+                                &mut current_position_reports_relative,
                                 &mut current_play_id,
                                 &mut playback_kind,
                                 &mut awaiting_source,
@@ -1020,6 +1199,7 @@ impl AudioEngine {
                             &playback_session,
                             &mut play_started,
                             &mut position_offset_ms,
+                            &mut current_position_reports_relative,
                             &mut current_play_id,
                             &mut playback_kind,
                             &mut awaiting_source,
@@ -1073,6 +1253,7 @@ impl AudioEngine {
                             &playback_session,
                             &mut play_started,
                             &mut position_offset_ms,
+                            &mut current_position_reports_relative,
                             &mut current_play_id,
                             &mut playback_kind,
                             &mut awaiting_source,
@@ -1106,6 +1287,7 @@ impl AudioEngine {
                             &playback_session,
                             &mut play_started,
                             &mut position_offset_ms,
+                            &mut current_position_reports_relative,
                             &mut current_play_id,
                             &mut playback_kind,
                             &mut awaiting_source,
@@ -1126,7 +1308,9 @@ impl AudioEngine {
                         &db,
                         &mut play_started,
                         &mut position_offset_ms,
+                        &mut current_position_reports_relative,
                         &mut current_play_id,
+                        awaiting_source,
                     );
                     break;
                 }
@@ -1141,7 +1325,12 @@ impl AudioEngine {
                     state_guard.is_playing || state_guard.is_buffering
                 };
                 if is_active {
-                    let pos = Self::current_position_ms(&sink);
+                    let pos = Self::playback_position_ms(
+                        &sink,
+                        position_offset_ms,
+                        current_position_reports_relative,
+                        awaiting_source,
+                    );
                     let mut s = state.lock();
                     s.position_ms = pos;
 
@@ -1175,6 +1364,7 @@ impl AudioEngine {
                                 &playback_session,
                                 &mut play_started,
                                 &mut position_offset_ms,
+                                &mut current_position_reports_relative,
                                 &mut current_play_id,
                                 &mut playback_kind,
                                 &mut awaiting_source,
@@ -1213,21 +1403,47 @@ impl AudioEngine {
         sink.get_pos().as_millis() as u64
     }
 
+    fn playback_position_ms(
+        sink: &Sink,
+        position_offset_ms: u64,
+        position_reports_relative: bool,
+        awaiting_source: bool,
+    ) -> u64 {
+        if awaiting_source {
+            return position_offset_ms;
+        }
+
+        let pos = Self::current_position_ms(sink);
+        if position_reports_relative {
+            position_offset_ms.saturating_add(pos)
+        } else {
+            pos
+        }
+    }
+
     fn reset_playback_session(
         sink: &Sink,
         playback_session: &Arc<AtomicU64>,
         db: &DbPool,
         play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
+        current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
+        awaiting_source: bool,
     ) -> u64 {
-        let pos = Self::current_position_ms(sink);
+        let pos = Self::playback_position_ms(
+            sink,
+            *position_offset_ms,
+            *current_position_reports_relative,
+            awaiting_source,
+        );
         if let Some(play_id) = current_play_id.take() {
             let _ = db::queries::complete_play(db, &play_id, pos as i64);
         }
 
         *play_started = None;
         *position_offset_ms = 0;
+        *current_position_reports_relative = false;
         sink.stop();
         playback_session.fetch_add(1, Ordering::SeqCst) + 1
     }

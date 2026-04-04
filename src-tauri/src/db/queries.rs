@@ -107,7 +107,11 @@ pub fn get_library_tracks(db: &DbPool) -> Result<Vec<LibraryTrack>, rusqlite::Er
     let mut stmt = conn.prepare(
         "SELECT r.id, r.title, a.name, a.id, al.title, al.id, r.duration_ms, r.cover_art_path, r.cover_art_url, r.genre, r.year,
                 COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local'),
-                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL)
+                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL),
+                COALESCE(
+                    (SELECT ts.file_path FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1),
+                    (SELECT d.file_path FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1)
+                )
          FROM recordings r
          LEFT JOIN recording_artists ra ON ra.recording_id = r.id AND ra.role = 'primary' AND ra.position = 0
          LEFT JOIN artists a ON a.id = ra.artist_id
@@ -133,6 +137,7 @@ pub fn get_library_tracks(db: &DbPool) -> Result<Vec<LibraryTrack>, rusqlite::Er
             year: row.get(10)?,
             source: row.get(11)?,
             is_downloaded: row.get::<_, bool>(12)?,
+            local_file_path: row.get(13)?,
             playlist_track_id: None,
             playlist_position: None,
         })
@@ -800,7 +805,11 @@ pub fn get_playlist_tracks(
         "SELECT r.id, r.title, COALESCE(a.name, 'Unknown Artist'), COALESCE(a.id, ''), al.title, al.id, r.duration_ms, r.cover_art_path, r.cover_art_url, r.genre, r.year,
                 pt.id, pt.position,
                 COALESCE((SELECT ts.source FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 ORDER BY CASE WHEN ts.file_path IS NOT NULL THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1), 'local'),
-                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL)
+                EXISTS(SELECT 1 FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL),
+                COALESCE(
+                    (SELECT ts.file_path FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL ORDER BY CASE WHEN ts.source = 'local' THEN 0 ELSE 1 END, ts.quality_score DESC LIMIT 1),
+                    (SELECT d.file_path FROM downloads d WHERE d.recording_id = r.id AND d.status = 'completed' AND d.file_path IS NOT NULL ORDER BY d.updated_at DESC LIMIT 1)
+                )
          FROM playlist_tracks pt
          JOIN recordings r ON r.id = pt.recording_id
          LEFT JOIN recording_artists ra ON ra.recording_id = r.id AND ra.role = 'primary' AND ra.position = 0
@@ -825,6 +834,7 @@ pub fn get_playlist_tracks(
             year: row.get(10)?,
             source: row.get(13)?,
             is_downloaded: row.get::<_, bool>(14)?,
+            local_file_path: row.get(15)?,
             playlist_track_id: row.get(11)?,
             playlist_position: row.get(12)?,
         })
@@ -1291,6 +1301,52 @@ pub fn get_downloads(db: &DbPool) -> Result<Vec<Download>, rusqlite::Error> {
         })
     })?;
     rows.collect()
+}
+
+pub fn get_download_by_id(
+    db: &DbPool,
+    download_id: &str,
+) -> Result<Option<Download>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, recording_id, source, source_url, status, progress, file_path, error_message, created_at, updated_at
+         FROM downloads
+         WHERE id = ?1
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![download_id], |row| {
+        Ok(Download {
+            id: row.get(0)?,
+            recording_id: row.get(1)?,
+            source: row.get(2)?,
+            source_url: row.get(3)?,
+            status: row.get(4)?,
+            progress: row.get(5)?,
+            file_path: row.get(6)?,
+            error_message: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    match rows.next() {
+        Some(row) => Ok(Some(row?)),
+        None => Ok(None),
+    }
+}
+
+pub fn delete_download(db: &DbPool, download_id: &str) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute("DELETE FROM downloads WHERE id = ?1", params![download_id])?;
+    Ok(())
+}
+
+pub fn delete_track_source(db: &DbPool, track_source_id: &str) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "DELETE FROM track_sources WHERE id = ?1",
+        params![track_source_id],
+    )?;
+    Ok(())
 }
 
 pub fn find_active_download_for_recording(
