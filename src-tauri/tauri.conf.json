@@ -7,7 +7,7 @@
     "frontendDist": "../build",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "pnpm build && pnpm prepare:runtime"
   },
   "app": {
     "windows": [
@@ -32,7 +32,7 @@
     "targets": "all",
     "resources": {
       "../sidecar/dist/index.cjs": "sidecar/dist/index.cjs",
-      "../sidecar/bin/yt-dlp": "sidecar/bin/yt-dlp"
+      "resources/bin/": "bin/"
     },
     "icon": [
       "icons/32x32.png",

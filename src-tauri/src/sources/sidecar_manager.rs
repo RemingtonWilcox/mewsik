@@ -1,7 +1,7 @@
+use crate::external_tools::find_binary;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -180,25 +180,7 @@ fn resolve_sidecar_script() -> Result<PathBuf, String> {
 }
 
 fn resolve_node_binary() -> Result<PathBuf, String> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Some(path_var) = env::var_os("PATH") {
-        for path in env::split_paths(&path_var) {
-            candidates.push(path.join("node"));
-        }
-    }
-
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/node"),
-        PathBuf::from("/usr/local/bin/node"),
-        PathBuf::from("/opt/local/bin/node"),
-        PathBuf::from("/usr/bin/node"),
-    ]);
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.exists())
-        .ok_or_else(|| {
-            "Unable to locate a Node.js binary for the sidecar. Checked PATH, /opt/homebrew/bin/node, /usr/local/bin/node, /opt/local/bin/node, and /usr/bin/node.".to_string()
-        })
+    find_binary("node").ok_or_else(|| {
+        "Unable to locate a Node.js binary for the sidecar. Checked bundled app resources, PATH, /opt/homebrew/bin/node, /usr/local/bin/node, /opt/local/bin/node, and /usr/bin/node.".to_string()
+    })
 }

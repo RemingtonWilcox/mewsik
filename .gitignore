@@ -2,6 +2,7 @@ node_modules
 .superpowers
 src-tauri/target
 sidecar/dist
+src-tauri/resources/bin
 test-results
 tmp
 
