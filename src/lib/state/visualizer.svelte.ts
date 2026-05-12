@@ -13,10 +13,29 @@ export type AudioFeatures = {
 	mid: number;
 	treble: number;
 	sample_rate: number;
+	bpm: number;
+	beat_phase: number;
+	chroma_key: number;
+	chroma_strength: number;
 };
+
+// Available presets — keep in sync with shader pipelines in visualizer.svelte.
+export const PRESET_COUNT = 4;
+export const PRESET_NAMES = [
+	'hyperbolic kaleidoscope',
+	'cathedral flythrough',
+	'voronoi caustics',
+	'nebulae flow'
+];
 
 class VisualizerState {
 	active = $state(false);
+	// `preset` tracks the currently-dominant preset for HUD display; rendering
+	// itself blends top-2 presets by softmax weight (continuous mix, not switch).
+	preset = $state(0);
+	// `forcedPreset` overrides auto-mix when ≥0 (used by the lab page's 1-4 keys
+	// to audit a single preset in isolation). -1 = auto-blend.
+	forcedPreset = $state(-1);
 	latest = $state<AudioFeatures | null>(null);
 	private unlisten: UnlistenFn | null = null;
 	private subs = 0;
@@ -25,12 +44,26 @@ class VisualizerState {
 		this.active = !this.active;
 	}
 
+	setPreset(idx: number) {
+		this.preset = ((idx % PRESET_COUNT) + PRESET_COUNT) % PRESET_COUNT;
+	}
+
+	cyclePreset() {
+		this.setPreset(this.preset + 1);
+	}
+
 	async subscribe(): Promise<() => void> {
 		this.subs += 1;
 		if (!this.unlisten) {
-			this.unlisten = await listen<AudioFeatures>('audio:features', (e) => {
-				this.latest = e.payload;
-			});
+			try {
+				this.unlisten = await listen<AudioFeatures>('audio:features', (e) => {
+					this.latest = e.payload;
+				});
+			} catch (e) {
+				// Non-Tauri runtime (e.g. browser-based visualizer-test lab page).
+				// Skip silently; the page is expected to drive `latest` directly.
+				this.unlisten = () => {};
+			}
 		}
 		return () => {
 			this.subs -= 1;

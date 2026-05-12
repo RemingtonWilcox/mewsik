@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use realfft::RealFftPlanner;
 use rodio::Source;
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
@@ -32,6 +33,13 @@ pub struct AudioFeatures {
     pub mid: f32,
     pub treble: f32,
     pub sample_rate: u32,
+    // BPM tracking — estimated tempo and phase within current beat.
+    pub bpm: f32,        // 0 if unknown, else 60..180
+    pub beat_phase: f32, // 0..1, 0 = on the beat
+    // Chroma — dominant pitch class as a hue index + how concentrated it is.
+    // chroma_key=0 corresponds to C, then C# … B (in 1/12 increments).
+    pub chroma_key: f32,      // 0..1
+    pub chroma_strength: f32, // 0..1, low when atonal/noisy
 }
 
 pub struct TapFrame {
@@ -98,6 +106,41 @@ impl<S: Source<Item = i16>> Source for TappedSource<S> {
     }
 }
 
+// Autocorrelation BPM estimation on the onset-flux envelope. Scans lag values
+// corresponding to 60..180 BPM and returns the best-scoring lag as a fractional
+// frame count, or 0 if the signal is too quiet to be confident.
+fn estimate_beat_period(flux: &VecDeque<f32>, emit_hz: f32) -> f32 {
+    if flux.len() < 64 {
+        return 0.0;
+    }
+    let min_lag = ((60.0 * emit_hz / 180.0).floor() as usize).max(2);
+    let max_lag = ((60.0 * emit_hz / 60.0).ceil() as usize).min(flux.len() - 1);
+    let mut best_lag = 0usize;
+    let mut best_score = 0.0f32;
+    let mut score_sum = 0.0f32;
+    let mut score_count = 0u32;
+    for lag in min_lag..=max_lag {
+        let n = flux.len() - lag;
+        let mut s = 0.0f32;
+        for i in 0..n {
+            s += flux[i] * flux[i + lag];
+        }
+        s /= n as f32;
+        score_sum += s;
+        score_count += 1;
+        if s > best_score {
+            best_score = s;
+            best_lag = lag;
+        }
+    }
+    // Confidence: peak must noticeably exceed mean autocorrelation, else bail.
+    let mean = score_sum / score_count.max(1) as f32;
+    if best_lag == 0 || best_score < mean * 1.4 || best_score < 1e-8 {
+        return 0.0;
+    }
+    best_lag as f32
+}
+
 pub fn spawn_analyzer(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>>>) {
     std::thread::Builder::new()
         .name("audio-analyzer".to_string())
@@ -116,6 +159,14 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
     let mut last_emit = Instant::now();
     let emit_interval = Duration::from_millis(1000 / EMIT_HZ);
     let mut prev_energy: f32 = 0.0;
+
+    // BPM tracker — onset flux ring buffer, ~4s long at 60Hz emit. Long enough
+    // to autocorrelate down to 60 BPM (1-beat-per-second period).
+    const FLUX_HIST_LEN: usize = 256;
+    let mut flux_hist: VecDeque<f32> = VecDeque::with_capacity(FLUX_HIST_LEN);
+    let mut beat_period_frames: f32 = 0.0; // 0 = no estimate yet
+    let mut beat_phase: f32 = 0.0;
+    let mut bpm_check_counter: u32 = 0;
 
     let window: Vec<f32> = (0..FFT_SIZE)
         .map(|i| {
@@ -202,6 +253,75 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         let onset = flux > prev_energy * 0.3 && prev_energy > 0.01;
         prev_energy = total_energy * 0.7 + prev_energy * 0.3;
 
+        // ── BPM / beat phase: track the onset-flux envelope, autocorrelate
+        // every ~0.5s. Beat phase advances per emit and snaps to onsets that
+        // land near the expected beat.
+        flux_hist.push_back(flux);
+        if flux_hist.len() > FLUX_HIST_LEN {
+            flux_hist.pop_front();
+        }
+        if beat_period_frames > 0.0 {
+            beat_phase += 1.0 / beat_period_frames;
+            if beat_phase >= 1.0 {
+                beat_phase -= beat_phase.floor();
+            }
+            // Re-align to strong onsets that arrive near the expected beat.
+            if onset && (beat_phase < 0.18 || beat_phase > 0.82) {
+                beat_phase = 0.0;
+            }
+        }
+        bpm_check_counter += 1;
+        if flux_hist.len() >= 128 && bpm_check_counter >= 30 {
+            bpm_check_counter = 0;
+            let new_period = estimate_beat_period(&flux_hist, EMIT_HZ as f32);
+            if new_period > 0.0 {
+                beat_period_frames = if beat_period_frames > 0.0 {
+                    beat_period_frames * 0.7 + new_period * 0.3
+                } else {
+                    new_period
+                };
+            }
+        }
+        let bpm = if beat_period_frames > 0.0 {
+            (EMIT_HZ as f32) * 60.0 / beat_period_frames
+        } else {
+            0.0
+        };
+
+        // ── Chroma — 12-bin pitch class profile. Bin energy is folded into
+        // the nearest semitone-mod-12 (C=0, C#=1, …). Skip out-of-musical-range
+        // bins (sub-bass rumble and hiss).
+        let mut chroma = [0.0f32; 12];
+        for (i, &m) in mags.iter().enumerate() {
+            let f = (i as f32 / mags.len() as f32) * nyquist;
+            if !(80.0..=5000.0).contains(&f) || m <= 0.0 {
+                continue;
+            }
+            // 12 * log2(f/440) gives semitones from A4. Shift by +9 so C=0.
+            let semitone = (12.0 * (f / 440.0).log2()).round() as i32 + 9 + 1200;
+            let pc = (semitone % 12) as usize;
+            chroma[pc] += m;
+        }
+        let chroma_total: f32 = chroma.iter().sum();
+        let (chroma_key, chroma_strength) = if chroma_total > 1e-6 {
+            let inv = 1.0 / chroma_total;
+            let mut max_idx = 0usize;
+            let mut max_val = 0.0f32;
+            for (i, c) in chroma.iter_mut().enumerate() {
+                *c *= inv;
+                if *c > max_val {
+                    max_val = *c;
+                    max_idx = i;
+                }
+            }
+            // Strength: how much the dominant pitch exceeds a flat distribution.
+            // Flat = 1/12; we map (max - 1/12) into 0..1 with a generous scale.
+            let strength = ((max_val - 1.0 / 12.0) * 6.0).clamp(0.0, 1.0);
+            (max_idx as f32 / 12.0, strength)
+        } else {
+            (0.0, 0.0)
+        };
+
         let features = AudioFeatures {
             bins,
             rms,
@@ -212,6 +332,10 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             mid: mid.clamp(0.0, 1.0),
             treble: treble.clamp(0.0, 1.0),
             sample_rate: sr,
+            bpm,
+            beat_phase,
+            chroma_key,
+            chroma_strength,
         };
 
         let handle = app_handle.lock().clone();

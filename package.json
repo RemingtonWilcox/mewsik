@@ -29,6 +29,7 @@
     "@tailwindcss/vite": "^4.2.2",
     "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^25.5.0",
+    "@webgpu/types": "^0.1.70",
     "bits-ui": "^2.16.4",
     "esbuild": "^0.27.4",
     "ffmpeg-static": "5.3.0",
