@@ -2,21 +2,22 @@ use crate::external_tools::find_binary;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-const LEGACY_SOCKET_PATH: &str = "/tmp/mewsik-sidecar.sock";
+use std::thread;
 
 pub struct SidecarManager {
-    process: Arc<Mutex<Option<Child>>>,
-    socket_path: PathBuf,
+    inner: Arc<Mutex<Inner>>,
     request_id: AtomicU64,
+}
+
+struct Inner {
+    child: Option<Child>,
+    stdin: Option<BufWriter<ChildStdin>>,
+    stdout: Option<BufReader<ChildStdout>>,
 }
 
 #[derive(Serialize)]
@@ -29,7 +30,9 @@ struct JsonRpcRequest {
 
 #[derive(Deserialize)]
 struct JsonRpcResponse {
-    jsonrpc: String,
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<Value>,
     error: Option<JsonRpcError>,
@@ -37,6 +40,7 @@ struct JsonRpcResponse {
 
 #[derive(Deserialize)]
 struct JsonRpcError {
+    #[allow(dead_code)]
     code: i32,
     message: String,
 }
@@ -44,46 +48,68 @@ struct JsonRpcError {
 impl SidecarManager {
     pub fn new() -> Self {
         Self {
-            process: Arc::new(Mutex::new(None)),
-            socket_path: std::env::temp_dir()
-                .join(format!("mewsik-sidecar-{}.sock", std::process::id())),
+            inner: Arc::new(Mutex::new(Inner {
+                child: None,
+                stdin: None,
+                stdout: None,
+            })),
             request_id: AtomicU64::new(1),
         }
     }
 
     pub fn start(&self) -> Result<(), String> {
-        // Check if already running
-        {
-            let proc = self.process.lock();
-            if proc.is_some() {
-                return Ok(());
-            }
+        let mut inner = self.inner.lock();
+        if inner.child.is_some() {
+            return Ok(());
         }
 
-        Self::remove_socket_if_exists(&self.socket_path);
-        Self::remove_socket_if_exists(Path::new(LEGACY_SOCKET_PATH));
         let script_path = resolve_sidecar_script()?;
         let node_binary = resolve_node_binary()?;
 
-        // Start the sidecar process
-        let child = Command::new(node_binary)
-            .arg(script_path)
-            .arg(&self.socket_path)
+        let mut command = Command::new(&node_binary);
+        command
+            .arg(&script_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        // Suppress console window flash when the GUI host spawns the Node sidecar on Windows.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to start sidecar: {}", e))?;
 
-        *self.process.lock() = Some(child);
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to capture sidecar stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture sidecar stdout".to_string())?;
+        let stderr = child.stderr.take();
 
-        // Wait for socket to be available
-        for _ in 0..50 {
-            std::thread::sleep(Duration::from_millis(100));
-            if self.socket_path.exists() {
-                return Ok(());
-            }
+        inner.stdin = Some(BufWriter::new(stdin));
+        inner.stdout = Some(BufReader::new(stdout));
+        inner.child = Some(child);
+
+        // Drain stderr in the background so a chatty child can't block on a full pipe.
+        if let Some(stderr) = stderr {
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    log::info!(target: "mewsik::sidecar", "{}", line);
+                }
+            });
         }
 
-        self.stop();
-        Err("Timed out waiting for sidecar socket".to_string())
+        Ok(())
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -96,25 +122,42 @@ impl SidecarManager {
         };
 
         let request_str = serde_json::to_string(&request).map_err(|e| e.to_string())? + "\n";
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .map_err(|e| format!("Failed to connect to sidecar: {}", e))?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .map_err(|e| e.to_string())?;
-        stream
-            .write_all(request_str.as_bytes())
-            .map_err(|e| format!("Failed to write to sidecar: {}", e))?;
-        stream.flush().map_err(|e| e.to_string())?;
 
-        // Read response
-        let mut reader = BufReader::new(stream);
+        let mut inner = self.inner.lock();
+        if inner.child.is_none() {
+            return Err("Sidecar not running".to_string());
+        }
+
+        {
+            let stdin = inner
+                .stdin
+                .as_mut()
+                .ok_or_else(|| "Sidecar stdin missing".to_string())?;
+            stdin
+                .write_all(request_str.as_bytes())
+                .map_err(|e| format!("Failed to write to sidecar: {}", e))?;
+            stdin
+                .flush()
+                .map_err(|e| format!("Failed to flush sidecar stdin: {}", e))?;
+        }
+
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| format!("Failed to read from sidecar: {}", e))?;
+        let bytes_read = {
+            let stdout = inner
+                .stdout
+                .as_mut()
+                .ok_or_else(|| "Sidecar stdout missing".to_string())?;
+            stdout
+                .read_line(&mut line)
+                .map_err(|e| format!("Failed to read from sidecar: {}", e))?
+        };
 
-        let response: JsonRpcResponse =
-            serde_json::from_str(&line).map_err(|e| format!("Invalid response: {}", e))?;
+        if bytes_read == 0 {
+            return Err("Sidecar closed stdout before responding".to_string());
+        }
+
+        let response: JsonRpcResponse = serde_json::from_str(line.trim())
+            .map_err(|e| format!("Invalid response: {} (raw: {})", e, line.trim()))?;
 
         if let Some(error) = response.error {
             return Err(format!("Sidecar error: {}", error.message));
@@ -126,22 +169,17 @@ impl SidecarManager {
     }
 
     pub fn stop(&self) {
-        if let Some(mut child) = self.process.lock().take() {
+        let mut inner = self.inner.lock();
+        inner.stdin.take();
+        inner.stdout.take();
+        if let Some(mut child) = inner.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        Self::remove_socket_if_exists(&self.socket_path);
-        Self::remove_socket_if_exists(Path::new(LEGACY_SOCKET_PATH));
     }
 
     pub fn is_running(&self) -> bool {
-        self.process.lock().is_some()
-    }
-
-    fn remove_socket_if_exists(path: &Path) {
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-        }
+        self.inner.lock().child.is_some()
     }
 }
 
@@ -165,6 +203,7 @@ fn resolve_sidecar_script() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Some(dir) = exe.parent() {
         candidates.push(dir.join("sidecar/dist/index.cjs"));
+        candidates.push(dir.join("resources/sidecar/dist/index.cjs"));
         if let Some(contents_dir) = dir.parent() {
             candidates.push(contents_dir.join("Resources/sidecar/dist/index.cjs"));
         }
@@ -181,6 +220,7 @@ fn resolve_sidecar_script() -> Result<PathBuf, String> {
 
 fn resolve_node_binary() -> Result<PathBuf, String> {
     find_binary("node").ok_or_else(|| {
-        "Unable to locate a Node.js binary for the sidecar. Checked bundled app resources, PATH, /opt/homebrew/bin/node, /usr/local/bin/node, /opt/local/bin/node, and /usr/bin/node.".to_string()
+        "Unable to locate a Node.js binary for the sidecar. Checked bundled app resources and PATH."
+            .to_string()
     })
 }

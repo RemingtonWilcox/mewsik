@@ -86,7 +86,27 @@ pub fn reveal_download_path(path: String) -> Result<(), String> {
         return Err("Finder failed to open the downloaded file".to_string());
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // explorer.exe needs the path quoted *inside* the /select, prefix — Rust's
+        // normal arg quoting would wrap the whole "/select,..." string and break parsing.
+        // Also: explorer returns a non-zero exit code even on success — fire and forget.
+        let raw = if file_path.is_dir() {
+            format!("\"{}\"", path)
+        } else {
+            format!("/select,\"{}\"", path)
+        };
+        std::process::Command::new("explorer.exe")
+            .raw_arg(raw)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("Failed to open Explorer: {}", e))?;
+        Ok(())
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let status = std::process::Command::new("xdg-open")
             .arg(&path)

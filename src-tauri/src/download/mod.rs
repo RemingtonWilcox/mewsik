@@ -370,6 +370,12 @@ fn transcode_remote_file_to_mp3(
     })?;
 
     let mut command = Command::new(ffmpeg);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
     command
         .arg("-hide_banner")
         .arg("-loglevel")

@@ -417,6 +417,12 @@ fn spawn_ffmpeg_transcode_worker(
         .name("ffmpeg-stream-transcode".to_string())
         .spawn(move || {
             let mut command = Command::new(ffmpeg);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
             command
                 .arg("-hide_banner")
                 .arg("-loglevel")
