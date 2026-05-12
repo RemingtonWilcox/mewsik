@@ -2,6 +2,7 @@
 	import * as api from '$lib/api/tauri';
 	import type { PlaybackWaveform } from '$lib/types';
 	import { usePlayer, formatTime } from '$lib/state/player.svelte';
+	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Toggle } from '$lib/components/ui/toggle';
 	import { Slider } from '$lib/components/ui/slider';
@@ -19,8 +20,11 @@
 		Volume2,
 		VolumeX,
 		ListMusic,
-		LoaderCircle
+		LoaderCircle,
+		Sparkles
 	} from '@lucide/svelte';
+
+	const visualizer = useVisualizer();
 
 	import { onMount } from 'svelte';
 
@@ -247,6 +251,15 @@
 			class="w-28"
 			onValueChange={handleVolumeChange}
 		/>
+		<Button
+			variant="ghost"
+			size="icon"
+			class="size-8"
+			title="Visualizer"
+			onclick={() => visualizer.toggle()}
+		>
+			<Sparkles class="size-4" />
+		</Button>
 		<Button variant="ghost" size="icon" class="size-8" onclick={() => (showQueue = true)}>
 			<ListMusic class="size-4" />
 		</Button>

@@ -4,6 +4,7 @@
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
 	import PlayerBar from '$lib/components/player/player-bar.svelte';
 	import CommandSearch from '$lib/components/search/command-search.svelte';
+	import Visualizer from '$lib/components/visualizer/visualizer.svelte';
 	import {
 		SidebarProvider,
 		SidebarInset
@@ -49,4 +50,5 @@
 </div>
 
 <CommandSearch />
+<Visualizer />
 <Toaster />
