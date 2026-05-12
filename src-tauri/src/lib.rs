@@ -34,6 +34,7 @@ pub fn run() {
 
     // Init audio engine
     let engine = Arc::new(AudioEngine::new(db.clone()));
+    let engine_for_setup = Arc::clone(&engine);
 
     // Config state
     let config_state: ConfigState = Arc::new(Mutex::new(cfg));
@@ -61,6 +62,7 @@ pub fn run() {
                 )?;
             }
             commands::stations::spawn_favorite_station_health_check(startup_db.clone());
+            engine_for_setup.set_app_handle(app.handle().clone());
             Ok(())
         })
         .manage(db)

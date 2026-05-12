@@ -1,3 +1,4 @@
+use super::analyzer::{self, TappedSource};
 use super::http_stream;
 use super::queue::{PlayQueue, QueueEntry, RepeatMode};
 use crate::db::{
@@ -8,6 +9,7 @@ use crate::db::{
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, Sink, Source};
+use tauri::AppHandle;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -74,6 +76,7 @@ pub struct AudioEngine {
     event_rx: Receiver<AudioEvent>,
     state: Arc<Mutex<PlaybackState>>,
     queue_items: Arc<Mutex<Vec<QueueItem>>>,
+    app_handle: Arc<Mutex<Option<AppHandle>>>,
 }
 
 impl AudioEngine {
@@ -82,8 +85,10 @@ impl AudioEngine {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let state = Arc::new(Mutex::new(PlaybackState::default()));
         let queue_items = Arc::new(Mutex::new(Vec::new()));
+        let app_handle: Arc<Mutex<Option<AppHandle>>> = Arc::new(Mutex::new(None));
         let state_clone = Arc::clone(&state);
         let queue_items_clone = Arc::clone(&queue_items);
+        let app_handle_clone = Arc::clone(&app_handle);
         let loop_cmd_tx = cmd_tx.clone();
 
         std::thread::Builder::new()
@@ -96,6 +101,7 @@ impl AudioEngine {
                     state_clone,
                     queue_items_clone,
                     db,
+                    app_handle_clone,
                 );
             })
             .expect("failed to spawn audio engine thread");
@@ -105,7 +111,13 @@ impl AudioEngine {
             event_rx,
             state,
             queue_items,
+            app_handle,
         }
+    }
+
+    /// Called after Tauri's setup() so the engine can emit `audio:features` events.
+    pub fn set_app_handle(&self, handle: AppHandle) {
+        *self.app_handle.lock() = Some(handle);
     }
 
     pub fn send(&self, cmd: AudioCommand) {
@@ -283,6 +295,7 @@ impl AudioEngine {
 
     fn start_remote_playback(
         sink: &Sink,
+        tap_tx: &Sender<analyzer::TapFrame>,
         entry: &QueueEntry,
         source: Box<dyn Source<Item = i16> + Send>,
         can_seek: bool,
@@ -301,7 +314,7 @@ impl AudioEngine {
     ) {
         *awaiting_source = false;
         sink.stop();
-        sink.append(source);
+        sink.append(TappedSource::new(source, tap_tx.clone()));
         if desired_playing {
             sink.play();
             *play_started = Some(Instant::now());
@@ -334,6 +347,7 @@ impl AudioEngine {
 
     fn start_radio_playback(
         sink: &Sink,
+        tap_tx: &Sender<analyzer::TapFrame>,
         station_id: &str,
         name: &str,
         favicon: &Option<String>,
@@ -352,7 +366,7 @@ impl AudioEngine {
     ) {
         *awaiting_source = false;
         sink.stop();
-        sink.append(source);
+        sink.append(TappedSource::new(source, tap_tx.clone()));
         if desired_playing {
             sink.play();
             *play_started = Some(Instant::now());
@@ -441,6 +455,7 @@ impl AudioEngine {
 
     fn play_queue_entry(
         sink: &Sink,
+        tap_tx: &Sender<analyzer::TapFrame>,
         entry: &QueueEntry,
         cmd_tx: &Sender<AudioCommand>,
         event_tx: &Sender<AudioEvent>,
@@ -490,7 +505,7 @@ impl AudioEngine {
             let file = File::open(path).map_err(|e| format!("File open error: {}", e))?;
             let reader = BufReader::new(file);
             let source = Decoder::new(reader).map_err(|e| format!("Decode error: {}", e))?;
-            sink.append(source);
+            sink.append(TappedSource::new(source, tap_tx.clone()));
         } else if let Some(url) = entry.source_url.as_ref() {
             *awaiting_source = true;
             {
@@ -639,6 +654,7 @@ impl AudioEngine {
         state: Arc<Mutex<PlaybackState>>,
         queue_items: Arc<Mutex<Vec<QueueItem>>>,
         db: DbPool,
+        app_handle: Arc<Mutex<Option<AppHandle>>>,
     ) {
         let (_stream, stream_handle) = match OutputStream::try_default() {
             Ok(s) => s,
@@ -650,6 +666,8 @@ impl AudioEngine {
         };
 
         let sink = Arc::new(Sink::try_new(&stream_handle).expect("failed to create sink"));
+        let (tap_tx, tap_rx) = analyzer::tap_channel();
+        analyzer::spawn_analyzer(tap_rx, Arc::clone(&app_handle));
         let playback_session = Arc::new(AtomicU64::new(0));
         let mut queue = PlayQueue::new();
         let mut play_started: Option<Instant> = None;
@@ -683,7 +701,7 @@ impl AudioEngine {
                             match Decoder::new(reader) {
                                 Ok(source) => {
                                     sink.stop();
-                                    sink.append(source);
+                                    sink.append(TappedSource::new(source, tap_tx.clone()));
                                     sink.play();
                                     play_started = Some(Instant::now());
                                     position_offset_ms = 0;
@@ -747,6 +765,7 @@ impl AudioEngine {
                 Ok(AudioCommand::PlayEntry(entry)) => {
                     if let Err(err) = Self::play_queue_entry(
                         &sink,
+                        &tap_tx,
                         &entry,
                         &cmd_tx,
                         &event_tx,
@@ -778,7 +797,7 @@ impl AudioEngine {
                     match Self::decode_fetched_audio(&entry, bytes) {
                         Ok((source, can_seek)) => {
                             sink.stop();
-                            sink.append(source);
+                            sink.append(TappedSource::new(source, tap_tx.clone()));
                             if initial_position_ms > 0 {
                                 let _ = sink.try_seek(Duration::from_millis(initial_position_ms));
                             }
@@ -832,6 +851,7 @@ impl AudioEngine {
                     }
                     Self::start_remote_playback(
                         &sink,
+                        &tap_tx,
                         &entry,
                         source,
                         entry.can_seek || entry.source == "youtube",
@@ -948,6 +968,7 @@ impl AudioEngine {
                     }
                     Self::start_radio_playback(
                         &sink,
+                        &tap_tx,
                         &station_id,
                         &name,
                         &favicon,
@@ -1139,6 +1160,7 @@ impl AudioEngine {
                         Self::sync_queue_state(&queue, &queue_items);
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
+                            &tap_tx,
                             &entry,
                             &cmd_tx,
                             &event_tx,
@@ -1170,6 +1192,7 @@ impl AudioEngine {
                         if let Some(entry) = queue.current() {
                             if let Err(err) = Self::play_queue_entry(
                                 &sink,
+                                &tap_tx,
                                 entry,
                                 &cmd_tx,
                                 &event_tx,
@@ -1191,6 +1214,7 @@ impl AudioEngine {
                         Self::sync_queue_state(&queue, &queue_items);
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
+                            &tap_tx,
                             &entry,
                             &cmd_tx,
                             &event_tx,
@@ -1245,6 +1269,7 @@ impl AudioEngine {
                     if let Some(entry) = queue.current() {
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
+                            &tap_tx,
                             entry,
                             &cmd_tx,
                             &event_tx,
@@ -1279,6 +1304,7 @@ impl AudioEngine {
                     if let Some(entry) = queue.current() {
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
+                            &tap_tx,
                             entry,
                             &cmd_tx,
                             &event_tx,
@@ -1356,6 +1382,7 @@ impl AudioEngine {
                             Self::sync_queue_state(&queue, &queue_items);
                             if let Err(err) = Self::play_queue_entry(
                                 &sink,
+                                &tap_tx,
                                 &entry,
                                 &cmd_tx,
                                 &event_tx,
