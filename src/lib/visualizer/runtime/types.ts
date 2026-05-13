@@ -17,7 +17,13 @@
 
 import type { VisualDirectorFrame } from '../director/types.js';
 
-export type MotifId = 'atmosphere' | 'organism' | 'particles' | 'lattice' | 'ribbon';
+export type MotifId =
+	| 'atmosphere'
+	| 'organism'
+	| 'particles'
+	| 'lattice'
+	| 'ribbon'
+	| 'tunnel';
 
 export type RuntimeContext = {
 	device: GPUDevice;

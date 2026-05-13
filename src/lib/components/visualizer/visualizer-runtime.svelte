@@ -17,6 +17,7 @@
 		createFlowFieldMotif,
 		createReactionMotif,
 		createAttractorMotif,
+		createMandalaMotif,
 		weightsForFrame,
 		type MotifWeights
 	} from '$lib/visualizer/runtime';
@@ -43,13 +44,13 @@
 		if (!canvas) return;
 		try {
 			await runtime.init(canvas);
-			// Atmosphere first → backdrop.
-			// Reaction-diffusion second → biological surface texture.
-			// Attractor third → geometric filaments.
+			// Atmosphere → backdrop. Reaction-diffusion → biological texture.
+			// Attractor → geometric filaments. Mandala → radial sacred geometry.
 			// Physarum + flow-field stack additively on top.
 			runtime.register(createAtmosphereMotif(), 1);
 			runtime.register(createReactionMotif(), 0.4);
 			runtime.register(createAttractorMotif(), 0.45);
+			runtime.register(createMandalaMotif(), 0.35);
 			runtime.register(createPhysarumMotif(), 0.5);
 			runtime.register(createFlowFieldMotif(), 0.5);
 			started = true;
@@ -69,7 +70,7 @@
 		runtime.render();
 		activeSection = frame.section;
 		const tag = overrideWeights ? 'manual' : frame.section;
-		activeMotifWeights = `${tag} · atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · att ${(weights.organism ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
+		activeMotifWeights = `${tag} · atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · att ${(weights.organism ?? 0).toFixed(2)} · man ${(weights.tunnel ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
 		raf = requestAnimationFrame(tick);
 	}
 
