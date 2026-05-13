@@ -17,6 +17,7 @@ import {
 	packDirectorUniform
 } from './uniforms.js';
 import { createFeedbackBank, disposeFeedbackBank, resizeFeedbackBank } from './feedback.js';
+import { BloomPass } from './post/bloom.js';
 import type { MotifModule, RuntimeContext, MotifWeights, MotifId } from './types.js';
 
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
@@ -44,6 +45,10 @@ export class VisualizerRuntime {
 	private compositePipeline: GPURenderPipeline | null = null;
 	private compositeBg: GPUBindGroup | null = null;
 	private compositeLayout: GPUBindGroupLayout | null = null;
+
+	private bloomPass: BloomPass | null = null;
+	private bloomView: GPUTextureView | null = null;
+	private currentDirectorFrame: VisualDirectorFrame | null = null;
 
 	private width = 1;
 	private height = 1;
@@ -116,6 +121,14 @@ export class VisualizerRuntime {
 
 		this.recreateSceneTarget();
 		this.feedback = createFeedbackBank(device, this.width, this.height, HDR_FORMAT, 4);
+
+		this.bloomPass = new BloomPass({
+			device,
+			directorUniform: this.uniformBuf,
+			directorLayout: this.uniformLayout
+		});
+		this.bloomPass.resize(this.width, this.height, this.uniformBuf);
+
 		this.buildComposite();
 
 		this.context_ = this.buildContext();
@@ -168,8 +181,32 @@ export class VisualizerRuntime {
 	private buildComposite() {
 		if (!this.device || !this.uniformLayout) return;
 		const code = /* wgsl */ `
+			struct Director {
+				viewport: vec4<f32>,
+				energy: vec4<f32>,
+				bands: vec4<f32>,
+				palette: vec4<f32>,
+				palette2: vec4<f32>,
+				mood: vec4<f32>,
+				clock: vec4<f32>,
+				clockI: vec4<u32>,
+				drop: vec4<f32>,
+				drop2: vec4<f32>,
+				section: vec4<u32>,
+				tonnetz_a: vec4<f32>,
+				tonnetz_b: vec4<f32>,
+				phrase: vec4<f32>,
+				_pad0: vec4<f32>, _pad1: vec4<f32>, _pad2: vec4<f32>, _pad3: vec4<f32>,
+				_pad4: vec4<f32>, _pad5: vec4<f32>, _pad6: vec4<f32>, _pad7: vec4<f32>,
+				_pad8: vec4<f32>, _pad9: vec4<f32>, _pad10: vec4<f32>, _pad11: vec4<f32>,
+				_pad12: vec4<f32>, _pad13: vec4<f32>, _pad14: vec4<f32>, _pad15: vec4<f32>,
+				_pad16: vec4<f32>, _pad17: vec4<f32>,
+			};
+
 			@group(0) @binding(0) var samp: sampler;
 			@group(0) @binding(1) var sceneTex: texture_2d<f32>;
+			@group(0) @binding(2) var bloomTex: texture_2d<f32>;
+			@group(0) @binding(3) var<uniform> dir: Director;
 
 			struct VsOut {
 				@builtin(position) pos: vec4<f32>,
@@ -208,8 +245,21 @@ export class VisualizerRuntime {
 
 			@fragment
 			fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-				let hdr = textureSample(sceneTex, samp, in.uv).rgb;
-				let mapped = agx(hdr);
+				let scene = textureSample(sceneTex, samp, in.uv).rgb;
+				let bloom = textureSample(bloomTex, samp, in.uv).rgb;
+
+				// Bloom intensity rides energy and pumps on the drop watershed.
+				let energy = dir.energy.x;
+				let postDrop = dir.drop2.x;
+				let bloomAmount = 0.45 + energy * 0.45 + postDrop * 0.7;
+
+				// Vignette: subtle darkening at edges, opens slightly on drops.
+				let uv = in.uv - vec2<f32>(0.5);
+				let r2 = dot(uv, uv);
+				let vig = 1.0 - smoothstep(0.30, 0.85, r2) * (0.32 - postDrop * 0.10);
+
+				let combined = scene + bloom * bloomAmount;
+				let mapped = agx(combined) * vig;
 				return vec4<f32>(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 			}
 		`;
@@ -222,6 +272,16 @@ export class VisualizerRuntime {
 					binding: 1,
 					visibility: GPUShaderStage.FRAGMENT,
 					texture: { sampleType: 'float' }
+				},
+				{
+					binding: 2,
+					visibility: GPUShaderStage.FRAGMENT,
+					texture: { sampleType: 'float' }
+				},
+				{
+					binding: 3,
+					visibility: GPUShaderStage.FRAGMENT,
+					buffer: { type: 'uniform' }
 				}
 			]
 		});
@@ -244,13 +304,25 @@ export class VisualizerRuntime {
 	}
 
 	private rebuildCompositeBindGroup() {
-		if (!this.device || !this.compositeLayout || !this.sceneHDRView || !this.sampler) return;
+		if (
+			!this.device ||
+			!this.compositeLayout ||
+			!this.sceneHDRView ||
+			!this.sampler ||
+			!this.uniformBuf
+		)
+			return;
+		// If bloom hasn't run yet, bind scene as a placeholder so the
+		// layout is satisfied — first frame will overwrite once render() runs.
+		const bloomView = this.bloomView ?? this.sceneHDRView;
 		this.compositeBg = this.device.createBindGroup({
 			label: 'composite_bg',
 			layout: this.compositeLayout,
 			entries: [
 				{ binding: 0, resource: this.sampler },
-				{ binding: 1, resource: this.sceneHDRView }
+				{ binding: 1, resource: this.sceneHDRView },
+				{ binding: 2, resource: bloomView },
+				{ binding: 3, resource: { buffer: this.uniformBuf } }
 			]
 		});
 	}
@@ -271,7 +343,7 @@ export class VisualizerRuntime {
 	}
 
 	resize(width: number, height: number) {
-		if (!this.device || !this.canvas || !this.feedback) return;
+		if (!this.device || !this.canvas || !this.feedback || !this.uniformBuf) return;
 		const w = Math.max(1, width | 0);
 		const h = Math.max(1, height | 0);
 		if (w === this.width && h === this.height) return;
@@ -281,6 +353,10 @@ export class VisualizerRuntime {
 		this.canvas.height = h;
 		this.recreateSceneTarget();
 		resizeFeedbackBank(this.feedback, this.device, w, h, HDR_FORMAT);
+		if (this.bloomPass) {
+			this.bloomPass.resize(w, h, this.uniformBuf);
+			this.bloomView = null; // force composite rebuild after next bloom pass
+		}
 		this.rebuildCompositeBindGroup();
 		this.context_ = this.buildContext();
 		for (const m of this.motifs) m.resize(this.context_);
@@ -346,7 +422,22 @@ export class VisualizerRuntime {
 			if (w > 0.005) m.render(encoder, this.context_, w);
 		}
 
-		// Composite HDR → swapchain with AgX tonemap.
+		// Bloom post-pass: scene HDR → threshold + downsample chain →
+		// progressive upsample. Returns the final mip0 view that composite
+		// blends with scene.
+		if (this.bloomPass && this.uniformBuf) {
+			const newBloomView = this.bloomPass.render(
+				encoder,
+				this.sceneHDRView,
+				this.uniformBuf
+			);
+			if (newBloomView && newBloomView !== this.bloomView) {
+				this.bloomView = newBloomView;
+				this.rebuildCompositeBindGroup();
+			}
+		}
+
+		// Composite scene + bloom → swapchain with AgX tonemap + vignette.
 		{
 			const swapView = this.context.getCurrentTexture().createView();
 			const pass = encoder.beginRenderPass({
@@ -374,6 +465,11 @@ export class VisualizerRuntime {
 		this.motifs.length = 0;
 		this.weights.clear();
 		this.targetWeights.clear();
+		if (this.bloomPass) {
+			this.bloomPass.dispose();
+			this.bloomPass = null;
+		}
+		this.bloomView = null;
 		if (this.feedback) {
 			disposeFeedbackBank(this.feedback);
 			this.feedback = null;
