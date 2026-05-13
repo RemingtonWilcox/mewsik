@@ -243,23 +243,54 @@ export class VisualizerRuntime {
 				return -17.86 * m4 * m2 + 78.01 * m4 * mapped - 126.7 * m4 + 92.06 * m2 * mapped - 28.72 * m2 + 4.361 * mapped - vec3<f32>(0.1718);
 			}
 
+			// IGN hash for cheap per-pixel film grain. From Jorge Jimenez.
+			fn ign(pixel: vec2<f32>) -> f32 {
+				let m = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+				return fract(m.z * fract(dot(pixel, m.xy)));
+			}
+
 			@fragment
 			fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-				let scene = textureSample(sceneTex, samp, in.uv).rgb;
-				let bloom = textureSample(bloomTex, samp, in.uv).rgb;
-
-				// Bloom intensity rides energy and pumps on the drop watershed.
 				let energy = dir.energy.x;
+				let bassPunch = dir.mood.z;
+				let trebleSparkle = dir.mood.w;
 				let postDrop = dir.drop2.x;
-				let bloomAmount = 0.45 + energy * 0.45 + postDrop * 0.7;
+				let antic = dir.drop.w;
 
 				// Vignette: subtle darkening at edges, opens slightly on drops.
 				let uv = in.uv - vec2<f32>(0.5);
 				let r2 = dot(uv, uv);
 				let vig = 1.0 - smoothstep(0.30, 0.85, r2) * (0.32 - postDrop * 0.10);
 
+				// Chromatic aberration: split RGB sample offsets in the edge zone.
+				// Amount scales with anticipation + bass — kicks visibly fringe.
+				let caAmount = (0.0018 + antic * 0.0050 + bassPunch * 0.0030) * smoothstep(0.10, 0.60, r2);
+				let dir2 = normalize(uv + vec2<f32>(0.00001));
+				let off = dir2 * caAmount;
+				let sceneR = textureSample(sceneTex, samp, in.uv + off).r;
+				let sceneG = textureSample(sceneTex, samp, in.uv).g;
+				let sceneB = textureSample(sceneTex, samp, in.uv - off).b;
+				let bloomR = textureSample(bloomTex, samp, in.uv + off * 1.5).r;
+				let bloomG = textureSample(bloomTex, samp, in.uv).g;
+				let bloomB = textureSample(bloomTex, samp, in.uv - off * 1.5).b;
+
+				let scene = vec3<f32>(sceneR, sceneG, sceneB);
+				let bloom = vec3<f32>(bloomR, bloomG, bloomB);
+
+				// Bloom intensity rides energy and pumps on the drop watershed.
+				let bloomAmount = 0.45 + energy * 0.45 + postDrop * 0.7;
+
 				let combined = scene + bloom * bloomAmount;
-				let mapped = agx(combined) * vig;
+				var mapped = agx(combined) * vig;
+
+				// Film grain — luma-aware (less grain in highlights) so blacks
+				// get the gritty 16mm feel and bright cores stay clean.
+				let pixelPos = in.pos.xy + vec2<f32>(dir.viewport.z * 137.0, dir.viewport.z * 271.0);
+				let g = ign(pixelPos) - 0.5;
+				let luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
+				let grainAmount = (0.020 + trebleSparkle * 0.035 + bassPunch * 0.018) * (1.0 - smoothstep(0.5, 1.0, luma));
+				mapped = mapped + vec3<f32>(g * grainAmount);
+
 				return vec4<f32>(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 			}
 		`;
