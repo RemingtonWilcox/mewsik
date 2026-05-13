@@ -1496,9 +1496,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		// Audio overlays the state baseline — bass adds power pulse, centroid
 		// nudges palette inside the state's window, RMS modulates shafts.
+		// Drop anticipation + post-drop decay (Yadati 2014) push tension before
+		// the watershed and let chorus emission ride out after.
+		const antic = directed.drop.anticipation;
+		const postDrop = directed.drop.postDropDecay;
 		const growth = Math.min(
 			1,
-			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18
+			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18 + antic * 0.42 + postDrop * 0.35
 		);
 		const tension = Math.min(
 			1,
@@ -1506,15 +1510,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				directed.density * 0.26 +
 				smoothed.mid * 0.20 +
 				smoothed.treble * 0.12 +
-				smoothed.flash * 0.24
+				smoothed.flash * 0.24 +
+				antic * 0.40
 		);
 		const mandelbulbPower =
-			moodPower + smoothed.bass * 0.28 + smoothed.mid * 0.16 + directed.structure * 0.10 + smoothed.flash * 0.18;
+			moodPower + smoothed.bass * 0.28 + smoothed.mid * 0.16 + directed.structure * 0.10 + smoothed.flash * 0.18 + antic * 0.22 + postDrop * 0.18;
 		const chromaAngleSlow = Math.atan2(smoothed.chromaYSlow, smoothed.chromaXSlow) / (2 * Math.PI);
+		// Tonnetz palette (V2): baseHue + accent blend for harmonically-aware drift.
+		const tonnetzBlend = 0.5 + 0.5 * Math.sin(directed.clock.phrasePos * Math.PI * 2);
+		const hueFromTonnetz = directed.palette.baseHue * (1 - 0.3 * tonnetzBlend) + directed.palette.accentHue * 0.3 * tonnetzBlend;
 		const paletteOffset =
-			directed.paletteBase + (moodPalOffset - 0.45) * 0.12 + (smoothed.centroidSlow - 0.5) * 0.06 + chromaAngleSlow * 0.04;
-		const fogDensity = 0.07 * moodFogMul + smoothed.bass * 0.035 + directed.density * 0.055;
-		const lightShaftIntensity = moodShaftMul * (0.30 + directed.energy * 0.48 + smoothed.bass * 0.13);
+			hueFromTonnetz + (moodPalOffset - 0.45) * 0.12 + (smoothed.centroidSlow - 0.5) * 0.06 + chromaAngleSlow * 0.04;
+		const fogDensity = 0.07 * moodFogMul + smoothed.bass * 0.035 + directed.density * 0.055 + antic * 0.025;
+		const lightShaftIntensity = moodShaftMul * (0.30 + directed.energy * 0.48 + smoothed.bass * 0.13 + antic * 0.55 + postDrop * 0.70);
 		const fovScale = 1.68;
 
 		// Camera path — state mood drives traversal speed and overall distance

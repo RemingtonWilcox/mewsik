@@ -1152,9 +1152,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		let pointSizeState = lerp(previousMood.pointSize, target.pointSize, transT);
 		const camDistMul = lerp(previousMood.camDistMul, target.camDistMul, transT);
 		const camSpeedMul = lerp(previousMood.camSpeedMul, target.camSpeedMul, transT);
-		palOffsetState = lerp(palOffsetState, directed.paletteBase, 0.65);
-		flowStrength *= 0.72 + directed.motion * 0.42;
-		pointSizeState *= 0.82 + directed.density * 0.24;
+		// Tonnetz-aware palette (V2) — base + accent hues weighted by phrase position
+		// so harmonically-related sections share a palette neighborhood.
+		const phraseW = 0.5 + 0.5 * Math.sin(directed.clock.phrasePos * Math.PI * 2);
+		const v2Hue = directed.palette.baseHue * (1 - 0.25 * phraseW) + directed.palette.accentHue * 0.25 * phraseW;
+		palOffsetState = lerp(palOffsetState, v2Hue, 0.65);
+
+		// Drop anticipation accelerates the flow before the drop lands; post-drop
+		// decay holds the energy ~1s into the chorus. Downbeat flag spikes flow
+		// briefly on each bar's first beat — the visual "lands the one."
+		const antic3 = directed.drop.anticipation;
+		const postDrop3 = directed.drop.postDropDecay;
+		const downbeatKick = directed.clock.downbeatFlag ? 0.35 : 0;
+		flowStrength *= 0.72 + directed.motion * 0.42 + antic3 * 0.55 + postDrop3 * 0.30 + downbeatKick;
+		pointSizeState *= 0.82 + directed.density * 0.24 + postDrop3 * 0.18;
 
 		// Long-arc drift — slow LFOs at 30/45/70-second periods so even steady
 		// states are never truly static. Three independent sin waves nudge
@@ -1223,15 +1234,15 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		sp[4] = smoothed.treble * (isSilent ? 0 : 1);
 		sp[5] = smoothed.rmsSlow;
 		sp[6] = 0.35; // flow scale
-		sp[7] = flowStrength * 0.82 + smoothed.bass * 0.18 + directed.motion * 0.14;
+		sp[7] = flowStrength * 0.82 + smoothed.bass * 0.18 + directed.motion * 0.14 + directed.bassPunch * 0.20;
 		sp[8] = dampingState;
-		sp[9] = 2.35 - directed.structure * 0.35; // radial pull (lateral)
-		sp[10] = swirlStrength + smoothed.mid * 0.14;
-		sp[11] = radialForce + smoothed.bass * 0.16;
+		sp[9] = 2.35 - directed.structure * 0.35 + antic3 * 0.45; // radial pull (lateral) — anticipation expands the field
+		sp[10] = swirlStrength + smoothed.mid * 0.14 + downbeatKick * 0.40;
+		sp[11] = radialForce + smoothed.bass * 0.16 + postDrop3 * 0.55; // drop releases a radial impulse
 		sp[12] = camZ; // recycle threshold reference
 		sp[13] = 6.0; // tailDist — recycle particles >6 units behind camera
 		sp[14] = 22.0; // headDist — new particles spawn within 22 units ahead
-		sp[15] = 1.15 + directed.density * 0.85; // spawnSpread — xy radius of new-spawn distribution
+		sp[15] = 1.15 + directed.density * 0.85 + postDrop3 * 0.50; // spawnSpread — drop blooms the field
 		sp[16] = topology;
 		sp[17] = chromaKey;
 		sp[18] = phrase;
