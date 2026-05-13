@@ -1,6 +1,7 @@
 export { VisualizerRuntime } from './runtime.js';
 export { createAtmosphereMotif } from './motifs/atmosphere.js';
 export { createPhysarumMotif } from './motifs/physarum.js';
+export { createFlowFieldMotif } from './motifs/flowfield.js';
 export { weightsForFrame } from './weights.js';
 export type { MotifModule, RuntimeContext, MotifWeights, MotifId } from './types.js';
 export {
