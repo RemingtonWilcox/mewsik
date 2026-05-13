@@ -42,6 +42,7 @@
 	let manualMotifMode = $state(false);
 	let motifAtmosphere = $state(1.0);
 	let motifReaction = $state(0.4);
+	let motifAttractor = $state(0.45);
 	let motifPhysarum = $state(0.5);
 	let motifFlow = $state(0.5);
 	const runtimeOverride = $derived<MotifWeights | null>(
@@ -49,16 +50,18 @@
 			? {
 					atmosphere: motifAtmosphere,
 					lattice: motifReaction,
+					organism: motifAttractor,
 					particles: motifPhysarum,
 					ribbon: motifFlow
 				}
 			: null
 	);
 
-	function soloMotif(name: 'atmosphere' | 'reaction' | 'physarum' | 'flow') {
+	function soloMotif(name: 'atmosphere' | 'reaction' | 'attractor' | 'physarum' | 'flow') {
 		manualMotifMode = true;
 		motifAtmosphere = name === 'atmosphere' ? 1 : 0;
 		motifReaction = name === 'reaction' ? 1 : 0;
+		motifAttractor = name === 'attractor' ? 1 : 0;
 		motifPhysarum = name === 'physarum' ? 1 : 0;
 		motifFlow = name === 'flow' ? 1 : 0;
 	}
@@ -375,6 +378,24 @@
 						class="w-24"
 					/>
 					<span class="w-10 text-white/70">{motifReaction.toFixed(2)}</span>
+				</div>
+				<div class="flex items-center gap-1">
+					<button
+						class="rounded border border-white/20 px-2 py-0.5 hover:bg-white/10"
+						onclick={() => soloMotif('attractor')}
+					>
+						solo att
+					</button>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={motifAttractor}
+						disabled={!manualMotifMode}
+						class="w-24"
+					/>
+					<span class="w-10 text-white/70">{motifAttractor.toFixed(2)}</span>
 				</div>
 				<div class="flex items-center gap-1">
 					<button
