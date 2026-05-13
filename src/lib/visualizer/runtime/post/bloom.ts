@@ -246,11 +246,20 @@ export class BloomPass {
 		const mipViews = mips.map((t) => t.createView());
 		this.res = { mips, mipViews, widths, heights };
 
-		// Bind groups will be rebuilt once we know the scene view for pass 0.
-		// (built lazily in `render` since scene view can change on canvas resize)
+		// Bind groups built lazily inside render() each frame against the
+		// current source view (scene → mip0 → mip1 → ...). Cheap enough to
+		// not cache, and avoids stale-view bugs across resize.
 		this.bgsDown = [];
 		this.bgsUp = [];
 		void directorUniform;
+	}
+
+	/**
+	 * Output view sampled by the composite pass. Stable across frames until
+	 * the next resize(); the composite bind group can bake it in.
+	 */
+	getOutputView(): GPUTextureView | null {
+		return this.res?.mipViews[0] ?? null;
 	}
 
 	private buildBindGroup(

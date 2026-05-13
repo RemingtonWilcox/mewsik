@@ -1153,17 +1153,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const camDistMul = lerp(previousMood.camDistMul, target.camDistMul, transT);
 		const camSpeedMul = lerp(previousMood.camSpeedMul, target.camSpeedMul, transT);
 		// Tonnetz-aware palette (V2) — base + accent hues weighted by phrase position
-		// so harmonically-related sections share a palette neighborhood.
-		const phraseW = 0.5 + 0.5 * Math.sin(directed.clock.phrasePos * Math.PI * 2);
-		const v2Hue = directed.palette.baseHue * (1 - 0.25 * phraseW) + directed.palette.accentHue * 0.25 * phraseW;
+		// so harmonically-related sections share a palette neighborhood. Read
+		// defensively so older director frames or hot-reload races don't crash.
+		const phrasePosMk3 = directed.clock?.phrasePos ?? directed.phrase ?? 0;
+		const baseHueMk3 = directed.palette?.baseHue ?? directed.paletteBase ?? 0;
+		const accentHueMk3 = directed.palette?.accentHue ?? directed.paletteAccent ?? 0;
+		const phraseW = 0.5 + 0.5 * Math.sin(phrasePosMk3 * Math.PI * 2);
+		const v2Hue = baseHueMk3 * (1 - 0.25 * phraseW) + accentHueMk3 * 0.25 * phraseW;
 		palOffsetState = lerp(palOffsetState, v2Hue, 0.65);
 
 		// Drop anticipation accelerates the flow before the drop lands; post-drop
 		// decay holds the energy ~1s into the chorus. Downbeat flag spikes flow
 		// briefly on each bar's first beat — the visual "lands the one."
-		const antic3 = directed.drop.anticipation;
-		const postDrop3 = directed.drop.postDropDecay;
-		const downbeatKick = directed.clock.downbeatFlag ? 0.35 : 0;
+		const antic3 = directed.drop?.anticipation ?? 0;
+		const postDrop3 = directed.drop?.postDropDecay ?? 0;
+		const downbeatKick = directed.clock?.downbeatFlag ? 0.35 : 0;
 		flowStrength *= 0.72 + directed.motion * 0.42 + antic3 * 0.55 + postDrop3 * 0.30 + downbeatKick;
 		pointSizeState *= 0.82 + directed.density * 0.24 + postDrop3 * 0.18;
 

@@ -128,6 +128,9 @@ export class VisualizerRuntime {
 			directorLayout: this.uniformLayout
 		});
 		this.bloomPass.resize(this.width, this.height, this.uniformBuf);
+		// BloomPass's first mip view is stable across frames until next resize,
+		// so we can grab it now and bake it into the composite bind group.
+		this.bloomView = this.bloomPass.getOutputView();
 
 		this.buildComposite();
 
@@ -386,7 +389,7 @@ export class VisualizerRuntime {
 		resizeFeedbackBank(this.feedback, this.device, w, h, HDR_FORMAT);
 		if (this.bloomPass) {
 			this.bloomPass.resize(w, h, this.uniformBuf);
-			this.bloomView = null; // force composite rebuild after next bloom pass
+			this.bloomView = this.bloomPass.getOutputView();
 		}
 		this.rebuildCompositeBindGroup();
 		this.context_ = this.buildContext();
@@ -454,18 +457,10 @@ export class VisualizerRuntime {
 		}
 
 		// Bloom post-pass: scene HDR → threshold + downsample chain →
-		// progressive upsample. Returns the final mip0 view that composite
-		// blends with scene.
+		// progressive upsample. The output view is stable across frames so
+		// the composite bind group was already built against it in init/resize.
 		if (this.bloomPass && this.uniformBuf) {
-			const newBloomView = this.bloomPass.render(
-				encoder,
-				this.sceneHDRView,
-				this.uniformBuf
-			);
-			if (newBloomView && newBloomView !== this.bloomView) {
-				this.bloomView = newBloomView;
-				this.rebuildCompositeBindGroup();
-			}
+			this.bloomPass.render(encoder, this.sceneHDRView, this.uniformBuf);
 		}
 
 		// Composite scene + bloom → swapchain with AgX tonemap + vignette.

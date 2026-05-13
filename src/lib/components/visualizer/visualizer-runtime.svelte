@@ -62,15 +62,22 @@
 
 	function tick() {
 		if (!started) return;
-		const time = performance.now() / 1000;
-		const frame = director.update(vis.latest, time);
-		const weights = overrideWeights ?? weightsForFrame(frame);
-		runtime.setWeights(weights);
-		runtime.update(frame, time);
-		runtime.render();
-		activeSection = frame.section;
-		const tag = overrideWeights ? 'manual' : frame.section;
-		activeMotifWeights = `${tag} · atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · att ${(weights.organism ?? 0).toFixed(2)} · man ${(weights.tunnel ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
+		try {
+			const time = performance.now() / 1000;
+			const frame = director.update(vis.latest, time);
+			const weights = overrideWeights ?? weightsForFrame(frame);
+			runtime.setWeights(weights);
+			runtime.update(frame, time);
+			runtime.render();
+			activeSection = frame.section;
+			const tag = overrideWeights ? 'manual' : frame.section;
+			activeMotifWeights = `${tag} · atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · att ${(weights.organism ?? 0).toFixed(2)} · man ${(weights.tunnel ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
+		} catch (e) {
+			errorMsg = `tick: ${(e as Error).message ?? String(e)}`;
+			console.error('[runtime tick]', e);
+			started = false;
+			return;
+		}
 		raf = requestAnimationFrame(tick);
 	}
 
