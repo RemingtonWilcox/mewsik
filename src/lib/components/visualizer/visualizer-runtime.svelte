@@ -15,6 +15,7 @@
 		createAtmosphereMotif,
 		createPhysarumMotif,
 		createFlowFieldMotif,
+		createReactionMotif,
 		weightsForFrame
 	} from '$lib/visualizer/runtime';
 
@@ -37,8 +38,11 @@
 		if (!canvas) return;
 		try {
 			await runtime.init(canvas);
-			// Atmosphere first → backdrop. Physarum + flow-field stack on top.
+			// Atmosphere first → backdrop.
+			// Reaction-diffusion second → biological surface texture.
+			// Physarum + flow-field stack additively on top.
 			runtime.register(createAtmosphereMotif(), 1);
+			runtime.register(createReactionMotif(), 0.4);
 			runtime.register(createPhysarumMotif(), 0.5);
 			runtime.register(createFlowFieldMotif(), 0.5);
 			started = true;
@@ -57,7 +61,7 @@
 		runtime.update(frame, time);
 		runtime.render();
 		activeSection = frame.section;
-		activeMotifWeights = `atm ${(weights.atmosphere ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
+		activeMotifWeights = `atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
 		raf = requestAnimationFrame(tick);
 	}
 

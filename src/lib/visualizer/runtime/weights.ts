@@ -9,9 +9,14 @@
 //                chorus / drop (the organism blooms on the watershed).
 //   flowfield  — linear strokes / streaks (Hobbs Fidenza). Dominant in
 //                verse / build (motion, accumulation, anticipation).
+//   reaction   — Gray-Scott surface texture (lattice MotifId). Slowly-
+//                evolving biological pattern that morphs by section
+//                (stripes → maze → spots → coral). Always present as
+//                ambient texture, slightly stronger during bridges and
+//                breakdowns where it becomes the focal vocabulary.
 //
-// The two subject motifs are roughly anti-correlated by section so users
-// see clear visual differentiation, but they never go fully to zero so
+// Subject motifs are roughly anti-correlated by section so users see
+// clear visual differentiation, but they never go fully to zero so
 // trails persist across transitions.
 
 import type { VisualDirectorFrame } from '../director/types.js';
@@ -26,52 +31,64 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 
 	let physarum = 0;
 	let flowfield = 0;
+	let reaction = 0;
 
 	switch (frame.section) {
 		case 'calm':
 		case 'intro':
 			physarum = 0.12 + energy * 0.3;
 			flowfield = 0.15 + energy * 0.25;
+			reaction = 0.35 + energy * 0.25;
 			break;
 		case 'verse':
 			physarum = 0.35 + energy * 0.25;
 			flowfield = 0.55 + energy * 0.3;
+			reaction = 0.30 + energy * 0.2;
 			break;
 		case 'pre_chorus':
 		case 'build':
 			physarum = 0.45 + antic * 0.35;
 			flowfield = 0.75 + antic * 0.20;
+			reaction = 0.25 + antic * 0.3;
 			break;
 		case 'drop':
 		case 'chorus':
 			physarum = 0.95 + postDrop * 0.05;
 			flowfield = 0.45 + postDrop * 0.30;
+			reaction = 0.55 + postDrop * 0.4;
 			break;
 		case 'bridge':
 			physarum = 0.32 + energy * 0.3;
 			flowfield = 0.30 + energy * 0.3;
+			reaction = 0.65 + energy * 0.25;
 			break;
 		case 'breakdown':
 			physarum = 0.20 + energy * 0.3;
 			flowfield = 0.18 + energy * 0.25;
+			reaction = 0.55 + energy * 0.25;
 			break;
 		case 'outro':
 			physarum = 0.25 + energy * 0.25;
 			flowfield = 0.20 + energy * 0.20;
+			reaction = 0.40 + energy * 0.20;
 			break;
 		default:
 			physarum = 0.45;
 			flowfield = 0.45;
+			reaction = 0.40;
 	}
 
 	if (frame.silence) {
 		physarum = 0;
 		flowfield = 0;
+		// reaction keeps simulating quietly so the field doesn't snap-reset
+		reaction = Math.min(reaction, 0.12);
 	}
 
 	return {
 		atmosphere: 1,
 		particles: clamp01(physarum),
-		ribbon: clamp01(flowfield)
+		ribbon: clamp01(flowfield),
+		lattice: clamp01(reaction)
 	} as Record<MotifId, number>;
 }
