@@ -3,6 +3,7 @@
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
 
 	const vis = useVisualizer();
+	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -1278,11 +1279,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		presetSmoothed[1] = lerp(presetSmoothed[1], cathedralInstant, 0.008);
 		presetSmoothed[2] = lerp(presetSmoothed[2], voronoiInstant, 0.008);
 		presetSmoothed[3] = lerp(presetSmoothed[3], nebulaeInstant, 0.008);
-		// HUD-display "dominant" preset — only kaleido (0) vs voronoi (2) matter
-		// in auto since the others are excluded from blending.
-		const autoLeader = presetSmoothed[0] >= presetSmoothed[2] ? 0 : 2;
-		if (autoLeader !== vis.preset && vis.forcedPreset < 0) {
-			vis.setPreset(autoLeader);
+		// Auto-pick disabled — switching between distinct presets created snap
+		// transitions even with smoothing. Auto stays on kaleidoscope (idx 0);
+		// lab keys force any preset for development. mk2 is the path forward.
+		const autoLeader = 0;
+		if (vis.forcedPreset < 0 && vis.preset !== 0) {
+			vis.setPreset(0);
 		}
 
 		// ── Upload uniforms (bins go separately)
@@ -1314,32 +1316,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[22] = 0;
 		u[23] = 0;
 
-		// ── Continuous blend between kaleidoscope (0) and voronoi (2) only.
-		// Cathedral (1) and Nebulae (3) are excluded from auto because their
-		// volumetric-only rendering doesn't read as real 3D / scene — they look
-		// flat and cheap, especially when the camera barely moves. Lab keys
-		// still allow forcing them for development. Future: rebuild with proper
-		// surface raymarching + lighting before re-enabling in auto.
-		let sceneIdxA = 0;
-		let sceneIdxB = 2;
-		let weightA = 1;
-		let weightB = 0;
-		if (vis.forcedPreset >= 0) {
-			sceneIdxA = vis.forcedPreset;
-			sceneIdxB = vis.forcedPreset;
-		} else {
-			// Softmax between just two presets — temperature low so the dominant
-			// preset gets most weight, but always with a smooth gradient between.
-			const T = 0.5;
-			const sA = presetSmoothed[0];
-			const sB = presetSmoothed[2];
-			const m = Math.max(sA, sB);
-			const eA = Math.exp((sA - m) / T);
-			const eB = Math.exp((sB - m) / T);
-			const sum = eA + eB;
-			weightA = eA / sum;
-			weightB = eB / sum;
-		}
+		// ── Single dominant preset (no top-2 blend). Cross-fading two distinct
+		// generators produced visible overlay/competition instead of evolution.
+		// Whichever preset has the highest score wins; transitions snap at the
+		// score boundary (but slow smoothing makes the snap a rare event).
+		let sceneIdxA = vis.forcedPreset >= 0 ? vis.forcedPreset : autoLeader;
+		const sceneIdxB = sceneIdxA;
+		const weightA = 1;
+		const weightB = 0;
 
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 		gpu.device.queue.writeBuffer(
@@ -1547,7 +1531,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 {#if vis.active}
 	<div
 		class="fixed inset-0 z-[100] bg-black"
-		role="presentation"
+		role="button"
+		aria-label="Close visualizer"
 		onclick={() => vis.toggle()}
 		onkeydown={(e) => {
 			if (e.key === 'Escape') vis.toggle();
@@ -1555,9 +1540,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		tabindex="0"
 	>
 		<canvas bind:this={canvas} class="h-full w-full"></canvas>
-		<div class="pointer-events-none absolute right-6 top-6 text-xs text-white/40">
-			click anywhere or press esc to exit
-		</div>
+		{#if showHud}
+			<div class="pointer-events-none absolute right-6 top-6 text-xs text-white/40">
+				click anywhere or press esc to exit
+			</div>
+		{/if}
 		{#if errorMsg}
 			<div class="absolute left-6 top-6 max-w-md text-xs text-red-300/80">
 				Visualizer error: {errorMsg}

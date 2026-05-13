@@ -28,8 +28,13 @@ export const PRESET_NAMES = [
 	'nebulae flow'
 ];
 
+export type VisualizerEngine = 'auto' | 'mk1' | 'mk2' | 'mk3';
+export type RenderVisualizerEngine = Exclude<VisualizerEngine, 'auto'>;
+export const VISUALIZER_ENGINES: VisualizerEngine[] = ['auto', 'mk1', 'mk2', 'mk3'];
+
 class VisualizerState {
 	active = $state(false);
+	engine = $state<VisualizerEngine>('auto');
 	// `preset` tracks the currently-dominant preset for HUD display; rendering
 	// itself blends top-2 presets by softmax weight (continuous mix, not switch).
 	preset = $state(0);
@@ -44,6 +49,15 @@ class VisualizerState {
 		this.active = !this.active;
 	}
 
+	setEngine(engine: VisualizerEngine) {
+		this.engine = engine;
+		try {
+			localStorage.setItem('mewsik.visualizer.engine', engine);
+		} catch {
+			// Storage can be unavailable in restricted webviews; keep runtime state.
+		}
+	}
+
 	setPreset(idx: number) {
 		this.preset = ((idx % PRESET_COUNT) + PRESET_COUNT) % PRESET_COUNT;
 	}
@@ -53,6 +67,13 @@ class VisualizerState {
 	}
 
 	async subscribe(): Promise<() => void> {
+		try {
+			const saved = localStorage.getItem('mewsik.visualizer.engine') as VisualizerEngine | null;
+			if (saved && VISUALIZER_ENGINES.includes(saved)) this.engine = saved;
+		} catch {
+			// Non-browser contexts or locked-down storage should not block rendering.
+		}
+
 		this.subs += 1;
 		if (!this.unlisten) {
 			try {

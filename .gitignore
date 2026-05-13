@@ -5,6 +5,7 @@ sidecar/dist
 src-tauri/resources/bin
 test-results
 tmp
+*.log
 
 # Output
 .output

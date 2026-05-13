@@ -4,7 +4,8 @@
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
 	import PlayerBar from '$lib/components/player/player-bar.svelte';
 	import CommandSearch from '$lib/components/search/command-search.svelte';
-	import Visualizer from '$lib/components/visualizer/visualizer.svelte';
+	import VisualizerHost from '$lib/components/visualizer/visualizer-host.svelte';
+	import { page } from '$app/state';
 	import {
 		SidebarProvider,
 		SidebarInset
@@ -12,6 +13,8 @@
 	import { ModeWatcher } from 'mode-watcher';
 
 	let { children } = $props();
+
+	const isVisualizerLab = $derived(page.url.pathname.startsWith('/visualizer-test'));
 </script>
 
 <ModeWatcher />
@@ -35,20 +38,24 @@
 	}}
 />
 
-<div class="flex h-screen flex-col">
-	<div class="flex flex-1 overflow-hidden">
-		<SidebarProvider>
-			<AppSidebar />
-			<SidebarInset>
-				<main class="flex min-w-0 flex-1 flex-col overflow-auto p-4 pb-24">
-					{@render children()}
-				</main>
-			</SidebarInset>
-		</SidebarProvider>
+{#if isVisualizerLab}
+	{@render children()}
+{:else}
+	<div class="flex h-screen flex-col">
+		<div class="flex flex-1 overflow-hidden">
+			<SidebarProvider>
+				<AppSidebar />
+				<SidebarInset>
+					<main class="flex min-w-0 flex-1 flex-col overflow-auto p-4 pb-24">
+						{@render children()}
+					</main>
+				</SidebarInset>
+			</SidebarProvider>
+		</div>
+		<PlayerBar />
 	</div>
-	<PlayerBar />
-</div>
 
-<CommandSearch />
-<Visualizer />
-<Toaster />
+	<CommandSearch />
+	<VisualizerHost />
+	<Toaster />
+{/if}
