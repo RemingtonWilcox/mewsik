@@ -17,6 +17,7 @@
 		type RenderVisualizerEngine
 	} from '$lib/state/visualizer.svelte';
 	import { WebAnalyzer } from '$lib/audio/web-analyzer';
+	import type { MotifWeights } from '$lib/visualizer/runtime';
 
 	type LabEngine = VisualizerEngine;
 	type LabRenderEngine = RenderVisualizerEngine;
@@ -34,6 +35,33 @@
 	let autoEngine = $state<LabRenderEngine>('mk2');
 	let demoMode = $state(true);
 	let manualPreset = $state(-1); // -1 = auto, 0..3 = force preset
+
+	// Runtime motif override — when manualMotifMode is on, the runtime uses
+	// these sliders instead of the section-driven weight policy. Lets us
+	// inspect each motif in isolation while iterating.
+	let manualMotifMode = $state(false);
+	let motifAtmosphere = $state(1.0);
+	let motifReaction = $state(0.4);
+	let motifPhysarum = $state(0.5);
+	let motifFlow = $state(0.5);
+	const runtimeOverride = $derived<MotifWeights | null>(
+		manualMotifMode
+			? {
+					atmosphere: motifAtmosphere,
+					lattice: motifReaction,
+					particles: motifPhysarum,
+					ribbon: motifFlow
+				}
+			: null
+	);
+
+	function soloMotif(name: 'atmosphere' | 'reaction' | 'physarum' | 'flow') {
+		manualMotifMode = true;
+		motifAtmosphere = name === 'atmosphere' ? 1 : 0;
+		motifReaction = name === 'reaction' ? 1 : 0;
+		motifPhysarum = name === 'physarum' ? 1 : 0;
+		motifFlow = name === 'flow' ? 1 : 0;
+	}
 	let lastFeatures = $state<{ bpm: number; chromaKey: number; chromaStrength: number } | null>(
 		null
 	);
@@ -292,8 +320,8 @@
 			<span><strong>mk3</strong> gpu compute particle field + camera traversal</span>
 			<span class="text-white/50">keys: a auto, q/w/e/r engines</span>
 		{:else if engine === 'runtime'}
-			<span><strong>runtime</strong> unified director-driven runtime (atmosphere motif)</span>
-			<span class="text-white/50">keys: a auto, q/w/e/r engines</span>
+			<span><strong>runtime</strong> unified director-driven runtime</span>
+			<span class="text-white/50">atm · rd · phy · flow + bloom + AgX</span>
 		{:else}
 			<span><strong>auto</strong> directed engine flow → {autoEngine}</span>
 			<span class="text-white/50">keys: q/w/e/r lock engines</span>
@@ -305,10 +333,92 @@
 			<span>tonal: {lastFeatures.chromaStrength.toFixed(2)}</span>
 		{/if}
 	</div>
+	{#if engine === 'runtime'}
+		<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-xs">
+			<label class="flex items-center gap-1 rounded border border-white/20 bg-black/40 px-2 py-1">
+				<input type="checkbox" bind:checked={manualMotifMode} />
+				<span>manual</span>
+			</label>
+			<div class="flex flex-1 flex-wrap items-center gap-3" class:opacity-40={!manualMotifMode}>
+				<div class="flex items-center gap-1">
+					<button
+						class="rounded border border-white/20 px-2 py-0.5 hover:bg-white/10"
+						onclick={() => soloMotif('atmosphere')}
+					>
+						solo atm
+					</button>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={motifAtmosphere}
+						disabled={!manualMotifMode}
+						class="w-24"
+					/>
+					<span class="w-10 text-white/70">{motifAtmosphere.toFixed(2)}</span>
+				</div>
+				<div class="flex items-center gap-1">
+					<button
+						class="rounded border border-white/20 px-2 py-0.5 hover:bg-white/10"
+						onclick={() => soloMotif('reaction')}
+					>
+						solo rd
+					</button>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={motifReaction}
+						disabled={!manualMotifMode}
+						class="w-24"
+					/>
+					<span class="w-10 text-white/70">{motifReaction.toFixed(2)}</span>
+				</div>
+				<div class="flex items-center gap-1">
+					<button
+						class="rounded border border-white/20 px-2 py-0.5 hover:bg-white/10"
+						onclick={() => soloMotif('physarum')}
+					>
+						solo phy
+					</button>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={motifPhysarum}
+						disabled={!manualMotifMode}
+						class="w-24"
+					/>
+					<span class="w-10 text-white/70">{motifPhysarum.toFixed(2)}</span>
+				</div>
+				<div class="flex items-center gap-1">
+					<button
+						class="rounded border border-white/20 px-2 py-0.5 hover:bg-white/10"
+						onclick={() => soloMotif('flow')}
+					>
+						solo flow
+					</button>
+					<input
+						type="range"
+						min="0"
+						max="1"
+						step="0.01"
+						bind:value={motifFlow}
+						disabled={!manualMotifMode}
+						class="w-24"
+					/>
+					<span class="w-10 text-white/70">{motifFlow.toFixed(2)}</span>
+				</div>
+			</div>
+		</div>
+	{/if}
 </div>
 
 {#if engine === 'runtime'}
-	<VisualizerRuntime showHud={false} />
+	<VisualizerRuntime showHud={false} overrideWeights={runtimeOverride} />
 {:else if (engine === 'auto' ? autoEngine : engine) === 'mk1'}
 	<VisualizerMk1 showHud={false} />
 {:else if (engine === 'auto' ? autoEngine : engine) === 'mk2'}

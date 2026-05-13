@@ -16,10 +16,14 @@
 		createPhysarumMotif,
 		createFlowFieldMotif,
 		createReactionMotif,
-		weightsForFrame
+		weightsForFrame,
+		type MotifWeights
 	} from '$lib/visualizer/runtime';
 
-	let { showHud = true } = $props<{ showHud?: boolean }>();
+	let {
+		showHud = true,
+		overrideWeights = null
+	} = $props<{ showHud?: boolean; overrideWeights?: MotifWeights | null }>();
 
 	const vis = useVisualizer();
 	const director = createVisualDirector();
@@ -56,12 +60,13 @@
 		if (!started) return;
 		const time = performance.now() / 1000;
 		const frame = director.update(vis.latest, time);
-		const weights = weightsForFrame(frame);
+		const weights = overrideWeights ?? weightsForFrame(frame);
 		runtime.setWeights(weights);
 		runtime.update(frame, time);
 		runtime.render();
 		activeSection = frame.section;
-		activeMotifWeights = `atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
+		const tag = overrideWeights ? 'manual' : frame.section;
+		activeMotifWeights = `${tag} · atm ${(weights.atmosphere ?? 0).toFixed(2)} · rd ${(weights.lattice ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)} · flow ${(weights.ribbon ?? 0).toFixed(2)}`;
 		raf = requestAnimationFrame(tick);
 	}
 
@@ -99,7 +104,7 @@
 		<div class="error">Runtime error: {errorMsg}</div>
 	{/if}
 	{#if showHud && !errorMsg}
-		<div class="hud">runtime · {activeSection} · {activeMotifWeights}</div>
+		<div class="hud">runtime · {activeMotifWeights}</div>
 	{/if}
 </div>
 
