@@ -9,6 +9,7 @@
 	import VisualizerMk1 from '$lib/components/visualizer/visualizer.svelte';
 	import VisualizerMk2 from '$lib/components/visualizer/visualizer-mk2.svelte';
 	import VisualizerMk3 from '$lib/components/visualizer/visualizer-mk3.svelte';
+	import VisualizerRuntime from '$lib/components/visualizer/visualizer-runtime.svelte';
 	import {
 		useVisualizer,
 		PRESET_NAMES,
@@ -214,6 +215,7 @@
 		else if (e.key.toLowerCase() === 'q') setEngine('mk1');
 		else if (e.key.toLowerCase() === 'w') setEngine('mk2');
 		else if (e.key.toLowerCase() === 'e') setEngine('mk3');
+		else if (e.key.toLowerCase() === 'r') setEngine('runtime');
 	}}
 />
 
@@ -247,6 +249,12 @@
 				class={`border-l border-white/20 px-3 py-1 ${engine === 'mk3' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
 			>
 				mk3
+			</button>
+			<button
+				onclick={() => setEngine('runtime')}
+				class={`border-l border-white/20 px-3 py-1 ${engine === 'runtime' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
+			>
+				runtime
 			</button>
 		</div>
 		<label class="flex items-center gap-2 rounded border border-white/20 bg-black/40 px-2 py-1">
@@ -282,10 +290,13 @@
 			<span class="text-white/50">keys: a auto, q/w/e engines</span>
 		{:else if engine === 'mk3'}
 			<span><strong>mk3</strong> gpu compute particle field + camera traversal</span>
-			<span class="text-white/50">keys: a auto, q/w/e engines</span>
+			<span class="text-white/50">keys: a auto, q/w/e/r engines</span>
+		{:else if engine === 'runtime'}
+			<span><strong>runtime</strong> unified director-driven runtime (atmosphere motif)</span>
+			<span class="text-white/50">keys: a auto, q/w/e/r engines</span>
 		{:else}
 			<span><strong>auto</strong> directed engine flow → {autoEngine}</span>
-			<span class="text-white/50">keys: q/w/e lock engines</span>
+			<span class="text-white/50">keys: q/w/e/r lock engines</span>
 		{/if}
 		{#if lastFeatures}
 			<span class="text-white/50">|</span>
@@ -296,7 +307,9 @@
 	</div>
 </div>
 
-{#if (engine === 'auto' ? autoEngine : engine) === 'mk1'}
+{#if engine === 'runtime'}
+	<VisualizerRuntime showHud={false} />
+{:else if (engine === 'auto' ? autoEngine : engine) === 'mk1'}
 	<VisualizerMk1 showHud={false} />
 {:else if (engine === 'auto' ? autoEngine : engine) === 'mk2'}
 	<VisualizerMk2 showHud={false} />

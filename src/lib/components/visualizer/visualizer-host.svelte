@@ -3,6 +3,7 @@
 	import VisualizerMk1 from './visualizer.svelte';
 	import VisualizerMk2 from './visualizer-mk2.svelte';
 	import VisualizerMk3 from './visualizer-mk3.svelte';
+	import VisualizerRuntime from './visualizer-runtime.svelte';
 	import { useVisualizer, type RenderVisualizerEngine } from '$lib/state/visualizer.svelte';
 	import { createVisualDirector } from '$lib/visualizer/visual-director';
 
@@ -44,7 +45,9 @@
 	});
 </script>
 
-{#if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk1'}
+{#if vis.engine === 'runtime'}
+	<VisualizerRuntime />
+{:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk1'}
 	<VisualizerMk1 />
 {:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk2'}
 	<VisualizerMk2 />

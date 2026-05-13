@@ -28,9 +28,9 @@ export const PRESET_NAMES = [
 	'nebulae flow'
 ];
 
-export type VisualizerEngine = 'auto' | 'mk1' | 'mk2' | 'mk3';
+export type VisualizerEngine = 'auto' | 'mk1' | 'mk2' | 'mk3' | 'runtime';
 export type RenderVisualizerEngine = Exclude<VisualizerEngine, 'auto'>;
-export const VISUALIZER_ENGINES: VisualizerEngine[] = ['auto', 'mk1', 'mk2', 'mk3'];
+export const VISUALIZER_ENGINES: VisualizerEngine[] = ['auto', 'mk1', 'mk2', 'mk3', 'runtime'];
 
 class VisualizerState {
 	active = $state(false);
