@@ -10,13 +10,20 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import { createVisualDirector } from '$lib/visualizer/visual-director';
-	import { VisualizerRuntime, createAtmosphereMotif } from '$lib/visualizer/runtime';
+	import {
+		VisualizerRuntime,
+		createAtmosphereMotif,
+		createPhysarumMotif,
+		weightsForFrame
+	} from '$lib/visualizer/runtime';
 
 	let { showHud = true } = $props<{ showHud?: boolean }>();
 
 	const vis = useVisualizer();
 	const director = createVisualDirector();
 	const runtime = new VisualizerRuntime();
+	let activeSection = $state<string>('intro');
+	let activeMotifWeights = $state<string>('');
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -29,7 +36,9 @@
 		if (!canvas) return;
 		try {
 			await runtime.init(canvas);
+			// Atmosphere first → backdrop. Physarum second → additive on top.
 			runtime.register(createAtmosphereMotif(), 1);
+			runtime.register(createPhysarumMotif(), 0.5);
 			started = true;
 			tick();
 		} catch (e) {
@@ -41,8 +50,12 @@
 		if (!started) return;
 		const time = performance.now() / 1000;
 		const frame = director.update(vis.latest, time);
+		const weights = weightsForFrame(frame);
+		runtime.setWeights(weights);
 		runtime.update(frame, time);
 		runtime.render();
+		activeSection = frame.section;
+		activeMotifWeights = `atm ${(weights.atmosphere ?? 0).toFixed(2)} · phy ${(weights.particles ?? 0).toFixed(2)}`;
 		raf = requestAnimationFrame(tick);
 	}
 
@@ -80,7 +93,7 @@
 		<div class="error">Runtime error: {errorMsg}</div>
 	{/if}
 	{#if showHud && !errorMsg}
-		<div class="hud">runtime · atmosphere</div>
+		<div class="hud">runtime · {activeSection} · {activeMotifWeights}</div>
 	{/if}
 </div>
 
