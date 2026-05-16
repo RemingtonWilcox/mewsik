@@ -19,13 +19,19 @@
 		createAttractorMotif,
 		createMandalaMotif,
 		weightsForFrame,
-		type MotifWeights
+		type MotifWeights,
+		type RuntimeControls
 	} from '$lib/visualizer/runtime';
 
 	let {
 		showHud = true,
-		overrideWeights = null
-	} = $props<{ showHud?: boolean; overrideWeights?: MotifWeights | null }>();
+		overrideWeights = null,
+		controls = null
+	} = $props<{
+		showHud?: boolean;
+		overrideWeights?: MotifWeights | null;
+		controls?: Partial<RuntimeControls> | null;
+	}>();
 
 	const vis = useVisualizer();
 	const director = createVisualDirector();
@@ -67,6 +73,7 @@
 			const frame = director.update(vis.latest, time);
 			const weights = overrideWeights ?? weightsForFrame(frame);
 			runtime.setWeights(weights);
+			runtime.setControls(controls);
 			runtime.update(frame, time);
 			runtime.render();
 			activeSection = frame.section;

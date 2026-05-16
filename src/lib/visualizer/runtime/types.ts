@@ -58,3 +58,17 @@ export type MotifModule = {
 };
 
 export type MotifWeights = Partial<Record<MotifId, number>>;
+
+export type RuntimeControls = {
+	master: number;
+	exposure: number;
+	bloom: number;
+	background: number;
+	contrast: number;
+	saturation: number;
+	vignette: number;
+	edge: number;
+	chromaticAberration: number;
+	grain: number;
+	bloomThreshold: number;
+};

@@ -69,7 +69,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 	// Silence dims everything.
 	let silence = dir.phrase.z;
-	col = col * (1.0 - silence * 0.6);
+	col = col * (1.0 - silence * 0.6) * dir.controls.w;
 
 	return vec4<f32>(max(col, vec3<f32>(0.0)), 1.0);
 }

@@ -20,9 +20,14 @@
 //     tonnetz_a: vec4<f32>,       // tonnetz[0..3]
 //     tonnetz_b: vec4<f32>,       // tonnetz[4..5], _, _
 //     phrase: vec4<f32>,          // phrase, sectionAge, silence(0/1), _
+//     controls: vec4<f32>,        // master, exposure, bloom, background
+//     post: vec4<f32>,            // contrast, saturation, vignette, edge
+//     fx: vec4<f32>,              // chromaticAberration, grain, bloomThreshold, _
 //   };
 
 import type { VisualDirectorFrame } from '../director/types.js';
+import { DEFAULT_RUNTIME_CONTROLS, normalizeRuntimeControls } from './controls.js';
+import type { RuntimeControls } from './types.js';
 
 export const DIRECTOR_UNIFORM_FLOATS = 32 * 4; // 32 vec4
 export const DIRECTOR_UNIFORM_BYTES = DIRECTOR_UNIFORM_FLOATS * 4;
@@ -54,8 +59,11 @@ export function packDirectorUniform(
 	width: number,
 	height: number,
 	time: number,
-	dt: number
+	dt: number,
+	controls: RuntimeControls = DEFAULT_RUNTIME_CONTROLS
 ) {
+	const c = normalizeRuntimeControls(controls);
+
 	// viewport
 	out[0] = width;
 	out[1] = height;
@@ -126,7 +134,21 @@ export function packDirectorUniform(
 	out[53] = frame.sectionAge;
 	out[54] = frame.silence ? 1 : 0;
 	out[55] = frame.motifIndex;
-	// remaining slots reserved
+	// runtime controls
+	out[56] = c.master;
+	out[57] = c.exposure;
+	out[58] = c.bloom;
+	out[59] = c.background;
+	// post controls
+	out[60] = c.contrast;
+	out[61] = c.saturation;
+	out[62] = c.vignette;
+	out[63] = c.edge;
+	// fx controls
+	out[64] = c.chromaticAberration;
+	out[65] = c.grain;
+	out[66] = c.bloomThreshold;
+	out[67] = 0;
 }
 
 export const DIRECTOR_WGSL_STRUCT = /* wgsl */ `
@@ -145,9 +167,9 @@ struct Director {
 	tonnetz_a: vec4<f32>,
 	tonnetz_b: vec4<f32>,
 	phrase: vec4<f32>,
-	_pad0: vec4<f32>,
-	_pad1: vec4<f32>,
-	_pad2: vec4<f32>,
+	controls: vec4<f32>,
+	post: vec4<f32>,
+	fx: vec4<f32>,
 	_pad3: vec4<f32>,
 	_pad4: vec4<f32>,
 	_pad5: vec4<f32>,

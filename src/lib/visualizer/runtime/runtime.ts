@@ -16,9 +16,16 @@ import {
 	DIRECTOR_UNIFORM_FLOATS,
 	packDirectorUniform
 } from './uniforms.js';
+import { DEFAULT_RUNTIME_CONTROLS, normalizeRuntimeControls } from './controls.js';
 import { createFeedbackBank, disposeFeedbackBank, resizeFeedbackBank } from './feedback.js';
 import { BloomPass } from './post/bloom.js';
-import type { MotifModule, RuntimeContext, MotifWeights, MotifId } from './types.js';
+import type {
+	MotifModule,
+	RuntimeContext,
+	MotifWeights,
+	MotifId,
+	RuntimeControls
+} from './types.js';
 
 const HDR_FORMAT: GPUTextureFormat = 'rgba16float';
 
@@ -40,6 +47,7 @@ export class VisualizerRuntime {
 	private motifs: MotifModule[] = [];
 	private weights = new Map<MotifId, number>();
 	private targetWeights = new Map<MotifId, number>();
+	private controls: RuntimeControls = DEFAULT_RUNTIME_CONTROLS;
 
 	private compositeModule: GPUShaderModule | null = null;
 	private compositePipeline: GPURenderPipeline | null = null;
@@ -199,7 +207,7 @@ export class VisualizerRuntime {
 				tonnetz_a: vec4<f32>,
 				tonnetz_b: vec4<f32>,
 				phrase: vec4<f32>,
-				_pad0: vec4<f32>, _pad1: vec4<f32>, _pad2: vec4<f32>, _pad3: vec4<f32>,
+				controls: vec4<f32>, post: vec4<f32>, fx: vec4<f32>, _pad3: vec4<f32>,
 				_pad4: vec4<f32>, _pad5: vec4<f32>, _pad6: vec4<f32>, _pad7: vec4<f32>,
 				_pad8: vec4<f32>, _pad9: vec4<f32>, _pad10: vec4<f32>, _pad11: vec4<f32>,
 				_pad12: vec4<f32>, _pad13: vec4<f32>, _pad14: vec4<f32>, _pad15: vec4<f32>,
@@ -259,6 +267,15 @@ export class VisualizerRuntime {
 				let trebleSparkle = dir.mood.w;
 				let postDrop = dir.drop2.x;
 				let antic = dir.drop.w;
+				let masterCtl = dir.controls.x;
+				let exposureCtl = dir.controls.y;
+				let bloomCtl = dir.controls.z;
+				let contrastCtl = dir.post.x;
+				let saturationCtl = dir.post.y;
+				let vignetteCtl = dir.post.z;
+				let edgeCtl = dir.post.w;
+				let chromaCtl = dir.fx.x;
+				let grainCtl = dir.fx.y;
 
 				// Stage mask: keep the outer frame dark and structured so edge content
 				// does not read as blurry corner distortion.
@@ -267,11 +284,13 @@ export class VisualizerRuntime {
 				let edgeDist = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
 				let edgeMask = smoothstep(0.018, 0.16, edgeDist);
 				let radialMask = 1.0 - smoothstep(0.26, 0.66, r2) * (0.40 - postDrop * 0.08);
-				let vig = mix(0.16, 1.0, edgeMask) * radialMask;
+				let edgeFloor = mix(0.65, 0.16, clamp(edgeCtl, 0.0, 1.0));
+				let edgeVig = mix(edgeFloor, 1.0, edgeMask);
+				let vig = mix(1.0, edgeVig * radialMask, clamp(vignetteCtl, 0.0, 1.5));
 
 				// Chromatic aberration: split RGB sample offsets in the edge zone.
 				// Amount scales with anticipation + bass — kicks visibly fringe.
-				let caAmount = (0.0008 + antic * 0.0028 + bassPunch * 0.0016) * smoothstep(0.16, 0.58, r2);
+				let caAmount = (0.0008 + antic * 0.0028 + bassPunch * 0.0016) * smoothstep(0.16, 0.58, r2) * chromaCtl;
 				let dir2 = normalize(uv + vec2<f32>(0.00001));
 				let off = dir2 * caAmount;
 				let sceneR = textureSample(sceneTex, samp, in.uv + off).r;
@@ -286,28 +305,28 @@ export class VisualizerRuntime {
 
 				// Bloom intensity rides energy and pumps on the drop watershed,
 				// but stays restrained so the runtime keeps contrast.
-				let bloomAmount = 0.12 + energy * 0.20 + postDrop * 0.26;
+				let bloomAmount = (0.12 + energy * 0.20 + postDrop * 0.26) * bloomCtl;
 
-				let exposure = 0.66 + postDrop * 0.08;
+				let exposure = (0.66 + postDrop * 0.08) * exposureCtl;
 				let combined = scene * exposure + bloom * bloomAmount;
 				var mapped = agx(combined) * vig;
 
 				// Contrast and saturation trim: recover black space after AgX so the
 				// runtime does not collapse into a pale full-screen overlay.
-				mapped = max(mapped - vec3<f32>(0.040), vec3<f32>(0.0));
-				mapped = pow(mapped, vec3<f32>(1.20));
+				mapped = max(mapped - vec3<f32>(0.040 * contrastCtl), vec3<f32>(0.0));
+				mapped = pow(mapped, vec3<f32>(1.0 + 0.20 * contrastCtl));
 				let mappedLuma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
-				mapped = mix(vec3<f32>(mappedLuma), mapped, 1.10);
+				mapped = mix(vec3<f32>(mappedLuma), mapped, clamp(saturationCtl * 1.10, 0.0, 2.0));
 
 				// Film grain — luma-aware (less grain in highlights) so blacks
 				// get the gritty 16mm feel and bright cores stay clean.
 				let pixelPos = in.pos.xy + vec2<f32>(dir.viewport.z * 137.0, dir.viewport.z * 271.0);
 				let g = ign(pixelPos) - 0.5;
 				let luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
-				let grainAmount = (0.012 + trebleSparkle * 0.024 + bassPunch * 0.012) * (1.0 - smoothstep(0.5, 1.0, luma));
+				let grainAmount = (0.012 + trebleSparkle * 0.024 + bassPunch * 0.012) * (1.0 - smoothstep(0.5, 1.0, luma)) * grainCtl;
 				mapped = mapped + vec3<f32>(g * grainAmount);
 
-				return vec4<f32>(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
+				return vec4<f32>(clamp(mapped * masterCtl, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 			}
 		`;
 		this.compositeModule = this.device.createShaderModule({ label: 'composite_shader', code });
@@ -389,6 +408,10 @@ export class VisualizerRuntime {
 		}
 	}
 
+	setControls(controls: Partial<RuntimeControls> | null | undefined): void {
+		this.controls = normalizeRuntimeControls(controls);
+	}
+
 	resize(width: number, height: number) {
 		if (!this.device || !this.canvas || !this.feedback || !this.uniformBuf) return;
 		const w = Math.max(1, width | 0);
@@ -427,7 +450,8 @@ export class VisualizerRuntime {
 			this.width,
 			this.height,
 			time,
-			dt
+			dt,
+			this.controls
 		);
 		this.device.queue.writeBuffer(this.uniformBuf, 0, this.uniformDataF32.buffer, 0, DIRECTOR_UNIFORM_BYTES);
 

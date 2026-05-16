@@ -17,7 +17,11 @@
 		type RenderVisualizerEngine
 	} from '$lib/state/visualizer.svelte';
 	import { WebAnalyzer } from '$lib/audio/web-analyzer';
-	import type { MotifWeights } from '$lib/visualizer/runtime';
+	import {
+		DEFAULT_RUNTIME_CONTROLS,
+		type MotifWeights,
+		type RuntimeControls
+	} from '$lib/visualizer/runtime';
 
 	type LabEngine = VisualizerEngine;
 	type LabRenderEngine = RenderVisualizerEngine;
@@ -46,6 +50,17 @@
 	let motifMandala = $state(0.35);
 	let motifPhysarum = $state(0.5);
 	let motifFlow = $state(0.5);
+	let ctlMaster = $state(DEFAULT_RUNTIME_CONTROLS.master);
+	let ctlExposure = $state(DEFAULT_RUNTIME_CONTROLS.exposure);
+	let ctlBloom = $state(DEFAULT_RUNTIME_CONTROLS.bloom);
+	let ctlBackground = $state(DEFAULT_RUNTIME_CONTROLS.background);
+	let ctlContrast = $state(DEFAULT_RUNTIME_CONTROLS.contrast);
+	let ctlSaturation = $state(DEFAULT_RUNTIME_CONTROLS.saturation);
+	let ctlVignette = $state(DEFAULT_RUNTIME_CONTROLS.vignette);
+	let ctlEdge = $state(DEFAULT_RUNTIME_CONTROLS.edge);
+	let ctlChromatic = $state(DEFAULT_RUNTIME_CONTROLS.chromaticAberration);
+	let ctlGrain = $state(DEFAULT_RUNTIME_CONTROLS.grain);
+	let ctlBloomThreshold = $state(DEFAULT_RUNTIME_CONTROLS.bloomThreshold);
 	const runtimeOverride = $derived<MotifWeights | null>(
 		manualMotifMode
 			? {
@@ -58,6 +73,33 @@
 				}
 			: null
 	);
+	const runtimeControls = $derived<RuntimeControls>({
+		master: ctlMaster,
+		exposure: ctlExposure,
+		bloom: ctlBloom,
+		background: ctlBackground,
+		contrast: ctlContrast,
+		saturation: ctlSaturation,
+		vignette: ctlVignette,
+		edge: ctlEdge,
+		chromaticAberration: ctlChromatic,
+		grain: ctlGrain,
+		bloomThreshold: ctlBloomThreshold
+	});
+
+	function resetRuntimeControls() {
+		ctlMaster = DEFAULT_RUNTIME_CONTROLS.master;
+		ctlExposure = DEFAULT_RUNTIME_CONTROLS.exposure;
+		ctlBloom = DEFAULT_RUNTIME_CONTROLS.bloom;
+		ctlBackground = DEFAULT_RUNTIME_CONTROLS.background;
+		ctlContrast = DEFAULT_RUNTIME_CONTROLS.contrast;
+		ctlSaturation = DEFAULT_RUNTIME_CONTROLS.saturation;
+		ctlVignette = DEFAULT_RUNTIME_CONTROLS.vignette;
+		ctlEdge = DEFAULT_RUNTIME_CONTROLS.edge;
+		ctlChromatic = DEFAULT_RUNTIME_CONTROLS.chromaticAberration;
+		ctlGrain = DEFAULT_RUNTIME_CONTROLS.grain;
+		ctlBloomThreshold = DEFAULT_RUNTIME_CONTROLS.bloomThreshold;
+	}
 
 	function soloMotif(
 		name: 'atmosphere' | 'reaction' | 'attractor' | 'mandala' | 'physarum' | 'flow'
@@ -458,11 +500,81 @@
 				</div>
 			</div>
 		</div>
+		<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-xs">
+			<button
+				class="rounded border border-white/20 bg-black/40 px-2 py-1 hover:bg-white/10"
+				onclick={resetRuntimeControls}
+			>
+				reset image
+			</button>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">master</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlMaster} class="w-24" />
+				<span class="w-10 text-white/70">{ctlMaster.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">expose</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlExposure} class="w-24" />
+				<span class="w-10 text-white/70">{ctlExposure.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">bloom</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlBloom} class="w-24" />
+				<span class="w-10 text-white/70">{ctlBloom.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">bg</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlBackground} class="w-24" />
+				<span class="w-10 text-white/70">{ctlBackground.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">contrast</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlContrast} class="w-24" />
+				<span class="w-10 text-white/70">{ctlContrast.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">sat</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlSaturation} class="w-24" />
+				<span class="w-10 text-white/70">{ctlSaturation.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">vign</span>
+				<input type="range" min="0" max="1.5" step="0.01" bind:value={ctlVignette} class="w-24" />
+				<span class="w-10 text-white/70">{ctlVignette.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">edge</span>
+				<input type="range" min="0" max="1.5" step="0.01" bind:value={ctlEdge} class="w-24" />
+				<span class="w-10 text-white/70">{ctlEdge.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">ca</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlChromatic} class="w-24" />
+				<span class="w-10 text-white/70">{ctlChromatic.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">grain</span>
+				<input type="range" min="0" max="2" step="0.01" bind:value={ctlGrain} class="w-24" />
+				<span class="w-10 text-white/70">{ctlGrain.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">thresh</span>
+				<input
+					type="range"
+					min="0.2"
+					max="3"
+					step="0.01"
+					bind:value={ctlBloomThreshold}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlBloomThreshold.toFixed(2)}</span>
+			</div>
+		</div>
 	{/if}
 </div>
 
 {#if engine === 'runtime'}
-	<VisualizerRuntime showHud={false} overrideWeights={runtimeOverride} />
+	<VisualizerRuntime showHud={false} overrideWeights={runtimeOverride} controls={runtimeControls} />
 {:else if (engine === 'auto' ? autoEngine : engine) === 'mk1'}
 	<VisualizerMk1 showHud={false} />
 {:else if (engine === 'auto' ? autoEngine : engine) === 'mk2'}
