@@ -19,14 +19,21 @@ import { DIRECTOR_WGSL_STRUCT } from '../uniforms.js';
 const PARTICLE_COUNT = 80_000;
 const PARTICLE_BYTES = 16; // pos vec2 + seed f32 + flavor f32
 
-const SHADER = /* wgsl */ `
-${DIRECTOR_WGSL_STRUCT}
-
+// Two shader modules — WebGPU forbids 'storage' (read_write) bindings in
+// the vertex stage. Compute needs read_write to update particles; render
+// only reads. Splitting modules avoids the access-mode mismatch that
+// invalidates the entire frame.
+const PARTICLE_STRUCT_WGSL = /* wgsl */ `
 struct Particle {
 	pos: vec2<f32>,
 	seed: f32,
 	flavor: f32,
 };
+`;
+
+const COMPUTE_SHADER = /* wgsl */ `
+${DIRECTOR_WGSL_STRUCT}
+${PARTICLE_STRUCT_WGSL}
 
 @group(0) @binding(0) var<uniform> dir: Director;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
@@ -39,8 +46,6 @@ fn hash11(x: u32) -> f32 {
 }
 
 fn paramsFromTonnetz() -> vec4<f32> {
-	// Map tonnetz 6-vector → (a, b, c, d) ∈ roughly [-2.5, 2.5].
-	// Different axis pairings give visually distinct attractor families.
 	let t = dir.tonnetz_a;
 	let u = dir.tonnetz_b;
 	let bass = dir.mood.z;
@@ -52,20 +57,18 @@ fn paramsFromTonnetz() -> vec4<f32> {
 	return vec4<f32>(a, b, c, d);
 }
 
-// ── INIT: scatter in [-1, 1] worldspace ─────────────────────────────────
 @compute @workgroup_size(64)
 fn init_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let i = gid.x;
 	if (i >= arrayLength(&particles)) { return; }
 	let x = (hash11(i * 5u + 1u) - 0.5) * 2.0;
 	let y = (hash11(i * 11u + 3u) - 0.5) * 2.0;
-	let flavor = floor(hash11(i * 23u + 7u) * 2.0); // 0 = De Jong, 1 = Clifford
+	let flavor = floor(hash11(i * 23u + 7u) * 2.0);
 	particles[i].pos = vec2<f32>(x, y);
 	particles[i].seed = hash11(i * 7u + 13u);
 	particles[i].flavor = flavor;
 }
 
-// ── STEP: one iteration of the chosen map ───────────────────────────────
 @compute @workgroup_size(64)
 fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let i = gid.x;
@@ -76,22 +79,17 @@ fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let b = abcd.y;
 	let c = abcd.z;
 	let d = abcd.w;
-
 	var nx: f32;
 	var ny: f32;
 	if (p.flavor < 0.5) {
-		// De Jong
 		nx = sin(a * p.pos.y) - cos(b * p.pos.x);
 		ny = sin(c * p.pos.x) - cos(d * p.pos.y);
 	} else {
-		// Clifford
 		nx = sin(a * p.pos.y) + c * cos(a * p.pos.x);
 		ny = sin(b * p.pos.x) + d * cos(b * p.pos.y);
 	}
 	p.pos = vec2<f32>(nx, ny);
 
-	// On downbeat, re-seed a small fraction so the field doesn't lock onto
-	// one fixed orbit forever — keeps the attractor "alive" across bars.
 	let downbeat = f32(dir.clockI.w);
 	let postDrop = dir.drop2.x;
 	let reseedProb = downbeat * 0.02 + postDrop * 0.06;
@@ -101,11 +99,17 @@ fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 		let ry = (hash11(i * 11u + u32(dir.viewport.z * 1933.0)) - 0.5) * 2.0;
 		p.pos = vec2<f32>(rx, ry);
 	}
-
 	particles[i] = p;
 }
+`;
 
-// ── RENDER: instanced 2-triangle quad per particle ──────────────────────
+const RENDER_SHADER = /* wgsl */ `
+${DIRECTOR_WGSL_STRUCT}
+${PARTICLE_STRUCT_WGSL}
+
+@group(0) @binding(0) var<uniform> dir: Director;
+@group(0) @binding(1) var<storage, read> particles: array<Particle>;
+
 struct VsOut {
 	@builtin(position) pos: vec4<f32>,
 	@location(0) uv: vec2<f32>,
@@ -132,7 +136,6 @@ fn vs_render(
 	let viewport = dir.viewport.xy;
 	let aspect = viewport.x / max(viewport.y, 1.0);
 
-	// World [-2.5, 2.5] → NDC [-1, 1], preserving aspect by fitting Y.
 	let world = p.pos * 0.35;
 	let ndc = vec2<f32>(world.x / aspect, world.y);
 
@@ -140,11 +143,9 @@ fn vs_render(
 	let accentHue = dir.palette.y;
 	let rimHue = dir.palette.z;
 	let sat = dir.palette.w;
-	// Two flavors → two palette slots, with seed-driven hue jitter.
 	let hue = mix(baseHue, rimHue, p.flavor) + (p.seed - 0.5) * 0.06 + accentHue * 0.04;
 	let col = hsv2rgb(vec3<f32>(fract(hue), sat * 0.9, 1.0));
 
-	// Per-particle quad radius in pixels; map to NDC by 2/height.
 	let radiusPx = 1.6 + dir.energy.x * 1.4 + dir.drop2.x * 1.2;
 	let radiusNdc = radiusPx * 2.0 / max(viewport.y, 1.0);
 
@@ -159,8 +160,6 @@ fn vs_render(
 fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 	let d = length(in.uv);
 	let glow = exp(-d * d * 4.0);
-	// Faint per-particle intensity — accumulation via additive blend builds
-	// the attractor structure over many frames.
 	let intensity = glow * (0.18 + dir.energy.x * 0.18);
 	return vec4<f32>(in.col * intensity, intensity);
 }
@@ -214,7 +213,14 @@ export function createAttractorMotif(): MotifModule {
 				]
 			});
 
-			const module = device.createShaderModule({ label: 'attractor_shader', code: SHADER });
+			const computeModule = device.createShaderModule({
+				label: 'attractor_compute_shader',
+				code: COMPUTE_SHADER
+			});
+			const renderModule = device.createShaderModule({
+				label: 'attractor_render_shader',
+				code: RENDER_SHADER
+			});
 
 			const computePL = device.createPipelineLayout({
 				label: 'attractor_compute_pl',
@@ -223,12 +229,12 @@ export function createAttractorMotif(): MotifModule {
 			initPipeline = device.createComputePipeline({
 				label: 'attractor_init',
 				layout: computePL,
-				compute: { module, entryPoint: 'init_main' }
+				compute: { module: computeModule, entryPoint: 'init_main' }
 			});
 			stepPipeline = device.createComputePipeline({
 				label: 'attractor_step',
 				layout: computePL,
-				compute: { module, entryPoint: 'step_main' }
+				compute: { module: computeModule, entryPoint: 'step_main' }
 			});
 
 			const renderPL = device.createPipelineLayout({
@@ -238,16 +244,16 @@ export function createAttractorMotif(): MotifModule {
 			renderPipeline = device.createRenderPipeline({
 				label: 'attractor_render_pipeline',
 				layout: renderPL,
-				vertex: { module, entryPoint: 'vs_render' },
+				vertex: { module: renderModule, entryPoint: 'vs_render' },
 				fragment: {
-					module,
+					module: renderModule,
 					entryPoint: 'fs_render',
 					targets: [
 						{
 							format: ctx.hdrFormat,
 							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
 							}
 						}
 					]
@@ -277,8 +283,9 @@ export function createAttractorMotif(): MotifModule {
 			needsInit = true;
 		},
 		update(_frame, _time, _dt) {},
-		render(encoder, ctx, _weight) {
+		render(encoder, ctx, weight) {
 			if (!initPipeline || !stepPipeline || !renderPipeline || !computeBg || !renderBg) return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 			const groups = Math.ceil(PARTICLE_COUNT / 64);
 			if (needsInit) {
 				const pass = encoder.beginComputePass({ label: 'attractor_init_pass' });
@@ -307,6 +314,12 @@ export function createAttractorMotif(): MotifModule {
 			});
 			rPass.setPipeline(renderPipeline);
 			rPass.setBindGroup(0, renderBg);
+			rPass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			rPass.draw(6, PARTICLE_COUNT);
 			rPass.end();
 		},

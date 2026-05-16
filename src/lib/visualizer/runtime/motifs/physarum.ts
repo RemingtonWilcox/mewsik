@@ -210,7 +210,7 @@ fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 	let postDrop = dir_r.drop2.x;
 	let flare = postDrop * 0.45;
 
-	let final_col = lit * (0.85 + glow * 0.35) + vec3<f32>(flare) * (p.r + p.g + p.b);
+	let final_col = lit * (0.48 + glow * 0.22) + vec3<f32>(flare * 0.45) * (p.r + p.g + p.b);
 	return vec4<f32>(final_col, 1.0);
 }
 `;
@@ -416,8 +416,8 @@ export function createPhysarumMotif(): MotifModule {
 						{
 							format: ctx.hdrFormat,
 							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
 							}
 						}
 					]
@@ -449,6 +449,7 @@ export function createPhysarumMotif(): MotifModule {
 				!bgRender[pingFlip]
 			)
 				return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 
 			const groupsAgents = Math.ceil(AGENT_COUNT / 64);
 			const groupsX = Math.ceil(pheroWidth / 8);
@@ -490,12 +491,14 @@ export function createPhysarumMotif(): MotifModule {
 			});
 			renderPass.setPipeline(renderPipeline);
 			renderPass.setBindGroup(0, bgRender[pingFlip]!);
+			renderPass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			renderPass.draw(3);
 			renderPass.end();
-
-			// Weight gates per-frame visibility; below threshold we still simulate
-			// (so trails don't snap when the motif fades back in).
-			void weight;
 
 			pingFlip = pingFlip === 0 ? 1 : 0;
 		},

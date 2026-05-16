@@ -82,9 +82,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let rot = dir.viewport.z * rotSpeed + downbeat * 0.06;
 	theta = theta + rot;
 
-	// Fold: kaleidoscopic mirror across k slices.
+	// Fold: kaleidoscopic mirror across k slices. Use fract instead of %
+	// so negative theta wraps into a stable positive slice coordinate.
 	let sliceWidth = TWO_PI / k;
-	let folded = abs(((theta + sliceWidth * 0.5) % sliceWidth) - sliceWidth * 0.5);
+	let sliceT = fract((theta + sliceWidth * 0.5) / sliceWidth);
+	let folded = abs(sliceT * sliceWidth - sliceWidth * 0.5);
 
 	// Ring count — centroid and energy pack more concentric petals.
 	let ringDensity = 5.0 + centroid * 7.0 + energy * 4.0;
@@ -92,11 +94,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let ring = 0.5 + 0.5 * cos(ringPhase * PI);
 
 	// Petal modulation along folded angle — narrows toward the symmetry axis.
-	let petal = pow(cos(folded * 2.0), 4.0);
+	let petalCos = max(abs(cos(folded * 2.0)), 0.0001);
+	let petal = petalCos * petalCos * petalCos * petalCos;
 
 	// Combine: ring × petal × radial falloff. r expansion grows on drops.
 	let radialReach = 0.85 + antic * 0.35 + postDrop * 0.40;
-	let radialFalloff = smoothstep(radialReach, 0.05, r);
+	let radialFalloff = 1.0 - smoothstep(0.05, radialReach, r);
 	let core = ring * petal * radialFalloff;
 
 	// Sparkle: bright dots where rings cross petal peaks.
@@ -112,10 +115,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	hue = mix(hue, rimHue, smoothstep(0.5, 1.0, radialT));
 	let col = hsv2rgb(vec3<f32>(fract(hue), sat * 0.95, 1.0));
 
-	let glow = col * (core * 0.85 + sparkle * 1.5);
+	let glow = col * (core * 0.48 + sparkle * 0.75);
 
 	// Subtle center pulse on the downbeat — the eye lands on the "one".
-	let centerPulse = downbeat * exp(-r * 12.0) * 0.4;
+	let centerPulse = downbeat * exp(-r * 12.0) * 0.22;
 	return vec4<f32>(glow + vec3<f32>(centerPulse), 1.0);
 }
 `;
@@ -146,8 +149,8 @@ export function createMandalaMotif(): MotifModule {
 						{
 							format: ctx.hdrFormat,
 							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
 							}
 						}
 					]
@@ -162,8 +165,9 @@ export function createMandalaMotif(): MotifModule {
 		},
 		resize(_ctx: RuntimeContext) {},
 		update(_frame, _time, _dt) {},
-		render(encoder, ctx, _weight) {
+		render(encoder, ctx, weight) {
 			if (!pipeline || !bg) return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 			const pass = encoder.beginRenderPass({
 				label: 'mandala_pass',
 				colorAttachments: [
@@ -177,6 +181,12 @@ export function createMandalaMotif(): MotifModule {
 			});
 			pass.setPipeline(pipeline);
 			pass.setBindGroup(0, bg);
+			pass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			pass.draw(3);
 			pass.end();
 		},

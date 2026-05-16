@@ -99,10 +99,10 @@ fn fs_threshold_downsample(in: VsOut) -> @location(0) vec4<f32> {
 	sum = sum + (b + d + f + h) * 0.0625;
 	sum = sum + (j + k + l + m) * 0.125;
 
-	// Soft knee threshold — only the >1.0 HDR overshoot blooms strongly.
+	// Soft knee threshold — only real HDR overshoot blooms strongly.
 	let brightness = max(max(sum.r, sum.g), sum.b);
-	let threshold = 0.85;
-	let knee = 0.5;
+	let threshold = 1.15;
+	let knee = 0.35;
 	let soft = max(brightness - threshold + knee, 0.0);
 	let softWeight = soft * soft / (4.0 * knee + 0.0001);
 	let contribution = max(brightness - threshold, softWeight) / max(brightness, 0.0001);

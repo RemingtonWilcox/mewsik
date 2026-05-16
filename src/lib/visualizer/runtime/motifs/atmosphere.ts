@@ -47,7 +47,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let phrase = dir.clock.w;
 	let mixT = 0.5 + 0.5 * sin(phrase * 6.28318);
 	let hue = mix(baseHue, accentHue, mixT * 0.5) + r * 0.08;
-	let v = mix(0.18, 0.55, smoothstep(0.85, 0.0, r));
+	let centerFade = 1.0 - smoothstep(0.0, 0.85, r);
+	let v = mix(0.18, 0.55, centerFade);
 
 	let baseCol = hsv2rgb(vec3<f32>(fract(hue), sat * 0.7, v));
 	let rimCol = hsv2rgb(vec3<f32>(fract(rimHue), sat * 0.5, v * 0.4));
@@ -55,7 +56,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 	// Downbeat pulse — brief radial brighten on every bar's first beat.
 	let isDown = f32(dir.clockI.w);
-	col = col + isDown * 0.08 * smoothstep(0.6, 0.0, r);
+	col = col + isDown * 0.08 * (1.0 - smoothstep(0.0, 0.6, r));
 
 	// Anticipation tints toward warmth before drops.
 	let antic = dir.drop.w;
@@ -91,7 +92,15 @@ export function createAtmosphereMotif(): MotifModule {
 				fragment: {
 					module,
 					entryPoint: 'fs_main',
-					targets: [{ format: ctx.hdrFormat }]
+					targets: [
+						{
+							format: ctx.hdrFormat,
+							blend: {
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
+							}
+						}
+					]
 				},
 				primitive: { topology: 'triangle-list' }
 			});
@@ -107,8 +116,9 @@ export function createAtmosphereMotif(): MotifModule {
 		update(_frame, _time, _dt) {
 			// All state lives in the shared director uniform; nothing per-frame here.
 		},
-		render(encoder, ctx, _weight) {
+		render(encoder, ctx, weight) {
 			if (!pipeline || !bindGroup) return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 			const pass = encoder.beginRenderPass({
 				label: 'atmosphere_pass',
 				colorAttachments: [
@@ -122,6 +132,12 @@ export function createAtmosphereMotif(): MotifModule {
 			});
 			pass.setPipeline(pipeline);
 			pass.setBindGroup(0, bindGroup);
+			pass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			pass.draw(3);
 			pass.end();
 		},

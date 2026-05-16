@@ -280,10 +280,12 @@ export class VisualizerRuntime {
 				let scene = vec3<f32>(sceneR, sceneG, sceneB);
 				let bloom = vec3<f32>(bloomR, bloomG, bloomB);
 
-				// Bloom intensity rides energy and pumps on the drop watershed.
-				let bloomAmount = 0.45 + energy * 0.45 + postDrop * 0.7;
+				// Bloom intensity rides energy and pumps on the drop watershed,
+				// but stays restrained so the runtime keeps contrast.
+				let bloomAmount = 0.18 + energy * 0.26 + postDrop * 0.34;
 
-				let combined = scene + bloom * bloomAmount;
+				let exposure = 0.72 + postDrop * 0.08;
+				let combined = scene * exposure + bloom * bloomAmount;
 				var mapped = agx(combined) * vig;
 
 				// Film grain — luma-aware (less grain in highlights) so blacks
@@ -291,7 +293,7 @@ export class VisualizerRuntime {
 				let pixelPos = in.pos.xy + vec2<f32>(dir.viewport.z * 137.0, dir.viewport.z * 271.0);
 				let g = ign(pixelPos) - 0.5;
 				let luma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
-				let grainAmount = (0.020 + trebleSparkle * 0.035 + bassPunch * 0.018) * (1.0 - smoothstep(0.5, 1.0, luma));
+				let grainAmount = (0.012 + trebleSparkle * 0.024 + bassPunch * 0.012) * (1.0 - smoothstep(0.5, 1.0, luma));
 				mapped = mapped + vec3<f32>(g * grainAmount);
 
 				return vec4<f32>(clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);

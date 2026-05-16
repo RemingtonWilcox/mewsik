@@ -168,7 +168,7 @@ fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 
 	// Anticipation slightly amplifies pre-drop.
 	let antic = dirR.drop.w;
-	return vec4<f32>(glow * (0.85 + antic * 0.45), 1.0);
+	return vec4<f32>(glow * (0.45 + antic * 0.22), 1.0);
 }
 `;
 
@@ -329,8 +329,8 @@ export function createReactionMotif(): MotifModule {
 						{
 							format: ctx.hdrFormat,
 							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
 							}
 						}
 					]
@@ -349,8 +349,9 @@ export function createReactionMotif(): MotifModule {
 			needsInit = true;
 		},
 		update(_frame, _time, _dt) {},
-		render(encoder, ctx, _weight) {
+		render(encoder, ctx, weight) {
 			if (!initPipeline || !stepPipeline || !renderPipeline) return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 
 			const gx = Math.ceil(w / 8);
 			const gy = Math.ceil(h / 8);
@@ -390,9 +391,14 @@ export function createReactionMotif(): MotifModule {
 			rPass.setPipeline(renderPipeline);
 			// pingFlip points at the next OUT; the last written one is the inverse.
 			rPass.setBindGroup(0, bgsRender[pingFlip === 0 ? 1 : 0]!);
+			rPass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			rPass.draw(3);
 			rPass.end();
-			void _weight;
 			void ctx;
 		},
 		dispose() {

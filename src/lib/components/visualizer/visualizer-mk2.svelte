@@ -378,8 +378,13 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let twist = q.y * (0.36 + tension * 1.55)
 		+ sin(q.z * 1.35 + u.time * (0.26 + u.bpmNorm * 0.22)) * (0.10 + u.mid * 0.24)
 		+ u.flash * 0.16;
-	q.xz = rot2(q.xz, twist);
-	q.xy = rot2(q.xy, sin(q.z * 0.9 + u.time * 0.11) * (0.08 + growth * 0.11));
+	// WGSL forbids assigning to swizzled lvalues — rotate via temp, write back component-wise.
+	let rxz = rot2(q.xz, twist);
+	q.x = rxz.x;
+	q.z = rxz.y;
+	let rxy = rot2(q.xy, sin(q.z * 0.9 + u.time * 0.11) * (0.08 + growth * 0.11));
+	q.x = rxy.x;
+	q.y = rxy.y;
 	q.y = q.y + sin(q.x * 1.7 + u.time * 0.19) * (0.045 + tension * 0.05);
 	return q;
 }

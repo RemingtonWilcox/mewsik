@@ -21,9 +21,7 @@ import { DIRECTOR_WGSL_STRUCT } from '../uniforms.js';
 const PARTICLE_COUNT = 48_000;
 const PARTICLE_BYTES = 32; // 8 floats: pos(2) + vel(2) + age + life + hue + pad
 
-const SHADER = /* wgsl */ `
-${DIRECTOR_WGSL_STRUCT}
-
+const PARTICLE_STRUCT_WGSL = /* wgsl */ `
 struct Particle {
 	pos: vec2<f32>,
 	vel: vec2<f32>,
@@ -32,6 +30,11 @@ struct Particle {
 	hueOffset: f32,
 	_pad: f32,
 };
+`;
+
+const COMPUTE_SHADER = /* wgsl */ `
+${DIRECTOR_WGSL_STRUCT}
+${PARTICLE_STRUCT_WGSL}
 
 @group(0) @binding(0) var<uniform> dir: Director;
 @group(0) @binding(1) var<storage, read_write> particles: array<Particle>;
@@ -167,6 +170,14 @@ fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 	particles[i] = p;
 }
+`;
+
+const RENDER_SHADER = /* wgsl */ `
+${DIRECTOR_WGSL_STRUCT}
+${PARTICLE_STRUCT_WGSL}
+
+@group(0) @binding(0) var<uniform> dir: Director;
+@group(0) @binding(1) var<storage, read> particles: array<Particle>;
 
 // ── RENDER ───────────────────────────────────────────────────────────────
 struct VsOut {
@@ -198,8 +209,8 @@ fn vs_render(
 	let lifeT = clamp(p.age / max(p.life, 0.0001), 0.0, 1.0);
 	let fade = 1.0 - lifeT;
 	// Radius scales with energy + bass punch + slight age-out shrink.
-	let radiusBase = 7.0 + dir.energy.x * 8.0 + dir.mood.z * 6.0;
-	let radius = radiusBase * (0.6 + fade * 0.6 + dir.drop2.x * 0.4);
+	let radiusBase = 2.8 + dir.energy.x * 3.6 + dir.mood.z * 2.8;
+	let radius = radiusBase * (0.55 + fade * 0.45 + dir.drop2.x * 0.25);
 
 	let worldPos = p.pos + corner * radius;
 	// Map pixel coordinates → NDC.
@@ -225,11 +236,11 @@ fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 	// Soft circle — Gaussian-ish falloff with a tight core.
 	let d = length(in.uv);
 	let core = exp(-d * d * 3.0);
-	let halo = exp(-d * d * 1.2) * 0.45;
+	let halo = exp(-d * d * 1.6) * 0.18;
 	let intensity = (core + halo) * (1.0 - in.lifeT);
 
 	let postDrop = dir.drop2.x;
-	let glow = in.col * intensity * (0.9 + postDrop * 0.6);
+	let glow = in.col * intensity * (0.48 + postDrop * 0.34);
 	return vec4<f32>(glow, intensity);
 }
 `;
@@ -278,7 +289,14 @@ export function createFlowFieldMotif(): MotifModule {
 				]
 			});
 
-			const module = device.createShaderModule({ label: 'flowfield_shader', code: SHADER });
+			const computeModule = device.createShaderModule({
+				label: 'flowfield_compute_shader',
+				code: COMPUTE_SHADER
+			});
+			const renderModule = device.createShaderModule({
+				label: 'flowfield_render_shader',
+				code: RENDER_SHADER
+			});
 
 			const computePL = device.createPipelineLayout({
 				label: 'flowfield_compute_pl',
@@ -287,12 +305,12 @@ export function createFlowFieldMotif(): MotifModule {
 			initPipeline = device.createComputePipeline({
 				label: 'flowfield_init',
 				layout: computePL,
-				compute: { module, entryPoint: 'init_main' }
+				compute: { module: computeModule, entryPoint: 'init_main' }
 			});
 			stepPipeline = device.createComputePipeline({
 				label: 'flowfield_step',
 				layout: computePL,
-				compute: { module, entryPoint: 'step_main' }
+				compute: { module: computeModule, entryPoint: 'step_main' }
 			});
 
 			const renderPL = device.createPipelineLayout({
@@ -302,16 +320,16 @@ export function createFlowFieldMotif(): MotifModule {
 			renderPipeline = device.createRenderPipeline({
 				label: 'flowfield_render_pipeline',
 				layout: renderPL,
-				vertex: { module, entryPoint: 'vs_render' },
+				vertex: { module: renderModule, entryPoint: 'vs_render' },
 				fragment: {
-					module,
+					module: renderModule,
 					entryPoint: 'fs_render',
 					targets: [
 						{
 							format: ctx.hdrFormat,
 							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+								color: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'constant', dstFactor: 'one', operation: 'add' }
 							}
 						}
 					]
@@ -342,8 +360,9 @@ export function createFlowFieldMotif(): MotifModule {
 			needsInit = true;
 		},
 		update(_frame, _time, _dt) {},
-		render(encoder, ctx, _weight) {
+		render(encoder, ctx, weight) {
 			if (!initPipeline || !stepPipeline || !renderPipeline || !computeBg || !renderBg) return;
+			const renderWeight = Math.max(0, Math.min(1, weight));
 
 			const groups = Math.ceil(PARTICLE_COUNT / 64);
 
@@ -375,6 +394,12 @@ export function createFlowFieldMotif(): MotifModule {
 			});
 			rPass.setPipeline(renderPipeline);
 			rPass.setBindGroup(0, renderBg);
+			rPass.setBlendConstant({
+				r: renderWeight,
+				g: renderWeight,
+				b: renderWeight,
+				a: renderWeight
+			});
 			rPass.draw(6, PARTICLE_COUNT);
 			rPass.end();
 		},

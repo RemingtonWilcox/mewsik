@@ -26,8 +26,9 @@
 //                quieter in verses where less symmetric vocabularies lead.
 //
 // Subject motifs are roughly anti-correlated by section so users see
-// clear visual differentiation, but they never go fully to zero so
-// trails persist across transitions.
+// clear visual differentiation. Simulated motifs can keep internal state,
+// but only one or two should visibly lead at a time; otherwise the HDR
+// post-stack collapses into pale visual soup.
 
 import type { VisualDirectorFrame } from '../director/types.js';
 import type { MotifId, MotifWeights } from './types.js';
@@ -48,62 +49,62 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 	switch (frame.section) {
 		case 'calm':
 		case 'intro':
-			physarum = 0.12 + energy * 0.3;
-			flowfield = 0.15 + energy * 0.25;
-			reaction = 0.35 + energy * 0.25;
-			attractor = 0.30 + energy * 0.3;
-			mandala = 0.25 + energy * 0.30;
+			physarum = 0;
+			flowfield = 0;
+			reaction = 0.12 + energy * 0.12;
+			attractor = 0.28 + energy * 0.28;
+			mandala = 0.10 + energy * 0.18;
 			break;
 		case 'verse':
-			physarum = 0.35 + energy * 0.25;
-			flowfield = 0.55 + energy * 0.3;
-			reaction = 0.30 + energy * 0.2;
-			attractor = 0.55 + energy * 0.3;
-			mandala = 0.20 + energy * 0.25;
+			physarum = 0.12 + energy * 0.14;
+			flowfield = 0.48 + energy * 0.26;
+			reaction = 0.14 + energy * 0.14;
+			attractor = 0.36 + energy * 0.24;
+			mandala = 0.08 + energy * 0.12;
 			break;
 		case 'pre_chorus':
 		case 'build':
-			physarum = 0.45 + antic * 0.35;
-			flowfield = 0.75 + antic * 0.20;
-			reaction = 0.25 + antic * 0.3;
-			attractor = 0.40 + antic * 0.35;
-			mandala = 0.45 + antic * 0.40;
+			physarum = 0.16 + antic * 0.18;
+			flowfield = 0.62 + antic * 0.22;
+			reaction = 0.10 + antic * 0.16;
+			attractor = 0.18 + antic * 0.18;
+			mandala = 0.30 + antic * 0.30;
 			break;
 		case 'drop':
 		case 'chorus':
-			physarum = 0.95 + postDrop * 0.05;
-			flowfield = 0.45 + postDrop * 0.30;
-			reaction = 0.55 + postDrop * 0.4;
-			attractor = 0.25 + postDrop * 0.5;
-			mandala = 0.70 + postDrop * 0.30;
+			physarum = 0.68 + postDrop * 0.20;
+			flowfield = 0.24 + postDrop * 0.18;
+			reaction = 0.30 + postDrop * 0.24;
+			attractor = 0.08 + postDrop * 0.16;
+			mandala = 0.46 + postDrop * 0.24;
 			break;
 		case 'bridge':
-			physarum = 0.32 + energy * 0.3;
-			flowfield = 0.30 + energy * 0.3;
-			reaction = 0.65 + energy * 0.25;
-			attractor = 0.70 + energy * 0.25;
-			mandala = 0.35 + energy * 0.25;
+			physarum = 0.10 + energy * 0.12;
+			flowfield = 0.14 + energy * 0.16;
+			reaction = 0.44 + energy * 0.20;
+			attractor = 0.52 + energy * 0.22;
+			mandala = 0.18 + energy * 0.16;
 			break;
 		case 'breakdown':
-			physarum = 0.20 + energy * 0.3;
-			flowfield = 0.18 + energy * 0.25;
-			reaction = 0.55 + energy * 0.25;
-			attractor = 0.45 + energy * 0.25;
-			mandala = 0.40 + energy * 0.30;
+			physarum = 0.06 + energy * 0.12;
+			flowfield = 0.08 + energy * 0.12;
+			reaction = 0.40 + energy * 0.18;
+			attractor = 0.24 + energy * 0.16;
+			mandala = 0.28 + energy * 0.18;
 			break;
 		case 'outro':
-			physarum = 0.25 + energy * 0.25;
-			flowfield = 0.20 + energy * 0.20;
-			reaction = 0.40 + energy * 0.20;
-			attractor = 0.40 + energy * 0.25;
-			mandala = 0.35 + energy * 0.25;
+			physarum = 0.06 + energy * 0.12;
+			flowfield = 0.08 + energy * 0.12;
+			reaction = 0.24 + energy * 0.16;
+			attractor = 0.28 + energy * 0.18;
+			mandala = 0.20 + energy * 0.14;
 			break;
 		default:
-			physarum = 0.45;
-			flowfield = 0.45;
-			reaction = 0.40;
-			attractor = 0.45;
-			mandala = 0.35;
+			physarum = 0.22;
+			flowfield = 0.28;
+			reaction = 0.18;
+			attractor = 0.28;
+			mandala = 0.18;
 	}
 
 	if (frame.silence) {

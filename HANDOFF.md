@@ -1,19 +1,22 @@
 # mewsik visualizer handoff
-*Last updated: 2026-05-13*
+*Last updated: 2026-05-15*
 
 ## TL;DR
 
 This repo is a Tauri 2 + SvelteKit music app with a WebGPU/WGSL visualizer. The goal is still **label-grade procedural release visualizers**: real 3D space, procedural growth, musical phrasing, drops/builds/hooks/bridges, and visuals that feel authored instead of like a spectrum toy.
 
 Important repo status:
-- `origin/main` and local `HEAD` are still `700f410`, tagged `visualizer-mk1`.
-- The mk2/mk3/lab/director/Windows support work in this workspace is **not committed or pushed yet**.
-- Current working tree contains tracked edits plus untracked visualizer files. Treat this local tree as the active experimental branch that needs to be cleaned up, committed, and pushed/PR'd.
+- `origin/main` is still `700f410`, tagged `visualizer-mk1`.
+- Local active branch is `visualizer-runtime`.
+- `visualizer-lab` is the checkpoint branch at `37b3043`.
+- `visualizer-runtime` contains the director v2 + unified runtime work. It is local-only unless explicitly pushed.
+- Current work after the 2026-05-15 repair pass fixes mk2/runtime WebGPU blockers and should be committed as the next local checkpoint.
 
 Current direction:
-- The visualizer is no longer just "mk3 current head." It is a transitional lab with `auto`, `mk1`, `mk2`, and `mk3`.
-- The real product direction is a **unified visual runtime**: mk1/mk2/mk3 should become motifs/passes inside one directed system, not three separate visual states cross-faded on top of each other.
-- A new shared `visual-director` is the first step toward that runtime. It converts audio features into higher-level intent: section, motif, energy, density, motion, palette, structure, and phrase.
+- The visualizer now has `auto`, `mk1`, `mk2`, `mk3`, and `runtime`.
+- The product direction remains a **unified visual runtime**: motifs/passes inside one directed WebGPU system, not separate visual states cross-faded on top of each other.
+- Director v2 is now modular under `src/lib/visualizer/director/` and emits clock/drop/palette/structure intent.
+- Unified runtime lives under `src/lib/visualizer/runtime/` with motif modules for atmosphere, reaction-diffusion, attractor, mandala, physarum, and flowfield.
 
 ## User target
 
@@ -32,6 +35,52 @@ Explicit anti-targets:
 - Motion that continues in silence like an embedded metronome.
 - Random fog/glow slapped over the real subject.
 - Bright particle spam without composition, intent, phrasing, or depth.
+
+## Session update - 2026-05-15
+
+### Current local branch state
+
+- Active branch: `visualizer-runtime`.
+- Recent runtime commits already on branch:
+  - director v2: clock, Yadati-style drop anticipation, Tonnetz palette, structure FSM
+  - unified runtime skeleton with shared director uniform, feedback bank, bloom/composite
+  - runtime motifs: atmosphere, physarum, flowfield, reaction-diffusion, attractor, mandala
+  - lab manual motif sliders / solo buttons
+- This session continued from a cutoff while fixing black screens and WebGPU validation failures.
+
+### Bugs fixed in this repair pass
+
+- mk2 black screen:
+  - Chrome reported WGSL parse error: cannot assign to swizzled lvalue at `q.xz = rot2(...)`.
+  - Fixed in `src/lib/components/visualizer/visualizer-mk2.svelte` by rotating through temp vectors and writing components individually.
+- runtime black screen:
+  - Chrome reported invalid command buffers after shader/pipeline validation failures.
+  - Fixed `attractor.ts` and `flowfield.ts` by splitting compute shaders (`var<storage, read_write>`) from render shaders (`var<storage, read>`). WebGPU forbids read/write storage bindings in vertex stages.
+- runtime black stair-step artifact:
+  - Root cause was undefined WGSL math in `mandala.ts`: `pow(cos(...), 4.0)` can NaN when cosine is negative, plus reversed `smoothstep` edges.
+  - Fixed mandala fold/wrapping with `fract`, replaced negative-base `pow`, and corrected radial falloff.
+  - Also corrected reversed `smoothstep` calls in atmosphere.
+- runtime washed-out stacking:
+  - Motif weights were previously only an on/off gate; every nonzero motif rendered full strength.
+  - Updated motif pipelines to use WebGPU constant blend factors and `setBlendConstant(weight)` so runtime/manual slider weights actually scale output.
+  - Reduced bloom threshold/intensity, lowered flowfield edge sprite size, and tightened auto weights so one or two motifs lead per section instead of all six stacking at once.
+
+### Verification after repair
+
+- `pnpm check` passes with 0 errors / 0 warnings.
+- `pnpm build` passes.
+- Playwright + Chrome WebGPU smoke loaded `mk2`, `mk3`, and `runtime` at `/visualizer-test` with no visible error overlays and no WGSL/WebGPU console errors.
+- Final smoke screenshots were written to:
+  - `tmp/mk2-smoke-postrepair.png`
+  - `tmp/mk3-smoke-postrepair.png`
+  - `tmp/runtime-smoke-postrepair.png`
+  - `tmp/runtime-after-policy-auto.png`
+
+### Remaining critique
+
+- Runtime is stable and visible, but it is still visually early. It now shows a coherent attractor/mandala subject instead of a black screen, but palette/contrast/composition still need art direction.
+- mk2 is loading and visually stronger than before, but true Lomas-style organism growth/memory is still future work.
+- mk3 is loading and distinct as a particle traversal, but it still needs richer foreground/background composition and stronger musical structural events.
 
 ## Session update - 2026-05-13
 
