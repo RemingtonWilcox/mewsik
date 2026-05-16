@@ -164,11 +164,11 @@ fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 	let cHi = hsv2rgb(vec3<f32>(fract(baseHue),   sat * 0.85, 1.0));
 	let cLo = hsv2rgb(vec3<f32>(fract(rimHue),    sat * 0.6,  0.6));
 	let col = mix(cLo, cHi, intensity);
-	let glow = col * (intensity * 0.9 + valley * 0.25);
+	let glow = col * (intensity * 0.56 + valley * 0.12);
 
 	// Anticipation slightly amplifies pre-drop.
 	let antic = dirR.drop.w;
-	return vec4<f32>(glow * (0.45 + antic * 0.22), 1.0);
+	return vec4<f32>(glow * (0.28 + antic * 0.14), 1.0);
 }
 `;
 

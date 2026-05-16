@@ -48,19 +48,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let mixT = 0.5 + 0.5 * sin(phrase * 6.28318);
 	let hue = mix(baseHue, accentHue, mixT * 0.5) + r * 0.08;
 	let centerFade = 1.0 - smoothstep(0.0, 0.85, r);
-	let v = mix(0.18, 0.55, centerFade);
+	let v = mix(0.014, 0.125, centerFade);
 
-	let baseCol = hsv2rgb(vec3<f32>(fract(hue), sat * 0.7, v));
-	let rimCol = hsv2rgb(vec3<f32>(fract(rimHue), sat * 0.5, v * 0.4));
+	let baseCol = hsv2rgb(vec3<f32>(fract(hue), sat * 0.78, v));
+	let rimCol = hsv2rgb(vec3<f32>(fract(rimHue), sat * 0.58, v * 0.22));
 	var col = mix(baseCol, rimCol, smoothstep(0.45, 1.0, r));
+
+	// Stage falloff: keep the outer frame dark so motifs feel placed in space
+	// instead of printed on a flat pastel wash.
+	let edgeFalloff = 1.0 - smoothstep(0.38, 0.82, r);
+	col = col * mix(0.16, 1.0, edgeFalloff);
 
 	// Downbeat pulse — brief radial brighten on every bar's first beat.
 	let isDown = f32(dir.clockI.w);
-	col = col + isDown * 0.08 * (1.0 - smoothstep(0.0, 0.6, r));
+	col = col + isDown * 0.032 * (1.0 - smoothstep(0.0, 0.6, r));
 
 	// Anticipation tints toward warmth before drops.
 	let antic = dir.drop.w;
-	col = col + vec3<f32>(antic * 0.10, antic * 0.06 * warmth, -antic * 0.04);
+	col = col + vec3<f32>(antic * 0.030, antic * 0.018 * warmth, -antic * 0.012);
 
 	// Silence dims everything.
 	let silence = dir.phrase.z;

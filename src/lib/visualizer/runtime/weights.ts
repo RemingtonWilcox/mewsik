@@ -51,14 +51,14 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 		case 'intro':
 			physarum = 0;
 			flowfield = 0;
-			reaction = 0.12 + energy * 0.12;
+			reaction = 0.08 + energy * 0.10;
 			attractor = 0.28 + energy * 0.28;
 			mandala = 0.10 + energy * 0.18;
 			break;
 		case 'verse':
 			physarum = 0.12 + energy * 0.14;
 			flowfield = 0.48 + energy * 0.26;
-			reaction = 0.14 + energy * 0.14;
+			reaction = 0.09 + energy * 0.12;
 			attractor = 0.36 + energy * 0.24;
 			mandala = 0.08 + energy * 0.12;
 			break;
@@ -66,7 +66,7 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 		case 'build':
 			physarum = 0.16 + antic * 0.18;
 			flowfield = 0.62 + antic * 0.22;
-			reaction = 0.10 + antic * 0.16;
+			reaction = 0.08 + antic * 0.12;
 			attractor = 0.18 + antic * 0.18;
 			mandala = 0.30 + antic * 0.30;
 			break;
@@ -74,35 +74,35 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 		case 'chorus':
 			physarum = 0.68 + postDrop * 0.20;
 			flowfield = 0.24 + postDrop * 0.18;
-			reaction = 0.30 + postDrop * 0.24;
+			reaction = 0.20 + postDrop * 0.18;
 			attractor = 0.08 + postDrop * 0.16;
 			mandala = 0.46 + postDrop * 0.24;
 			break;
 		case 'bridge':
 			physarum = 0.10 + energy * 0.12;
 			flowfield = 0.14 + energy * 0.16;
-			reaction = 0.44 + energy * 0.20;
+			reaction = 0.30 + energy * 0.16;
 			attractor = 0.52 + energy * 0.22;
 			mandala = 0.18 + energy * 0.16;
 			break;
 		case 'breakdown':
 			physarum = 0.06 + energy * 0.12;
 			flowfield = 0.08 + energy * 0.12;
-			reaction = 0.40 + energy * 0.18;
+			reaction = 0.28 + energy * 0.14;
 			attractor = 0.24 + energy * 0.16;
 			mandala = 0.28 + energy * 0.18;
 			break;
 		case 'outro':
 			physarum = 0.06 + energy * 0.12;
 			flowfield = 0.08 + energy * 0.12;
-			reaction = 0.24 + energy * 0.16;
+			reaction = 0.16 + energy * 0.12;
 			attractor = 0.28 + energy * 0.18;
 			mandala = 0.20 + energy * 0.14;
 			break;
 		default:
 			physarum = 0.22;
 			flowfield = 0.28;
-			reaction = 0.18;
+			reaction = 0.12;
 			attractor = 0.28;
 			mandala = 0.18;
 	}
@@ -111,13 +111,13 @@ export function weightsForFrame(frame: VisualDirectorFrame): MotifWeights {
 		physarum = 0;
 		flowfield = 0;
 		// reaction + attractor + mandala keep running quietly so visuals don't snap.
-		reaction = Math.min(reaction, 0.12);
+		reaction = Math.min(reaction, 0.08);
 		attractor = Math.min(attractor, 0.15);
 		mandala = Math.min(mandala, 0.10);
 	}
 
 	return {
-		atmosphere: 1,
+		atmosphere: frame.silence ? 0.24 : clamp01(0.42 + energy * 0.08),
 		particles: clamp01(physarum),
 		ribbon: clamp01(flowfield),
 		lattice: clamp01(reaction),

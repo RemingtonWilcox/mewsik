@@ -260,14 +260,18 @@ export class VisualizerRuntime {
 				let postDrop = dir.drop2.x;
 				let antic = dir.drop.w;
 
-				// Vignette: subtle darkening at edges, opens slightly on drops.
+				// Stage mask: keep the outer frame dark and structured so edge content
+				// does not read as blurry corner distortion.
 				let uv = in.uv - vec2<f32>(0.5);
 				let r2 = dot(uv, uv);
-				let vig = 1.0 - smoothstep(0.30, 0.85, r2) * (0.32 - postDrop * 0.10);
+				let edgeDist = min(min(in.uv.x, 1.0 - in.uv.x), min(in.uv.y, 1.0 - in.uv.y));
+				let edgeMask = smoothstep(0.018, 0.16, edgeDist);
+				let radialMask = 1.0 - smoothstep(0.26, 0.66, r2) * (0.40 - postDrop * 0.08);
+				let vig = mix(0.16, 1.0, edgeMask) * radialMask;
 
 				// Chromatic aberration: split RGB sample offsets in the edge zone.
 				// Amount scales with anticipation + bass — kicks visibly fringe.
-				let caAmount = (0.0018 + antic * 0.0050 + bassPunch * 0.0030) * smoothstep(0.10, 0.60, r2);
+				let caAmount = (0.0008 + antic * 0.0028 + bassPunch * 0.0016) * smoothstep(0.16, 0.58, r2);
 				let dir2 = normalize(uv + vec2<f32>(0.00001));
 				let off = dir2 * caAmount;
 				let sceneR = textureSample(sceneTex, samp, in.uv + off).r;
@@ -282,11 +286,18 @@ export class VisualizerRuntime {
 
 				// Bloom intensity rides energy and pumps on the drop watershed,
 				// but stays restrained so the runtime keeps contrast.
-				let bloomAmount = 0.18 + energy * 0.26 + postDrop * 0.34;
+				let bloomAmount = 0.12 + energy * 0.20 + postDrop * 0.26;
 
-				let exposure = 0.72 + postDrop * 0.08;
+				let exposure = 0.66 + postDrop * 0.08;
 				let combined = scene * exposure + bloom * bloomAmount;
 				var mapped = agx(combined) * vig;
+
+				// Contrast and saturation trim: recover black space after AgX so the
+				// runtime does not collapse into a pale full-screen overlay.
+				mapped = max(mapped - vec3<f32>(0.040), vec3<f32>(0.0));
+				mapped = pow(mapped, vec3<f32>(1.20));
+				let mappedLuma = dot(mapped, vec3<f32>(0.299, 0.587, 0.114));
+				mapped = mix(vec3<f32>(mappedLuma), mapped, 1.10);
 
 				// Film grain — luma-aware (less grain in highlights) so blacks
 				// get the gritty 16mm feel and bright cores stay clean.

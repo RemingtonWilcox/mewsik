@@ -209,8 +209,8 @@ fn vs_render(
 	let lifeT = clamp(p.age / max(p.life, 0.0001), 0.0, 1.0);
 	let fade = 1.0 - lifeT;
 	// Radius scales with energy + bass punch + slight age-out shrink.
-	let radiusBase = 2.8 + dir.energy.x * 3.6 + dir.mood.z * 2.8;
-	let radius = radiusBase * (0.55 + fade * 0.45 + dir.drop2.x * 0.25);
+	let radiusBase = 1.8 + dir.energy.x * 2.4 + dir.mood.z * 1.8;
+	let radius = radiusBase * (0.52 + fade * 0.42 + dir.drop2.x * 0.16);
 
 	let worldPos = p.pos + corner * radius;
 	// Map pixel coordinates → NDC.
@@ -240,7 +240,7 @@ fn fs_render(in: VsOut) -> @location(0) vec4<f32> {
 	let intensity = (core + halo) * (1.0 - in.lifeT);
 
 	let postDrop = dir.drop2.x;
-	let glow = in.col * intensity * (0.48 + postDrop * 0.34);
+	let glow = in.col * intensity * (0.32 + postDrop * 0.22);
 	return vec4<f32>(glow, intensity);
 }
 `;
