@@ -61,7 +61,12 @@
 		chromaYSlow: 0,
 		rmsSlow: 0,
 		bpmNormSlow: 0.4,
-		flash: 0
+		flash: 0,
+		// ADSR channels — onset response decomposed so different visual
+		// behaviors can ride different envelope shapes.
+		staccato: 0, // attack-only spike; decays ~60ms half-life
+		sustain: 0, // slow-follower of long-RMS; ~5s window
+		reverbStart: -10 // wall-time of last onset; used to derive reverbT
 	};
 
 	function lerp(a: number, b: number, t: number) {
@@ -212,11 +217,50 @@
 	let camPhase = 0;
 	let camPhaseLastTime = 0;
 
+	// One of five camera identities per session — picked from mk2SongSeed
+	// at module scope below. Each mode produces a fundamentally different
+	// motion pattern through 3D space, not just different visits to the
+	// same waypoint loop.
+	//   0 waypoint   — current Catmull-Rom through 6 hand-picked positions
+	//   1 ring       — constant-radius azimuthal orbit, slow y drift
+	//   2 dive       — figure-eight passes THROUGH the organism each loop
+	//   3 spiral     — radius decays then snaps back; spirals inward
+	//   4 perched    — high overhead, slow yaw, looking down
+	const CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
+
 	function getCameraPos(time: number, speedMul: number): [number, number, number] {
 		const baseSpeed = 0.020 + smoothed.bpmNormSlow * 0.025 + smoothed.rmsSlow * 0.015;
 		const dt = Math.max(0, time - camPhaseLastTime);
 		camPhase += dt * baseSpeed * speedMul;
 		camPhaseLastTime = time;
+
+		if (CAM_MODE === 1) {
+			// Ring orbit — constant radius, azimuthal sweep
+			const a = camPhase * 1.1;
+			const radius = 3.4;
+			return [Math.cos(a) * radius, 1.0 + Math.sin(camPhase * 0.27) * 0.8, Math.sin(a) * radius];
+		}
+		if (CAM_MODE === 2) {
+			// Dive-through — figure-eight passing through origin
+			const a = camPhase * 0.7;
+			const r = 3.0 + Math.sin(a * 2) * 1.8; // pulses inward
+			return [Math.cos(a) * r, Math.sin(a * 0.5) * 1.4, Math.sin(a * 2) * r * 0.7];
+		}
+		if (CAM_MODE === 3) {
+			// Spiral — radius shrinks then resets each ~12s
+			const phase = (camPhase * 0.5) % 12;
+			const t = phase / 12;
+			const a = phase * 0.8;
+			const radius = 4.5 - t * 2.5;
+			const y = 0.6 + t * 1.4;
+			return [Math.cos(a) * radius, y, Math.sin(a) * radius];
+		}
+		if (CAM_MODE === 4) {
+			// Perched overhead — slow yaw, looking down (handled in target)
+			const a = camPhase * 0.35;
+			return [Math.cos(a) * 2.2, 3.6, Math.sin(a) * 2.2];
+		}
+		// Default — original Catmull-Rom waypoint loop
 		const cycle = camPhase % CAM_WAYPOINTS.length;
 		const i = Math.floor(cycle);
 		const f = cycle - i;
@@ -289,12 +333,13 @@ struct Uniforms {
 	_pad0: f32,
 	_pad1: f32,
 	paletteFamily: f32,
-	_res0: f32,
-	_res1: f32,
-	_res2: f32,
+	staccato: f32,   // attack-only spike from onsets, ~60ms decay
+	sustain: f32,    // slow-follower of rms, ~5s window — long-form energy
+	reverbT: f32,    // time since last onset, normalized 0..1 over 2s
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> bins: array<f32, 64>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
@@ -481,10 +526,25 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	q.z = q.z / stretchXZ;
 	q.y = q.y / stretchY;
 
+	// Chroma-driven structural axis — chord position (chromaX, chromaY) is
+	// the smoothed unit-circle representation of the song's dominant pitch
+	// class. We torque the entire organism's coordinate frame around an
+	// axis derived from chroma so chord changes visibly rotate the
+	// silhouette in 3D, not just hue-shift it. chromaStrength gates how
+	// hard the rotation pulls (atonal songs barely rotate; tonal songs
+	// torque visibly when the chord changes).
+	let chromaAngle = atan2(u.chromaY, u.chromaX);
+	let chromaPull = u.chromaStrength * 0.55;
+	let chromaTilt = chromaAngle * chromaPull;
+	let rChroma = rot2(q.xy, chromaTilt);
+	q.x = rChroma.x;
+	q.y = rChroma.y;
+
 	// Twist — bpm-coupled time term so fast songs torque faster.
 	let twist = q.y * (0.36 + tension * 1.55)
 		+ sin(q.z * 1.35 + u.time * (0.20 + u.bpmNorm * 0.55)) * (0.10 + u.mid * 0.24)
-		+ u.flash * 0.16;
+		+ u.flash * 0.16
+		+ chromaAngle * chromaPull * 0.35;
 	let rxz = rot2(q.xz, twist);
 	q.x = rxz.x;
 	q.z = rxz.y;
@@ -687,13 +747,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			// only varied ~0.04 across the whole organism (1/14 of one stop)
 			// so the surface read as one flat colour. New mix sweeps across
 			// roughly 2 stops based on: position depth, surface orientation,
-			// height above origin, and treble-driven micro-shimmer.
+			// height above origin, treble-driven micro-shimmer, AND a
+			// per-region FFT bin lookup so different parts of the organism
+			// physically respond to different frequencies of the music.
+			// Height maps to bin index — bottom of organism samples bass
+			// bins, top samples treble bins. The surface literally hums to
+			// the spectrum.
+			let regionBin = i32(clamp((p.y + 1.5) * 16.0, 0.0, 63.0));
+			let bandShimmer = bins[regionBin] * 0.18;
 			let palT = u.paletteOffset
 				+ length(p) * 0.22
 				+ n.x * 0.10
 				+ n.y * 0.08
 				+ abs(p.y) * 0.14
-				+ u.treble * sin(p.x * 5.0 + p.z * 4.0) * 0.04;
+				+ u.treble * sin(p.x * 5.0 + p.z * 4.0) * 0.04
+				+ bandShimmer;
 			let baseCol = palette7(palT);
 
 			// Thin-film iridescence via wavelength interference. Thickness drifts
@@ -724,7 +792,24 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let pulseVein = vein * (0.10 + u.mid * 0.18 + u.treble * 0.10) + u.flash * 0.18;
 			let emission = palette7(u.paletteOffset + 0.22) * pulseVein * (0.65 + u.rms);
 
-			let surfaceCol = diffuse + specularCol + emission;
+			// Staccato spike — sharp bright micro-spikes on surface aligned
+			// with the vein pattern. Fires on every onset, decays in ~3
+			// frames. Reads as the organism "flinching" on snare hits.
+			let spikeMask = pow(vein, 3.0) * u.staccato;
+			let staccatoCol = palette7(u.paletteOffset + 0.45) * spikeMask * 1.2;
+
+			// Reverb ripple — expanding ring of bright displacement-emission
+			// that radiates outward from the organism over ~2s after each
+			// onset. reverbT goes 0->1 over 2s; ringR is the radius of the
+			// expanding ring (grows with reverbT); ringWidth pinches as it
+			// expands so it reads as a single moving band.
+			let ringR = u.reverbT * 1.4;
+			let ringWidth = 0.05 + u.reverbT * 0.20;
+			let distToRing = abs(length(p) - ringR);
+			let ringMask = smoothstep(ringWidth, 0.0, distToRing) * (1.0 - u.reverbT);
+			let reverbCol = palette7(u.paletteOffset + 0.62) * ringMask * 0.8;
+
+			let surfaceCol = diffuse + specularCol + emission + staccatoCol + reverbCol;
 			scattered = scattered + surfaceCol * transmittance;
 			transmittance = 0.0;
 			break;
@@ -909,9 +994,9 @@ struct Uniforms {
 	_pad0: f32,
 	_pad1: f32,
 	paletteFamily: f32,
-	_res0: f32,
-	_res1: f32,
-	_res2: f32,
+	staccato: f32,   // attack-only spike from onsets, ~60ms decay
+	sustain: f32,    // slow-follower of rms, ~5s window — long-form energy
+	reverbT: f32,    // time since last onset, normalized 0..1 over 2s
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -1082,9 +1167,9 @@ struct Uniforms {
 	_pad0: f32,
 	_pad1: f32,
 	paletteFamily: f32,
-	_res0: f32,
-	_res1: f32,
-	_res2: f32,
+	staccato: f32,   // attack-only spike from onsets, ~60ms decay
+	sustain: f32,    // slow-follower of rms, ~5s window — long-form energy
+	reverbT: f32,    // time since last onset, normalized 0..1 over 2s
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -1300,10 +1385,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 	function buildBindGroups(g: GPU) {
 		if (!g.targets) return null;
-		const { device, pipelines, uniformBuf, bloomParamBuf, sampler, targets } = g;
+		const { device, pipelines, uniformBuf, bloomParamBuf, sampler, targets, binsBuf } = g;
 		const scene = device.createBindGroup({
 			layout: pipelines.scene.getBindGroupLayout(0),
-			entries: [{ binding: 0, resource: { buffer: uniformBuf } }]
+			entries: [
+				{ binding: 0, resource: { buffer: uniformBuf } },
+				{ binding: 1, resource: { buffer: binsBuf } }
+			]
 		});
 		// Composite has 2 bind groups — each reads a different prevTex (the
 		// other ping-pong texture). Output target alternates each frame.
@@ -1567,8 +1655,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		smoothed.bass = lerp(smoothed.bass, feat?.bass ?? 0, 0.25);
 		smoothed.mid = lerp(smoothed.mid, feat?.mid ?? 0, 0.18);
 		smoothed.treble = lerp(smoothed.treble, feat?.treble ?? 0, 0.35);
-		if (feat?.onset) smoothed.flash = 1;
+		if (feat?.onset) {
+			smoothed.flash = 1;
+			smoothed.staccato = 1;
+			smoothed.reverbStart = time;
+		}
 		smoothed.flash *= 0.88;
+		// staccato — sharper than flash; ~3-frame half-life. Used for crisp
+		// surface spike emission, not for the broader fog flash.
+		smoothed.staccato *= 0.74;
+		// sustain — long-RMS follower (~5s envelope). Drives mood-level
+		// changes, not transient response.
+		const sustainTarget = smoothed.rmsSlow;
+		smoothed.sustain = smoothed.sustain * 0.992 + sustainTarget * 0.008;
 		// Slow params (mood / palette / camera):
 		smoothed.centroidSlow = lerp(smoothed.centroidSlow, feat?.centroid ?? 0.5, 0.015);
 		smoothed.rmsSlow = lerp(smoothed.rmsSlow, feat?.rms ?? 0, 0.02);
@@ -1727,7 +1826,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			camPosRaw[1] * moodCamDistMul * camSceneScale,
 			camPosRaw[2] * moodCamDistMul * camSceneScale
 		];
-		const camTarget: [number, number, number] = [0, sessionTargetY, 0];
+		// Mode 4 (perched overhead) needs to look down at origin, not at the
+		// session-biased Y target — otherwise camera looks past the organism.
+		const targetY = CAM_MODE === 4 ? -0.4 : sessionTargetY;
+		const camTarget: [number, number, number] = [0, targetY, 0];
 		const fwd: [number, number, number] = [
 			camTarget[0] - camPos[0],
 			camTarget[1] - camPos[1],
@@ -1803,9 +1905,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// distinct colour worlds (dusk / aurora / synthwave / volcanic /
 		// bioluminous / oil-on-water). Reload or switch engines to reroll.
 		u[32] = Math.floor(mk2SongSeed * 6) % 6;
-		u[33] = 0;
-		u[34] = 0;
-		u[35] = 0;
+		// ADSR + reverb channels — staccato spike, sustain mood envelope,
+		// reverb time-since-onset normalized 0..1 over 2s.
+		u[33] = smoothed.staccato;
+		u[34] = smoothed.sustain;
+		u[35] = Math.min(1, Math.max(0, (time - smoothed.reverbStart) / 2.0));
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Write FFT bins to storage buffer (consumed by particle shader).
