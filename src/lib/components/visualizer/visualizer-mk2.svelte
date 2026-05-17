@@ -960,19 +960,28 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
 	return vec4<f32>(pos[idx], 0.0, 1.0);
 }
 
-fn aces(x: vec3<f32>) -> vec3<f32> {
-	let a = 2.51;
-	let b = 0.03;
-	let c = 2.43;
-	let d = 0.59;
-	let e = 0.14;
-	return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+// AgX tone-map (Troy Sobotka). Preserves saturation in bright hues better
+// than the cheap ACES approximation — gold cores stay gold instead of
+// bleaching to white.
+fn agx(c: vec3<f32>) -> vec3<f32> {
+	let m = mat3x3<f32>(
+		0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+		0.0784335999999992, 0.878468636469772, 0.0784336,
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104
+	);
+	let x = m * c;
+	let lo = vec3<f32>(0.0001);
+	let mapped = clamp((log2(max(x, lo)) + 12.47393) / (12.47393 + 4.026069), vec3<f32>(0.0), vec3<f32>(1.0));
+	let m2 = mapped * mapped;
+	let m4 = m2 * m2;
+	return -17.86 * m4 * m2 + 78.01 * m4 * mapped - 126.7 * m4 + 92.06 * m2 * mapped - 28.72 * m2 + 4.361 * mapped - vec3<f32>(0.1718);
 }
 
-fn hash13(p: vec3<f32>) -> f32 {
-	var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
-	q = q + dot(q, q.yzx + 33.33);
-	return fract((q.x + q.y) * q.z);
+// IGN — Jorge Jimenez interleaved gradient noise. Per-pixel hash for the
+// 16mm film-grain look — much less random-looking than scalar hash13.
+fn ign(pixel: vec2<f32>) -> f32 {
+	let m = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+	return fract(m.z * fract(dot(pixel, m.xy)));
 }
 
 @fragment
@@ -994,16 +1003,24 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let particles = textureSample(particleTex, samp, uv).rgb;
 	col = col + particles * 0.055;
 
-	col = aces(col);
-	col = max((col - 0.42) * 1.10 + 0.42, vec3<f32>(0.0));
+	col = agx(col);
+	// Black-point lift + micro-contrast so the deep volumetric blacks don't
+	// read as flat. AgX is gentler than ACES so blacks need a little help.
+	col = max(col - vec3<f32>(0.018), vec3<f32>(0.0));
+	col = pow(col, vec3<f32>(1.06));
 
-	let grainSeed = vec3<f32>(frag.xy, u.time * 7.31);
-	let grain = (hash13(grainSeed) - 0.5);
-	let grainStrength = 0.018 + u.treble * 0.012;
-	col = col + vec3<f32>(grain) * grainStrength;
+	// Luma-aware IGN grain — less grain in highlights so gold cores stay
+	// clean, more in shadows where 16mm film naturally shows density noise.
+	// (Named grainN — the simple letter g is already claimed by the green-
+	// channel sample of compositeTex above in this same scope.)
+	let pixelJitter = frag.xy + vec2<f32>(u.time * 137.0, u.time * 271.0);
+	let grainN = ign(pixelJitter) - 0.5;
+	let luma = dot(col, vec3<f32>(0.299, 0.587, 0.114));
+	let grainStrength = (0.014 + u.treble * 0.022) * (1.0 - smoothstep(0.55, 1.0, luma));
+	col = col + vec3<f32>(grainN * grainStrength);
 
-	let h = fract(sin(dot(frag.xy, vec2<f32>(12.9898, 78.233)) + u.time) * 43758.5453);
-	col = col + (h - 0.5) / 255.0;
+	// Pre-quantization dither — kills 8-bit banding in volumetric gradients.
+	col = col + vec3<f32>((ign(frag.xy + vec2<f32>(33.0, 71.0)) - 0.5) / 255.0);
 
 	return vec4<f32>(col, 1.0);
 }
