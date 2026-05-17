@@ -44,6 +44,9 @@
 	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
 	// returns instead of touching destroyed GPU resources mid-frame.
 	let running = false;
+	// Per-session seed → picks the palette family on mount. Different mounts
+	// (engine swap in lab, app remount) reroll the colour world.
+	const mk2SongSeed = Math.random();
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Audio smoothing — multiple timescales per research recommendation.
@@ -246,7 +249,9 @@
 	// 29   lightShaftIntensity
 	// 30-31 pad
 	// ──────────────────────────────────────────────────────────────────────────
-	const UNIFORM_FLOATS = 32;
+	// 36 floats = 144 bytes. New slots after _pad1: paletteFamily (0-5 song
+	// family index), plus three reserved for future per-song flavor knobs.
+	const UNIFORM_FLOATS = 36;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
 	const SCENE_WGSL = /* wgsl */ `
@@ -283,6 +288,10 @@ struct Uniforms {
 	lightShaftIntensity: f32,
 	_pad0: f32,
 	_pad1: f32,
+	paletteFamily: f32,
+	_res0: f32,
+	_res1: f32,
+	_res2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -297,25 +306,88 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7-stop photographic palette. Stops sampled from photography (deep navy →
-// plum → burnt orange → warm gold → cream → pale steel → cyan-teal) so
-// transitions feel like passing through real lighting conditions, not
-// rotating through a rainbow cosine.
+// 7-stop palette LUT — six families, picked per song via u.paletteFamily.
+// Each family is a totally distinct visual world rather than a rotation
+// through the same hues. Picked by song seed so every track lands a
+// different colour world.
+//   0 dusk        photographic — deep navy → plum → burnt orange → cream → teal
+//   1 aurora      cool — blacks → indigos → cyans → mint → bright magenta cap
+//   2 synthwave   neon — black → hot magenta → cyan → electric purple
+//   3 volcanic    warm — black → ember red → orange → bright yellow → bone white
+//   4 bioluminous UV → cyan → green → chartreuse on near-black field
+//   5 oil-on-water iridescent — petrol blues → magenta → gold → mint shifts
 // ═══════════════════════════════════════════════════════════════════════════
 fn palette7(t: f32) -> vec3<f32> {
 	let s = fract(t);
 	let x = s * 7.0;
 	let i = i32(floor(x));
 	let f = smoothstep(0.0, 1.0, x - floor(x));
-	let stops = array<vec3<f32>, 7>(
-		vec3<f32>(0.020, 0.025, 0.080),  // deep navy
-		vec3<f32>(0.090, 0.045, 0.150),  // plum
-		vec3<f32>(0.380, 0.120, 0.105),  // burnt umber
-		vec3<f32>(0.880, 0.420, 0.150),  // warm gold
-		vec3<f32>(0.950, 0.820, 0.620),  // cream
-		vec3<f32>(0.460, 0.580, 0.700),  // pale steel
-		vec3<f32>(0.090, 0.300, 0.380)   // cyan-teal
+	let family = i32(u.paletteFamily);
+	var stops = array<vec3<f32>, 7>(
+		vec3<f32>(0.020, 0.025, 0.080),
+		vec3<f32>(0.090, 0.045, 0.150),
+		vec3<f32>(0.380, 0.120, 0.105),
+		vec3<f32>(0.880, 0.420, 0.150),
+		vec3<f32>(0.950, 0.820, 0.620),
+		vec3<f32>(0.460, 0.580, 0.700),
+		vec3<f32>(0.090, 0.300, 0.380)
 	);
+	if (family == 1) {
+		// aurora
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.010, 0.015, 0.045),
+			vec3<f32>(0.040, 0.025, 0.180),
+			vec3<f32>(0.060, 0.160, 0.420),
+			vec3<f32>(0.180, 0.580, 0.640),
+			vec3<f32>(0.520, 0.880, 0.640),
+			vec3<f32>(0.900, 0.500, 0.880),
+			vec3<f32>(0.310, 0.080, 0.380)
+		);
+	} else if (family == 2) {
+		// synthwave neon
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.020, 0.010, 0.040),
+			vec3<f32>(0.260, 0.020, 0.180),
+			vec3<f32>(0.980, 0.140, 0.520),
+			vec3<f32>(0.620, 0.080, 0.860),
+			vec3<f32>(0.060, 0.780, 0.940),
+			vec3<f32>(0.180, 0.220, 0.640),
+			vec3<f32>(0.880, 0.300, 0.760)
+		);
+	} else if (family == 3) {
+		// volcanic
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.018, 0.008, 0.005),
+			vec3<f32>(0.220, 0.030, 0.020),
+			vec3<f32>(0.640, 0.080, 0.040),
+			vec3<f32>(0.940, 0.380, 0.070),
+			vec3<f32>(0.980, 0.760, 0.180),
+			vec3<f32>(0.980, 0.940, 0.760),
+			vec3<f32>(0.400, 0.100, 0.030)
+		);
+	} else if (family == 4) {
+		// bioluminous
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.005, 0.020, 0.030),
+			vec3<f32>(0.020, 0.060, 0.260),
+			vec3<f32>(0.040, 0.420, 0.580),
+			vec3<f32>(0.180, 0.880, 0.620),
+			vec3<f32>(0.720, 0.980, 0.220),
+			vec3<f32>(0.080, 0.640, 0.480),
+			vec3<f32>(0.040, 0.180, 0.220)
+		);
+	} else if (family == 5) {
+		// oil-on-water iridescent
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.030, 0.060, 0.140),
+			vec3<f32>(0.140, 0.080, 0.420),
+			vec3<f32>(0.060, 0.640, 0.720),
+			vec3<f32>(0.880, 0.380, 0.620),
+			vec3<f32>(0.980, 0.840, 0.300),
+			vec3<f32>(0.580, 0.940, 0.640),
+			vec3<f32>(0.380, 0.120, 0.520)
+		);
+	}
 	let a = stops[(i % 7 + 7) % 7];
 	let b = stops[((i + 1) % 7 + 7) % 7];
 	return mix(a, b, f);
@@ -327,11 +399,15 @@ fn palette7(t: f32) -> vec3<f32> {
 // approximation via the derivative magnitude — accurate enough to raymarch
 // without overshooting the genuine fractal boundary.
 // ═══════════════════════════════════════════════════════════════════════════
-fn mandelbulbDE(p: vec3<f32>, power: f32) -> f32 {
+// iters now passed in — audio-driven from caller so the fractal literally
+// reveals more detail during high-energy sections. 4 = smooth blob (calm),
+// 11 = full fractal detail (drop/chorus). This is the actual "evolution"
+// the user wants: the geometry has more or less complexity, not just a
+// pulsing version of the same shape.
+fn mandelbulbDE(p: vec3<f32>, power: f32, iters: i32) -> f32 {
 	var z = p;
 	var dr = 1.0;
 	var r = 0.0;
-	let iters = 7;
 	for (var i: i32 = 0; i < iters; i = i + 1) {
 		r = length(z);
 		if (r > 2.0) { break; }
@@ -375,17 +451,44 @@ fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
 fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let growth = u._pad0;
 	let tension = u._pad1;
-	let breath = 1.0 + u.rms * 0.22 + u.bass * 0.16 + u.flash * 0.08;
+	// BPM-locked breath rate — bpmNorm scales how fast the organism inflates.
+	// 60bpm song = slow swelling, 174bpm dnb = rapid pulsing. Different songs
+	// genuinely feel different in rhythm, not just one idle speed.
+	let tempoT = u.time * (0.6 + u.bpmNorm * 1.2);
+	let breath = 1.0 + u.rms * 0.22 + u.bass * 0.16 + u.flash * 0.08 + sin(tempoT) * 0.04 * (0.5 + u.bpmNorm);
 	var q = p / breath;
 
+	// Continuous unfolding — slow time-driven displacement that accumulates
+	// across the song. Multi-period sinusoids (different frequencies per
+	// axis) so the organism never returns to the same silhouette during a
+	// session. Period ~30-60s; visible drift but not jittery per frame.
+	// Drift rate ALSO scales with bpmNorm so faster songs unfold faster.
+	let tSlow = u.time * (0.04 + u.bpmNorm * 0.08);
+	let drift = vec3<f32>(
+		sin(q.y * 0.9 + tSlow) * 0.07 + cos(q.z * 0.7 - tSlow * 0.6) * 0.05,
+		sin(q.x * 0.7 - tSlow * 0.4) * 0.05,
+		cos(q.x * 0.9 + tSlow * 0.8) * 0.07 + sin(q.y * 0.7 + tSlow * 0.5) * 0.05
+	);
+	q = q + drift * (0.5 + growth * 0.7);
+
+	// Section-driven anisotropic stretch — gentler than the failed attempt.
+	// 0.18 amplitude means clear silhouette change between sections without
+	// the raymarcher safety factor needing to be aggressive.
+	let differential = tension - growth;
+	let stretchY = 1.0 + differential * 0.18;
+	let stretchXZ = 1.0 - differential * 0.14;
+	q.x = q.x / stretchXZ;
+	q.z = q.z / stretchXZ;
+	q.y = q.y / stretchY;
+
+	// Twist — bpm-coupled time term so fast songs torque faster.
 	let twist = q.y * (0.36 + tension * 1.55)
-		+ sin(q.z * 1.35 + u.time * (0.26 + u.bpmNorm * 0.22)) * (0.10 + u.mid * 0.24)
+		+ sin(q.z * 1.35 + u.time * (0.20 + u.bpmNorm * 0.55)) * (0.10 + u.mid * 0.24)
 		+ u.flash * 0.16;
-	// WGSL forbids assigning to swizzled lvalues — rotate via temp, write back component-wise.
 	let rxz = rot2(q.xz, twist);
 	q.x = rxz.x;
 	q.z = rxz.y;
-	let rxy = rot2(q.xy, sin(q.z * 0.9 + u.time * 0.11) * (0.08 + growth * 0.11));
+	let rxy = rot2(q.xy, sin(q.z * 0.9 + u.time * (0.08 + u.bpmNorm * 0.20)) * (0.08 + growth * 0.11));
 	q.x = rxy.x;
 	q.y = rxy.y;
 	q.y = q.y + sin(q.x * 1.7 + u.time * 0.19) * (0.045 + tension * 0.05);
@@ -400,7 +503,12 @@ fn map(p: vec3<f32>) -> f32 {
 	// Core fractal body. Audio changes the coordinate field and power, so the
 	// organism actually grows/twists instead of sitting under a post glow.
 	let bodyScale = 1.05 + growth * 0.10 - u.flash * 0.030;
-	var body = mandelbulbDE(q * bodyScale, u.mandelbulbPower + tension * 0.55) * (1.03 - growth * 0.10);
+	// Audio-driven iter count — calm sections are intentionally LESS detailed
+	// so drops landing at 11 iterations read as the fractal "blooming" into
+	// existence. 4 iters = smooth blob; 11 = full Mandelbulb spine detail.
+	let audioIters = 4 + i32(floor(growth * 5.0 + tension * 3.0));
+	let safeIters = clamp(audioIters, 4, 11);
+	var body = mandelbulbDE(q * bodyScale, u.mandelbulbPower + tension * 0.55, safeIters) * (1.03 - growth * 0.10);
 
 	// Breathing membrane/lobed shell. This gives build-ups a visible expansion
 	// phase and drops a wider silhouette without replacing the Mandelbulb core.
@@ -444,11 +552,20 @@ fn map(p: vec3<f32>) -> f32 {
 // 4-tap tetrahedral normal estimation.
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
 	let e = vec2<f32>(0.0015, -0.0015);
+	let m1 = map(p + e.xyy);
+	let m2 = map(p + e.yyx);
+	let m3 = map(p + e.yxy);
+	let m4 = map(p + e.xxx);
+	// Black-square guard — NaN comparisons all return false in WGSL, so a NaN
+	// distance fails (x < 1e10) and we fall back to the up vector. Without
+	// this, NaN propagates through normal/lighting and produces the tile-
+	// shaped black artifacts characteristic of fragment-shader SDF failures.
+	let allFinite = (m1 < 1e10) && (m2 < 1e10) && (m3 < 1e10) && (m4 < 1e10);
+	if (!allFinite) {
+		return vec3<f32>(0.0, 1.0, 0.0);
+	}
 	return safeNormalize(
-		e.xyy * map(p + e.xyy) +
-		e.yyx * map(p + e.yyx) +
-		e.yxy * map(p + e.yxy) +
-		e.xxx * map(p + e.xxx),
+		e.xyy * m1 + e.yyx * m2 + e.yxy * m3 + e.xxx * m4,
 		vec3<f32>(0.0, 1.0, 0.0)
 	);
 }
@@ -536,7 +653,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
 		if (t > MAX_DIST) { break; }
 		let p = camPos + rd * t;
-		let d = map(p);
+		var d = map(p);
+		// Black-square guard — if SDF returns NaN/Inf from a degenerate iteration,
+		// treat as max distance so the marcher skips and the pixel falls through
+		// to sky instead of stamping a NaN tile.
+		if (!(d < 1e10)) { d = 0.5; }
 
 		// ── Surface hit
 		if (d < EPS) {
@@ -561,7 +682,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 			// Photographic palette base color sampled via centroid + iter depth
 			// proxy (distance from origin gives "depth into the fractal").
-			let palT = u.paletteOffset + length(p) * 0.04;
+			// Multi-axis palette variation — different parts of the organism
+			// sample different stops of the 7-stop palette. Previously palT
+			// only varied ~0.04 across the whole organism (1/14 of one stop)
+			// so the surface read as one flat colour. New mix sweeps across
+			// roughly 2 stops based on: position depth, surface orientation,
+			// height above origin, and treble-driven micro-shimmer.
+			let palT = u.paletteOffset
+				+ length(p) * 0.22
+				+ n.x * 0.10
+				+ n.y * 0.08
+				+ abs(p.y) * 0.14
+				+ u.treble * sin(p.x * 5.0 + p.z * 4.0) * 0.04;
 			let baseCol = palette7(palT);
 
 			// Thin-film iridescence via wavelength interference. Thickness drifts
@@ -605,17 +737,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		let localDensity = u.fogDensity * (1.0 + proxim * 1.8);
 		// Light visibility from this point — what fraction of light reaches here?
 		let lightV = lightVisibility(p, lightDir, 5.5);
-		// Henyey-Greenstein-ish forward scattering phase function (g ≈ 0.3).
-		let cosTheta = dot(rd, lightDir);
-		let g = 0.3;
-		let g2 = g * g;
-		let phase = (1.0 - g2) / pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5) * 0.0795;
-		let lightTint = palette7(u.paletteOffset + 0.18) * (1.2 + u.lightShaftIntensity * 0.8);
-		let scatterIn = lightTint * lightV * phase;
-		let organismBloom = palette7(u.paletteOffset + 0.25)
-			* proxim * proxim
-			* (u.rms * 0.12 + u.bass * 0.18 + u.flash * 0.32)
-			* (0.65 + u._pad0 * 0.55);
+		// Atmospheric tint — dramatically reduced from earlier attempt. The
+		// per-step contribution gets multiplied by stepDensity and then
+		// summed across ~30 fog steps, so what looks like a "tiny constant"
+		// adds up to a bright central blob when camera points toward the
+		// key light. Baseline 0.12 (was 0.6) and inscatter 0.0028 (was 0.012)
+		// together make fog readable as atmosphere without dominating.
+		let lightTint = palette7(u.paletteOffset + 0.18) * (0.12 + u.lightShaftIntensity * 0.08);
+		let scatterIn = lightTint * lightV * 0.0028;
+		// organismBloom — disabled. The colored halo around the organism
+		// read as a detached glow overlay. Direct surface lighting carries
+		// the silhouette now; no volumetric helper needed.
+		let organismBloom = vec3<f32>(0.0);
 		let stepDensity = localDensity * 0.08;
 		scattered = scattered + (scatterIn + organismBloom) * stepDensity * transmittance;
 		transmittance = transmittance * exp(-stepDensity);
@@ -775,6 +908,10 @@ struct Uniforms {
 	lightShaftIntensity: f32,
 	_pad0: f32,
 	_pad1: f32,
+	paletteFamily: f32,
+	_res0: f32,
+	_res1: f32,
+	_res2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -944,6 +1081,10 @@ struct Uniforms {
 	lightShaftIntensity: f32,
 	_pad0: f32,
 	_pad1: f32,
+	paletteFamily: f32,
+	_res0: f32,
+	_res1: f32,
+	_res2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -1528,19 +1669,32 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const phrasePos = directed.clock?.phrasePos ?? directed.phrase ?? 0;
 		const baseHue = directed.palette?.baseHue ?? directed.paletteBase ?? 0;
 		const accentHue = directed.palette?.accentHue ?? directed.paletteAccent ?? 0;
-		const growth = Math.min(
-			1,
-			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18 + antic * 0.42 + postDrop * 0.35
-		);
-		const tension = Math.min(
-			1,
+		// Modest section bias — pushes growth/tension apart per section so
+		// the anisotropic stretch in organismWarp produces a visible shape
+		// change. Small enough that the raymarcher safety factor stays valid.
+		let growthBias = 0;
+		let tensionBias = 0;
+		const dirSec = directed.section;
+		if (dirSec === 'drop' || dirSec === 'chorus') {
+			growthBias = 0.20; tensionBias = -0.10;
+		} else if (dirSec === 'build' || dirSec === 'pre_chorus') {
+			growthBias = -0.05; tensionBias = 0.25;
+		} else if (dirSec === 'bridge') {
+			growthBias = -0.15; tensionBias = -0.10;
+		} else if (dirSec === 'breakdown' || dirSec === 'calm') {
+			growthBias = -0.20; tensionBias = -0.15;
+		}
+		const growth = Math.max(0, Math.min(1,
+			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18 + antic * 0.42 + postDrop * 0.35 + growthBias
+		));
+		const tension = Math.max(0, Math.min(1,
 			directed.motion * 0.38 +
 				directed.density * 0.26 +
 				smoothed.mid * 0.20 +
 				smoothed.treble * 0.12 +
 				smoothed.flash * 0.24 +
-				antic * 0.40
-		);
+				antic * 0.40 + tensionBias
+		));
 		const mandelbulbPower =
 			moodPower + smoothed.bass * 0.28 + smoothed.mid * 0.16 + directed.structure * 0.10 + smoothed.flash * 0.18 + antic * 0.22 + postDrop * 0.18;
 		const chromaAngleSlow = Math.atan2(smoothed.chromaYSlow, smoothed.chromaXSlow) / (2 * Math.PI);
@@ -1551,18 +1705,29 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			hueFromTonnetz + (moodPalOffset - 0.45) * 0.12 + (smoothed.centroidSlow - 0.5) * 0.06 + chromaAngleSlow * 0.04;
 		const fogDensity = 0.07 * moodFogMul + smoothed.bass * 0.035 + directed.density * 0.055 + antic * 0.025;
 		const lightShaftIntensity = moodShaftMul * (0.30 + directed.energy * 0.48 + smoothed.bass * 0.13 + antic * 0.55 + postDrop * 0.70);
-		const fovScale = 1.68;
+		// Per-session FOV — different sessions land different focal lengths
+		// (1.35 = wide-angle dramatic, 1.95 = tighter portrait). Combined
+		// with target offset + roll below, the same waypoint loop produces
+		// totally different framings per mount.
+		const fovScale = 1.35 + mk2SongSeed * 0.60;
 
 		// Camera path — state mood drives traversal speed and overall distance
 		// from origin. Calm = far + slow drift; peak = close + fast traversal.
-		const camPosRaw = getCameraPos(time, moodCamSpeedMul);
+		// PER-SESSION VARIATION: each load shifts the look-target Y, adds a
+		// roll on camUp, and offsets the traversal start phase so different
+		// mounts visit the waypoints in different orders → genuinely different
+		// camera identity.
+		const sessionPhaseOffset = mk2SongSeed * 6.28318; // 0..2π start offset
+		const sessionTargetY = -0.05 + (mk2SongSeed - 0.5) * 0.45; // -0.275..+0.20
+		const sessionRoll = (mk2SongSeed - 0.5) * 0.55; // ±0.275 rad ≈ ±16°
+		const camPosRaw = getCameraPos(time + sessionPhaseOffset, moodCamSpeedMul);
 		const camSceneScale = 1.18 + growth * 0.20;
 		const camPos: [number, number, number] = [
 			camPosRaw[0] * moodCamDistMul * camSceneScale,
 			camPosRaw[1] * moodCamDistMul * camSceneScale,
 			camPosRaw[2] * moodCamDistMul * camSceneScale
 		];
-		const camTarget: [number, number, number] = [0, -0.05, 0];
+		const camTarget: [number, number, number] = [0, sessionTargetY, 0];
 		const fwd: [number, number, number] = [
 			camTarget[0] - camPos[0],
 			camTarget[1] - camPos[1],
@@ -1578,12 +1743,28 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		right[0] /= rLen;
 		right[1] /= rLen;
 		right[2] /= rLen;
-		// up = cross(right, fwd)
-		const camUp: [number, number, number] = [
+		// up = cross(right, fwd) — then roll around fwd by sessionRoll so the
+		// horizon line is tilted per session. Adds Dutch-angle camera identity.
+		let camUp: [number, number, number] = [
 			right[1] * fwd[2] - right[2] * fwd[1],
 			right[2] * fwd[0] - right[0] * fwd[2],
 			right[0] * fwd[1] - right[1] * fwd[0]
 		];
+		const cr = Math.cos(sessionRoll);
+		const sr = Math.sin(sessionRoll);
+		camUp = [
+			camUp[0] * cr + right[0] * sr,
+			camUp[1] * cr + right[1] * sr,
+			camUp[2] * cr + right[2] * sr
+		];
+		const rolledRight: [number, number, number] = [
+			right[0] * cr - camUp[0] * sr,
+			right[1] * cr - camUp[1] * sr,
+			right[2] * cr - camUp[2] * sr
+		];
+		right[0] = rolledRight[0];
+		right[1] = rolledRight[1];
+		right[2] = rolledRight[2];
 
 		const u = gpu.uniformData;
 		u[0] = w;
@@ -1618,6 +1799,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[29] = lightShaftIntensity;
 		u[30] = growth;
 		u[31] = tension;
+		// Per-session palette family — mk2SongSeed picks one of six totally
+		// distinct colour worlds (dusk / aurora / synthwave / volcanic /
+		// bioluminous / oil-on-water). Reload or switch engines to reroll.
+		u[32] = Math.floor(mk2SongSeed * 6) % 6;
+		u[33] = 0;
+		u[34] = 0;
+		u[35] = 0;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Write FFT bins to storage buffer (consumed by particle shader).
