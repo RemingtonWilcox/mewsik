@@ -123,21 +123,28 @@ fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let motion = dir.energy.z;
 	let energy = dir.energy.x;
 	let bassPunch = dir.mood.z;
+	let bassRaw = dir.bands.x;
 	let antic = dir.drop.w;
 	let postDrop = dir.drop2.x;
 	let downbeat = f32(dir.clockI.w);
 
 	// Curl-noise field — slowly drifting time term + audio-modulated scale.
+	// motifA.w is the user's curl-scale multiplier; bigger = tighter eddies,
+	// smaller = sweeping macro arcs.
+	let curlScale = dir.motifA.w;
 	let timePhase = dir.viewport.z * (0.06 + motion * 0.12);
-	let scale = 0.0024 / (1.0 + energy * 0.5);
+	let scale = (0.0024 * curlScale) / (1.0 + energy * 0.5);
 	let sample = p.pos * scale + vec2<f32>(timePhase, -timePhase * 0.6);
 	let curl = curl2D(sample);
 
-	let flowMag = 240.0 * (0.45 + motion * 0.7 + antic * 0.6);
+	// motifA.z is the user's overall flow magnitude multiplier.
+	let flowMul = dir.motifA.z;
+	let flowMag = 240.0 * flowMul * (0.45 + motion * 0.7 + antic * 0.6);
 	var force = curl * flowMag;
 
 	// Bass kicks add a downward gravity-like pulse so the field "lands".
-	force.y = force.y + bassPunch * 35.0;
+	// Raw bass drives the punch; envelope mostly adds sustain.
+	force.y = force.y + bassRaw * 48.0 + bassPunch * 14.0;
 
 	// Downbeat: brief radial outward impulse from screen center.
 	if (downbeat > 0.5) {

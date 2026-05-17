@@ -13,7 +13,16 @@ export const DEFAULT_RUNTIME_CONTROLS: RuntimeControls = {
 	edge: 1,
 	chromaticAberration: 1,
 	grain: 1,
-	bloomThreshold: 1.35
+	bloomThreshold: 1.35,
+	feedbackMix: 0.55,
+	feedbackDecay: 0.94,
+	feedbackWarp: 0.5,
+	feedbackRotation: 0.35,
+	mandalaKFold: 6,
+	mandalaRingDensity: 6,
+	flowStrength: 1,
+	flowCurlScale: 1,
+	physarumSense: 0.38
 };
 
 export function normalizeRuntimeControls(input?: Partial<RuntimeControls> | null): RuntimeControls {
@@ -36,6 +45,23 @@ export function normalizeRuntimeControls(input?: Partial<RuntimeControls> | null
 			input?.bloomThreshold ?? DEFAULT_RUNTIME_CONTROLS.bloomThreshold,
 			0.2,
 			3
-		)
+		),
+		feedbackMix: clamp(input?.feedbackMix ?? DEFAULT_RUNTIME_CONTROLS.feedbackMix, 0, 1),
+		feedbackDecay: clamp(input?.feedbackDecay ?? DEFAULT_RUNTIME_CONTROLS.feedbackDecay, 0.5, 0.999),
+		feedbackWarp: clamp(input?.feedbackWarp ?? DEFAULT_RUNTIME_CONTROLS.feedbackWarp, 0, 1.5),
+		feedbackRotation: clamp(
+			input?.feedbackRotation ?? DEFAULT_RUNTIME_CONTROLS.feedbackRotation,
+			0,
+			1.5
+		),
+		mandalaKFold: clamp(input?.mandalaKFold ?? DEFAULT_RUNTIME_CONTROLS.mandalaKFold, 2, 16),
+		mandalaRingDensity: clamp(
+			input?.mandalaRingDensity ?? DEFAULT_RUNTIME_CONTROLS.mandalaRingDensity,
+			2,
+			14
+		),
+		flowStrength: clamp(input?.flowStrength ?? DEFAULT_RUNTIME_CONTROLS.flowStrength, 0.2, 3),
+		flowCurlScale: clamp(input?.flowCurlScale ?? DEFAULT_RUNTIME_CONTROLS.flowCurlScale, 0.3, 4),
+		physarumSense: clamp(input?.physarumSense ?? DEFAULT_RUNTIME_CONTROLS.physarumSense, 0.1, 1.2)
 	};
 }

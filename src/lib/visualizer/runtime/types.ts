@@ -71,4 +71,19 @@ export type RuntimeControls = {
 	chromaticAberration: number;
 	grain: number;
 	bloomThreshold: number;
+	// Feedback bank (the "live together" lever) — every frame's scene HDR is
+	// copied to a ping-ponged texture, then the next frame samples it back with
+	// rotation + zoom warp + decay, blended underneath the motifs. Makes
+	// motifs share visual memory instead of stamping on a blank canvas.
+	feedbackMix: number;         // 0 = off (current behavior), 1 = full strength
+	feedbackDecay: number;       // 0.85–0.99 per frame
+	feedbackWarp: number;        // bass-driven zoom pump amplitude (0–1)
+	feedbackRotation: number;    // per-frame rotation rate (rad/sec scale, 0–1)
+	// Per-motif generative knobs — not post-process; actually change the
+	// geometry / behavior of the simulation.
+	mandalaKFold: number;        // 2–16 symmetry order
+	mandalaRingDensity: number;  // 2–14 concentric rings
+	flowStrength: number;        // 0.3–2.5 base flow magnitude multiplier
+	flowCurlScale: number;       // 0.4–3.0 curl-noise spatial frequency multiplier
+	physarumSense: number;       // 0.15–0.85 sense angle base (rad)
 };

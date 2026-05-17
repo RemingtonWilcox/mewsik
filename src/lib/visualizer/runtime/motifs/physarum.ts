@@ -112,14 +112,20 @@ fn step_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 	let density = dir.energy.y;
 	let energy = dir.energy.x;
 	let bassPunch = dir.mood.z;
+	let bassRaw = dir.bands.x;
 	let antic = dir.drop.w;
 	let downbeat = f32(dir.clockI.w);
 
-	let senseAngle = 0.38 + motion * 0.55;     // 22° → 55°
+	// motifB.x is the user's sense-angle base (rad). Wider = more turning, more
+	// organic blobs. Narrower = more linear streaming. motion still modulates
+	// on top so the field "opens" during high-energy sections.
+	let senseAngle = dir.motifB.x + motion * 0.45;
 	let senseDist = 6.0 + density * 14.0;      // 6px → 20px
-	let rotateBase = 0.28 + bassPunch * 0.55;  // 16° → 47°
+	// Rotation reads raw bass — sharper turns lock to kick frame-for-frame
+	// instead of riding the envelope tail. Field "snaps" on hits.
+	let rotateBase = 0.28 + bassRaw * 0.70 + bassPunch * 0.10;
 	let speed = 0.7 + motion * 1.1 + antic * 1.4;
-	let depositMag = 0.04 + energy * 0.18;
+	let depositMag = 0.04 + energy * 0.18 + bassRaw * 0.06;
 
 	let aL = a.heading + senseAngle;
 	let aR = a.heading - senseAngle;

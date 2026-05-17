@@ -44,11 +44,16 @@
 	let unsub: (() => void) | null = null;
 	let raf = 0;
 	let resizeObserver: ResizeObserver | null = null;
+	let resizeTimer: ReturnType<typeof setTimeout> | null = null;
 	let started = false;
 
 	async function start() {
 		if (!canvas) return;
 		try {
+			runtime.onDeviceLost = (reason) => {
+				errorMsg = reason;
+				started = false;
+			};
 			await runtime.init(canvas);
 			// Atmosphere → backdrop. Reaction-diffusion → biological texture.
 			// Attractor → geometric filaments. Mandala → radial sacred geometry.
@@ -89,11 +94,20 @@
 	}
 
 	function onResize() {
-		if (!canvas) return;
-		const dpr = Math.min(2, window.devicePixelRatio || 1);
-		const w = Math.max(1, canvas.clientWidth * dpr);
-		const h = Math.max(1, canvas.clientHeight * dpr);
-		runtime.resize(w, h);
+		// Debounced: ResizeObserver fires on every sub-pixel layout shift
+		// (HUD focus rings, tooltip mount, scrollbar reveal). Each fire would
+		// destroy + recreate the scene HDR + bloom mip chain; if a frame is in
+		// flight we get cascading validation errors. 100ms trailing edge means
+		// we only resize when motion has actually stopped.
+		if (resizeTimer) clearTimeout(resizeTimer);
+		resizeTimer = setTimeout(() => {
+			resizeTimer = null;
+			if (!canvas || !started) return;
+			const dpr = Math.min(2, window.devicePixelRatio || 1);
+			const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+			const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+			runtime.resize(w, h);
+		}, 100);
 	}
 
 	onMount(() => {
@@ -108,8 +122,14 @@
 	});
 
 	onDestroy(() => {
+		// Order matters: stop the RAF loop before disposing GPU resources so
+		// the next tick can't reference destroyed textures and crash to black.
 		started = false;
 		cancelAnimationFrame(raf);
+		if (resizeTimer) {
+			clearTimeout(resizeTimer);
+			resizeTimer = null;
+		}
 		resizeObserver?.disconnect();
 		runtime.dispose();
 		unsub?.();

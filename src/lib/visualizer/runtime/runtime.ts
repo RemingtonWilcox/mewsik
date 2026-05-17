@@ -19,6 +19,7 @@ import {
 import { DEFAULT_RUNTIME_CONTROLS, normalizeRuntimeControls } from './controls.js';
 import { createFeedbackBank, disposeFeedbackBank, resizeFeedbackBank } from './feedback.js';
 import { BloomPass } from './post/bloom.js';
+import { FeedbackPass } from './post/feedback.js';
 import type {
 	MotifModule,
 	RuntimeContext,
@@ -56,6 +57,9 @@ export class VisualizerRuntime {
 
 	private bloomPass: BloomPass | null = null;
 	private bloomView: GPUTextureView | null = null;
+	private feedbackPass: FeedbackPass | null = null;
+	private feedbackPing: 0 | 1 = 0; // toggles each frame; read = ping, write = !ping
+	private feedbackInitialized = false;
 	private currentDirectorFrame: VisualDirectorFrame | null = null;
 
 	private width = 1;
@@ -63,9 +67,15 @@ export class VisualizerRuntime {
 	private lastTime = 0;
 
 	private context_: RuntimeContext | null = null;
+	private deviceLost = false;
 	get ctx(): RuntimeContext | null {
 		return this.context_;
 	}
+
+	// Set by callers (host component) so it can surface device-lost as visible
+	// text instead of a silent black screen. Without this the RAF loop swallows
+	// validation cascades and the canvas just goes dark.
+	onDeviceLost: ((reason: string) => void) | null = null;
 
 	constructor() {
 		const buf = new ArrayBuffer(DIRECTOR_UNIFORM_BYTES);
@@ -80,6 +90,12 @@ export class VisualizerRuntime {
 		const adapter = await navigator.gpu.requestAdapter();
 		if (!adapter) throw new Error('No GPU adapter.');
 		const device = await adapter.requestDevice();
+		device.lost.then((info) => {
+			this.deviceLost = true;
+			const reason = `WebGPU device lost: ${info.reason ?? 'unknown'} — ${info.message ?? ''}`;
+			console.error('[runtime]', reason);
+			this.onDeviceLost?.(reason);
+		});
 		const context = canvas.getContext('webgpu');
 		if (!context) throw new Error('Failed to acquire WebGPU canvas context.');
 
@@ -129,6 +145,8 @@ export class VisualizerRuntime {
 
 		this.recreateSceneTarget();
 		this.feedback = createFeedbackBank(device, this.width, this.height, HDR_FORMAT, 4);
+		this.feedbackInitialized = false;
+		this.feedbackPing = 0;
 
 		this.bloomPass = new BloomPass({
 			device,
@@ -139,6 +157,16 @@ export class VisualizerRuntime {
 		// BloomPass's first mip view is stable across frames until next resize,
 		// so we can grab it now and bake it into the composite bind group.
 		this.bloomView = this.bloomPass.getOutputView();
+
+		this.feedbackPass = new FeedbackPass({
+			device,
+			hdrFormat: HDR_FORMAT,
+			directorUniform: this.uniformBuf
+		});
+		this.feedbackPass.bind({
+			directorUniform: this.uniformBuf,
+			feedbackViews: [this.feedback.views[0], this.feedback.views[1]]
+		});
 
 		this.buildComposite();
 
@@ -184,7 +212,11 @@ export class VisualizerRuntime {
 			label: 'scene_hdr',
 			size: [this.width, this.height, 1],
 			format: HDR_FORMAT,
-			usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+			// COPY_SRC required so we can copy scene → feedback texture each frame.
+			usage:
+				GPUTextureUsage.RENDER_ATTACHMENT |
+				GPUTextureUsage.TEXTURE_BINDING |
+				GPUTextureUsage.COPY_SRC
 		});
 		this.sceneHDRView = this.sceneHDR.createView();
 	}
@@ -207,8 +239,8 @@ export class VisualizerRuntime {
 				tonnetz_a: vec4<f32>,
 				tonnetz_b: vec4<f32>,
 				phrase: vec4<f32>,
-				controls: vec4<f32>, post: vec4<f32>, fx: vec4<f32>, _pad3: vec4<f32>,
-				_pad4: vec4<f32>, _pad5: vec4<f32>, _pad6: vec4<f32>, _pad7: vec4<f32>,
+				controls: vec4<f32>, post: vec4<f32>, fx: vec4<f32>, feedback: vec4<f32>,
+				motifA: vec4<f32>, motifB: vec4<f32>, _pad6: vec4<f32>, _pad7: vec4<f32>,
 				_pad8: vec4<f32>, _pad9: vec4<f32>, _pad10: vec4<f32>, _pad11: vec4<f32>,
 				_pad12: vec4<f32>, _pad13: vec4<f32>, _pad14: vec4<f32>, _pad15: vec4<f32>,
 				_pad16: vec4<f32>, _pad17: vec4<f32>,
@@ -423,9 +455,17 @@ export class VisualizerRuntime {
 		this.canvas.height = h;
 		this.recreateSceneTarget();
 		resizeFeedbackBank(this.feedback, this.device, w, h, HDR_FORMAT);
+		this.feedbackInitialized = false;
+		this.feedbackPing = 0;
 		if (this.bloomPass) {
 			this.bloomPass.resize(w, h, this.uniformBuf);
 			this.bloomView = this.bloomPass.getOutputView();
+		}
+		if (this.feedbackPass && this.feedback) {
+			this.feedbackPass.bind({
+				directorUniform: this.uniformBuf,
+				feedbackViews: [this.feedback.views[0], this.feedback.views[1]]
+			});
 		}
 		this.rebuildCompositeBindGroup();
 		this.context_ = this.buildContext();
@@ -437,10 +477,15 @@ export class VisualizerRuntime {
 		const dt = Math.max(0, time - this.lastTime);
 		this.lastTime = time;
 
-		// LERP weights toward targets (parameter morph, not component swap).
+		// Two-rail weight LERP — fast attack so kicks/drops can promote a motif
+		// in real time, slow release so the field doesn't flicker between events.
+		// Old behaviour (symmetric 0.08) had a 200ms half-life that swallowed
+		// transient promotions; this gets to 80%+ of target inside ~3 frames on
+		// the way up, 14 frames on the way down.
 		for (const [id, target] of this.targetWeights) {
 			const current = this.weights.get(id) ?? 0;
-			this.weights.set(id, current + (target - current) * 0.08);
+			const a = target > current ? 0.45 : 0.06;
+			this.weights.set(id, current + (target - current) * a);
 		}
 
 		packDirectorUniform(
@@ -460,6 +505,7 @@ export class VisualizerRuntime {
 
 	render(): void {
 		if (
+			this.deviceLost ||
 			!this.device ||
 			!this.context ||
 			!this.context_ ||
@@ -487,10 +533,38 @@ export class VisualizerRuntime {
 			clearPass.end();
 		}
 
-		// Render each motif into the HDR target at its current weight.
+		// Hydra-style temporal feedback: write the warped+decayed previous
+		// frame into the scene HDR as the underlay. Skipped on the very first
+		// frame because the feedback textures are uninitialized garbage at that
+		// point — the first frame paints clean, subsequent frames blend with
+		// history. Motifs then render additively on top.
+		if (this.feedbackPass && this.feedbackInitialized && this.feedback) {
+			this.feedbackPass.render(encoder, this.sceneHDRView, this.feedbackPing);
+		}
+
+		// Render each motif at its current weight. Threshold raised from 0.005
+		// → 0.06: anything below that is invisible but still pays full overdraw
+		// and dilutes the lead motif's read. Skipping clears the "pale soup"
+		// failure mode where 5+ motifs each contribute 0.10-0.30.
 		for (const m of this.motifs) {
 			const w = this.weights.get(m.id) ?? 0;
-			if (w > 0.005) m.render(encoder, this.context_, w);
+			if (w > 0.06) m.render(encoder, this.context_, w);
+		}
+
+		// Snapshot the post-motif scene HDR into the WRITE feedback texture so
+		// next frame can sample it. Pre-bloom: we want trails of motif state,
+		// not trails of bloom on bloom (which would compound to white). Bloom
+		// re-derives from current scene HDR every frame.
+		if (this.feedback && this.feedback.textures.length >= 2 && this.sceneHDR) {
+			const writeIndex = this.feedbackPing === 0 ? 1 : 0;
+			encoder.copyTextureToTexture(
+				{ texture: this.sceneHDR },
+				{ texture: this.feedback.textures[writeIndex] },
+				[this.width, this.height, 1]
+			);
+			// Next frame reads what we just wrote.
+			this.feedbackPing = writeIndex as 0 | 1;
+			this.feedbackInitialized = true;
 		}
 
 		// Bloom post-pass: scene HDR → threshold + downsample chain →
@@ -533,6 +607,11 @@ export class VisualizerRuntime {
 			this.bloomPass = null;
 		}
 		this.bloomView = null;
+		if (this.feedbackPass) {
+			this.feedbackPass.dispose();
+			this.feedbackPass = null;
+		}
+		this.feedbackInitialized = false;
 		if (this.feedback) {
 			disposeFeedbackBank(this.feedback);
 			this.feedback = null;

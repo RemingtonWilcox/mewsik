@@ -41,6 +41,9 @@
 	let errorMsg = $state<string | null>(null);
 	let raf = 0;
 	let unsub: (() => void) | null = null;
+	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
+	// returns instead of touching destroyed GPU resources mid-frame.
+	let running = false;
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Audio smoothing — multiple timescales per research recommendation.
@@ -1378,8 +1381,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	}
 
 	function loop() {
-		if (!canvas || !gpu) {
-			raf = requestAnimationFrame(loop);
+		if (!running || !canvas || !gpu) {
+			if (running) raf = requestAnimationFrame(loop);
 			return;
 		}
 
@@ -1818,10 +1821,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 	onMount(async () => {
 		unsub = await vis.subscribe();
+		running = true;
 		raf = requestAnimationFrame(loop);
 	});
 
 	onDestroy(() => {
+		running = false;
 		cancelAnimationFrame(raf);
 		if (unsub) unsub();
 		teardownGpu();
@@ -1833,9 +1838,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		class="fixed inset-0 z-[100] bg-black"
 		role="button"
 		aria-label="Close visualizer"
-		onclick={() => vis.toggle()}
+		onclick={() => {
+			if (showHud) vis.toggle();
+		}}
 		onkeydown={(e) => {
-			if (e.key === 'Escape') vis.toggle();
+			if (e.key === 'Escape' && showHud) vis.toggle();
 		}}
 		tabindex="0"
 	>

@@ -60,22 +60,27 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 	let energy = dir.energy.x;
 	let motion = dir.energy.z;
+	// Fast rail — gen-1 reactivity. Kick lands → sparkle in ~30ms instead of
+	// waiting for the bassPunch envelope's 120ms release tail.
+	let bassRaw = dir.bands.x;
+	let trebleRaw = dir.bands.z;
 	let bassPunch = dir.mood.z;
 	let antic = dir.drop.w;
 	let postDrop = dir.drop2.x;
 	let downbeat = f32(dir.clockI.w);
-	let centroid = dir.bands.w; // (placeholder — bands not yet wired; falls back to 0)
+	let centroid = dir.bands.w;
 	let chromaStrength = dir.palette.w;
 
-	// Symmetry order — choose from {4, 6, 8, 12} per section/chroma.
+	// Symmetry order — user override via motifA.x; section/chroma adjustments
+	// still bias around it so the section vocabulary is preserved while the
+	// user gets a direct generative knob.
+	let kUser = dir.motifA.x;
 	let sec = dir.section.x;
-	var kBase: f32 = 6.0;
-	if (sec == 0u || sec == 1u) { kBase = 8.0; }       // calm/intro
-	else if (sec == 4u) { kBase = 12.0; }              // build
-	else if (sec == 5u || sec == 6u) { kBase = 6.0; }  // drop/chorus
-	else if (sec == 7u || sec == 8u) { kBase = 4.0; }  // bridge/breakdown
-	// Chroma strength can bump us to a tighter symmetry inside each section.
-	let k = kBase + step(0.7, chromaStrength) * 2.0;
+	var kBias: f32 = 0.0;
+	if (sec == 0u || sec == 1u) { kBias = 2.0; }       // calm/intro → richer
+	else if (sec == 4u) { kBias = 4.0; }                // build → tighter
+	else if (sec == 7u || sec == 8u) { kBias = -2.0; }  // bridge/breakdown → simpler
+	let k = clamp(kUser + kBias + step(0.7, chromaStrength) * 1.5, 2.0, 16.0);
 
 	// Slow rotation; motion accelerates, downbeat flicks.
 	let rotSpeed = 0.05 + motion * 0.30;
@@ -88,8 +93,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let sliceT = fract((theta + sliceWidth * 0.5) / sliceWidth);
 	let folded = abs(sliceT * sliceWidth - sliceWidth * 0.5);
 
-	// Ring count — centroid and energy pack more concentric petals.
-	let ringDensity = 5.0 + centroid * 7.0 + energy * 4.0;
+	// Ring count — user base via motifA.y; centroid/energy add audio variation
+	// on top so a kick visibly inserts an extra ring band.
+	let ringDensity = dir.motifA.y + centroid * 4.0 + energy * 3.0;
 	let ringPhase = r * ringDensity - dir.viewport.z * (0.3 + antic * 0.4);
 	let ring = 0.5 + 0.5 * cos(ringPhase * PI);
 
@@ -102,8 +108,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let radialFalloff = 1.0 - smoothstep(0.05, radialReach, r);
 	let core = ring * petal * radialFalloff;
 
-	// Sparkle: bright dots where rings cross petal peaks.
-	let sparkle = pow(core, 6.0) * (0.4 + bassPunch * 0.9 + downbeat * 0.6);
+	// Sparkle: bright dots where rings cross petal peaks. Read RAW bass so the
+	// sparkle locks to the kick frame-for-frame (gen-1 visceral feel) instead
+	// of riding the bassPunch envelope's release. trebleRaw adds hi-hat shimmer.
+	let sparkle = pow(core, 6.0) * (0.4 + bassRaw * 1.1 + trebleRaw * 0.35 + downbeat * 0.6);
 
 	// Palette: base hue at center → accent in mid → rim at outer.
 	let baseHue = dir.palette.x;
@@ -118,7 +126,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 	let glow = col * (core * 0.48 + sparkle * 0.75);
 
 	// Subtle center pulse on the downbeat — the eye lands on the "one".
-	let centerPulse = downbeat * exp(-r * 12.0) * 0.22;
+	// Add a per-kick pulse that responds to raw bass so every transient
+	// reads as a hit, not just downbeats.
+	let centerPulse = (downbeat * 0.22 + bassRaw * 0.35) * exp(-r * 12.0);
 	return vec4<f32>(glow + vec3<f32>(centerPulse), 1.0);
 }
 `;

@@ -69,4 +69,12 @@ export type VisualDirectorFrame = {
 	bassPunch: number;
 	trebleSparkle: number;
 	tonnetz: [number, number, number, number, number, number];
+	// Fast rail — raw bass/mid/treble/centroid with only a one-frame denoise
+	// (~30ms half-life). Renderers that want gen-1-style instant audio response
+	// read these instead of the longer-tail envelopes (energy/bassPunch).
+	// Filled with zeros when features are absent or silence is held.
+	bassRaw: number;
+	midRaw: number;
+	trebleRaw: number;
+	centroidRaw: number;
 };

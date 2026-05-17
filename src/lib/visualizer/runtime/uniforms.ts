@@ -22,7 +22,10 @@
 //     phrase: vec4<f32>,          // phrase, sectionAge, silence(0/1), _
 //     controls: vec4<f32>,        // master, exposure, bloom, background
 //     post: vec4<f32>,            // contrast, saturation, vignette, edge
-//     fx: vec4<f32>,              // chromaticAberration, grain, bloomThreshold, _
+//     fx: vec4<f32>,              // chromaticAberration, grain, bloomThreshold, feedbackMix
+//     feedback: vec4<f32>,        // decay, warp, rotation, _
+//     motifA: vec4<f32>,          // mandalaKFold, mandalaRingDensity, flowStrength, flowCurlScale
+//     motifB: vec4<f32>,          // physarumSense, _, _, _
 //   };
 
 import type { VisualDirectorFrame } from '../director/types.js';
@@ -74,11 +77,13 @@ export function packDirectorUniform(
 	out[5] = frame.density;
 	out[6] = frame.motion;
 	out[7] = frame.structure;
-	// bands (renderer can supply via separate path if needed; placeholders for now)
-	out[8] = 0;
-	out[9] = 0;
-	out[10] = 0;
-	out[11] = 0;
+	// bands — fast rail: raw bass/mid/treble/centroid with ~30ms one-frame
+	// denoise. Motifs read these instead of the longer-tail envelopes
+	// (dir.energy / dir.mood) when they want gen-1 transient response.
+	out[8] = frame.bassRaw;
+	out[9] = frame.midRaw;
+	out[10] = frame.trebleRaw;
+	out[11] = frame.centroidRaw;
 	// palette
 	out[12] = frame.palette.baseHue;
 	out[13] = frame.palette.accentHue;
@@ -144,11 +149,26 @@ export function packDirectorUniform(
 	out[61] = c.saturation;
 	out[62] = c.vignette;
 	out[63] = c.edge;
-	// fx controls
+	// fx controls + feedbackMix (was free slot fx.w)
 	out[64] = c.chromaticAberration;
 	out[65] = c.grain;
 	out[66] = c.bloomThreshold;
-	out[67] = 0;
+	out[67] = c.feedbackMix;
+	// feedback vec4 (was _pad3)
+	out[68] = c.feedbackDecay;
+	out[69] = c.feedbackWarp;
+	out[70] = c.feedbackRotation;
+	out[71] = 0;
+	// motifA vec4 (was _pad4)
+	out[72] = c.mandalaKFold;
+	out[73] = c.mandalaRingDensity;
+	out[74] = c.flowStrength;
+	out[75] = c.flowCurlScale;
+	// motifB vec4 (was _pad5)
+	out[76] = c.physarumSense;
+	out[77] = 0;
+	out[78] = 0;
+	out[79] = 0;
 }
 
 export const DIRECTOR_WGSL_STRUCT = /* wgsl */ `
@@ -170,9 +190,9 @@ struct Director {
 	controls: vec4<f32>,
 	post: vec4<f32>,
 	fx: vec4<f32>,
-	_pad3: vec4<f32>,
-	_pad4: vec4<f32>,
-	_pad5: vec4<f32>,
+	feedback: vec4<f32>,
+	motifA: vec4<f32>,
+	motifB: vec4<f32>,
 	_pad6: vec4<f32>,
 	_pad7: vec4<f32>,
 	_pad8: vec4<f32>,

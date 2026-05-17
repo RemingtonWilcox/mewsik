@@ -32,6 +32,12 @@ export class VisualDirector {
 	private silenceStart = 0;
 	private subBassEnv = new AsymmetricEnvelope(0.05, 0.5, 60);
 	private onsetDensityEnv = new AsymmetricEnvelope(0.1, 0.5, 60);
+	// Fast rail one-frame denoise — symmetric ~30ms half-life. Just enough to
+	// kill single-sample spikes from the FFT, not enough to lose transient feel.
+	private rawBass = 0;
+	private rawMid = 0;
+	private rawTreble = 0;
+	private rawCentroid = 0.5;
 
 	update(features: AudioFeatures | null | undefined, time: number): VisualDirectorFrame {
 		const rms = features?.rms ?? 0;
@@ -101,6 +107,14 @@ export class VisualDirector {
 		const bassPunch = this.bassPunchEnv.tick(bass);
 		const trebleSparkle = this.trebleSparkEnv.tick(treble);
 
+		// Fast rail — light denoise only, no envelope. Silence collapses to 0
+		// so motifs that read raw bands don't keep pulsing when audio dies.
+		const denoise = 0.4;
+		this.rawBass = silence ? this.rawBass * 0.6 : this.rawBass + (bass - this.rawBass) * denoise;
+		this.rawMid = silence ? this.rawMid * 0.6 : this.rawMid + (mid - this.rawMid) * denoise;
+		this.rawTreble = silence ? this.rawTreble * 0.6 : this.rawTreble + (treble - this.rawTreble) * denoise;
+		this.rawCentroid = this.rawCentroid + (centroid - this.rawCentroid) * denoise;
+
 		const phrase = clock.phrasePos;
 		const structureScalar = clamp01(0.7 - treble * 0.25 + chromaStrength * 0.35);
 
@@ -124,7 +138,11 @@ export class VisualDirector {
 			arousal,
 			bassPunch,
 			trebleSparkle,
-			tonnetz: palette.tonnetz
+			tonnetz: palette.tonnetz,
+			bassRaw: this.rawBass,
+			midRaw: this.rawMid,
+			trebleRaw: this.rawTreble,
+			centroidRaw: this.rawCentroid
 		};
 	}
 }

@@ -61,6 +61,17 @@
 	let ctlChromatic = $state(DEFAULT_RUNTIME_CONTROLS.chromaticAberration);
 	let ctlGrain = $state(DEFAULT_RUNTIME_CONTROLS.grain);
 	let ctlBloomThreshold = $state(DEFAULT_RUNTIME_CONTROLS.bloomThreshold);
+	// Feedback bank — the "live together" controls.
+	let ctlFeedbackMix = $state(DEFAULT_RUNTIME_CONTROLS.feedbackMix);
+	let ctlFeedbackDecay = $state(DEFAULT_RUNTIME_CONTROLS.feedbackDecay);
+	let ctlFeedbackWarp = $state(DEFAULT_RUNTIME_CONTROLS.feedbackWarp);
+	let ctlFeedbackRotation = $state(DEFAULT_RUNTIME_CONTROLS.feedbackRotation);
+	// Per-motif generative controls.
+	let ctlMandalaK = $state(DEFAULT_RUNTIME_CONTROLS.mandalaKFold);
+	let ctlMandalaRings = $state(DEFAULT_RUNTIME_CONTROLS.mandalaRingDensity);
+	let ctlFlowStrength = $state(DEFAULT_RUNTIME_CONTROLS.flowStrength);
+	let ctlFlowCurl = $state(DEFAULT_RUNTIME_CONTROLS.flowCurlScale);
+	let ctlPhysarumSense = $state(DEFAULT_RUNTIME_CONTROLS.physarumSense);
 	const runtimeOverride = $derived<MotifWeights | null>(
 		manualMotifMode
 			? {
@@ -84,7 +95,16 @@
 		edge: ctlEdge,
 		chromaticAberration: ctlChromatic,
 		grain: ctlGrain,
-		bloomThreshold: ctlBloomThreshold
+		bloomThreshold: ctlBloomThreshold,
+		feedbackMix: ctlFeedbackMix,
+		feedbackDecay: ctlFeedbackDecay,
+		feedbackWarp: ctlFeedbackWarp,
+		feedbackRotation: ctlFeedbackRotation,
+		mandalaKFold: ctlMandalaK,
+		mandalaRingDensity: ctlMandalaRings,
+		flowStrength: ctlFlowStrength,
+		flowCurlScale: ctlFlowCurl,
+		physarumSense: ctlPhysarumSense
 	});
 
 	function resetRuntimeControls() {
@@ -99,6 +119,15 @@
 		ctlChromatic = DEFAULT_RUNTIME_CONTROLS.chromaticAberration;
 		ctlGrain = DEFAULT_RUNTIME_CONTROLS.grain;
 		ctlBloomThreshold = DEFAULT_RUNTIME_CONTROLS.bloomThreshold;
+		ctlFeedbackMix = DEFAULT_RUNTIME_CONTROLS.feedbackMix;
+		ctlFeedbackDecay = DEFAULT_RUNTIME_CONTROLS.feedbackDecay;
+		ctlFeedbackWarp = DEFAULT_RUNTIME_CONTROLS.feedbackWarp;
+		ctlFeedbackRotation = DEFAULT_RUNTIME_CONTROLS.feedbackRotation;
+		ctlMandalaK = DEFAULT_RUNTIME_CONTROLS.mandalaKFold;
+		ctlMandalaRings = DEFAULT_RUNTIME_CONTROLS.mandalaRingDensity;
+		ctlFlowStrength = DEFAULT_RUNTIME_CONTROLS.flowStrength;
+		ctlFlowCurl = DEFAULT_RUNTIME_CONTROLS.flowCurlScale;
+		ctlPhysarumSense = DEFAULT_RUNTIME_CONTROLS.physarumSense;
 	}
 
 	function soloMotif(
@@ -568,6 +597,111 @@
 					class="w-24"
 				/>
 				<span class="w-10 text-white/70">{ctlBloomThreshold.toFixed(2)}</span>
+			</div>
+		</div>
+		<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-xs">
+			<span class="font-bold text-white/80">feedback</span>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">mix</span>
+				<input type="range" min="0" max="1" step="0.01" bind:value={ctlFeedbackMix} class="w-24" />
+				<span class="w-10 text-white/70">{ctlFeedbackMix.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">decay</span>
+				<input
+					type="range"
+					min="0.5"
+					max="0.999"
+					step="0.001"
+					bind:value={ctlFeedbackDecay}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlFeedbackDecay.toFixed(3)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">warp</span>
+				<input
+					type="range"
+					min="0"
+					max="1.5"
+					step="0.01"
+					bind:value={ctlFeedbackWarp}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlFeedbackWarp.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">rot</span>
+				<input
+					type="range"
+					min="0"
+					max="1.5"
+					step="0.01"
+					bind:value={ctlFeedbackRotation}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlFeedbackRotation.toFixed(2)}</span>
+			</div>
+			<span class="font-bold text-white/80">motif gen</span>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">man k</span>
+				<input
+					type="range"
+					min="2"
+					max="16"
+					step="1"
+					bind:value={ctlMandalaK}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlMandalaK.toFixed(0)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">man rings</span>
+				<input
+					type="range"
+					min="2"
+					max="14"
+					step="0.1"
+					bind:value={ctlMandalaRings}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlMandalaRings.toFixed(1)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">flow</span>
+				<input
+					type="range"
+					min="0.2"
+					max="3"
+					step="0.01"
+					bind:value={ctlFlowStrength}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlFlowStrength.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">curl</span>
+				<input
+					type="range"
+					min="0.3"
+					max="4"
+					step="0.01"
+					bind:value={ctlFlowCurl}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlFlowCurl.toFixed(2)}</span>
+			</div>
+			<div class="flex items-center gap-1">
+				<span class="w-12 text-white/60">phy sense</span>
+				<input
+					type="range"
+					min="0.1"
+					max="1.2"
+					step="0.01"
+					bind:value={ctlPhysarumSense}
+					class="w-24"
+				/>
+				<span class="w-10 text-white/70">{ctlPhysarumSense.toFixed(2)}</span>
 			</div>
 		</div>
 	{/if}
