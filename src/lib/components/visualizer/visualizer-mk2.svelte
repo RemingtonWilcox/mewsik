@@ -658,14 +658,68 @@ fn dither(p: vec2<f32>) -> f32 {
 	return bayer[iy][ix];
 }
 
-// Background gradient — deep cosmic with subtle palette-position-driven tint.
-// Sampled via the palette where the deepest end is the "void."
+// Hash for procedural starfield.
+fn h31(p: vec3<f32>) -> f32 {
+	var q = fract(p * vec3<f32>(443.897, 441.423, 437.195));
+	q = q + dot(q, q.yzx + 19.19);
+	return fract((q.x + q.y) * q.z);
+}
+
+// 3D value noise — for nebula clouds. Cheap trilinear interp of hash values.
+fn vn3(p: vec3<f32>) -> f32 {
+	let i = floor(p);
+	let f = fract(p);
+	let u = f * f * (3.0 - 2.0 * f);
+	let c000 = h31(i);
+	let c100 = h31(i + vec3<f32>(1.0, 0.0, 0.0));
+	let c010 = h31(i + vec3<f32>(0.0, 1.0, 0.0));
+	let c110 = h31(i + vec3<f32>(1.0, 1.0, 0.0));
+	let c001 = h31(i + vec3<f32>(0.0, 0.0, 1.0));
+	let c101 = h31(i + vec3<f32>(1.0, 0.0, 1.0));
+	let c011 = h31(i + vec3<f32>(0.0, 1.0, 1.0));
+	let c111 = h31(i + vec3<f32>(1.0, 1.0, 1.0));
+	let x00 = mix(c000, c100, u.x);
+	let x10 = mix(c010, c110, u.x);
+	let x01 = mix(c001, c101, u.x);
+	let x11 = mix(c011, c111, u.x);
+	let y0 = mix(x00, x10, u.y);
+	let y1 = mix(x01, x11, u.y);
+	return mix(y0, y1, u.z);
+}
+
+// Procedural nebula + starfield sky. Replaces the flat olive background
+// with: (1) atmospheric horizon-to-zenith gradient, (2) two-octave nebula
+// cloud field tinted with the palette family, (3) twinkling starfield
+// from hashed pixel positions. Twinkle rate locks to BPM. Sky still
+// behaves as a low-intensity HDR backdrop so AgX tonemap reads correctly.
 fn sky(rd: vec3<f32>) -> vec3<f32> {
-	let up = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+	let upT = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
 	let baseT = u.paletteOffset;
-	let horizon = palette7(baseT) * 0.18;
-	let zenith = palette7(baseT + 0.7) * 0.05;
-	return mix(horizon, zenith, smoothstep(0.0, 1.0, up));
+	let horizon = palette7(baseT) * 0.10;
+	let zenith = palette7(baseT + 0.7) * 0.025;
+	var bg = mix(horizon, zenith, smoothstep(0.0, 1.0, upT));
+
+	// Nebula clouds — two octaves of 3D value noise sampled along the ray
+	// direction. Slow drift via u.time keeps the field alive. fbm shapes
+	// the cloud into wisps with a sharper threshold.
+	let cloudSample = rd * 3.5 + vec3<f32>(u.time * 0.012, u.time * 0.008, u.time * 0.006);
+	let cloud = vn3(cloudSample) * 0.6 + vn3(cloudSample * 2.7 + 4.1) * 0.35;
+	let cloudMask = smoothstep(0.38, 0.88, cloud);
+	let nebulaTint = palette7(baseT + 0.32) * cloudMask * (0.16 + u.sustain * 0.10);
+	bg = bg + nebulaTint;
+
+	// Stars — sparse hashed bright dots. Twinkle phase locked to BPM so
+	// faster songs have faster sparkle. Star density slightly higher in
+	// the upper hemisphere (sky-facing rays).
+	let starScale = 220.0;
+	let starP = rd * starScale;
+	let starHash = h31(floor(starP));
+	let starMask = step(0.9975, starHash);
+	let twinkle = 0.5 + 0.5 * sin(u.time * (4.0 + u.bpmNorm * 8.0) + starHash * 6.28);
+	let star = starMask * twinkle * (0.6 + upT * 0.4);
+	bg = bg + vec3<f32>(star * 0.7, star * 0.78, star * 0.92);
+
+	return bg;
 }
 
 @fragment
@@ -777,13 +831,37 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let specPow = 32.0 + u.mid * 64.0;
 			let specular = pow(cosNH, specPow);
 
-			// Key + ambient lighting
+			// Multi-scale surface detail — three octaves of triplanar noise
+			// modulate the base color and add micro-shading. Macro form is
+			// the fractal itself; meso detail is vein + ripple; micro
+			// detail is this triplanar layer. Visible at close zoom as
+			// pore-level texture without bloating the SDF.
+			let triA = (sin(p.x * 28.0) * sin(p.y * 26.0) * sin(p.z * 30.0)) * 0.5 + 0.5;
+			let triB = (sin(p.x * 73.0 + 2.1) * sin(p.y * 79.0 - 1.4) * sin(p.z * 71.0 + 3.7)) * 0.5 + 0.5;
+			let microDetail = triA * 0.6 + triB * 0.4;
+			let detailShade = 0.82 + microDetail * 0.36;
+
+			// Three-point lighting — cinematic dramatic look.
+			//   key   warm directional from upper-right (existing lightDir)
+			//   fill  cool soft from below, palette accent — lifts shadows
+			//   rim   palette rim hue from behind subject — silhouette pop
 			let keyTint = palette7(u.paletteOffset + 0.18) * 1.4 + vec3<f32>(0.05);
-			let fillTint = palette7(u.paletteOffset + 0.6) * 0.35;
+			let fillTint = palette7(u.paletteOffset + 0.55) * 0.45;
+			let rimTint = palette7(u.paletteOffset + 0.82) * 1.8;
+
+			let fillDir = safeNormalize(vec3<f32>(-0.25, -0.55, -0.35), vec3<f32>(0.0, -1.0, 0.0));
+			let rimDir = -lightDir;
+			let cosNF = max(0.0, dot(n, fillDir));
+			let cosNR = max(0.0, dot(n, rimDir));
+			// Rim term — Fresnel-weighted backlight along silhouette edges only.
+			let rimFresnel = pow(1.0 - cosNV, 3.5);
+			let rim = rimTint * cosNR * rimFresnel * (0.65 + u.sustain * 0.5);
+
 			let direct = keyTint * cosNL * shadow;
-			let ambient = fillTint * (0.55 + n.y * 0.5);
-			let diffuse = baseCol * (direct + ambient) * ao;
-			let specularCol = irid * (specular * 1.4 + fresnel * 0.5) * shadow;
+			let fill = fillTint * cosNF * 0.45;
+			let ambient = fillTint * (0.32 + n.y * 0.30);
+			let diffuse = baseCol * (direct + fill + ambient) * ao * detailShade;
+			let specularCol = irid * (specular * 1.4 + fresnel * 0.5) * shadow + rim;
 			let surfQ = organismWarp(p);
 			let vein = pow(
 				0.5 + 0.5 * sin(surfQ.x * 17.0 + surfQ.y * 11.0 - surfQ.z * 9.0 + u.time * (0.7 + u.bpmNorm)),
@@ -1228,6 +1306,24 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	// Add spectrum-painted particle layer additively (still linear HDR).
 	let particles = textureSample(particleTex, samp, uv).rgb;
 	col = col + particles * 0.055;
+
+	// Anamorphic lens streaks — the JJ-Abrams Hollywood look. For each
+	// highlight pixel, blur horizontally with falling-off taps and add the
+	// streak back into the frame. Cyan-tinted because real anamorphic
+	// streaks are slightly cooler than the highlight they come from.
+	// 9-tap horizontal box with widening offsets to fake a long streak.
+	let texel = vec2<f32>(1.0 / u.resolutionX, 1.0 / u.resolutionY);
+	var streak = vec3<f32>(0.0);
+	for (var s: i32 = 1; s <= 9; s = s + 1) {
+		let off = f32(s) * texel.x * 8.0;
+		let sL = textureSample(compositeTex, samp, uv + vec2<f32>(-off, 0.0)).rgb;
+		let sR = textureSample(compositeTex, samp, uv + vec2<f32>( off, 0.0)).rgb;
+		let bright = max(sL, sR);
+		let mask = max(bright - vec3<f32>(0.55), vec3<f32>(0.0));
+		let falloff = 1.0 / (1.0 + f32(s) * 0.7);
+		streak = streak + mask * falloff;
+	}
+	col = col + streak * vec3<f32>(0.18, 0.34, 0.46) * (0.45 + u.flash * 0.55);
 
 	col = agx(col);
 	// Black-point lift + micro-contrast so the deep volumetric blacks don't
@@ -1821,10 +1917,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const sessionRoll = (mk2SongSeed - 0.5) * 0.55; // ±0.275 rad ≈ ±16°
 		const camPosRaw = getCameraPos(time + sessionPhaseOffset, moodCamSpeedMul);
 		const camSceneScale = 1.18 + growth * 0.20;
+		// Hand-held camera shake — subtle smoothed-perlin-style jitter scaled
+		// by raw bass + flash so kicks/snares give the camera an impact
+		// shudder. Octave structure produces low-frequency drift not jitter.
+		// Hollywood handheld feel without going GoPro.
+		const shakeT = time * 7.0;
+		const shakeAmp = (smoothed.bass * 0.025 + smoothed.flash * 0.035) * camSceneScale;
+		const shakeX = (Math.sin(shakeT * 1.13) + Math.sin(shakeT * 2.7) * 0.5) * shakeAmp;
+		const shakeY = (Math.cos(shakeT * 1.39) + Math.sin(shakeT * 3.1) * 0.5) * shakeAmp * 0.7;
+		const shakeZ = (Math.sin(shakeT * 0.87 + 1.5) + Math.cos(shakeT * 2.3) * 0.5) * shakeAmp * 0.8;
 		const camPos: [number, number, number] = [
-			camPosRaw[0] * moodCamDistMul * camSceneScale,
-			camPosRaw[1] * moodCamDistMul * camSceneScale,
-			camPosRaw[2] * moodCamDistMul * camSceneScale
+			camPosRaw[0] * moodCamDistMul * camSceneScale + shakeX,
+			camPosRaw[1] * moodCamDistMul * camSceneScale + shakeY,
+			camPosRaw[2] * moodCamDistMul * camSceneScale + shakeZ
 		];
 		// Mode 4 (perched overhead) needs to look down at origin, not at the
 		// session-biased Y target — otherwise camera looks past the organism.
