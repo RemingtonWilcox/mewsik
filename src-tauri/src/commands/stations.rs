@@ -84,6 +84,15 @@ fn is_playlist_content_type(content_type: &str) -> bool {
     )
 }
 
+fn url_looks_like_playlist(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    path.ends_with(".m3u") || path.ends_with(".m3u8") || path.ends_with(".pls")
+}
+
 fn bytes_to_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).to_string()
 }
@@ -193,7 +202,11 @@ async fn read_probe_bytes(response: &mut reqwest::Response) -> Result<Vec<u8>, r
     Ok(bytes)
 }
 
-async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bool {
+/// Probe a station URL, following playlist redirects (.m3u/.pls). Returns
+/// the *direct stream URL* that actually serves audio — the audio engine
+/// cannot decode playlist text, so callers should play/persist this URL,
+/// not the original.
+async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> Option<String> {
     let mut current_url = initial_url.to_string();
 
     for _ in 0..=STATION_PLAYLIST_DEPTH {
@@ -207,11 +220,11 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bo
             .await
         {
             Ok(response) => response,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         if !response.status().is_success() {
-            return false;
+            return None;
         }
 
         let content_type = response
@@ -223,11 +236,11 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bo
         let final_url = response.url().clone();
         let bytes = match read_probe_bytes(&mut response).await {
             Ok(bytes) => bytes,
-            Err(_) => return false,
+            Err(_) => return None,
         };
 
         if bytes.is_empty() {
-            return false;
+            return None;
         }
 
         if is_playlist_content_type(&content_type) || bytes_look_like_playlist(&bytes) {
@@ -235,25 +248,25 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bo
                 current_url = next_url;
                 continue;
             }
-            return false;
+            return None;
         }
 
         if bytes_look_like_html(&bytes) {
-            return false;
+            return None;
         }
 
         if is_audio_content_type(&content_type) {
-            return looks_like_audio_payload(&bytes);
+            return looks_like_audio_payload(&bytes).then_some(current_url);
         }
 
         if normalize_content_type(&content_type).starts_with("text/") {
-            return false;
+            return None;
         }
 
-        return looks_like_audio_payload(&bytes);
+        return looks_like_audio_payload(&bytes).then_some(current_url);
     }
 
-    false
+    None
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,47 +275,65 @@ struct RadioBrowserUuidStation {
     url_resolved: Option<String>,
 }
 
-/// Look up a station's *current* stream URL from radio-browser by its
-/// permanent UUID. Stream hosts rotate; the UUID is stable.
-async fn resolve_station_url_by_uuid(client: &reqwest::Client, uuid: &str) -> Option<String> {
+/// Look up a station's *current* stream URLs from radio-browser by its
+/// permanent UUID. Stream hosts rotate; the UUID is stable. Returns
+/// candidates in preference order: url_resolved (direct stream) first,
+/// then url (may be a playlist — the probe unwraps it).
+async fn resolve_station_urls_by_uuid(client: &reqwest::Client, uuid: &str) -> Vec<String> {
     let url = format!(
         "https://de1.api.radio-browser.info/json/stations/byuuid/{}",
         urlencoding::encode(uuid)
     );
-    let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let stations: Vec<RadioBrowserUuidStation> = response.json().await.ok()?;
-    let station = stations.into_iter().next()?;
-    let pick = |value: Option<String>| {
-        value
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
+    let Ok(response) = client.get(&url).send().await else {
+        return Vec::new();
     };
-    pick(station.url_resolved).or_else(|| pick(station.url))
+    if !response.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(stations) = response.json::<Vec<RadioBrowserUuidStation>>().await else {
+        return Vec::new();
+    };
+    let Some(station) = stations.into_iter().next() else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for value in [station.url_resolved, station.url] {
+        if let Some(trimmed) = value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+            if !candidates.contains(&trimmed) {
+                candidates.push(trimmed);
+            }
+        }
+    }
+    candidates
 }
 
-/// Self-heal a station whose saved URL stopped working: re-resolve the
-/// current URL by UUID, probe it, and persist it if it actually streams.
-/// Returns the fresh URL on success.
+/// Self-heal a station whose saved URL stopped working: re-resolve current
+/// URLs by UUID, probe each (unwrapping playlists), and persist the first
+/// one that actually streams audio. Returns the playable URL on success.
 async fn try_heal_station(
     db: &DbPool,
     client: &reqwest::Client,
     station: &Station,
 ) -> Option<String> {
     let uuid = station.radio_browser_id.as_deref()?;
-    let fresh_url = resolve_station_url_by_uuid(client, uuid).await?;
-    if fresh_url == station.url || !probe_station_stream(client, &fresh_url).await {
-        return None;
+    for candidate in resolve_station_urls_by_uuid(client, uuid).await {
+        let Some(playable_url) = probe_station_stream(client, &candidate).await else {
+            continue;
+        };
+        if playable_url == station.url {
+            // Same URL we already have — nothing to heal with.
+            return None;
+        }
+        queries::update_station_url(db, &station.id, &playable_url).ok()?;
+        let _ = queries::update_station_health(db, &station.id, 0, &queries::now());
+        log::info!(
+            "Healed station '{}': stale URL replaced via radio-browser uuid",
+            station.name
+        );
+        return Some(playable_url);
     }
-    queries::update_station_url(db, &station.id, &fresh_url).ok()?;
-    let _ = queries::update_station_health(db, &station.id, 0, &queries::now());
-    log::info!(
-        "Healed station '{}': stale URL replaced via radio-browser uuid",
-        station.name
-    );
-    Some(fresh_url)
+    None
 }
 
 fn build_station_health_client() -> Result<reqwest::Client, String> {
@@ -318,13 +349,13 @@ fn build_station_health_client() -> Result<reqwest::Client, String> {
 async fn probe_station_targets(
     client: &reqwest::Client,
     targets: Vec<StationVerifyTarget>,
-) -> Result<Vec<(StationVerifyTarget, bool)>, String> {
+) -> Result<Vec<(StationVerifyTarget, Option<String>)>, String> {
     let mut probes = JoinSet::new();
     for target in targets {
         let client = client.clone();
         probes.spawn(async move {
-            let is_healthy = probe_station_stream(&client, &target.url).await;
-            (target, is_healthy)
+            let playable_url = probe_station_stream(&client, &target.url).await;
+            (target, playable_url)
         });
     }
 
@@ -360,10 +391,10 @@ async fn verify_station_urls_inner(urls: Vec<String>) -> Result<Vec<StationHealt
 
     Ok(verified
         .into_iter()
-        .map(|(target, is_healthy)| StationHealthResult {
+        .map(|(target, playable_url)| StationHealthResult {
             station_id: target.station_id,
             url: target.url,
-            status: if is_healthy { "ok" } else { "dead" }.to_string(),
+            status: if playable_url.is_some() { "ok" } else { "dead" }.to_string(),
             last_checked_at: Some(checked_at.clone()),
         })
         .collect())
@@ -389,18 +420,28 @@ async fn verify_favorite_stations_inner(db: &DbPool) -> Result<Vec<StationHealth
     .await?;
 
     let mut health_by_station_id = std::collections::HashMap::new();
-    for (target, is_healthy) in verified {
+    for (target, playable_url) in verified {
         if let Some(station_id) = target.station_id {
-            health_by_station_id.insert(station_id, (target.url, is_healthy));
+            health_by_station_id.insert(station_id, playable_url);
         }
     }
 
     let mut results = Vec::with_capacity(stations.len());
     for station in stations {
         let checked_at = queries::now();
-        let (mut url, mut is_healthy) = health_by_station_id
-            .remove(&station.id)
-            .unwrap_or((station.url.clone(), false));
+        let playable = health_by_station_id.remove(&station.id).flatten();
+        let mut is_healthy = playable.is_some();
+        let mut url = playable.unwrap_or_else(|| station.url.clone());
+
+        // The probe unwraps playlist URLs (.m3u/.pls) to the direct stream.
+        // Persist that — the audio engine cannot decode playlist text.
+        if is_healthy && url != station.url {
+            let _ = queries::update_station_url(db, &station.id, &url);
+            log::info!(
+                "Station '{}': unwrapped playlist URL to direct stream",
+                station.name
+            );
+        }
 
         // Saved stream URLs go stale (hosts/tokens rotate). Before declaring
         // a station unhealthy, try re-resolving its current URL by UUID.
@@ -624,10 +665,16 @@ pub async fn play_station(
         // (e.g. healed by the launch-time health check).
         play_url = station.url.clone();
 
-        // Known-failing station: re-resolve its current URL before playing.
-        if station.fail_count > 0 && station.radio_browser_id.is_some() {
+        // The engine can only decode raw audio: unwrap playlist URLs to the
+        // direct stream first. Also re-resolve known-failing stations.
+        if url_looks_like_playlist(&play_url) || station.fail_count > 0 {
             if let Ok(client) = build_station_health_client() {
-                if let Some(fresh_url) = try_heal_station(&db, &client, &station).await {
+                if let Some(playable_url) = probe_station_stream(&client, &play_url).await {
+                    if playable_url != station.url {
+                        let _ = queries::update_station_url(&db, &station.id, &playable_url);
+                    }
+                    play_url = playable_url;
+                } else if let Some(fresh_url) = try_heal_station(&db, &client, &station).await {
                     play_url = fresh_url;
                 }
             }
@@ -640,7 +687,7 @@ pub async fn play_station(
 }
 
 #[tauri::command]
-pub fn play_station_search_result(
+pub async fn play_station_search_result(
     db: State<'_, DbPool>,
     engine: State<'_, Arc<AudioEngine>>,
     name: String,
@@ -654,6 +701,17 @@ pub fn play_station_search_result(
     bitrate: Option<i32>,
     stationuuid: String,
 ) -> Result<(), String> {
+    // Unwrap playlist URLs before saving/playing — the engine decodes raw
+    // audio only.
+    let mut url = url;
+    if url_looks_like_playlist(&url) {
+        if let Ok(client) = build_station_health_client() {
+            if let Some(playable_url) = probe_station_stream(&client, &url).await {
+                url = playable_url;
+            }
+        }
+    }
+
     let now = queries::now();
     let station = upsert_station(
         &db,
