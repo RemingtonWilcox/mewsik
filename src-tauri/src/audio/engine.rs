@@ -895,6 +895,7 @@ impl AudioEngine {
                     let station_id_clone = station_id.clone();
                     let name_clone = name.clone();
                     let favicon_clone = favicon.clone();
+                    let db_clone = db.clone();
 
                     // Update state immediately to show "loading"
                     {
@@ -939,6 +940,12 @@ impl AudioEngine {
                                     ));
                                 }
                                 Err(err) => {
+                                    // Mark the station as failing so the next play
+                                    // attempt re-resolves its URL (self-heal).
+                                    let _ = db::queries::increment_station_fail_count(
+                                        &db_clone,
+                                        &station_id_clone,
+                                    );
                                     if playback_session_ref.load(Ordering::SeqCst) != session_id {
                                         return;
                                     }

@@ -12,6 +12,8 @@ use tokio::task::JoinSet;
 pub struct RadioBrowserStation {
     pub name: String,
     pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_resolved: Option<String>,
     pub homepage: Option<String>,
     pub favicon: Option<String>,
     pub country: Option<String>,
@@ -254,6 +256,55 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> bo
     false
 }
 
+#[derive(Debug, Deserialize)]
+struct RadioBrowserUuidStation {
+    url: Option<String>,
+    url_resolved: Option<String>,
+}
+
+/// Look up a station's *current* stream URL from radio-browser by its
+/// permanent UUID. Stream hosts rotate; the UUID is stable.
+async fn resolve_station_url_by_uuid(client: &reqwest::Client, uuid: &str) -> Option<String> {
+    let url = format!(
+        "https://de1.api.radio-browser.info/json/stations/byuuid/{}",
+        urlencoding::encode(uuid)
+    );
+    let response = client.get(&url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let stations: Vec<RadioBrowserUuidStation> = response.json().await.ok()?;
+    let station = stations.into_iter().next()?;
+    let pick = |value: Option<String>| {
+        value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    pick(station.url_resolved).or_else(|| pick(station.url))
+}
+
+/// Self-heal a station whose saved URL stopped working: re-resolve the
+/// current URL by UUID, probe it, and persist it if it actually streams.
+/// Returns the fresh URL on success.
+async fn try_heal_station(
+    db: &DbPool,
+    client: &reqwest::Client,
+    station: &Station,
+) -> Option<String> {
+    let uuid = station.radio_browser_id.as_deref()?;
+    let fresh_url = resolve_station_url_by_uuid(client, uuid).await?;
+    if fresh_url == station.url || !probe_station_stream(client, &fresh_url).await {
+        return None;
+    }
+    queries::update_station_url(db, &station.id, &fresh_url).ok()?;
+    let _ = queries::update_station_health(db, &station.id, 0, &queries::now());
+    log::info!(
+        "Healed station '{}': stale URL replaced via radio-browser uuid",
+        station.name
+    );
+    Some(fresh_url)
+}
+
 fn build_station_health_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(STATION_PROBE_TIMEOUT)
@@ -347,9 +398,18 @@ async fn verify_favorite_stations_inner(db: &DbPool) -> Result<Vec<StationHealth
     let mut results = Vec::with_capacity(stations.len());
     for station in stations {
         let checked_at = queries::now();
-        let (url, is_healthy) = health_by_station_id
+        let (mut url, mut is_healthy) = health_by_station_id
             .remove(&station.id)
             .unwrap_or((station.url.clone(), false));
+
+        // Saved stream URLs go stale (hosts/tokens rotate). Before declaring
+        // a station unhealthy, try re-resolving its current URL by UUID.
+        if !is_healthy {
+            if let Some(fresh_url) = try_heal_station(db, &client, &station).await {
+                url = fresh_url;
+                is_healthy = true;
+            }
+        }
 
         let next_fail_count = if is_healthy {
             0
@@ -466,10 +526,21 @@ async fn search_radio_stations_with_mode(
         .await
         .map_err(|e| format!("Radio browser request failed: {}", e))?;
 
-    let stations: Vec<RadioBrowserStation> = resp
+    let mut stations: Vec<RadioBrowserStation> = resp
         .json()
         .await
         .map_err(|e| format!("Failed to parse radio stations: {}", e))?;
+
+    // Prefer the resolved direct stream URL over playlist redirects —
+    // playlist URLs go stale far more often.
+    for station in &mut stations {
+        if let Some(resolved) = station.url_resolved.take() {
+            let trimmed = resolved.trim();
+            if !trimmed.is_empty() {
+                station.url = trimmed.to_string();
+            }
+        }
+    }
 
     Ok(stations)
 }
@@ -537,7 +608,7 @@ pub fn toggle_station_favorite(db: State<'_, DbPool>, station_id: String) -> Res
 }
 
 #[tauri::command]
-pub fn play_station(
+pub async fn play_station(
     db: State<'_, DbPool>,
     engine: State<'_, Arc<AudioEngine>>,
     station_id: String,
@@ -545,8 +616,26 @@ pub fn play_station(
     name: String,
     favicon: Option<String>,
 ) -> Result<(), String> {
+    let db = db.inner().clone();
+    let mut play_url = url;
+
+    if let Ok(Some(station)) = queries::get_station_by_id(&db, &station_id) {
+        // DB may hold a fresher URL than the frontend's cached copy
+        // (e.g. healed by the launch-time health check).
+        play_url = station.url.clone();
+
+        // Known-failing station: re-resolve its current URL before playing.
+        if station.fail_count > 0 && station.radio_browser_id.is_some() {
+            if let Ok(client) = build_station_health_client() {
+                if let Some(fresh_url) = try_heal_station(&db, &client, &station).await {
+                    play_url = fresh_url;
+                }
+            }
+        }
+    }
+
     let _ = queries::update_station_last_played(&db, &station_id, &queries::now());
-    engine.send(AudioCommand::PlayUrl(station_id, url, name, favicon));
+    engine.send(AudioCommand::PlayUrl(station_id, play_url, name, favicon));
     Ok(())
 }
 

@@ -1172,6 +1172,47 @@ pub fn update_station_last_played(
     Ok(())
 }
 
+pub fn get_station_by_id(
+    db: &DbPool,
+    station_id: &str,
+) -> Result<Option<Station>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, name, url, homepage, favicon_url, favicon_path, country, language, tags, codec, bitrate, radio_browser_id, is_favorite, fail_count, last_played_at, last_checked_at, created_at
+         FROM stations WHERE id = ?1"
+    )?;
+    let mut rows = stmt.query_map(params![station_id], station_from_row)?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
+pub fn update_station_url(
+    db: &DbPool,
+    station_id: &str,
+    url: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE stations SET url = ?1 WHERE id = ?2",
+        params![url, station_id],
+    )?;
+    Ok(())
+}
+
+pub fn increment_station_fail_count(
+    db: &DbPool,
+    station_id: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE stations SET fail_count = fail_count + 1 WHERE id = ?1",
+        params![station_id],
+    )?;
+    Ok(())
+}
+
 pub fn update_station_health(
     db: &DbPool,
     station_id: &str,
