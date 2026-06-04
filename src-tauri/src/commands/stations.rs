@@ -14,6 +14,8 @@ pub struct RadioBrowserStation {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url_resolved: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hls: Option<i32>,
     pub homepage: Option<String>,
     pub favicon: Option<String>,
     pub country: Option<String>,
@@ -41,6 +43,33 @@ pub struct StationVerifyTarget {
 const STATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const STATION_PROBE_BYTES: usize = 8 * 1024;
 const STATION_PLAYLIST_DEPTH: usize = 2;
+const STATION_RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Public radio-browser mirrors, tried in order. The directory is a
+/// volunteer-run cluster; any single server can be down.
+const RADIO_BROWSER_SERVERS: [&str; 3] = [
+    "https://de1.api.radio-browser.info",
+    "https://de2.api.radio-browser.info",
+    "https://fi1.api.radio-browser.info",
+];
+
+/// GET from the radio-browser directory with mirror failover.
+async fn radio_browser_get(
+    client: &reqwest::Client,
+    path_and_query: &str,
+) -> Option<reqwest::Response> {
+    for server in RADIO_BROWSER_SERVERS {
+        match client
+            .get(format!("{}{}", server, path_and_query))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Some(response),
+            _ => continue,
+        }
+    }
+    None
+}
 
 fn station_health_status(fail_count: i32) -> &'static str {
     match fail_count {
@@ -108,6 +137,13 @@ fn bytes_look_like_html(bytes: &[u8]) -> bool {
         || lowercase.contains("<html")
         || lowercase.contains("<body")
         || lowercase.contains("<script")
+}
+
+fn bytes_look_like_hls(bytes: &[u8]) -> bool {
+    let text = bytes_to_text(bytes);
+    text.contains("#EXT-X-STREAM-INF")
+        || text.contains("#EXT-X-TARGETDURATION")
+        || text.contains("#EXT-X-MEDIA")
 }
 
 fn bytes_look_like_playlist(bytes: &[u8]) -> bool {
@@ -244,6 +280,11 @@ async fn probe_station_stream(client: &reqwest::Client, initial_url: &str) -> Op
         }
 
         if is_playlist_content_type(&content_type) || bytes_look_like_playlist(&bytes) {
+            // HLS segment playlists are not decodable by the engine — a
+            // station that resolves into HLS must never be marked healthy.
+            if bytes_look_like_hls(&bytes) {
+                return None;
+            }
             if let Some(next_url) = resolve_playlist_target(&bytes, &final_url) {
                 current_url = next_url;
                 continue;
@@ -280,16 +321,10 @@ struct RadioBrowserUuidStation {
 /// candidates in preference order: url_resolved (direct stream) first,
 /// then url (may be a playlist — the probe unwraps it).
 async fn resolve_station_urls_by_uuid(client: &reqwest::Client, uuid: &str) -> Vec<String> {
-    let url = format!(
-        "https://de1.api.radio-browser.info/json/stations/byuuid/{}",
-        urlencoding::encode(uuid)
-    );
-    let Ok(response) = client.get(&url).send().await else {
+    let url = format!("/json/stations/byuuid/{}", urlencoding::encode(uuid));
+    let Some(response) = radio_browser_get(client, &url).await else {
         return Vec::new();
     };
-    if !response.status().is_success() {
-        return Vec::new();
-    }
     let Ok(stations) = response.json::<Vec<RadioBrowserUuidStation>>().await else {
         return Vec::new();
     };
@@ -474,8 +509,11 @@ async fn verify_favorite_stations_inner(db: &DbPool) -> Result<Vec<StationHealth
 
 pub(crate) fn spawn_favorite_station_health_check(db: DbPool) {
     tauri::async_runtime::spawn(async move {
-        if let Err(err) = verify_favorite_stations_inner(&db).await {
-            log::warn!("Favorite station health check failed: {}", err);
+        loop {
+            if let Err(err) = verify_favorite_stations_inner(&db).await {
+                log::warn!("Favorite station health check failed: {}", err);
+            }
+            tokio::time::sleep(STATION_RECHECK_INTERVAL).await;
         }
     });
 }
@@ -557,20 +595,27 @@ async fn search_radio_stations_with_mode(
         Some("tag") => "bytag",
         _ => "byname",
     };
-    let url = format!(
-        "https://de1.api.radio-browser.info/json/stations/{}/{}?limit=50&order=clickcount&reverse=true",
+    // hidebroken: the directory continuously checks its stations — skip
+    // ones its own monitoring already knows are dead.
+    let path = format!(
+        "/json/stations/{}/{}?limit=100&order=clickcount&reverse=true&hidebroken=true",
         endpoint,
         urlencoding::encode(&query)
     );
 
-    let resp = reqwest::get(&url)
+    let client = build_station_health_client()?;
+    let resp = radio_browser_get(&client, &path)
         .await
-        .map_err(|e| format!("Radio browser request failed: {}", e))?;
+        .ok_or_else(|| "All radio directory servers are unreachable".to_string())?;
 
     let mut stations: Vec<RadioBrowserStation> = resp
         .json()
         .await
         .map_err(|e| format!("Failed to parse radio stations: {}", e))?;
+
+    // The audio engine cannot play HLS — don't offer stations that can
+    // never work.
+    stations.retain(|station| station.hls.unwrap_or(0) == 0);
 
     // Prefer the resolved direct stream URL over playlist redirects —
     // playlist URLs go stale far more often.
@@ -664,6 +709,18 @@ pub async fn play_station(
         // DB may hold a fresher URL than the frontend's cached copy
         // (e.g. healed by the launch-time health check).
         play_url = station.url.clone();
+
+        // Report the click to the directory (fire-and-forget). This keeps
+        // radio-browser's popularity/liveness data fresh — required API
+        // etiquette for apps that play directory stations.
+        if let Some(uuid) = station.radio_browser_id.clone() {
+            tauri::async_runtime::spawn(async move {
+                if let Ok(client) = build_station_health_client() {
+                    let path = format!("/json/url/{}", urlencoding::encode(&uuid));
+                    let _ = radio_browser_get(&client, &path).await;
+                }
+            });
+        }
 
         // The engine can only decode raw audio: unwrap playlist URLs to the
         // direct stream first. Also re-resolve known-failing stations.
