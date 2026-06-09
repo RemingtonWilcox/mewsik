@@ -155,7 +155,7 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
     let mut output = r2c.make_output_vec();
     let mut ring = vec![0.0f32; FFT_SIZE];
     let mut ring_head: usize = 0;
-    let mut sr: u32 = 44100;
+    let mut sr: u32;
     let mut last_emit = Instant::now();
     let emit_interval = Duration::from_millis(1000 / EMIT_HZ);
     let mut prev_energy: f32 = 0.0;
