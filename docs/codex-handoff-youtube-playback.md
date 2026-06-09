@@ -1,5 +1,11 @@
 # Codex Handoff: Fix YouTube Audio Playback
 
+> **RESOLVED (2026-06-09).** The fix landed as proposed in option 2 below: the engine
+> now prefers a full-fetch path for MP4/M4A/YouTube sources
+> (`should_prefer_full_fetch`, `src-tauri/src/audio/engine.rs:139`) and falls back
+> from ffmpeg streaming to full fetch on setup failure (`engine.rs:432`).
+> Kept for historical context only.
+
 ## Problem
 
 YouTube stream URL resolution now works (via youtubei.js IOS client), but audio doesn't actually play. The player UI briefly shows the track title, artist, album art, and scrubber, then it all disappears — indicating the audio engine fails to decode/play the stream.
