@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004];
 
 const MIGRATION_001: &str = r#"
 -- Canonical library entries (one per song)
@@ -211,6 +211,17 @@ const MIGRATION_003: &str = r#"
 ALTER TABLE stations ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE stations ADD COLUMN last_checked_at TEXT;
 CREATE INDEX IF NOT EXISTS idx_stations_favorite_health ON stations(is_favorite, fail_count);
+"#;
+
+const MIGRATION_004: &str = r#"
+-- Per-track visual score cache (offline analysis: beat grid, sections,
+-- key, energy arc). version invalidates rows when algorithms change.
+CREATE TABLE IF NOT EXISTS track_analysis (
+    recording_id TEXT PRIMARY KEY REFERENCES recordings(id) ON DELETE CASCADE,
+    version      INTEGER NOT NULL,
+    score_json   TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
 "#;
 
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {

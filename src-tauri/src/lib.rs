@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod analysis;
 mod audio;
 mod commands;
 mod config;
@@ -141,6 +142,9 @@ pub fn run() {
             commands::downloads::cancel_download,
             commands::downloads::delete_download,
             commands::downloads::reveal_download_path,
+            // Visual score (track analysis)
+            commands::analysis::get_track_analysis,
+            commands::analysis::request_track_analysis,
             // Stations
             commands::stations::search_radio_stations,
             commands::stations::search_radio_stations_advanced,
