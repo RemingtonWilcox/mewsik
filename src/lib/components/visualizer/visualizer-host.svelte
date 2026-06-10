@@ -59,12 +59,43 @@
 	});
 </script>
 
-{#if vis.engine === 'runtime'}
-	<VisualizerRuntime />
-{:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk1'}
-	<VisualizerMk1 />
-{:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk2'}
-	<VisualizerMk2 />
-{:else}
-	<VisualizerMk3 />
+<!-- Escape must ALWAYS exit, regardless of which engine renders or where
+     keyboard focus sits. The per-engine overlays also handle click/Esc, but
+     their handlers only fire when the overlay itself has focus — which it
+     never does after toggling via the player-bar button. -->
+<svelte:window
+	onkeydown={(e) => {
+		if (vis.active && e.key === 'Escape') {
+			e.preventDefault();
+			vis.toggle();
+		}
+	}}
+/>
+
+{#if vis.active}
+	{#if vis.engine === 'runtime'}
+		<!-- The runtime component fills its parent and has no exit affordance of
+		     its own, so the host provides the fullscreen layer + click-to-exit. -->
+		<div
+			class="fixed inset-0 z-[100] bg-black"
+			role="button"
+			aria-label="Close visualizer"
+			tabindex="0"
+			onclick={() => vis.toggle()}
+			onkeydown={(e) => {
+				if (e.key === 'Escape') vis.toggle();
+			}}
+		>
+			<VisualizerRuntime showHud={false} />
+			<div class="pointer-events-none absolute right-6 top-6 text-xs text-white/40">
+				click anywhere or press esc to exit
+			</div>
+		</div>
+	{:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk1'}
+		<VisualizerMk1 showHud={true} />
+	{:else if (vis.engine === 'auto' ? autoEngine : vis.engine) === 'mk2'}
+		<VisualizerMk2 showHud={true} />
+	{:else}
+		<VisualizerMk3 showHud={true} />
+	{/if}
 {/if}

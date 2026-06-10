@@ -37,6 +37,34 @@
 		return () => window.removeEventListener('toggle-playback', handler);
 	});
 
+	// While the visualizer overlay is up, the bar floats above it (z-110 > the
+	// overlay's z-100) so volume/track/station control stays reachable. It
+	// fades out after a few idle seconds and any mouse movement brings it back.
+	let vizBarVisible = $state(true);
+	let vizHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function wakeVizBar() {
+		vizBarVisible = true;
+		if (vizHideTimer) clearTimeout(vizHideTimer);
+		vizHideTimer = setTimeout(() => {
+			vizBarVisible = false;
+		}, 3000);
+	}
+
+	$effect(() => {
+		if (!visualizer.active) {
+			if (vizHideTimer) clearTimeout(vizHideTimer);
+			vizBarVisible = true;
+			return;
+		}
+		wakeVizBar();
+		window.addEventListener('pointermove', wakeVizBar);
+		return () => {
+			window.removeEventListener('pointermove', wakeVizBar);
+			if (vizHideTimer) clearTimeout(vizHideTimer);
+		};
+	});
+
 	let showQueue = $state(false);
 	let prevVolume = $state(1);
 	let waveform = $state<PlaybackWaveform | null>(null);
@@ -122,7 +150,13 @@
 </script>
 
 <div
-	class="fixed inset-x-0 bottom-0 z-50 grid h-[88px] grid-cols-[1fr_auto_1fr] items-center gap-4 border-t border-border bg-[oklch(0.18_0.005_285/0.97)] px-5 shadow-[0_-4px_24px_rgba(0,0,0,0.3)] backdrop-blur-sm"
+	class={`fixed inset-x-0 bottom-0 grid h-[88px] grid-cols-[1fr_auto_1fr] items-center gap-4 border-t border-border bg-[oklch(0.18_0.005_285/0.97)] px-5 shadow-[0_-4px_24px_rgba(0,0,0,0.3)] backdrop-blur-sm transition-opacity duration-500 ${
+		visualizer.active
+			? vizBarVisible
+				? 'z-[110] opacity-100'
+				: 'pointer-events-none z-[110] opacity-0'
+			: 'z-50 opacity-100'
+	}`}
 >
 	<!-- Left: track info -->
 	<div class="flex min-w-0 flex-1 items-center gap-3">
@@ -260,7 +294,17 @@
 		>
 			<Sparkles class="size-4" />
 		</Button>
-		<Button variant="ghost" size="icon" class="size-8" onclick={() => (showQueue = true)}>
+		<Button
+			variant="ghost"
+			size="icon"
+			class="size-8"
+			onclick={() => {
+				// The queue sheet portals below the visualizer overlay — leave the
+				// visualizer first so the sheet is actually visible.
+				if (visualizer.active) visualizer.toggle();
+				showQueue = true;
+			}}
+		>
 			<ListMusic class="size-4" />
 		</Button>
 	</div>
