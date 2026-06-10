@@ -4,7 +4,11 @@
 	import VisualizerMk2 from './visualizer-mk2.svelte';
 	import VisualizerMk3 from './visualizer-mk3.svelte';
 	import VisualizerRuntime from './visualizer-runtime.svelte';
-	import { useVisualizer, type RenderVisualizerEngine } from '$lib/state/visualizer.svelte';
+	import {
+		useVisualizer,
+		VISUALIZER_ENGINES,
+		type RenderVisualizerEngine
+	} from '$lib/state/visualizer.svelte';
 	import { createVisualDirector } from '$lib/visualizer/visual-director';
 
 	const vis = useVisualizer();
@@ -12,6 +16,20 @@
 	let autoEngine = $state<RenderVisualizerEngine>('mk2');
 	let raf = 0;
 	let lastSwitchAt = 0;
+
+	// Transient on-screen label when the user cycles engines with the V key.
+	let engineFlash = $state('');
+	let engineFlashTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function cycleEngine(dirn: 1 | -1) {
+		const order = VISUALIZER_ENGINES;
+		const idx = order.indexOf(vis.engine);
+		const next = order[(idx + dirn + order.length) % order.length];
+		vis.setEngine(next);
+		engineFlash = next === 'auto' ? 'auto (director picks)' : next;
+		if (engineFlashTimer) clearTimeout(engineFlashTimer);
+		engineFlashTimer = setTimeout(() => (engineFlash = ''), 1800);
+	}
 
 	// Swapping engines tears down and reinits a full WebGPU pipeline (mk2 alone
 	// is a multi-thousand-line shader compile), and the raw energy/motion
@@ -65,14 +83,35 @@
      never does after toggling via the player-bar button. -->
 <svelte:window
 	onkeydown={(e) => {
-		if (vis.active && e.key === 'Escape') {
+		if (!vis.active) return;
+		if (e.key === 'Escape') {
 			e.preventDefault();
 			vis.toggle();
+			return;
+		}
+		const target = e.target as HTMLElement;
+		const isInput =
+			target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
+		if (isInput) return;
+		// V / Shift+V cycles engines: auto → mk1 → mk2 → mk3 → runtime.
+		if (e.key === 'v' || e.key === 'V') {
+			e.preventDefault();
+			cycleEngine(e.shiftKey ? -1 : 1);
 		}
 	}}
 />
 
 {#if vis.active}
+	{#if engineFlash}
+		<div
+			class="pointer-events-none fixed left-1/2 top-8 z-[106] -translate-x-1/2 rounded border border-white/20 bg-black/60 px-3 py-1.5 font-mono text-sm tracking-wide text-white/90"
+		>
+			engine: {engineFlash}
+		</div>
+	{/if}
+	<div class="pointer-events-none fixed bottom-24 right-6 z-[106] font-mono text-[11px] text-white/35">
+		esc exit · v next engine
+	</div>
 	{#if vis.engine === 'runtime'}
 		<!-- The runtime component fills its parent and has no exit affordance of
 		     its own, so the host provides the fullscreen layer + click-to-exit. -->
