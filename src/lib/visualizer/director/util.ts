@@ -125,3 +125,14 @@ export function hsvToRgb(h: number, s: number, v: number): [number, number, numb
 			return [v, p, q];
 	}
 }
+
+/** Deterministic string → [0,1) hash (FNV-1a). Used to derive per-track
+ * visual identity seeds: the same track always grows the same world. */
+export function stringHash01(s: string): number {
+	let h = 2166136261;
+	for (let i = 0; i < s.length; i++) {
+		h ^= s.charCodeAt(i);
+		h = Math.imul(h, 16777619);
+	}
+	return (h >>> 0) / 4294967296;
+}

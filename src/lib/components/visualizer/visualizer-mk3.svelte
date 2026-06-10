@@ -27,9 +27,12 @@
 
 	import { onMount, onDestroy } from 'svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
+	import { usePlayer } from '$lib/state/player.svelte';
 	import { createVisualDirector } from '$lib/visualizer/visual-director';
+	import { stringHash01 } from '$lib/visualizer/director/util';
 
 	const vis = useVisualizer();
+	const player = usePlayer();
 	const director = createVisualDirector();
 	let { showHud = false } = $props<{ showHud?: boolean }>();
 
@@ -38,6 +41,26 @@
 	let raf = 0;
 	let unsub: (() => void) | null = null;
 	let running = false;
+
+	// Per-TRACK identity seed: same song → same field character (curl-noise
+	// scale, hue offset); different song → different world.
+	let mk3TrackSeed = Math.random();
+	let mk3TrackKey: string | null = null;
+	// Drop burst envelope — spikes to 1 when a drop section lands, decays over
+	// ~1.5s. Drives a radial impulse + spawn bloom + point-size pop so the
+	// field visibly DETONATES on the drop instead of merely getting denser.
+	let dropBurst = 0;
+	let lastSectionMk3 = '';
+
+	$effect(() => {
+		const key = player.state.current_recording_id ?? player.state.current_source_url;
+		if (key === mk3TrackKey) return;
+		mk3TrackKey = key;
+		if (!key) return;
+		mk3TrackSeed = stringHash01(key);
+		dropBurst = 0;
+		lastSectionMk3 = '';
+	});
 
 	// Particle count — start at 100K for safety on integrated GPUs, can crank
 	// later. Each particle is 32 bytes (pos vec3 + life + vel vec3 + seed).
@@ -1169,6 +1192,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const antic3 = directed.drop?.anticipation ?? 0;
 		const postDrop3 = directed.drop?.postDropDecay ?? 0;
 		const downbeatKick = directed.clock?.downbeatFlag ? 0.35 : 0;
+
+		// Drop detonation: section entry into 'drop' (beat-exact with the
+		// visual score) spikes the burst envelope; chorus entry gets a softer
+		// pop. Decays over ~1.5s at 60fps.
+		const sec3 = directed.section;
+		if (sec3 !== lastSectionMk3) {
+			if (sec3 === 'drop') {
+				dropBurst = 1;
+				smoothed.flash = Math.min(1, smoothed.flash + 0.8);
+			} else if (sec3 === 'chorus') {
+				dropBurst = Math.max(dropBurst, 0.55);
+			}
+			lastSectionMk3 = sec3;
+		}
+		dropBurst *= 0.972;
+
 		flowStrength *= 0.72 + directed.motion * 0.42 + antic3 * 0.55 + postDrop3 * 0.30 + downbeatKick;
 		pointSizeState *= 0.82 + directed.density * 0.24 + postDrop3 * 0.18;
 
@@ -1238,16 +1277,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		sp[3] = smoothed.mid * (isSilent ? 0 : 1);
 		sp[4] = smoothed.treble * (isSilent ? 0 : 1);
 		sp[5] = smoothed.rmsSlow;
-		sp[6] = 0.35; // flow scale
+		// Per-track curl field character: same song = same flow texture.
+		sp[6] = 0.28 + mk3TrackSeed * 0.2; // flow scale
 		sp[7] = flowStrength * 0.82 + smoothed.bass * 0.18 + directed.motion * 0.14 + directed.bassPunch * 0.20;
 		sp[8] = dampingState;
 		sp[9] = 2.35 - directed.structure * 0.35 + antic3 * 0.45; // radial pull (lateral) — anticipation expands the field
 		sp[10] = swirlStrength + smoothed.mid * 0.14 + downbeatKick * 0.40;
-		sp[11] = radialForce + smoothed.bass * 0.16 + postDrop3 * 0.55; // drop releases a radial impulse
+		// Drop detonation rides the radial impulse hard for ~1.5s.
+		sp[11] = radialForce + smoothed.bass * 0.16 + postDrop3 * 0.55 + dropBurst * 1.3;
 		sp[12] = camZ; // recycle threshold reference
 		sp[13] = 6.0; // tailDist — recycle particles >6 units behind camera
 		sp[14] = 22.0; // headDist — new particles spawn within 22 units ahead
-		sp[15] = 1.15 + directed.density * 0.85 + postDrop3 * 0.50; // spawnSpread — drop blooms the field
+		sp[15] = 1.15 + directed.density * 0.85 + postDrop3 * 0.50 + dropBurst * 1.2; // spawnSpread — drop blooms the field
 		sp[16] = topology;
 		sp[17] = chromaKey;
 		sp[18] = phrase;
@@ -1260,12 +1301,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		vp[16] = camRight[0];
 		vp[17] = camRight[1];
 		vp[18] = camRight[2];
-		vp[19] = pointSizeState + smoothed.treble * 0.0035; // pointSize
+		// +25% base size addresses the near-black field from the visual audit;
+		// the drop burst pops sprites a further ~30% for the detonation frame.
+		vp[19] = pointSizeState * 1.25 + smoothed.treble * 0.0035 + dropBurst * 0.004;
 		vp[20] = camUp[0];
 		vp[21] = camUp[1];
 		vp[22] = camUp[2];
 		// Palette anchored to state archetype; audio nudges it within the zone.
-		vp[23] = palOffsetState + (smoothed.centroidSlow - 0.5) * 0.05;
+		vp[23] = palOffsetState + (smoothed.centroidSlow - 0.5) * 0.05 + mk3TrackSeed * 0.31;
 		vp[24] = smoothed.bass;
 		vp[25] = smoothed.mid;
 		vp[26] = smoothed.treble;
@@ -1292,7 +1335,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		sp2[1] = h;
 		sp2[2] = time;
 		// Slightly offset palette so sky sits in a complementary zone to particles.
-		sp2[3] = palOffsetState + (smoothed.centroidSlow - 0.5) * 0.05 + 0.15;
+		sp2[3] = palOffsetState + (smoothed.centroidSlow - 0.5) * 0.05 + mk3TrackSeed * 0.31 + 0.15;
 		sp2[4] = smoothed.rmsSlow;
 		sp2[5] = smoothed.bass * (isSilent ? 0 : 1);
 		sp2[6] = cloudPhase;
