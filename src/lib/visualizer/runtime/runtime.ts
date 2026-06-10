@@ -474,7 +474,11 @@ export class VisualizerRuntime {
 
 	update(frame: VisualDirectorFrame, time: number): void {
 		if (!this.device || !this.uniformBuf || !this.context_) return;
-		const dt = Math.max(0, time - this.lastTime);
+		// Clamp dt at the source: rAF pauses while backgrounded, so the first
+		// frame back (and the very first frame, lastTime=0) can be seconds long.
+		// flowfield/feedback re-clamp in-shader, but new motifs shouldn't have
+		// to remember to. mk3 does the same (Math.min(0.05, ...)).
+		const dt = Math.min(1 / 30, Math.max(0, time - this.lastTime));
 		this.lastTime = time;
 
 		// Two-rail weight LERP — fast attack so kicks/drops can promote a motif

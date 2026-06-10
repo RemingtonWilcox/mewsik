@@ -11,9 +11,16 @@
 	const director = createVisualDirector();
 	let autoEngine = $state<RenderVisualizerEngine>('mk2');
 	let raf = 0;
+	let lastSwitchAt = 0;
 
-	function pickAutoEngine(): RenderVisualizerEngine {
-		const frame = director.update(vis.latest, performance.now() / 1000);
+	// Swapping engines tears down and reinits a full WebGPU pipeline (mk2 alone
+	// is a multi-thousand-line shader compile), and the raw energy/motion
+	// thresholds below have no hysteresis — without a residency floor the pick
+	// can flap across a threshold frame-to-frame and thrash GPU init.
+	const MIN_ENGINE_RESIDENCY_S = 6;
+
+	function pickAutoEngine(now: number): RenderVisualizerEngine {
+		const frame = director.update(vis.latest, now);
 		if (frame.silence) return 'mk1';
 		// Drop / chorus / explicit peak → mk3 particle field (the loudest motif).
 		if (frame.section === 'drop' || frame.section === 'chorus' || frame.energy > 0.76)
@@ -32,7 +39,14 @@
 	}
 
 	function loop() {
-		if (vis.engine === 'auto') autoEngine = pickAutoEngine();
+		if (vis.engine === 'auto') {
+			const now = performance.now() / 1000;
+			const pick = pickAutoEngine(now);
+			if (pick !== autoEngine && now - lastSwitchAt >= MIN_ENGINE_RESIDENCY_S) {
+				autoEngine = pick;
+				lastSwitchAt = now;
+			}
+		}
 		raf = requestAnimationFrame(loop);
 	}
 
