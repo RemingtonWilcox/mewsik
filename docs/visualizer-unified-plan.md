@@ -65,6 +65,23 @@ energy accumulation = blown white cores + fog wash. Production fix (Jimenez SIGG
 4. Budget pre-bloom energy: per-motif luminance caps / exposure control so additive sums
    stay inside tonemap headroom.
 
+## Taste calibration (2026-06-10, after live A/B in the app)
+
+Remington's verdict cycling all engines on real use: **mk1 is the only good one** —
+mk2/mk3 "right idea, horribly executed", runtime "especially weird, needs full
+redesign". Read carefully: mk1 is nominally the anti-target shape (centered, radial),
+yet it wins because each preset is a *finished authored composition* — coherent motion
+language, confident post-stack, legible beat response. The emergent systems lose not on
+concept but on craft.
+
+Consequences for Phase 3:
+- Do NOT iterate the current runtime toward the goal. Design the unified scene from a
+  blank slate at mk1's finish level; motif systems are ingredients inside authored
+  compositions, not co-equal additive layers.
+- mk1's post-stack and reactivity language is the proven foundation — carry it over.
+- The acceptance bar for any unified-scene milestone is "as finished as mk1", judged in
+  the app on real music, not "better than the previous runtime".
+
 ## Phases
 
 1. **Energy budget** — items above. Small diff, fixes both stated output defects. Do first.
