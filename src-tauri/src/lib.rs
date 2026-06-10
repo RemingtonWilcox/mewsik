@@ -10,6 +10,7 @@ mod external_tools;
 mod keychain;
 mod metadata;
 mod sources;
+mod stations;
 
 use audio::AudioEngine;
 use commands::external_search::ExternalSearchRuntime;
@@ -61,7 +62,7 @@ pub fn run() {
                         .build(),
                 )?;
             }
-            commands::stations::spawn_favorite_station_health_check(startup_db.clone());
+            stations::health::spawn_favorite_station_health_check(startup_db.clone());
             engine_for_setup.set_app_handle(app.handle().clone());
             Ok(())
         })
