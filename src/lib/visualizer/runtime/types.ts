@@ -70,7 +70,6 @@ export type RuntimeControls = {
 	edge: number;
 	chromaticAberration: number;
 	grain: number;
-	bloomThreshold: number;
 	// Feedback bank (the "live together" lever) — every frame's scene HDR is
 	// copied to a ping-ponged texture, then the next frame samples it back with
 	// rotation + zoom warp + decay, blended underneath the motifs. Makes

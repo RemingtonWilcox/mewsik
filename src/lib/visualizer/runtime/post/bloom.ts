@@ -3,7 +3,9 @@
 // than UnrealBloomPass. Reference impl: LearnOpenGL Phys-Based Bloom guide.
 //
 // Pipeline (each pass is full-screen-triangle fragment shader):
-//   1. threshold + downsample scene HDR → mip[0] (half res, 13-tap kernel)
+//   1. Karis-weighted downsample scene HDR → mip[0] (half res, 13-tap,
+//      threshold-free per Jimenez — the composite lerps bloom at a small
+//      weight so thresholding is unnecessary and bands less)
 //   2. progressively downsample mip[i] → mip[i+1] (4 passes total)
 //   3. progressively upsample mip[N] → mip[N-1] with 9-tap tent,
 //      additively blended onto the destination (3 passes total)
@@ -28,6 +30,13 @@ struct VsOut {
 	@builtin(position) pos: vec4<f32>,
 	@location(0) uv: vec2<f32>,
 };
+
+// Karis average weight: 1/(1+luma). Down-weights ultra-bright single
+// samples so one firefly pixel can't dominate a whole bloom mip.
+fn karisWeight(c: vec3<f32>) -> f32 {
+	let luma = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+	return 1.0 / (1.0 + luma);
+}
 
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
@@ -72,9 +81,13 @@ fn fs_downsample(in: VsOut) -> @location(0) vec4<f32> {
 	return vec4<f32>(sum, 1.0);
 }
 
-// First downsample also applies a soft threshold so deep shadows don't bloom.
+// First downsample — threshold-free per Jimenez 2014 ("when using HDR you
+// don't need to threshold"); the composite lerps bloom in at a small weight
+// so only genuinely bright HDR pixels bloom noticeably. Karis-style luma
+// weighting suppresses fireflies (single ultra-bright particles flickering
+// the whole mip chain).
 @fragment
-fn fs_threshold_downsample(in: VsOut) -> @location(0) vec4<f32> {
+fn fs_karis_downsample(in: VsOut) -> @location(0) vec4<f32> {
 	let dims = vec2<f32>(textureDimensions(src));
 	let x = 1.0 / dims.x;
 	let y = 1.0 / dims.y;
@@ -94,19 +107,24 @@ fn fs_threshold_downsample(in: VsOut) -> @location(0) vec4<f32> {
 	let l = textureSample(src, samp, vec2<f32>(uv.x - x,       uv.y - y      )).rgb;
 	let m = textureSample(src, samp, vec2<f32>(uv.x + x,       uv.y - y      )).rgb;
 
-	var sum = e * 0.125;
-	sum = sum + (a + c + g + i) * 0.03125;
-	sum = sum + (b + d + f + h) * 0.0625;
-	sum = sum + (j + k + l + m) * 0.125;
+	let wa = karisWeight(a) * 0.03125;
+	let wb = karisWeight(b) * 0.0625;
+	let wc = karisWeight(c) * 0.03125;
+	let wd = karisWeight(d) * 0.0625;
+	let we = karisWeight(e) * 0.125;
+	let wf = karisWeight(f) * 0.0625;
+	let wg = karisWeight(g) * 0.03125;
+	let wh = karisWeight(h) * 0.0625;
+	let wi = karisWeight(i) * 0.03125;
+	let wj = karisWeight(j) * 0.125;
+	let wk = karisWeight(k) * 0.125;
+	let wl = karisWeight(l) * 0.125;
+	let wm = karisWeight(m) * 0.125;
 
-	// Soft knee threshold — only real HDR overshoot blooms strongly.
-	let brightness = max(max(sum.r, sum.g), sum.b);
-	let threshold = max(0.2, dir.fx.z);
-	let knee = 0.35;
-	let soft = max(brightness - threshold + knee, 0.0);
-	let softWeight = soft * soft / (4.0 * knee + 0.0001);
-	let contribution = max(brightness - threshold, softWeight) / max(brightness, 0.0001);
-	return vec4<f32>(sum * contribution, 1.0);
+	let sum = a * wa + b * wb + c * wc + d * wd + e * we + f * wf + g * wg
+		+ h * wh + i * wi + j * wj + k * wk + l * wl + m * wm;
+	let totalWeight = wa + wb + wc + wd + we + wf + wg + wh + wi + wj + wk + wl + wm;
+	return vec4<f32>(sum / max(totalWeight, 0.0001), 1.0);
 }
 
 // 9-tap tent upsample — additive blend handled by the pipeline.
@@ -208,7 +226,7 @@ export class BloomPass {
 				primitive: { topology: 'triangle-list' }
 			});
 
-		this.pipelineThreshold = makePipeline('fs_threshold_downsample');
+		this.pipelineThreshold = makePipeline('fs_karis_downsample');
 		this.pipelineDownsample = makePipeline('fs_downsample');
 		this.pipelineUpsample = makePipeline('fs_upsample', {
 			color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
