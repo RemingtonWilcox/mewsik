@@ -52,6 +52,21 @@
 		soundcloud: true,
 		bandcamp: true
 	});
+	let queueAppendGeneration = 0;
+	let activeQueueSelection:
+		| {
+			recordingId: string | null;
+				source: string;
+				title: string;
+				artist: string;
+				previous: {
+					recordingId: string | null;
+					source: string | null;
+					title: string | null;
+					artist: string | null;
+				};
+			  }
+		| null = null;
 
 	const MIN_QUERY_LENGTH = 2;
 	const EXTERNAL_SEARCH_DEBOUNCE_MS = 520;
@@ -89,6 +104,7 @@
 
 		return () => {
 			disposed = true;
+			invalidateQueueAppender();
 			for (const cleanup of cleanups) {
 				cleanup();
 			}
@@ -101,6 +117,31 @@
 	$effect(() => { searchState.query = query; });
 	$effect(() => { searchState.results = externalResults; });
 	$effect(() => { searchState.sourcePreference = sourcePreference; });
+	$effect(() => {
+		const selection = {
+			recordingId: player.state.current_recording_id,
+			source: player.state.source,
+			title: player.state.current_title,
+			artist: player.state.current_artist
+		};
+
+		if (!activeQueueSelection) return;
+
+		const isActiveSearchSelection = activeQueueSelection.recordingId !== null
+			? selection.recordingId === activeQueueSelection.recordingId
+			: selection.source === activeQueueSelection.source &&
+				selection.title === activeQueueSelection.title &&
+				selection.artist === activeQueueSelection.artist;
+		const isPreviousSelectionWhileResolving = activeQueueSelection.recordingId === null &&
+			selection.recordingId === activeQueueSelection.previous.recordingId &&
+			selection.source === activeQueueSelection.previous.source &&
+			selection.title === activeQueueSelection.previous.title &&
+			selection.artist === activeQueueSelection.previous.artist;
+
+		if (!isActiveSearchSelection && !isPreviousSelectionWhileResolving) {
+			invalidateQueueAppender();
+		}
+	});
 
 
 	function resetPaginationState() {
@@ -223,18 +264,20 @@
 	let pagedResults = $derived(displayedResults().slice((currentPage - 1) * RESULTS_PER_PAGE, currentPage * RESULTS_PER_PAGE));
 
 	function goToPage(page: number) {
-		currentPage = page;
+		const requestedPage = Number.isFinite(page) ? Math.trunc(page) : 1;
+		currentPage = Math.min(Math.max(1, requestedPage), totalPages);
 		// Scroll to top of results
 		document.querySelector('[data-slot="search-results"]')?.scrollIntoView({ behavior: 'smooth' });
 	}
 
-	async function loadMoreResults() {
+	async function loadMoreResults(): Promise<number | null> {
 		const searchQuery = query.trim();
-		if (loadingMore || !searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return;
+		if (loadingMore || !searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return null;
 
 		const sourcesToLoad = SEARCH_SOURCES.filter((source) => sourceHasMore[source]);
-		if (sourcesToLoad.length === 0) return;
+		if (sourcesToLoad.length === 0) return null;
 
+		const previousTotalPages = totalPages;
 		loadingMore = true;
 		try {
 			await ensureSidecarReady();
@@ -262,9 +305,14 @@
 
 			if (addedCount === 0) {
 				toast.info('No more results available');
+				return null;
 			}
+
+			const nextTotalPages = Math.max(1, Math.ceil(displayedResults().length / RESULTS_PER_PAGE));
+			return nextTotalPages > previousTotalPages ? previousTotalPages + 1 : null;
 		} catch (error) {
 			toast.error(`Failed to load more: ${error}`);
+			return null;
 		} finally {
 			loadingMore = false;
 		}
@@ -289,9 +337,23 @@
 	}
 
 	async function playExternalTrack(result: ExternalSearchResult) {
+		const generation = invalidateQueueAppender();
+		activeQueueSelection = {
+			recordingId: null,
+			source: result.source,
+			title: result.title,
+			artist: result.artist,
+			previous: {
+				recordingId: player.state.current_recording_id,
+				source: player.state.source,
+				title: player.state.current_title,
+				artist: player.state.current_artist
+			}
+		};
+
 		await runExternalAction(result, 'play', async () => {
 			// Play the clicked track immediately
-			await api.playExternal(
+			const recordingId = await api.playExternal(
 				result.source,
 				result.source_id,
 				result.title,
@@ -299,6 +361,8 @@
 				result.duration_ms ?? undefined,
 				result.cover_art_url ?? undefined
 			);
+			if (generation !== queueAppendGeneration) return;
+			if (activeQueueSelection) activeQueueSelection.recordingId = recordingId;
 			toast.success(`Playing: ${result.title}`);
 
 			// Queue the rest of the visible page in the background
@@ -307,13 +371,19 @@
 			const tracksAfter = currentResults.slice(clickedIndex + 1);
 			if (tracksAfter.length > 0) {
 				// Fire and forget — don't block playback
-				void queueRemainingTracks(tracksAfter);
+				void queueRemainingTracks(tracksAfter, generation);
 			}
 		});
 	}
 
-	async function queueRemainingTracks(tracks: ExternalSearchResult[]) {
+	function invalidateQueueAppender(): number {
+		activeQueueSelection = null;
+		return ++queueAppendGeneration;
+	}
+
+	async function queueRemainingTracks(tracks: ExternalSearchResult[], generation: number) {
 		for (const track of tracks) {
+			if (generation !== queueAppendGeneration) return;
 			try {
 				const recordingId = await api.ensureExternalRecording(
 					track.source,
@@ -323,6 +393,7 @@
 					track.duration_ms ?? undefined,
 					track.cover_art_url ?? undefined
 				);
+				if (generation !== queueAppendGeneration) return;
 				await player.addToQueue(recordingId);
 			} catch {
 				// Skip tracks that fail to resolve — don't break the queue
@@ -598,7 +669,10 @@
 				<button
 					class="rounded-md px-3 py-1 text-sm text-primary transition-colors hover:bg-primary/10"
 					disabled={loadingMore}
-					onclick={async () => { await loadMoreResults(); goToPage(totalPages + 1); }}
+					onclick={async () => {
+						const firstNewPage = await loadMoreResults();
+						if (firstNewPage !== null) goToPage(firstNewPage);
+					}}
 				>
 					{#if loadingMore}
 						<span class="inline-flex items-center gap-1"><LoaderCircle class="size-3 animate-spin" /> Loading...</span>

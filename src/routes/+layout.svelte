@@ -15,22 +15,67 @@
 	let { children } = $props();
 
 	const isVisualizerLab = $derived(page.url.pathname.startsWith('/visualizer-test'));
+
+	const interactiveKeyboardTarget = [
+		'a[href]',
+		'button',
+		'input',
+		'textarea',
+		'select',
+		'summary',
+		'audio[controls]',
+		'video[controls]',
+		'[contenteditable]:not([contenteditable="false"])',
+		'[tabindex]:not([tabindex="-1"])',
+		'[role="button"]',
+		'[role="link"]',
+		'[role="checkbox"]',
+		'[role="radio"]',
+		'[role="switch"]',
+		'[role="slider"]',
+		'[role="spinbutton"]',
+		'[role="scrollbar"]',
+		'[role="textbox"]',
+		'[role="searchbox"]',
+		'[role="combobox"]',
+		'[role="listbox"]',
+		'[role="option"]',
+		'[role="menuitem"]',
+		'[role="menuitemcheckbox"]',
+		'[role="menuitemradio"]',
+		'[role="tab"]',
+		'[role="treeitem"]',
+		'[role="gridcell"]',
+		'[role="row"]',
+		'[role="rowheader"]',
+		'[role="columnheader"]'
+	].join(',');
+
+	function isInteractiveKeyboardTarget(event: KeyboardEvent): boolean {
+		return event
+			.composedPath()
+			.some((node) => node instanceof Element && node.matches(interactiveKeyboardTarget));
+	}
 </script>
 
 <ModeWatcher />
 
 <svelte:window
 	onkeydown={(e) => {
-		const target = e.target as HTMLElement;
-		const isInput = target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
-
 		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
 			e.preventDefault();
 			const event = new CustomEvent('toggle-command', { bubbles: true });
 			window.dispatchEvent(event);
+			return;
 		}
 
-		if (!isInput && e.key === ' ') {
+		if (
+			e.key === ' ' &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			!isInteractiveKeyboardTarget(e)
+		) {
 			e.preventDefault();
 			const event = new CustomEvent('toggle-playback', { bubbles: true });
 			window.dispatchEvent(event);

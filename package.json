@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "vite dev",
     "prepare:runtime": "node scripts/prepare-runtime-resources.mjs",
-    "sidecar:mkdir": "node -e \"require('fs').mkdirSync('sidecar/dist',{recursive:true})\"",
-    "sidecar:build": "pnpm sidecar:mkdir && pnpm exec esbuild sidecar/src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=sidecar/dist/index.cjs",
+    "sidecar:build": "pnpm --filter mewsik-sidecar build",
     "build": "pnpm sidecar:build && vite build",
     "preview": "vite preview",
     "prepare": "svelte-kit sync || echo ''",
@@ -55,12 +54,9 @@
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.4.2",
     "@tauri-apps/plugin-shell": "^2.3.5",
-    "bandcamp-fetch": "^3.0.0",
     "clsx": "^2.1.1",
     "mode-watcher": "^1.1.0",
-    "soundcloud-downloader": "^1.0.0",
     "tailwind-merge": "^3.5.0",
-    "tailwind-variants": "^3.2.2",
-    "youtubei.js": "^17.0.1"
+    "tailwind-variants": "^3.2.2"
   }
 }

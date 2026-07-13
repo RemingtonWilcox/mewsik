@@ -55,8 +55,10 @@
 		if (trimmedQuery.length > 1) {
 			searchError = '';
 			const requestId = ++searchRequest;
+			const healthRequestId = ++stationHealthRequest;
+			const mode = searchMode;
 			debounceTimer = setTimeout(
-				() => void searchStations(trimmedQuery, requestId, searchMode),
+				() => void searchStations(trimmedQuery, requestId, healthRequestId, mode),
 				300
 			);
 		} else {
@@ -74,6 +76,7 @@
 	async function searchStations(
 		searchQuery = query.trim(),
 		requestId = ++searchRequest,
+		healthRequestId = ++stationHealthRequest,
 		mode: 'name' | 'tag' = searchMode
 	) {
 		if (!searchQuery) return;
@@ -84,7 +87,7 @@
 				results = nextResults;
 				searchHealthByUrl = {};
 				searchError = '';
-				void verifySearchResults(nextResults, requestId);
+				void verifySearchResults(nextResults, healthRequestId);
 			}
 		} catch (e) {
 			if (requestId === searchRequest) {
@@ -254,13 +257,14 @@
 	}
 
 	function searchGenre(genre: string) {
-		searchMode = 'name';
+		searchMode = 'tag';
 		query = genre;
 	}
 
 	async function verifyStations() {
 		if (verifyingStations) return;
 
+		const healthRequestId = ++stationHealthRequest;
 		verifyingStations = true;
 		toast.info('Checking visible stations...');
 		try {
@@ -268,10 +272,16 @@
 				api.verifyFavoriteStations(),
 				results.length > 0 ? api.verifyStationUrls(results.map((station) => station.url)) : Promise.resolve([])
 			]);
-			searchHealthByUrl = Object.fromEntries(
-				visibleResults.map((result) => [result.url, result.status] as const)
-			);
-			const combinedResults = [...favoriteResults, ...visibleResults];
+			const visibleResultsAreCurrent = healthRequestId === stationHealthRequest;
+			if (visibleResultsAreCurrent) {
+				searchHealthByUrl = Object.fromEntries(
+					visibleResults.map((result) => [result.url, result.status] as const)
+				);
+			}
+
+			const combinedResults = visibleResultsAreCurrent
+				? [...favoriteResults, ...visibleResults]
+				: favoriteResults;
 			const deadCount = combinedResults.filter((result) => result.status === 'dead').length;
 			const staleCount = combinedResults.filter((result) => result.status === 'stale').length;
 			const okCount = combinedResults.filter((result) => result.status === 'ok').length;
