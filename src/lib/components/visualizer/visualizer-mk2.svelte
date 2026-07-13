@@ -4,21 +4,21 @@
 	// Architecture per research findings:
 	//   • Mandelbulb SDF raymarched as the hero — a genuine fractal architecture,
 	//     not a smoothed primitive. Forms read as alien geology, not "blob."
-	//   • Volumetric participating medium — fog density accumulates along each
-	//     ray with proper transmittance, AND scatters light from a key source.
-	//     Light shafts emerge naturally where the fractal occludes the sun.
-	//     ~60% of label-grade visuals by pixel count IS atmosphere.
+	//   • Volumetric participating medium — fog accumulates with transmittance
+	//     and phase-weighted key light, while the hero retains real soft shadow.
+	//     Atmosphere stays dimensional without nesting a shadow raymarch inside
+	//     every fog sample.
 	//   • Catmull-Rom camera path through 6 waypoints. Eased traversal speed.
 	//     Camera looks at origin (where the Mandelbulb sits). Authored motion,
 	//     not procedural drift.
 	//   • Photographic 7-stop palette interpolated smoothly — golden hour /
 	//     dusk / deep space stops, never cosine RGB.
-	//   • ACES filmic tone map + procedural film grain + edge chromatic
+	//   • AgX filmic tone map + procedural film grain + edge chromatic
 	//     aberration + vignette + dither for post-processing signature.
 	//
 	// Audio routing (multiple timescales):
-	//   • bass (fast)        → Mandelbulb power pulse + fog density
-	//   • mid (medium)       → specular sharpness, displacement amplitude
+	//   • bass (fast)        → organism breath/growth + fog density
+	//   • mid (medium)       → topology detail, twist + specular sharpness
 	//   • treble (fast)      → grain intensity, small surface ripple
 	//   • centroid (slow)    → palette LERP position
 	//   • chromaKey (slow)   → key light hue
@@ -26,8 +26,8 @@
 	//   • rms (slow)         → light shaft intensity
 	//   • onset (impulse)    → tiny camera nudge
 	//
-	// Future iterations: phrase-aware waypoint advancement, Kawase bloom, real
-	// circle-of-confusion DOF, Mandelbox / hybrid IFS variants per song seed.
+	// Future iterations: optional quality tiers, real circle-of-confusion DOF,
+	// Mandelbox / hybrid IFS variants per song seed.
 
 	import { onMount, onDestroy } from 'svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
@@ -37,13 +37,16 @@
 
 	const vis = useVisualizer();
 	const player = usePlayer();
-	const director = createVisualDirector();
+	let director = createVisualDirector();
+	const t0 = performance.now();
 	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
+	let gpuReady = $state(false);
 	let raf = 0;
 	let unsub: (() => void) | null = null;
+	let initGeneration = 0;
 	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
 	// returns instead of touching destroyed GPU resources mid-frame.
 	let running = false;
@@ -54,25 +57,15 @@
 	let mk2SongSeed = Math.random();
 	let mk2TrackKey: string | null = null;
 
-	// Discrete evolution events — the mk1-style variety engine. Phrase
-	// boundaries advance the framing; drops cut camera + palette family.
-	let paletteFamilyShift = 0;
-	let camPhaseJump = 0;
+	// Phrase/section events move toward new authored framings. The offset is
+	// eased instead of cutting the camera, and each track keeps one coherent
+	// palette family instead of jumping colour worlds mid-song.
+	let camPhaseOffset = 0;
+	let camPhaseTargetOffset = 0;
 	let lastPhraseIndex = -1;
 	let lastDirSection = '';
-
-	$effect(() => {
-		const key = player.state.current_recording_id ?? player.state.current_source_url;
-		if (key === mk2TrackKey) return;
-		mk2TrackKey = key;
-		if (!key) return;
-		mk2SongSeed = stringHash01(key);
-		CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
-		paletteFamilyShift = 0;
-		camPhaseJump = 0;
-		lastPhraseIndex = -1;
-		lastDirSection = '';
-	});
+	let audioWarmupFrames = 0;
+	let temporalResetRequested = true;
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Audio smoothing — multiple timescales per research recommendation.
@@ -141,38 +134,34 @@
 		shaftMul: number;
 		camDistMul: number; // camera distance scale
 		camSpeedMul: number; // camera traversal speed scale
-		saturation: number; // post-saturation
 	};
 	const STATE_MOODS: Record<SongState, StateMood> = {
 		// Calm: cool, distant, slow, dim. Palette in deep navy / plum end.
 		calm: {
 			palOffset: 0.02,
-			power: 7.0,
-			fogMul: 0.55,
-			shaftMul: 0.4,
-			camDistMul: 1.35,
-			camSpeedMul: 0.5,
-			saturation: 0.85
+			power: 6.8,
+			fogMul: 0.5,
+			shaftMul: 0.45,
+			camDistMul: 1.25,
+			camSpeedMul: 0.55
 		},
 		// Rising: warming, pushing in, increasing fog, palette moves toward gold.
 		rising: {
 			palOffset: 0.45,
-			power: 7.7,
-			fogMul: 1.1,
-			shaftMul: 1.2,
+			power: 7.5,
+			fogMul: 0.95,
+			shaftMul: 1.05,
 			camDistMul: 1.0,
-			camSpeedMul: 1.1,
-			saturation: 1.0
+			camSpeedMul: 0.95
 		},
 		// Peak: hot, close, fast, full fog, palette in cream/gold. Drop hits live here.
 		peak: {
 			palOffset: 0.6,
-			power: 8.6,
-			fogMul: 1.7,
-			shaftMul: 1.9,
-			camDistMul: 0.82,
-			camSpeedMul: 1.6,
-			saturation: 1.15
+			power: 8.4,
+			fogMul: 1.3,
+			shaftMul: 1.45,
+			camDistMul: 0.92,
+			camSpeedMul: 1.25
 		},
 		// Releasing: cooling out, pulling back, palette moves to steel/cyan.
 		releasing: {
@@ -181,8 +170,7 @@
 			fogMul: 0.85,
 			shaftMul: 0.9,
 			camDistMul: 1.15,
-			camSpeedMul: 0.7,
-			saturation: 0.95
+			camSpeedMul: 0.7
 		}
 	};
 
@@ -244,51 +232,40 @@
 	let camPhase = 0;
 	let camPhaseLastTime = 0;
 
-	// One of five camera identities per session — picked from mk2SongSeed
-	// at module scope below. Each mode produces a fundamentally different
-	// motion pattern through 3D space, not just different visits to the
-	// same waypoint loop.
+	// One of three authored camera identities per track. The old dive-through
+	// and resettable spiral modes regularly crossed the geometry or visibly
+	// snapped, so production Mk2 keeps only compositions that preserve a hero.
 	//   0 waypoint   — current Catmull-Rom through 6 hand-picked positions
 	//   1 ring       — constant-radius azimuthal orbit, slow y drift
-	//   2 dive       — figure-eight passes THROUGH the organism each loop
-	//   3 spiral     — radius decays then snaps back; spirals inward
-	//   4 perched    — high overhead, slow yaw, looking down
-	let CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
+	//   2 perched    — high overhead, slow yaw, looking down
+	let CAM_MODE = Math.floor(mk2SongSeed * 3) % 3;
 
-	function getCameraPos(time: number, speedMul: number): [number, number, number] {
+	function getCameraPos(
+		time: number,
+		speedMul: number,
+		phaseOffset: number
+	): [number, number, number] {
 		const baseSpeed = 0.020 + smoothed.bpmNormSlow * 0.025 + smoothed.rmsSlow * 0.015;
-		const dt = Math.max(0, time - camPhaseLastTime);
+		if (camPhaseLastTime === 0) camPhaseLastTime = time;
+		const dt = Math.max(0, Math.min(0.1, time - camPhaseLastTime));
 		camPhase += dt * baseSpeed * speedMul;
 		camPhaseLastTime = time;
+		const pathPhase = camPhase + phaseOffset;
 
 		if (CAM_MODE === 1) {
 			// Ring orbit — constant radius, azimuthal sweep
-			const a = camPhase * 1.1;
+			const a = pathPhase * 1.1;
 			const radius = 3.4;
-			return [Math.cos(a) * radius, 1.0 + Math.sin(camPhase * 0.27) * 0.8, Math.sin(a) * radius];
+			return [Math.cos(a) * radius, 1.0 + Math.sin(pathPhase * 0.27) * 0.65, Math.sin(a) * radius];
 		}
 		if (CAM_MODE === 2) {
-			// Dive-through — figure-eight passing through origin
-			const a = camPhase * 0.7;
-			const r = 3.0 + Math.sin(a * 2) * 1.8; // pulses inward
-			return [Math.cos(a) * r, Math.sin(a * 0.5) * 1.4, Math.sin(a * 2) * r * 0.7];
-		}
-		if (CAM_MODE === 3) {
-			// Spiral — radius shrinks then resets each ~12s
-			const phase = (camPhase * 0.5) % 12;
-			const t = phase / 12;
-			const a = phase * 0.8;
-			const radius = 4.5 - t * 2.5;
-			const y = 0.6 + t * 1.4;
-			return [Math.cos(a) * radius, y, Math.sin(a) * radius];
-		}
-		if (CAM_MODE === 4) {
 			// Perched overhead — slow yaw, looking down (handled in target)
-			const a = camPhase * 0.35;
-			return [Math.cos(a) * 2.2, 3.6, Math.sin(a) * 2.2];
+			const a = pathPhase * 0.35;
+			return [Math.cos(a) * 2.4, 3.5, Math.sin(a) * 2.4];
 		}
 		// Default — original Catmull-Rom waypoint loop
-		const cycle = camPhase % CAM_WAYPOINTS.length;
+		const cycle =
+			((pathPhase % CAM_WAYPOINTS.length) + CAM_WAYPOINTS.length) % CAM_WAYPOINTS.length;
 		const i = Math.floor(cycle);
 		const f = cycle - i;
 		const n = CAM_WAYPOINTS.length;
@@ -299,6 +276,58 @@
 		const eased = smoothstepJs(0, 1, f);
 		return catmullRom3(eased, p0, p1, p2, p3);
 	}
+
+	function resetTrackVisualState(seed: number) {
+		// The director owns additional clock/drop/palette/structure envelopes and
+		// has no public reset method. A fresh instance is the complete, local
+		// reset and prevents a new track inheriting the previous drop or phrase.
+		director = createVisualDirector();
+
+		smoothed.bass = 0;
+		smoothed.mid = 0;
+		smoothed.treble = 0;
+		smoothed.centroidSlow = 0.5;
+		smoothed.chromaXSlow = 1;
+		smoothed.chromaYSlow = 0;
+		smoothed.rmsSlow = 0;
+		smoothed.bpmNormSlow = 0.4;
+		smoothed.flash = 0;
+		smoothed.staccato = 0;
+		smoothed.sustain = 0;
+		smoothed.reverbStart = -10;
+		smoothed.smoothEnergy = 0;
+
+		songState = 'calm';
+		stateEnterTime = (performance.now() - t0) / 1000;
+		previousMood = { ...STATE_MOODS.calm };
+		rmsHist.fill(0);
+		onsetHist.fill(0);
+		histIdx = 0;
+		histFilled = 0;
+
+		CAM_MODE = Math.floor(seed * 3) % 3;
+		camPhase = seed * CAM_WAYPOINTS.length;
+		camPhaseLastTime = 0;
+		camPhaseOffset = 0;
+		camPhaseTargetOffset = 0;
+		lastPhraseIndex = -1;
+		lastDirSection = '';
+
+		// Ignore a few analyzer frames while playback swaps sources, then rebuild
+		// every temporal target on the render loop before accepting new audio.
+		audioWarmupFrames = 3;
+		temporalResetRequested = true;
+		gpuReady = false;
+		resetFrameScheduler();
+	}
+
+	$effect(() => {
+		const key = player.state.current_recording_id ?? player.state.current_source_url;
+		if (key === mk2TrackKey) return;
+		mk2TrackKey = key;
+		mk2SongSeed = key ? stringHash01(key) : Math.random();
+		resetTrackVisualState(mk2SongSeed);
+	});
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Uniform layout — 32 f32s = 128 bytes (multiple of 16 ✓)
@@ -512,6 +541,10 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 	return mix(b, a, h) - k * h * (1.0 - h);
 }
 
+fn smax(a: f32, b: f32, k: f32) -> f32 {
+	return -smin(-a, -b, k);
+}
+
 fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
 	let lenV = length(v);
 	if (lenV < 1e-5) {
@@ -585,18 +618,24 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 fn map(p: vec3<f32>) -> f32 {
 	let growth = u._pad0;
 	let tension = u._pad1;
+	// Cheap conservative scene bound: most screen rays never get close to the
+	// hero. Tendrils are explicitly capped and smoothly intersected with a
+	// smaller p-space envelope below, so they cannot be silently clipped by this
+	// shortcut or produce discontinuous normals at the early-out boundary.
+	let outerBound = length(p) - 1.85;
+	if (outerBound > 0.35) {
+		return outerBound * 0.82;
+	}
 	let q = organismWarp(p);
 
 	// Core fractal body. Audio changes the coordinate field and power, so the
 	// organism actually grows/twists instead of sitting under a post glow.
 	let bodyScale = 1.05 + growth * 0.10 - u.flash * 0.030;
-	// Audio-driven iter count — calm sections are intentionally LESS detailed
-	// so drops landing at 11 iterations read as the fractal "blooming" into
-	// existence. 4 iters = smooth blob; 11 = full Mandelbulb spine detail.
-	let audioIters = 4 + i32(floor(growth * 5.0 + tension * 3.0));
-	// Iter cap 9 (was 11). Each extra iter costs ~12% of pixel shading time;
-	// 9 vs 11 saves ~24% with no perceptible loss in fractal detail.
-	let safeIters = clamp(audioIters, 4, 9);
+	// Five to seven iterations retain the recognizable Mandelbulb silhouette;
+	// energy reveals the last two detail bands without making peak sections
+	// several times more expensive than calm sections.
+	let audioIters = 5 + i32(floor(growth * 1.4 + tension * 1.2));
+	let safeIters = clamp(audioIters, 5, 7);
 	var body = mandelbulbDE(q * bodyScale, u.mandelbulbPower + tension * 0.55, safeIters) * (1.03 - growth * 0.10);
 
 	// Breathing membrane/lobed shell. This gives build-ups a visible expansion
@@ -606,18 +645,25 @@ fn map(p: vec3<f32>) -> f32 {
 		- (0.018 + u.bass * 0.018 + growth * 0.010);
 	body = body - exp(-abs(shell) * 18.0) * (0.004 + growth * 0.007 + u.bass * 0.004);
 
-	// Tendril lanes: multiple helixes attached to the same warped space. These
-	// react to tension/midrange so hooks and bridges visibly braid or loosen.
+	// Tendril lanes: multiple finite helixes attached to the same warped space.
+	// Clamping the lane's Y coordinate turns each formerly-infinite tube into a
+	// round-ended capsule. The p-space envelope is deliberately inside the
+	// scene early-out radius, with ample room for the later smooth union.
 	var tendril = 1000.0;
-	for (var i: i32 = 0; i < 6; i = i + 1) {
-		let fi = f32(i) / 6.0;
+	let tendrilHalfLength = 0.82 + growth * 0.18;
+	for (var i: i32 = 0; i < 4; i = i + 1) {
+		let fi = f32(i) / 4.0;
 		let phase = fi * 6.2831853 + u.paletteOffset * 6.2831853 + u.time * (0.045 + u.bpmNorm * 0.075);
-		let yPhase = q.y * (2.1 + tension * 0.8) + phase;
-		let radius = 0.30 + growth * 0.32 + sin(q.y * 2.7 + phase) * (0.040 + u.mid * 0.030);
+		let laneY = clamp(q.y, -tendrilHalfLength, tendrilHalfLength);
+		let yPhase = laneY * (2.1 + tension * 0.8) + phase;
+		let radius = 0.30 + growth * 0.32 + sin(laneY * 2.7 + phase) * (0.040 + u.mid * 0.030);
 		let lane = vec2<f32>(cos(yPhase), sin(yPhase)) * radius;
-		let d = length(q.xz - lane) - (0.014 + u.mid * 0.030 + u.flash * 0.026);
+		let laneCenter = vec3<f32>(lane.x, laneY, lane.y);
+		let d = length(q - laneCenter) - (0.014 + u.mid * 0.030 + u.flash * 0.026);
 		tendril = min(tendril, d);
 	}
+	let tendrilEnvelope = length(p) - 1.72;
+	tendril = smax(tendril, tendrilEnvelope, 0.055);
 	body = smin(body, tendril, 0.052 + tension * 0.025);
 
 	// Cavity carving: restrained negative space inside the creature. Kept small
@@ -659,11 +705,11 @@ fn calcNormal(p: vec3<f32>) -> vec3<f32> {
 	);
 }
 
-// Short march toward light for soft shadow + light-shaft occlusion test.
+// Short march toward the key light for the hero's soft surface shadow.
 fn lightVisibility(ro: vec3<f32>, rd: vec3<f32>, maxt: f32) -> f32 {
 	var res = 1.0;
 	var t = 0.02;
-	for (var i: i32 = 0; i < 16; i = i + 1) {
+	for (var i: i32 = 0; i < 7; i = i + 1) {
 		let h = map(ro + rd * t);
 		if (h < 0.001) { return 0.0; }
 		res = min(res, 12.0 * h / t);
@@ -717,7 +763,7 @@ fn vn3(p: vec3<f32>) -> f32 {
 }
 
 // Procedural nebula + starfield sky. Replaces the flat olive background
-// with: (1) atmospheric horizon-to-zenith gradient, (2) two-octave nebula
+// with: (1) atmospheric horizon-to-zenith gradient, (2) three-octave nebula
 // cloud field tinted with the palette family, (3) twinkling starfield
 // from hashed pixel positions. Twinkle rate locks to BPM. Sky still
 // behaves as a low-intensity HDR backdrop so AgX tonemap reads correctly.
@@ -728,7 +774,7 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	let zenith = palette7(baseT + 0.7) * 0.025;
 	var bg = mix(horizon, zenith, smoothstep(0.0, 1.0, upT));
 
-	// Nebula clouds — 4-octave fBm at higher base frequency (was 3.5, now
+	// Nebula clouds — 3-octave fBm at higher base frequency (was 3.5, now
 	// 12.0). Earlier version produced bitmap-y patches because each value-
 	// noise cell was 5+ pixels wide on screen. Higher frequency + more
 	// octaves gives proper cloud structure. Two-tone tint (deep + warm)
@@ -737,7 +783,7 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	var cloud = 0.0;
 	var amp = 0.5;
 	var freq = 1.0;
-	for (var oc: i32 = 0; oc < 4; oc = oc + 1) {
+	for (var oc: i32 = 0; oc < 3; oc = oc + 1) {
 		cloud = cloud + vn3(cloudP * freq) * amp;
 		amp = amp * 0.5;
 		freq = freq * 2.1;
@@ -796,10 +842,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	// If a step hits the surface (distance < EPS) we shade it physically and
 	// premultiply the surface contribution by the remaining transmittance,
 	// then return — naturally compositing fog over surface over background.
-	let MAX_STEPS = 72;     // was 96 — ~25% fewer marches, no quality loss when paired
-	let MAX_DIST = 14.0;    // with distance-adaptive EPS below
-	let EPS_NEAR = 0.0010;
-	let EPS_FAR  = 0.0060;
+	let MAX_STEPS = 48;
+	let MAX_DIST = 10.0;
+	let EPS_NEAR = 0.0014;
+	let EPS_FAR  = 0.0070;
 
 	var transmittance = 1.0;
 	var scattered = vec3<f32>(0.0);
@@ -828,11 +874,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let cosNV = max(0.0, dot(n, view));
 			let shadow = lightVisibility(p + n * 0.005, lightDir, 4.0);
 
-			// Cheap ambient occlusion — five short samples along surface normal.
+			// Three short ambient-occlusion probes preserve crevice depth without
+			// repeating the full fractal map five times at every surface pixel.
 			var ao = 0.0;
 			var aoW = 0.0;
-			for (var k: i32 = 1; k <= 5; k = k + 1) {
-				let ko = f32(k) * 0.05;
+			for (var k: i32 = 1; k <= 3; k = k + 1) {
+				let ko = f32(k) * 0.065;
 				let occ = ko - map(p + n * ko);
 				ao = ao + occ * pow(0.6, f32(k));
 				aoW = aoW + pow(0.6, f32(k));
@@ -943,8 +990,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// the SDF value), so fog hugs the form like incense smoke.
 		let proxim = exp(-d * 1.4);
 		let localDensity = u.fogDensity * (1.0 + proxim * 1.8);
-		// Light visibility from this point — what fraction of light reaches here?
-		let lightV = lightVisibility(p, lightDir, 5.5);
+		// A phase/clearance approximation replaces a nested shadow raymarch at
+		// every fog step. Surface hits still receive a real soft shadow above;
+		// atmosphere keeps directional depth at a tiny fraction of the cost.
+		let lightPhase = pow(max(dot(rd, lightDir), 0.0), 4.0);
+		let clearance = smoothstep(0.015, 0.45, d);
+		let lightV = mix(0.32, 1.0, clearance) * (0.58 + lightPhase * 0.42);
 		// Atmospheric tint — dramatically reduced from earlier attempt. The
 		// per-step contribution gets multiplied by stepDensity and then
 		// summed across ~30 fog steps, so what looks like a "tiny constant"
@@ -962,9 +1013,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		transmittance = transmittance * exp(-stepDensity);
 
 		// March step. Smaller in dense areas (near surface), larger in open space.
-		let stepSize = max(d * 0.85, 0.05);
+		let stepSize = max(d * 0.92, 0.065);
 		t = t + stepSize;
-		if (transmittance < 0.01) { break; }
+		if (transmittance < 0.025) { break; }
 	}
 
 	// Composite remaining transmittance with sky background.
@@ -1063,16 +1114,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let dstRes = vec2<f32>(p.dstResX, p.dstResY);
 	let uv = frag.xy / dstRes;
 	let texel = vec2<f32>(1.0 / p.srcResX, 1.0 / p.srcResY);
-	// Wide tent-blur for upsample (9-tap Kawase variation).
-	var c = textureSample(srcTex, samp, uv).rgb * 0.25;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  0.0) * texel).rgb * 0.125;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  0.0) * texel).rgb * 0.125;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0, -1.0) * texel).rgb * 0.125;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0,  1.0) * texel).rgb * 0.125;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0, -1.0) * texel).rgb * 0.0625;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0, -1.0) * texel).rgb * 0.0625;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  1.0) * texel).rgb * 0.0625;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  1.0) * texel).rgb * 0.0625;
+	// Five-tap tent blur. The scene's temporal accumulation supplies the soft
+	// tail, so four diagonal reads per mip were redundant bandwidth.
+	var c = textureSample(srcTex, samp, uv).rgb * 0.4;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  0.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  0.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0, -1.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0,  1.0) * texel).rgb * 0.15;
 	return vec4<f32>(c * p.intensity, 1.0);
 }
 `;
@@ -1155,7 +1203,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Particle pass — persistent spectrum-painted constellation around hero.
-	// Each frame fades the previous particle texture and adds 64 bin-keyed
+	// Each frame fades the previous particle texture and adds 32 paired-bin
 	// "splat" contributions. Each FFT bin lives at angle = (bin/64) × 2π
 	// around the screen center; radius drifts with time + bin index, glow
 	// magnitude = bin energy, color sampled from palette7. Trails build up
@@ -1220,13 +1268,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	// Fade previous accumulation.
 	let prev = textureSample(prevTex, samp, uv).rgb * p.fadeRate;
 
-	// Add 64 bin contributions. Each bin lives at angle = (bin/64)·2π with
-	// slow azimuthal drift, radius staircase, energy-driven brightness.
+	// Pair adjacent FFT bins into 32 visual bands. At one-third resolution this
+	// retains the continuous aura while removing most of its per-pixel work.
 	var contrib = vec3<f32>(0.0);
-	for (var i: i32 = 0; i < 64; i = i + 1) {
-		let bin = bins[i];
+	for (var i: i32 = 0; i < 32; i = i + 1) {
+		let binIdx = i * 2;
+		let bin = (bins[binIdx] + bins[binIdx + 1]) * 0.5;
 		if (bin < 0.03) { continue; }
-		let fi = f32(i) / 64.0;
+		let fi = f32(i) / 32.0;
 		// Two angular waves so contributions don't sit on a perfect ring
 		let theta = fi * 6.28318530718 + p.time * 0.05 + sin(p.time * 0.18 + fi * 6.28) * 0.15;
 		// Radius depends on bin index: low bins inner, high bins outer.
@@ -1352,15 +1401,15 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let particles = textureSample(particleTex, samp, uv).rgb;
 	col = col + particles * 0.055;
 
-	// Anamorphic lens streaks — JJ-Abrams Hollywood look. Reduced to 5 taps
-	// (was 9 — half the present-pass texture reads) with a higher threshold
+	// Anamorphic lens streaks — three paired samples keep the cinematic accent
+	// with substantially less full-resolution texture bandwidth. A high threshold
 	// (1.10 vs 0.55) so only TRUE highlights streak. Old version was picking
 	// up ambient glow + nebula clouds, producing the "white ash" the user
 	// complained about.
 	let texel = vec2<f32>(1.0 / u.resolutionX, 1.0 / u.resolutionY);
 	var streak = vec3<f32>(0.0);
-	for (var s: i32 = 1; s <= 5; s = s + 1) {
-		let off = f32(s) * texel.x * 14.0;
+	for (var s: i32 = 1; s <= 3; s = s + 1) {
+		let off = f32(s) * texel.x * 20.0;
 		let sL = textureSample(compositeTex, samp, uv + vec2<f32>(-off, 0.0)).rgb;
 		let sR = textureSample(compositeTex, samp, uv + vec2<f32>( off, 0.0)).rgb;
 		let bright = max(sL, sR);
@@ -1393,10 +1442,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 }
 `;
 
-	// Bloom param uniform layout — 8 f32s = 32 bytes (×4 mips, ×2 for up/down).
+	// Bloom param uniform layout — 8 f32s = 32 bytes (×3 mips, down + up).
 	const BLOOM_PARAM_FLOATS = 8;
 	const BLOOM_PARAM_BYTES = BLOOM_PARAM_FLOATS * 4;
-	const BLOOM_LEVELS = 4;
+	const BLOOM_LEVELS = 3;
 
 	// Particle params: 8 f32s = 32 bytes
 	const PARTICLE_PARAM_FLOATS = 8;
@@ -1434,7 +1483,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			bloomSizes: { w: number; h: number }[];
 			compositeAB: [GPUTexture, GPUTexture];
 			compositeViewsAB: [GPUTextureView, GPUTextureView];
-			// Particle ping-pong textures (half res)
+			// Particle ping-pong textures (one-third res)
 			particleAB: [GPUTexture, GPUTexture];
 			particleViewsAB: [GPUTextureView, GPUTextureView];
 			particleW: number;
@@ -1455,7 +1504,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	};
 
 	let gpu: GPU | null = null;
-	const t0 = performance.now();
+	const TARGET_FRAME_MS = 1000 / 60;
+	// Render at 72% of physical display resolution, then let the browser's
+	// linear canvas upscale recover the final edge. Combined with 60 Hz this
+	// keeps cost predictable on high-refresh / high-DPI displays.
+	const INTERNAL_RENDER_SCALE = 0.72;
+	const MAX_DEVICE_DPR = 1.5;
+	let schedulerTickAt = 0;
+	let renderBudgetMs = TARGET_FRAME_MS;
+	let lastRenderedAt = 0;
+
+	function resetFrameScheduler() {
+		schedulerTickAt = 0;
+		renderBudgetMs = TARGET_FRAME_MS;
+		lastRenderedAt = 0;
+	}
 
 	function buildTargets(device: GPUDevice, w: number, h: number) {
 		const hdr: GPUTextureFormat = 'rgba16float';
@@ -1493,10 +1556,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			format: hdr,
 			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
 		});
-		// Particle ping-pong textures (half res — 64-bin inner loop per pixel
-		// is expensive at full res).
-		const particleW = Math.max(1, Math.floor(w / 2));
-		const particleH = Math.max(1, Math.floor(h / 2));
+		// Particle accumulation is intentionally one-third resolution; soft
+		// persistent splats upscale cleanly and do not need scene resolution.
+		const particleW = Math.max(1, Math.floor(w / 3));
+		const particleH = Math.max(1, Math.floor(h / 3));
 		const pA = device.createTexture({
 			size: { width: particleW, height: particleH },
 			format: hdr,
@@ -1594,8 +1657,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				})
 			);
 		}
-		// Bloom upsample bind groups: src=mip[i+1], dst=mip[i]; 3 upsamples to
-		// climb from mip 3 → 2 → 1 → 0. Param slice offset starts at level 4.
+		// Bloom upsample bind groups: src=mip[i+1], dst=mip[i]. Param slices
+		// begin immediately after the three downsample slices.
 		const bloomUpBGs: GPUBindGroup[] = [];
 		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
 			const srcLevel = BLOOM_LEVELS - 1 - i;
@@ -1635,6 +1698,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		const context = c.getContext('webgpu') as unknown as GPUCanvasContext;
 		if (!context) {
+			device.destroy?.();
 			errorMsg = 'WebGPU canvas context unavailable.';
 			return null;
 		}
@@ -1699,7 +1763,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		});
 
 		const bloomParamBuf = device.createBuffer({
-			size: 256 * 7,
+			size: 256 * (BLOOM_LEVELS * 2 - 1),
 			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 		});
 
@@ -1733,8 +1797,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		};
 	}
 
-	function ensureTargets(g: GPU, w: number, h: number) {
-		if (g.targets && g.targets.width === w && g.targets.height === h) return;
+	function discardTargets(g: GPU) {
 		if (g.targets) {
 			g.targets.scene.destroy();
 			for (const t of g.targets.bloomMips) t.destroy();
@@ -1743,72 +1806,140 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			g.targets.particleAB[0].destroy();
 			g.targets.particleAB[1].destroy();
 		}
+		g.targets = null;
+		g.bindGroups = null;
+		g.frame = 0;
+	}
+
+	function ensureTargets(g: GPU, w: number, h: number) {
+		if (g.targets && g.targets.width === w && g.targets.height === h) return;
+		discardTargets(g);
 		g.targets = buildTargets(g.device, w, h);
 		g.bindGroups = buildBindGroups(g);
 	}
 
-	function teardownGpu() {
-		if (!gpu) return;
+	function destroyGpuResources(g: GPU) {
 		try {
-			if (gpu.targets) {
-				gpu.targets.scene.destroy();
-				for (const t of gpu.targets.bloomMips) t.destroy();
-				gpu.targets.compositeAB[0].destroy();
-				gpu.targets.compositeAB[1].destroy();
-				gpu.targets.particleAB[0].destroy();
-				gpu.targets.particleAB[1].destroy();
-			}
-			gpu.uniformBuf.destroy();
-			gpu.bloomParamBuf.destroy();
-			gpu.binsBuf.destroy();
-			gpu.particleParamBuf.destroy();
-			gpu.device.destroy?.();
+			discardTargets(g);
+			g.uniformBuf.destroy();
+			g.bloomParamBuf.destroy();
+			g.binsBuf.destroy();
+			g.particleParamBuf.destroy();
+			g.device.destroy?.();
 		} catch {}
-		gpu = null;
 	}
 
-	function loop() {
-		if (!running || !canvas || !gpu) {
-			if (running) raf = requestAnimationFrame(loop);
-			return;
-		}
+	function failGpuDevice(g: GPU, generation: number, message: string) {
+		// An old device may resolve `lost` after a normal engine switch. Identity
+		// and generation checks ensure it cannot tear down a newer replacement.
+		if (gpu !== g || generation !== initGeneration) return;
+		initGeneration++;
+		gpu = null;
+		gpuReady = false;
+		resetFrameScheduler();
+		temporalResetRequested = true;
+		errorMsg = message;
+		destroyGpuResources(g);
+	}
 
-		// Mandelbulb is expensive — cap DPR at 1.5 so we get good fps on integrated GPUs.
-		const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+	function teardownGpu() {
+		initGeneration++;
+		gpuReady = false;
+		resetFrameScheduler();
+		temporalResetRequested = true;
+		if (!gpu) return;
+		const doomed = gpu;
+		gpu = null;
+		destroyGpuResources(doomed);
+	}
+
+	function loop(frameNow = performance.now()) {
+		if (!running) return;
+		raf = requestAnimationFrame(loop);
+		if (!canvas || !gpu) return;
+
+		if (!schedulerTickAt) {
+			schedulerTickAt = frameNow;
+			renderBudgetMs = TARGET_FRAME_MS;
+		} else {
+			const tickElapsed = Math.max(0, frameNow - schedulerTickAt);
+			schedulerTickAt = frameNow;
+			// Accumulate refresh intervals instead of phase-adjusting the previous
+			// render timestamp. Keep only a small catch-up budget so a stalled or
+			// backgrounded window renders one current frame, never an obsolete burst.
+			renderBudgetMs = Math.min(TARGET_FRAME_MS * 4, renderBudgetMs + tickElapsed);
+		}
+		if (renderBudgetMs + 0.25 < TARGET_FRAME_MS) return;
+		// Carry fractional refresh time forward. Subtract first to avoid a value
+		// microscopically below one interval wrapping to an almost-full budget.
+		let remainderMs = renderBudgetMs - TARGET_FRAME_MS;
+		if (remainderMs >= TARGET_FRAME_MS) remainderMs %= TARGET_FRAME_MS;
+		renderBudgetMs = Math.max(0, remainderMs);
+
+		// This is the actual time between rendered frames, independent of the
+		// scheduler's fractional budget, so smoothing remains time-correct on
+		// 60/75/90/120/144 Hz displays and after an occasional missed frame.
+		const elapsedMs = lastRenderedAt ? Math.max(0, frameNow - lastRenderedAt) : TARGET_FRAME_MS;
+		lastRenderedAt = frameNow;
+		const frameDt = Math.min(1, Math.max(0.001, elapsedMs / 1000));
+
+		const dpr = Math.min(window.devicePixelRatio || 1, MAX_DEVICE_DPR) * INTERNAL_RENDER_SCALE;
 		const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
 		const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
 		if (canvas.width !== w || canvas.height !== h) {
 			canvas.width = w;
 			canvas.height = h;
 		}
-		ensureTargets(gpu, w, h);
+		const targetGpu = gpu;
+		const targetGeneration = initGeneration;
+		try {
+			if (temporalResetRequested) {
+				discardTargets(targetGpu);
+				temporalResetRequested = false;
+			}
+			ensureTargets(targetGpu, w, h);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			failGpuDevice(
+				targetGpu,
+				targetGeneration,
+				`Mk2 could not prepare its WebGPU render targets: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+			);
+			return;
+		}
 		if (!gpu.bindGroups || !gpu.targets) {
-			raf = requestAnimationFrame(loop);
 			return;
 		}
 
 		const time = (performance.now() - t0) / 1000;
-		const feat = vis.latest;
+		const feat = audioWarmupFrames > 0 ? null : vis.getLatest();
+		if (audioWarmupFrames > 0) audioWarmupFrames--;
 		const directed = director.update(feat, time);
+
+		// Convert the original 60 Hz tuning into time-correct coefficients so
+		// reactions feel identical if a machine occasionally misses a frame.
+		const frameScale = frameDt * 60;
+		const alpha = (at60Hz: number) => 1 - Math.pow(1 - at60Hz, frameScale);
+		const decay = (at60Hz: number) => Math.pow(at60Hz, frameScale);
 
 		// Smooth audio at appropriate timescales.
 		// Fast-attack params for transients:
-		smoothed.bass = lerp(smoothed.bass, feat?.bass ?? 0, 0.25);
-		smoothed.mid = lerp(smoothed.mid, feat?.mid ?? 0, 0.18);
-		smoothed.treble = lerp(smoothed.treble, feat?.treble ?? 0, 0.35);
+		smoothed.bass = lerp(smoothed.bass, feat?.bass ?? 0, alpha(0.25));
+		smoothed.mid = lerp(smoothed.mid, feat?.mid ?? 0, alpha(0.18));
+		smoothed.treble = lerp(smoothed.treble, feat?.treble ?? 0, alpha(0.35));
 		if (feat?.onset) {
 			smoothed.flash = 1;
 			smoothed.staccato = 1;
 			smoothed.reverbStart = time;
 		}
-		smoothed.flash *= 0.88;
+		smoothed.flash *= decay(0.88);
 		// staccato — sharper than flash; ~3-frame half-life. Used for crisp
 		// surface spike emission, not for the broader fog flash.
-		smoothed.staccato *= 0.74;
+		smoothed.staccato *= decay(0.74);
 		// sustain — long-RMS follower (~5s envelope). Drives mood-level
 		// changes, not transient response.
 		const sustainTarget = smoothed.rmsSlow;
-		smoothed.sustain = smoothed.sustain * 0.992 + sustainTarget * 0.008;
+		smoothed.sustain = lerp(smoothed.sustain, sustainTarget, alpha(0.008));
 		// smoothEnergy — slow follower of overall instantaneous energy with
 		// asymmetric envelope (200ms attack / 800ms release). This is the
 		// channel that drives BIG modulations (camera dolly, organism scale,
@@ -1816,20 +1947,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// flicker. Fast channels (flash, staccato) keep handling per-hit
 		// reactions; smoothEnergy keeps the macro feel from being jittery.
 		const energyTarget = Math.min(1, (feat?.rms ?? 0) * 1.4 + (feat?.bass ?? 0) * 0.4);
-		const smoothAttack = energyTarget > smoothed.smoothEnergy ? 0.08 : 0.02;
+		const smoothAttack = alpha(energyTarget > smoothed.smoothEnergy ? 0.08 : 0.02);
 		smoothed.smoothEnergy = smoothed.smoothEnergy + (energyTarget - smoothed.smoothEnergy) * smoothAttack;
 		// Slow params (mood / palette / camera):
-		smoothed.centroidSlow = lerp(smoothed.centroidSlow, feat?.centroid ?? 0.5, 0.015);
-		smoothed.rmsSlow = lerp(smoothed.rmsSlow, feat?.rms ?? 0, 0.02);
+		smoothed.centroidSlow = lerp(smoothed.centroidSlow, feat?.centroid ?? 0.5, alpha(0.015));
+		smoothed.rmsSlow = lerp(smoothed.rmsSlow, feat?.rms ?? 0, alpha(0.02));
 		smoothed.bpmNormSlow = lerp(
 			smoothed.bpmNormSlow,
 			feat?.bpm ? Math.max(0, Math.min(1, (feat.bpm - 60) / 120)) : 0,
-			0.012
+			alpha(0.012)
 		);
 		// Circular chroma smoothing (slow)
 		const chromaAngle = (feat?.chroma_key ?? 0) * 2 * Math.PI;
-		smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), 0.02);
-		smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), 0.02);
+		smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.02));
+		smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.02));
 
 		// ── Real-time section detection: feed history, compute window stats,
 		// run state machine, lerp to current state's mood template. Runs before
@@ -1846,17 +1977,24 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const onsetRatio = onsetNow / Math.max(1, onsetAgo);
 
 		// State machine transitions
-		const timeInState = time - stateEnterTime;
+		let timeInState = time - stateEnterTime;
 		const transitionTo = (next: SongState) => {
 			if (next !== songState) {
-				previousMood = (() => {
-					// Snapshot current effective mood at transition start so we LERP
-					// from where the visual currently sits, not from the template baseline.
-					const mp = STATE_MOODS[songState];
-					return { ...mp };
-				})();
+				// Snapshot the actual in-between mood. This also handles a section
+				// changing again before the previous 2.5-second ease has completed.
+				const currentTarget = STATE_MOODS[songState];
+				const currentT = smoothstepJs(0, 1, Math.min(1, timeInState / 2.5));
+				previousMood = {
+					palOffset: lerp(previousMood.palOffset, currentTarget.palOffset, currentT),
+					power: lerp(previousMood.power, currentTarget.power, currentT),
+					fogMul: lerp(previousMood.fogMul, currentTarget.fogMul, currentT),
+					shaftMul: lerp(previousMood.shaftMul, currentTarget.shaftMul, currentT),
+					camDistMul: lerp(previousMood.camDistMul, currentTarget.camDistMul, currentT),
+					camSpeedMul: lerp(previousMood.camSpeedMul, currentTarget.camSpeedMul, currentT)
+				};
 				songState = next;
 				stateEnterTime = time;
+				timeInState = 0;
 			}
 		};
 
@@ -1925,104 +2063,121 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		let tensionBias = 0;
 		const dirSec = directed.section;
 		if (dirSec === 'drop' || dirSec === 'chorus') {
-			growthBias = 0.20; tensionBias = -0.10;
+			growthBias = 0.2;
+			tensionBias = -0.1;
 		} else if (dirSec === 'build' || dirSec === 'pre_chorus') {
-			growthBias = -0.05; tensionBias = 0.25;
+			growthBias = -0.05;
+			tensionBias = 0.25;
 		} else if (dirSec === 'bridge') {
-			growthBias = -0.15; tensionBias = -0.10;
+			growthBias = -0.15;
+			tensionBias = -0.1;
 		} else if (dirSec === 'breakdown' || dirSec === 'calm') {
-			growthBias = -0.20; tensionBias = -0.15;
+			growthBias = -0.2;
+			tensionBias = -0.15;
 		}
 
-		// ── Discrete evolution events ──────────────────────────────────────
-		// Continuous envelopes alone read as drift; mk1 feels alive because
-		// things change DECISIVELY. With the visual score, phrase boundaries
-		// and drops are beat-exact, so cuts land on the music.
+		// ── Authored evolution events ──────────────────────────────────────
+		// Phrase boundaries request a new framing, but the camera eases toward
+		// it. Drops still feel decisive through light/form response without a
+		// random hard cut or palette-family swap.
 		const phraseIdx = directed.clock?.phraseIndex ?? 0;
 		if (phraseIdx !== lastPhraseIndex) {
 			if (lastPhraseIndex >= 0) {
-				// Every 8 bars: glide-cut to a fresh waypoint framing.
-				camPhaseJump += 0.55 + mk2SongSeed * 0.6;
+				camPhaseTargetOffset += 0.32 + mk2SongSeed * 0.18;
 			}
 			lastPhraseIndex = phraseIdx;
 		}
 		// Alternate phrases bias the fractal power so the organism's topology
 		// breathes on a 16-bar cycle instead of holding one shape forever.
-		const phrasePowerBias = phraseIdx % 2 === 1 ? 0.9 : -0.45;
+		const phrasePowerBias = phraseIdx % 2 === 1 ? 0.28 : -0.18;
 		if (dirSec !== lastDirSection) {
 			if (dirSec === 'drop') {
-				// Drop: hard cut — new camera identity, next palette family,
-				// impact flash. The scene transforms when the song does.
-				CAM_MODE = (CAM_MODE + 1 + Math.floor(mk2SongSeed * 3)) % 5;
-				paletteFamilyShift = (paletteFamilyShift + 1) % 6;
-				camPhaseJump += 2.4;
+				camPhaseTargetOffset += 0.7;
 				smoothed.flash = Math.min(1, smoothed.flash + 0.7);
 			} else if (dirSec === 'chorus' && lastDirSection !== 'drop') {
-				// Chorus entry without a drop still earns a palette move + reframe.
-				paletteFamilyShift = (paletteFamilyShift + 1) % 6;
-				camPhaseJump += 1.1;
+				camPhaseTargetOffset += 0.42;
 			} else if (dirSec === 'breakdown' || dirSec === 'bridge') {
-				// Quiet sections pull back to a distant framing — negative space.
-				camPhaseJump += 0.8;
+				camPhaseTargetOffset += 0.24;
 			}
 			lastDirSection = dirSec;
 		}
-		const growth = Math.max(0, Math.min(1,
-			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18 + antic * 0.42 + postDrop * 0.35 + growthBias
-		));
-		const tension = Math.max(0, Math.min(1,
-			directed.motion * 0.38 +
-				directed.density * 0.26 +
-				smoothed.mid * 0.20 +
-				smoothed.treble * 0.12 +
-				smoothed.flash * 0.24 +
-				antic * 0.40 + tensionBias
-		));
-		// Mandelbulb power now varies WIDELY — 3.5 calm to 11.5 peak. Power
-		// directly controls fractal topology (low = blocky, mid = classic
-		// 8-pointed bulb, high = hyperdetailed spines), so this gives
-		// genuine SHAPE variety per section. Driven by smoothEnergy (slow)
-		// so the topology change is smooth and visible, not jittery.
-		const mandelbulbPower =
-			3.5 +
-			smoothed.smoothEnergy * 5.0 +
-			tension * 2.5 +
-			smoothed.sustain * 2.0 +
-			directed.energy * 1.5 +
-			phrasePowerBias * (0.4 + smoothed.sustain * 0.6);
+		camPhaseOffset = lerp(camPhaseOffset, camPhaseTargetOffset, alpha(0.025));
+		const growth = Math.max(
+			0,
+			Math.min(
+				1,
+				directed.energy * 0.42 +
+					smoothed.smoothEnergy * 0.36 +
+					smoothed.bass * 0.32 +
+					smoothed.rmsSlow * 0.12 +
+					smoothed.flash * 0.08 +
+					antic * 0.22 +
+					postDrop * 0.18 +
+					growthBias
+			)
+		);
+		const tension = Math.max(
+			0,
+			Math.min(
+				1,
+				directed.motion * 0.26 +
+					directed.density * 0.18 +
+					smoothed.mid * 0.34 +
+					smoothed.treble * 0.12 +
+					smoothed.flash * 0.08 +
+					antic * 0.28 +
+					tensionBias
+			)
+		);
+		// Topology stays in the Mandelbulb's strongest range. Section mood sets
+		// the base form; mids and sustained energy reveal detail without wildly
+		// remeshing the whole subject on every transient.
+		const mandelbulbPower = Math.max(
+			5.8,
+			Math.min(
+				9.0,
+				moodPower +
+					smoothed.smoothEnergy * 0.35 +
+					smoothed.mid * 0.25 +
+					phrasePowerBias * (0.25 + smoothed.sustain * 0.15)
+			)
+		);
 		const chromaAngleSlow = Math.atan2(smoothed.chromaYSlow, smoothed.chromaXSlow) / (2 * Math.PI);
 		// Tonnetz palette (V2): baseHue + accent blend for harmonically-aware drift.
 		const tonnetzBlend = 0.5 + 0.5 * Math.sin(phrasePos * Math.PI * 2);
 		const hueFromTonnetz = baseHue * (1 - 0.3 * tonnetzBlend) + accentHue * 0.3 * tonnetzBlend;
 		const paletteOffset =
 			hueFromTonnetz + (moodPalOffset - 0.45) * 0.12 + (smoothed.centroidSlow - 0.5) * 0.06 + chromaAngleSlow * 0.04;
-		const fogDensity = 0.07 * moodFogMul + smoothed.bass * 0.035 + directed.density * 0.055 + antic * 0.025;
-		const lightShaftIntensity = moodShaftMul * (0.30 + directed.energy * 0.48 + smoothed.bass * 0.13 + antic * 0.55 + postDrop * 0.70);
-		// Per-session FOV — different sessions land different focal lengths
-		// (1.35 = wide-angle dramatic, 1.95 = tighter portrait). Combined
-		// with target offset + roll below, the same waypoint loop produces
-		// totally different framings per mount.
-		const fovScale = 1.35 + mk2SongSeed * 0.60;
+		const fogDensity =
+			0.055 * moodFogMul +
+			smoothed.bass * 0.025 +
+			directed.density * 0.025 +
+			antic * 0.012;
+		const lightShaftIntensity =
+			moodShaftMul *
+			(0.28 +
+				directed.energy * 0.34 +
+				smoothed.bass * 0.16 +
+				antic * 0.25 +
+				postDrop * 0.35);
+		// Track-stable focal length varies inside a deliberately narrow range;
+		// identity changes without turning some tracks into distorted wide shots.
+		const fovScale = 1.5 + mk2SongSeed * 0.2;
 
 		// Camera path — state mood drives traversal speed and overall distance
 		// from origin. Calm = far + slow drift; peak = close + fast traversal.
-		// PER-SESSION VARIATION: each load shifts the look-target Y, adds a
-		// roll on camUp, and offsets the traversal start phase so different
-		// mounts visit the waypoints in different orders → genuinely different
-		// camera identity.
-		// Track seed sets the start phase; phrase/drop cuts accumulate jumps so
-		// the camera visits genuinely new framings as the song develops.
-		const sessionPhaseOffset = mk2SongSeed * 6.28318 + camPhaseJump;
-		const sessionTargetY = -0.05 + (mk2SongSeed - 0.5) * 0.45; // -0.275..+0.20
-		const sessionRoll = (mk2SongSeed - 0.5) * 0.55; // ±0.275 rad ≈ ±16°
-		const camPosRaw = getCameraPos(time + sessionPhaseOffset, moodCamSpeedMul);
-		const camSceneScale = 1.18 + growth * 0.20;
+		// The track seed gives a restrained target offset and roll. Phrase/drop
+		// events glide to a new path phase rather than cutting the camera.
+		const sessionTargetY = -0.05 + (mk2SongSeed - 0.5) * 0.24;
+		const sessionRoll = (mk2SongSeed - 0.5) * 0.24;
+		const camPosRaw = getCameraPos(time, moodCamSpeedMul, camPhaseOffset);
+		const camSceneScale = 1.08 - growth * 0.08;
 		// Hand-held camera shake — driven by smoothEnergy (slow follower)
 		// instead of raw flash, so kicks add subtle drift not jittery snap.
 		// flash still contributes a tiny extra spike per onset for the
 		// "impact" feel without making the whole image vibrate.
 		const shakeT = time * 7.0;
-		const shakeAmp = (smoothed.smoothEnergy * 0.028 + smoothed.flash * 0.010) * camSceneScale;
+		const shakeAmp = (smoothed.smoothEnergy * 0.014 + smoothed.flash * 0.004) * camSceneScale;
 		const shakeX = (Math.sin(shakeT * 1.13) + Math.sin(shakeT * 2.7) * 0.5) * shakeAmp;
 		const shakeY = (Math.cos(shakeT * 1.39) + Math.sin(shakeT * 3.1) * 0.5) * shakeAmp * 0.7;
 		const shakeZ = (Math.sin(shakeT * 0.87 + 1.5) + Math.cos(shakeT * 2.3) * 0.5) * shakeAmp * 0.8;
@@ -2031,9 +2186,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			camPosRaw[1] * moodCamDistMul * camSceneScale + shakeY,
 			camPosRaw[2] * moodCamDistMul * camSceneScale + shakeZ
 		];
-		// Mode 4 (perched overhead) needs to look down at origin, not at the
+		// Mode 2 (perched overhead) needs to look down at origin, not at the
 		// session-biased Y target — otherwise camera looks past the organism.
-		const targetY = CAM_MODE === 4 ? -0.4 : sessionTargetY;
+		const targetY = CAM_MODE === 2 ? -0.35 : sessionTargetY;
 		const camTarget: [number, number, number] = [0, targetY, 0];
 		const fwd: [number, number, number] = [
 			camTarget[0] - camPos[0],
@@ -2052,22 +2207,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		right[2] /= rLen;
 		// up = cross(right, fwd) — then roll around fwd by sessionRoll so the
 		// horizon line is tilted per session. Adds Dutch-angle camera identity.
-		let camUp: [number, number, number] = [
+		const baseUp: [number, number, number] = [
 			right[1] * fwd[2] - right[2] * fwd[1],
 			right[2] * fwd[0] - right[0] * fwd[2],
 			right[0] * fwd[1] - right[1] * fwd[0]
 		];
 		const cr = Math.cos(sessionRoll);
 		const sr = Math.sin(sessionRoll);
-		camUp = [
-			camUp[0] * cr + right[0] * sr,
-			camUp[1] * cr + right[1] * sr,
-			camUp[2] * cr + right[2] * sr
+		const camUp: [number, number, number] = [
+			baseUp[0] * cr + right[0] * sr,
+			baseUp[1] * cr + right[1] * sr,
+			baseUp[2] * cr + right[2] * sr
 		];
 		const rolledRight: [number, number, number] = [
-			right[0] * cr - camUp[0] * sr,
-			right[1] * cr - camUp[1] * sr,
-			right[2] * cr - camUp[2] * sr
+			right[0] * cr - baseUp[0] * sr,
+			right[1] * cr - baseUp[1] * sr,
+			right[2] * cr - baseUp[2] * sr
 		];
 		right[0] = rolledRight[0];
 		right[1] = rolledRight[1];
@@ -2106,11 +2261,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[29] = lightShaftIntensity;
 		u[30] = growth;
 		u[31] = tension;
-		// Per-TRACK palette family — the seed picks one of six distinct colour
-		// worlds (dusk / aurora / synthwave / volcanic / bioluminous /
-		// oil-on-water); drops and chorus entries advance to the next family
-		// so the colour world transforms at the song's structural moments.
-		u[32] = (Math.floor(mk2SongSeed * 6) + paletteFamilyShift) % 6;
+		// Per-track palette family stays stable; harmonic analysis moves within
+		// it, so the track develops without looking like a preset roulette.
+		u[32] = Math.floor(mk2SongSeed * 6);
 		// ADSR + reverb channels — staccato spike, sustain mood envelope,
 		// reverb time-since-onset normalized 0..1 over 2s.
 		u[33] = smoothed.staccato;
@@ -2142,7 +2295,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		pp[3] = paletteOffset;
 		// Fade: peak holds trails longer, calm fades faster.
 		pp[4] =
-			songState === 'peak' ? 0.94 : songState === 'rising' ? 0.925 : songState === 'releasing' ? 0.91 : 0.885;
+			songState === 'peak' ? 0.92 : songState === 'rising' ? 0.9 : songState === 'releasing' ? 0.88 : 0.85;
 		// Spawn intensity: keep the aura subordinate to the raymarched organism.
 		pp[5] =
 			songState === 'peak' ? 0.28 : songState === 'rising' ? 0.22 : songState === 'releasing' ? 0.16 : 0.10;
@@ -2157,10 +2310,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			PARTICLE_PARAM_BYTES
 		);
 
-		// ── Pack bloom params for all 7 passes (4 down + 3 up).
+		// ── Pack bloom params for five passes (3 down + 2 up).
 		// Each slice is 256-byte aligned (WebGPU minimum dynamic uniform alignment).
 		const bloomThreshold = 1.15; // HDR threshold for first downsample
-		const bloomIntensity = 0.34; // contribution scale for each upsample
+		const bloomIntensity = 0.3; // contribution scale for each upsample
 		const gpuRef = gpu;
 		const bp = gpuRef.bloomParamData;
 		// Helper to write a slice
@@ -2183,7 +2336,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			const dst = t.bloomSizes[i];
 			writeSlice(i, [src.w, src.h, dst.w, dst.h, 0, 0, 0, 0]);
 		}
-		// Up passes: index 4,5,6 → climb from mip 3 to mip 0
+		// Up passes climb from the smallest mip back to mip 0.
 		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
 			const srcLevel = BLOOM_LEVELS - 1 - i;
 			const dstLevel = srcLevel - 1;
@@ -2192,7 +2345,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			writeSlice(BLOOM_LEVELS + i, [src.w, src.h, dst.w, dst.h, 0, bloomIntensity, 0, 0]);
 		}
 
-		const encoder = gpu.device.createCommandEncoder();
+		const submittingGpu = gpuRef;
+		const submittingBindGroups = submittingGpu.bindGroups;
+		if (!submittingBindGroups) return;
+		const submittingGeneration = initGeneration;
+		try {
+			const encoder = submittingGpu.device.createCommandEncoder();
 
 		// Scene → sceneTex
 		{
@@ -2206,8 +2364,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					}
 				]
 			});
-			pass.setPipeline(gpu.pipelines.scene);
-			pass.setBindGroup(0, gpu.bindGroups.scene);
+			pass.setPipeline(submittingGpu.pipelines.scene);
+			pass.setBindGroup(0, submittingBindGroups.scene);
 			pass.draw(6);
 			pass.end();
 		}
@@ -2224,8 +2382,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					}
 				]
 			});
-			pass.setPipeline(gpu.pipelines.bloomDown);
-			pass.setBindGroup(0, gpu.bindGroups.bloomDownBGs[i]);
+			pass.setPipeline(submittingGpu.pipelines.bloomDown);
+			pass.setBindGroup(0, submittingBindGroups.bloomDownBGs[i]);
 			pass.draw(6);
 			pass.end();
 		}
@@ -2238,13 +2396,13 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					{ view: t.bloomViews[dstLevel], loadOp: 'load', storeOp: 'store' }
 				]
 			});
-			pass.setPipeline(gpu.pipelines.bloomUp);
-			pass.setBindGroup(0, gpu.bindGroups.bloomUpBGs[i]);
+			pass.setPipeline(submittingGpu.pipelines.bloomUp);
+			pass.setBindGroup(0, submittingBindGroups.bloomUpBGs[i]);
 			pass.draw(6);
 			pass.end();
 		}
 
-		const prevIdx = (gpu.frame % 2) as 0 | 1;
+		const prevIdx = (submittingGpu.frame % 2) as 0 | 1;
 		const currIdx = (1 - prevIdx) as 0 | 1;
 
 		// Particle update — reads previous particle tex, fades, adds bin splats,
@@ -2260,8 +2418,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					}
 				]
 			});
-			pass.setPipeline(gpu.pipelines.particle);
-			pass.setBindGroup(0, gpu.bindGroups.particle[prevIdx]);
+			pass.setPipeline(submittingGpu.pipelines.particle);
+			pass.setBindGroup(0, submittingBindGroups.particle[prevIdx]);
 			pass.draw(6);
 			pass.end();
 		}
@@ -2279,15 +2437,15 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					}
 				]
 			});
-			pass.setPipeline(gpu.pipelines.composite);
-			pass.setBindGroup(0, gpu.bindGroups.composite[prevIdx]);
+			pass.setPipeline(submittingGpu.pipelines.composite);
+			pass.setBindGroup(0, submittingBindGroups.composite[prevIdx]);
 			pass.draw(6);
 			pass.end();
 		}
 
 		// Present (tone-map + grain + CA) → swap chain
 		{
-			const view = gpu.context.getCurrentTexture().createView();
+			const view = submittingGpu.context.getCurrentTexture().createView();
 			const pass = encoder.beginRenderPass({
 				colorAttachments: [
 					{
@@ -2298,15 +2456,24 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					}
 				]
 			});
-			pass.setPipeline(gpu.pipelines.present);
-			pass.setBindGroup(0, gpu.bindGroups.present[currIdx]);
+			pass.setPipeline(submittingGpu.pipelines.present);
+			pass.setBindGroup(0, submittingBindGroups.present[currIdx]);
 			pass.draw(6);
 			pass.end();
 		}
 
-		gpu.device.queue.submit([encoder.finish()]);
-		gpu.frame++;
-		raf = requestAnimationFrame(loop);
+			submittingGpu.device.queue.submit([encoder.finish()]);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			failGpuDevice(
+				submittingGpu,
+				submittingGeneration,
+				`Mk2 could not encode or submit WebGPU work: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+			);
+			return;
+		}
+		submittingGpu.frame++;
+		if (!gpuReady) gpuReady = true;
 	}
 
 	$effect(() => {
@@ -2316,64 +2483,92 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		}
 		if (gpu) return;
 		errorMsg = null;
+		gpuReady = false;
 		const initFor = canvas;
+		const generation = ++initGeneration;
 		initGpu(initFor)
 			.then((g) => {
 				if (!g) return;
-				if (canvas !== initFor) {
-					try {
-						g.uniformBuf.destroy();
-						g.device.destroy?.();
-					} catch {}
+				if (generation !== initGeneration || canvas !== initFor) {
+					destroyGpuResources(g);
 					return;
 				}
 				gpu = g;
+				resetFrameScheduler();
+				void g.device.lost.then((info) => {
+					const reason = info.reason === 'destroyed' ? 'destroyed unexpectedly' : 'lost';
+					const detail = info.message.trim();
+					failGpuDevice(
+						g,
+						generation,
+						`Mk2's WebGPU device was ${reason}${detail ? `: ${detail}` : ''}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+					);
+				});
 			})
 			.catch((e) => {
-				errorMsg = e instanceof Error ? e.message : String(e);
+				if (generation === initGeneration && canvas === initFor) {
+					errorMsg = e instanceof Error ? e.message : String(e);
+				}
 			});
 	});
 
-	onMount(async () => {
-		unsub = await vis.subscribe();
+	onMount(() => {
 		running = true;
 		raf = requestAnimationFrame(loop);
+		void vis.subscribe().then((stop) => {
+			if (!running) {
+				stop();
+				return;
+			}
+			unsub = stop;
+		});
 	});
 
 	onDestroy(() => {
 		running = false;
 		cancelAnimationFrame(raf);
-		if (unsub) unsub();
+		if (unsub) {
+			unsub();
+			unsub = null;
+		}
 		teardownGpu();
 	});
 </script>
 
 {#if vis.active}
-	<div
-		class="fixed inset-0 z-[100] bg-black"
-		role="button"
-		aria-label="Close visualizer"
-		onclick={() => {
-			if (showHud) vis.toggle();
-		}}
-		onkeydown={(e) => {
-			if (e.key === 'Escape' && showHud) vis.toggle();
-		}}
-		tabindex="0"
-	>
-		<canvas bind:this={canvas} class="h-full w-full"></canvas>
+	<div class="fixed inset-0 z-[100] overflow-hidden bg-black">
+		<div
+			class="pointer-events-none absolute inset-0 transition-opacity duration-500"
+			class:opacity-0={gpuReady}
+			style="background: radial-gradient(circle at 50% 44%, #171029 0%, #070410 46%, #000 78%);"
+			aria-hidden="true"
+		></div>
+		<canvas
+			bind:this={canvas}
+			class="relative z-10 h-full w-full transition-opacity duration-300"
+			class:opacity-0={!gpuReady}
+		></canvas>
 		{#if showHud}
-			<div class="pointer-events-none absolute right-6 top-6 text-xs text-white/40">
+			<button
+				type="button"
+				class="absolute inset-0 z-20 cursor-default border-0 bg-transparent p-0"
+				aria-label="Close visualizer"
+				onclick={() => vis.toggle()}
+				onkeydown={(event) => {
+					if (event.key === 'Escape') vis.toggle();
+				}}
+			></button>
+			<div class="pointer-events-none absolute right-6 top-6 z-30 text-xs text-white/40">
 				mk2 — fractal atmosphere — click anywhere or press esc to exit
 			</div>
 			<div
-				class="pointer-events-none absolute left-6 top-6 rounded border border-white/15 bg-black/40 px-2 py-1 font-mono text-xs uppercase tracking-wider text-white/70"
+				class="pointer-events-none absolute left-6 top-6 z-30 rounded border border-white/15 bg-black/40 px-2 py-1 font-mono text-xs uppercase tracking-wider text-white/70"
 			>
 				section: <strong>{songState}</strong>
 			</div>
 		{/if}
 		{#if errorMsg}
-			<div class="absolute left-6 top-16 max-w-md text-xs text-red-300/80">
+			<div class="pointer-events-none absolute left-6 top-16 z-30 max-w-md text-xs text-red-300/80">
 				Visualizer error: {errorMsg}
 			</div>
 		{/if}

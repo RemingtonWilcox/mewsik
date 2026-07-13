@@ -102,7 +102,8 @@ export function motifForSection(
 		case 'calm':
 		default: {
 			// Rotate organism through harmonic variations on phrase boundaries.
-			const idx = (Math.floor(chromaKey / 3) + phraseIndex) % 4;
+			const pitchClass = Math.floor(clamp01(chromaKey) * 12) % 12;
+			const idx = (Math.floor(pitchClass / 3) + phraseIndex) % 4;
 			const motifs: ('organism' | 'tunnel' | 'lattice' | 'ribbon')[] = [
 				'organism',
 				'tunnel',

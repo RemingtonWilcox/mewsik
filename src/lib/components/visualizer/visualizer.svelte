@@ -1187,7 +1187,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		}
 
 		// ── Feature smoothing
-		const feat = vis.latest;
+		// Read one freshness-checked snapshot for the entire rendered frame. When
+		// native delivery stalls, every target below eases back toward silence.
+		const feat = vis.getLatest();
 		const incoming = feat?.bins ?? [];
 		const attack = 0.55;
 		const release = 0.16;
@@ -1517,41 +1519,48 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			});
 	});
 
-	onMount(async () => {
-		unsub = await vis.subscribe();
+	onMount(() => {
 		running = true;
-		raf = requestAnimationFrame(loop);
+		void vis.subscribe().then((stop) => {
+			if (!running) {
+				stop();
+				return;
+			}
+			unsub = stop;
+			raf = requestAnimationFrame(loop);
+		});
 	});
 
 	onDestroy(() => {
 		running = false;
 		cancelAnimationFrame(raf);
-		if (unsub) unsub();
+		if (unsub) {
+			unsub();
+			unsub = null;
+		}
 		teardownGpu();
 	});
 </script>
 
 {#if vis.active}
-	<div
-		class="fixed inset-0 z-[100] bg-black"
-		role="button"
-		aria-label="Close visualizer"
-		onclick={() => {
-			if (showHud) vis.toggle();
-		}}
-		onkeydown={(e) => {
-			if (e.key === 'Escape' && showHud) vis.toggle();
-		}}
-		tabindex="0"
-	>
+	<div class="fixed inset-0 z-[100] bg-black">
 		<canvas bind:this={canvas} class="h-full w-full"></canvas>
 		{#if showHud}
-			<div class="pointer-events-none absolute right-6 top-6 text-xs text-white/40">
+			<button
+				type="button"
+				class="absolute inset-0 z-10 cursor-default border-0 bg-transparent p-0"
+				aria-label="Close visualizer"
+				onclick={() => vis.toggle()}
+				onkeydown={(event) => {
+					if (event.key === 'Escape') vis.toggle();
+				}}
+			></button>
+			<div class="pointer-events-none absolute right-6 top-6 z-20 text-xs text-white/40">
 				click anywhere or press esc to exit
 			</div>
 		{/if}
 		{#if errorMsg}
-			<div class="absolute left-6 top-6 max-w-md text-xs text-red-300/80">
+			<div class="pointer-events-none absolute left-6 top-6 z-20 max-w-md text-xs text-red-300/80">
 				Visualizer error: {errorMsg}
 			</div>
 		{/if}

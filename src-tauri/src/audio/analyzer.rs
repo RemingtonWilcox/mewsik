@@ -25,9 +25,9 @@ const TAP_CAPACITY: usize = 1 << 16;
 #[derive(Clone, Debug, Serialize)]
 pub struct AudioFeatures {
     pub bins: Vec<f32>, // BIN_COUNT log-spaced magnitudes, 0..1
-    pub rms: f32,
-    pub peak: f32,
-    pub centroid: f32, // normalized 0..1 (relative to Nyquist)
+    pub rms: f32,       // time-domain waveform RMS amplitude, 0..1
+    pub peak: f32,      // time-domain absolute waveform peak, 0..1
+    pub centroid: f32,  // normalized 0..1 (relative to Nyquist)
     pub onset: bool,
     pub bass: f32,
     pub mid: f32,
@@ -141,6 +141,24 @@ fn estimate_beat_period(flux: &VecDeque<f32>, emit_hz: f32) -> f32 {
     best_lag as f32
 }
 
+/// Return waveform loudness using the normalized PCM contract shared with the
+/// browser analyzer: RMS amplitude and absolute peak, both in 0..1.
+fn pcm_levels(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let mut sum_sq = 0.0f32;
+    let mut peak = 0.0f32;
+    for &sample in samples {
+        sum_sq += sample * sample;
+        peak = peak.max(sample.abs());
+    }
+
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    (rms.clamp(0.0, 1.0), peak.clamp(0.0, 1.0))
+}
+
 pub fn spawn_analyzer(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>>>) {
     std::thread::Builder::new()
         .name("audio-analyzer".to_string())
@@ -196,6 +214,10 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         }
         last_emit = Instant::now();
 
+        // Loudness is a time-domain property. Measure the unwindowed PCM ring;
+        // FFT magnitudes stay dedicated to spectral features below.
+        let (rms, peak) = pcm_levels(&ring);
+
         for i in 0..FFT_SIZE {
             let src_idx = (ring_head + i) % FFT_SIZE;
             input[i] = ring[src_idx] * window[i];
@@ -209,9 +231,6 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             .iter()
             .map(|c| (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32)
             .collect();
-        let peak = mags.iter().copied().fold(0.0f32, f32::max);
-        let rms_sum: f32 = mags.iter().map(|m| m * m).sum();
-        let rms = (rms_sum / mags.len() as f32).sqrt().min(1.0);
 
         let nyquist = sr.max(1) as f32 / 2.0;
         let mut bins = vec![0.0f32; BIN_COUNT];
@@ -239,7 +258,11 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             num += f * m;
             den += m;
         }
-        let centroid = if den > 0.0 { (num / den) / nyquist } else { 0.0 };
+        let centroid = if den > 0.0 {
+            (num / den) / nyquist
+        } else {
+            0.0
+        };
 
         let bass_n = BIN_COUNT / 8;
         let mid_n = BIN_COUNT / 2 - bass_n;
@@ -325,7 +348,7 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         let features = AudioFeatures {
             bins,
             rms,
-            peak: peak.min(1.0),
+            peak,
             centroid: centroid.clamp(0.0, 1.0),
             onset,
             bass: bass.clamp(0.0, 1.0),
@@ -342,5 +365,50 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         if let Some(h) = handle {
             let _ = h.emit("audio:features", &features);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pcm_levels;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1e-5,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn pcm_levels_report_silence() {
+        let (rms, peak) = pcm_levels(&[0.0; 32]);
+        assert_eq!((rms, peak), (0.0, 0.0));
+    }
+
+    #[test]
+    fn pcm_levels_use_waveform_amplitude() {
+        let (rms, peak) = pcm_levels(&[0.5, -0.5, 0.5, -0.5]);
+        assert_close(rms, 0.5);
+        assert_close(peak, 0.5);
+    }
+
+    #[test]
+    fn pcm_levels_match_a_sine_wave() {
+        let samples: Vec<f32> = (0..2048)
+            .map(|i| {
+                let phase = 2.0 * std::f32::consts::PI * 32.0 * i as f32 / 2048.0;
+                0.8 * phase.sin()
+            })
+            .collect();
+
+        let (rms, peak) = pcm_levels(&samples);
+        assert_close(rms, 0.8 / 2.0f32.sqrt());
+        assert_close(peak, 0.8);
+    }
+
+    #[test]
+    fn pcm_levels_stay_normalized() {
+        let (rms, peak) = pcm_levels(&[2.0, -2.0]);
+        assert_eq!((rms, peak), (1.0, 1.0));
     }
 }
