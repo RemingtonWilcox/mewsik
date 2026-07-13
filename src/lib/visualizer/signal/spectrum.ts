@@ -1,4 +1,4 @@
-import type { AudioFeatures } from '$lib/state/visualizer.svelte';
+import type { AudioFeatureFrame } from '$lib/visualizer/director/types';
 
 /**
  * Signal's six perceptual bands. The native analyzer publishes 64 logarithmic
@@ -20,7 +20,7 @@ export type SignalBandVector = {
 };
 
 export type SignalSpectrumInput = Pick<
-	AudioFeatures,
+	AudioFeatureFrame,
 	'bins' | 'sample_rate' | 'rms' | 'peak' | 'centroid'
 >;
 
@@ -37,6 +37,12 @@ export type SignalSpectrumProfile = {
 	levels: SignalBandVector;
 	/** Fast minus slow energy, normalized by the adaptive ceiling, -1..1. */
 	deltas: SignalBandVector;
+	/**
+	 * Decoded, baseline-relative detail for the 64-bin trace buffer. Values are
+	 * signed -1..1: positive is newly-arrived energy, negative is a receding
+	 * partial. The array identity is stable for direct GPU uploads.
+	 */
+	detailBins: Float32Array;
 	/** Positive short-term spectral change, 0..1. */
 	novelty: number;
 	/** Absolute movement of the six-band spectral shape, 0..1. */
@@ -78,6 +84,9 @@ const CEILING_ATTACK = [0.28, 0.16, 0.22, 0.25, 0.18, 0.14];
 const CEILING_RELEASE = [16, 12, 14, 14, 11, 9];
 const MIN_CEILING = [0.008, 0.009, 0.008, 0.007, 0.006, 0.005];
 const SPECTRAL_DIRECTION_WEIGHTS = [-1, -0.68, -0.28, 0.2, 0.62, 1];
+// Mildly compensate the natural spectral roll-off without allowing a tiny,
+// steady air/noise floor to normalize to the same strength as a kick.
+const RELATIVE_BAND_GAIN = [0.9, 1, 0.96, 0.94, 1.08, 1.28];
 
 function makeBandVector(): SignalBandVector {
 	return { sub: 0, kick: 0, body: 0, mids: 0, presence: 0, air: 0 };
@@ -89,6 +98,11 @@ function clamp(value: number, low: number, high: number): number {
 
 function clamp01(value: number): number {
 	return clamp(value, 0, 1);
+}
+
+function smoothstep(edge0: number, edge1: number, value: number): number {
+	const t = clamp01((value - edge0) / Math.max(edge1 - edge0, 1e-9));
+	return t * t * (3 - 2 * t);
 }
 
 function safeDt(dtSeconds: number): number {
@@ -234,6 +248,33 @@ export function deriveSignalBandEnergies(
 	return out;
 }
 
+function decodeSignalBins(bins: ArrayLike<number>, out: Float32Array): number {
+	const limit = Math.min(SIGNAL_SPECTRUM_BIN_COUNT, bins.length);
+	let peak = 0;
+	for (let bin = 0; bin < limit; bin += 1) {
+		const decoded = decodeSignalAnalyzerBin(bins[bin] ?? 0);
+		out[bin] = decoded;
+		peak = Math.max(peak, decoded);
+	}
+	for (let bin = limit; bin < SIGNAL_SPECTRUM_BIN_COUNT; bin += 1) out[bin] = 0;
+	return peak;
+}
+
+function reduceDecodedSignalBands(
+	decodedBins: Float32Array,
+	weights: Float32Array,
+	out: Float32Array
+): void {
+	out.fill(0);
+	for (let bin = 0; bin < SIGNAL_SPECTRUM_BIN_COUNT; bin += 1) {
+		const magnitude = decodedBins[bin];
+		if (magnitude <= 0) continue;
+		for (let band = 0; band < SIGNAL_BAND_COUNT; band += 1) {
+			out[band] += magnitude * weights[band * SIGNAL_SPECTRUM_BIN_COUNT + bin];
+		}
+	}
+}
+
 /**
  * Stateful, steady-state allocation-free spectral profiler for Signal. It
  * supplies both instantaneous detail and slow musical context without binding
@@ -249,6 +290,12 @@ export class SignalSpectrumTracker {
 	private readonly levels = new Float32Array(SIGNAL_BAND_COUNT);
 	private readonly deltas = new Float32Array(SIGNAL_BAND_COUNT);
 	private readonly previousLevels = new Float32Array(SIGNAL_BAND_COUNT);
+	private readonly decodedBins = new Float32Array(SIGNAL_SPECTRUM_BIN_COUNT);
+	private readonly detailFast = new Float32Array(SIGNAL_SPECTRUM_BIN_COUNT);
+	private readonly detailSlow = new Float32Array(SIGNAL_SPECTRUM_BIN_COUNT);
+	private readonly detailBins = new Float32Array(SIGNAL_SPECTRUM_BIN_COUNT);
+	private globalCeiling = 0.008;
+	private detailCeiling = 0.008;
 	private centroid = 0.42;
 	private previousCentroid = 0.42;
 	private centroidVelocity = 0;
@@ -265,6 +312,7 @@ export class SignalSpectrumTracker {
 		slow: makeBandVector(),
 		levels: makeBandVector(),
 		deltas: makeBandVector(),
+		detailBins: this.detailBins,
 		novelty: 0,
 		spectralMotion: 0,
 		spectralDirection: 0,
@@ -290,6 +338,12 @@ export class SignalSpectrumTracker {
 		this.levels.fill(0);
 		this.deltas.fill(0);
 		this.previousLevels.fill(0);
+		this.decodedBins.fill(0);
+		this.detailFast.fill(0);
+		this.detailSlow.fill(0);
+		this.detailBins.fill(0);
+		this.globalCeiling = 0.008;
+		this.detailCeiling = 0.008;
 		for (let i = 0; i < SIGNAL_BAND_COUNT; i += 1) this.ceiling[i] = MIN_CEILING[i];
 		this.centroid = 0.42;
 		this.previousCentroid = 0.42;
@@ -310,10 +364,12 @@ export class SignalSpectrumTracker {
 			fillSignalBandWeights(this.weights, this.sampleRate);
 		}
 
-		deriveSignalBandEnergies(features?.bins ?? EMPTY_BINS, this.sampleRate, this.raw, this.weights);
+		const decodedPeak = decodeSignalBins(features?.bins ?? EMPTY_BINS, this.decodedBins);
+		reduceDecodedSignalBands(this.decodedBins, this.weights, this.raw);
 		let motionInstant = 0;
 		let noveltyInstant = 0;
 		let directionInstant = 0;
+		let globalMagnitude = 0;
 		for (let band = 0; band < SIGNAL_BAND_COUNT; band += 1) {
 			const raw = this.raw[band];
 			this.fast[band] = asymmetricApproach(
@@ -339,10 +395,38 @@ export class SignalSpectrumTracker {
 				CEILING_RELEASE[band],
 				dt
 			);
+			globalMagnitude = Math.max(globalMagnitude, this.fast[band] * RELATIVE_BAND_GAIN[band]);
+		}
+
+		this.globalCeiling = asymmetricApproach(
+			this.globalCeiling,
+			Math.max(globalMagnitude, 0.004),
+			0.2,
+			12,
+			dt
+		);
+		const rms = clamp01(features?.rms ?? 0);
+		const activityGate = smoothstep(0.0025, 0.025, rms);
+		// The current maximum preserves within-frame spectral balance. A fraction
+		// of the slow global ceiling prevents a lone residual/noise band from
+		// becoming the new reference immediately after a loud passage.
+		const globalReference = Math.max(globalMagnitude, this.globalCeiling * 0.35, 0.004);
+
+		for (let band = 0; band < SIGNAL_BAND_COUNT; band += 1) {
 			const scale = Math.max(this.ceiling[band], MIN_CEILING[band]);
-			const level = clamp01(this.fast[band] / scale);
+			const adaptiveLevel = clamp01(this.fast[band] / scale);
+			const relativeLevel = clamp01(
+				(this.fast[band] * RELATIVE_BAND_GAIN[band]) / globalReference
+			);
+			const relativeGate = smoothstep(0.025, 0.16, relativeLevel);
+			const relativeShape = 0.18 + Math.sqrt(relativeLevel) * 0.82;
+			const level = clamp01(adaptiveLevel * relativeGate * relativeShape * activityGate);
 			this.levels[band] = level;
-			this.deltas[band] = clamp((this.fast[band] - this.slow[band]) / scale, -1, 1);
+			this.deltas[band] = clamp(
+				((this.fast[band] - this.slow[band]) / scale) * relativeGate * activityGate,
+				-1,
+				1
+			);
 
 			if (this.primed) {
 				const velocity = (level - this.previousLevels[band]) / dt;
@@ -353,6 +437,42 @@ export class SignalSpectrumTracker {
 					compressedVelocity * SPECTRAL_DIRECTION_WEIGHTS[band] / SIGNAL_BAND_COUNT;
 			}
 			this.previousLevels[band] = level;
+		}
+
+		// Preserve local spectral motion without sending the analyzer's compressed
+		// display bins back to the GPU. Per-bin residuals can be much larger than a
+		// normalized six-band average, so they use a dedicated peak ceiling. The
+		// current peak protects broadband onsets from hard clipping; the slower
+		// release retains magnitude context for receding partials.
+		this.detailCeiling = asymmetricApproach(
+			this.detailCeiling,
+			Math.max(decodedPeak, 0.004),
+			0.04,
+			2.4,
+			dt
+		);
+		const detailScale = Math.max(decodedPeak, this.detailCeiling * 0.85, 0.004);
+		for (let bin = 0; bin < SIGNAL_SPECTRUM_BIN_COUNT; bin += 1) {
+			const decoded = this.decodedBins[bin];
+			this.detailFast[bin] = asymmetricApproach(
+				this.detailFast[bin],
+				decoded,
+				0.016,
+				0.13,
+				dt
+			);
+			this.detailSlow[bin] = asymmetricApproach(
+				this.detailSlow[bin],
+				decoded,
+				0.48,
+				1.35,
+				dt
+			);
+			this.detailBins[bin] = clamp(
+				((this.detailFast[bin] - this.detailSlow[bin]) / detailScale) * activityGate,
+				-1,
+				1
+			);
 		}
 
 		const centroidTarget = clamp01(features?.centroid ?? 0.42);
@@ -377,7 +497,6 @@ export class SignalSpectrumTracker {
 			dt
 		);
 
-		const rms = clamp01(features?.rms ?? 0);
 		const peak = clamp01(features?.peak ?? 0);
 		const crestRatio = rms > 0.002 ? clamp(peak / Math.max(rms, 1e-4), 0, 12) : 0;
 		const crestTarget = crestRatio > 0 ? clamp01((crestRatio - 1) / 4) : 0;

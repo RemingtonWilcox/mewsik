@@ -26,14 +26,18 @@ export type SignalConductorFrame = {
 	shapeWeights: SignalShapeWeights;
 	/** Build pressure / geometric winding, 0..1. */
 	tension: number;
-	/** Drop/chorus expansion and ring-out, 0..1. */
+	/** Sustained drop/chorus expansion, 0..1. */
 	release: number;
 	/** Overall spatial expansion, 0..1. */
 	openness: number;
 	/** Controlled departure from bilateral symmetry, 0..1. */
 	asymmetry: number;
-	/** Fast beat/kick/crest impulse, 0..1. */
+	/** Phrase-polarized asymmetry eased through zero, -1..1. */
+	signedAsymmetry: number;
+	/** Fast kick/novelty/crest impulse, independent of the beat clock, 0..1. */
 	impact: number;
+	/** Temporary post-drop echo/ring envelope; never a sustained section state. */
+	ringOut: number;
 	/** One-shot envelope when the director enters a different section, 0..1. */
 	sectionPulse: number;
 	/** Tempo normalized over the analyzer's 60..180 BPM operating range. */
@@ -44,6 +48,10 @@ export type SignalConductorFrame = {
 	phrase: number;
 	/** Deterministic phrase identity derived from seed + phrase index, 0..1. */
 	phraseVariation: number;
+	/** Continuous contour offset; wraps without a visible phrase-boundary jump. */
+	spectrumTravel: number;
+	/** Shared renderer phase in radians; survives Signal component remounts. */
+	tracePhase: number;
 	/** Smoothed fifth-axis key angle, 0..1 around the circle. */
 	key: number;
 };
@@ -282,16 +290,23 @@ export class SignalConductor {
 	private readonly currentShapes = new Float32Array(SHAPE_COUNT);
 	private readonly targetShapes = new Float32Array(SHAPE_COUNT);
 	private lastSection: VisualizerSection | null = null;
+	private lastContextSource: VisualDirectorFrame['context']['source'] | null = null;
 	private lastPhraseIndex = Number.MIN_SAFE_INTEGER;
 	private tension = 0;
 	private release = 0;
 	private openness = 0.4;
 	private asymmetry = 0;
+	private signedAsymmetry = 0;
 	private impact = 0;
+	private ringOut = 0;
+	private postDropArmed = true;
+	private landingCooldown = 0;
 	private sectionPulse = 0;
 	private tempo = 0.5;
 	private motion = 0;
 	private key = 0;
+	private spectrumTravel = 0;
+	private tracePhase = 0;
 
 	private readonly output: SignalConductorFrame = {
 		section: 'intro',
@@ -300,12 +315,16 @@ export class SignalConductor {
 		release: 0,
 		openness: 0.4,
 		asymmetry: 0,
+		signedAsymmetry: 0,
 		impact: 0,
+		ringOut: 0,
 		sectionPulse: 0,
 		tempo: 0.5,
 		motion: 0,
 		phrase: 0,
 		phraseVariation: 0.5,
+		spectrumTravel: 0,
+		tracePhase: 0,
 		key: 0
 	};
 
@@ -316,6 +335,7 @@ export class SignalConductor {
 	reset(seed: SignalSeed): void {
 		this.seed = seed;
 		this.lastSection = null;
+		this.lastContextSource = null;
 		this.lastPhraseIndex = Number.MIN_SAFE_INTEGER;
 		this.phraseBias.fill(0);
 		writeProfileWeights(this.currentShapes, SECTION_PROFILES.intro.shapes);
@@ -324,23 +344,33 @@ export class SignalConductor {
 		this.release = SECTION_PROFILES.intro.release;
 		this.openness = SECTION_PROFILES.intro.openness;
 		this.asymmetry = SECTION_PROFILES.intro.asymmetry;
+		this.signedAsymmetry = 0;
 		this.impact = 0;
+		this.ringOut = 0;
+		this.postDropArmed = true;
+		this.landingCooldown = 0;
 		this.sectionPulse = 0;
 		this.tempo = 0.5;
 		this.motion = SECTION_PROFILES.intro.motion;
 		this.key = 0;
+		this.spectrumTravel = 0;
+		this.tracePhase = 0;
 		this.output.section = 'intro';
 		writeShapeWeights(this.output.shapeWeights, this.currentShapes);
 		this.output.tension = this.tension;
 		this.output.release = this.release;
 		this.output.openness = this.openness;
 		this.output.asymmetry = this.asymmetry;
+		this.output.signedAsymmetry = 0;
 		this.output.impact = 0;
+		this.output.ringOut = 0;
 		this.output.sectionPulse = 0;
 		this.output.tempo = this.tempo;
 		this.output.motion = this.motion;
 		this.output.phrase = 0;
 		this.output.phraseVariation = 0.5;
+		this.output.spectrumTravel = 0;
+		this.output.tracePhase = 0;
 		this.output.key = 0;
 	}
 
@@ -351,11 +381,25 @@ export class SignalConductor {
 	): Readonly<SignalConductorFrame> {
 		const dt = safeDt(dtSeconds);
 		const section = getSignalSectionProfile(frame.section);
+		const previousSection = this.lastSection;
+		const contextSource = frame.context.source;
+		const contextSourceChanged =
+			this.lastContextSource !== null && contextSource !== this.lastContextSource;
+		this.lastContextSource = contextSource;
+		let sectionChanged = false;
 		if (this.lastSection === null) {
 			this.lastSection = frame.section;
 		} else if (frame.section !== this.lastSection) {
 			this.lastSection = frame.section;
-			this.sectionPulse = 1;
+			if (contextSourceChanged) {
+				// Offline analysis may arrive during playback and relabel the current
+				// section. Morph toward that better context without pretending a real
+				// musical boundary or drop just occurred.
+				this.sectionPulse *= Math.exp(-dt / 0.72);
+			} else {
+				this.sectionPulse = 1;
+				sectionChanged = true;
+			}
 		} else {
 			this.sectionPulse *= Math.exp(-dt / 0.72);
 		}
@@ -368,8 +412,18 @@ export class SignalConductor {
 			fillSignalPhraseVariation(this.phraseBias, this.seed, phraseIndex);
 		}
 
-		const tempoTarget = clamp01((frame.clock.tempoBpm - 60) / 120);
+		const tempoBpm = clamp(
+			Number.isFinite(frame.clock.tempoBpm) ? frame.clock.tempoBpm : 120,
+			60,
+			180
+		);
+		const beatSeconds = 60 / tempoBpm;
+		const tempoTarget = clamp01((tempoBpm - 60) / 120);
 		this.tempo = approach(this.tempo, tempoTarget, 1.4, dt);
+		// One eighth of a contour revolution per eight-bar phrase. Integrating
+		// tempo makes the offset continuous even when phrasePos wraps or a live
+		// clock corrects its phrase index.
+		this.spectrumTravel = wrap01(this.spectrumTravel + (dt * tempoBpm) / 60 / 256);
 
 		const keyTarget = wrap01(Math.atan2(frame.tonnetz[1], frame.tonnetz[0]) / (Math.PI * 2));
 		this.key = approachCircular(this.key, keyTarget, 0.9, dt);
@@ -379,7 +433,6 @@ export class SignalConductor {
 		const positivePresence = Math.max(0, spectrum.deltas.presence);
 		const impactTarget = clamp01(
 			Math.max(
-				frame.clock.beatPulse * (0.48 + spectrum.crestFactor * 0.24),
 				positiveKick * 0.82 + positiveBody * 0.24,
 				frame.bassPunch * 0.58,
 				spectrum.novelty * (0.34 + spectrum.crestFactor * 0.52)
@@ -387,10 +440,55 @@ export class SignalConductor {
 		);
 		this.impact = approachAsymmetric(this.impact, impactTarget, 0.012, 0.17, dt);
 
+		// Expansion is a section state; ring-out is one landing event. The
+		// director's postDropDecay is itself a multi-second envelope, so treating
+		// its value as a continuous drive would pin this rail and erase its BPM
+		// timing. Hysteresis turns only a fresh low->high post-drop transition into
+		// an impulse. Entering the peak family can supply the impulse when no drop
+		// detector is available; drop->chorus stays inside that family and cannot
+		// retrigger the same landing.
+		const postDropDecay = clamp01(frame.drop.postDropDecay);
+		const peakSection = frame.section === 'drop' || frame.section === 'chorus';
+		const previousPeakSection =
+			previousSection === 'drop' || previousSection === 'chorus';
+		const enteredPeakFamily = sectionChanged && peakSection && !previousPeakSection;
+		this.landingCooldown = Math.max(0, this.landingCooldown - dt);
+		if (previousSection === null || contextSourceChanged) {
+			// Opening Signal in the middle of an existing decay is not a new landing.
+			// The same rule applies when live analysis hands off to a cached score.
+			this.postDropArmed = postDropDecay <= 0.04;
+		} else {
+			if (postDropDecay <= 0.04) this.postDropArmed = true;
+			const freshPostDrop = this.postDropArmed && postDropDecay >= 0.12;
+			if (freshPostDrop || enteredPeakFamily) {
+				// Consume both cues even during the short de-duplication window. This
+				// handles section/post-drop signals arriving one analyzer frame apart.
+				this.postDropArmed = false;
+				if (this.landingCooldown <= 0) {
+					this.ringOut = 1;
+					this.landingCooldown = clamp(beatSeconds, 0.35, 1);
+				}
+			}
+		}
+		this.ringOut *= Math.exp(-dt / clamp(beatSeconds * 2, 0.7, 2));
+
+		const sectionProgress = clamp01(frame.context.sectionProgress);
+		const sectionArc = Math.sin(sectionProgress * Math.PI);
+		const lookaheadDelta = clamp(
+			frame.context.energyLookahead - frame.context.energyCurrent,
+			-1,
+			1
+		);
+		const positiveFuture = Math.max(0, lookaheadDelta);
+		const negativeFuture = Math.max(0, -lookaheadDelta);
+		const positiveSlope = Math.max(0, frame.context.energySlope);
+
 		const tensionTarget = clamp01(
 			section.tension +
 				frame.drop.anticipation * 0.56 +
 				frame.drop.buildProgress * 0.16 +
+				positiveFuture * 0.18 +
+				positiveSlope * 0.1 +
 				positivePresence * 0.1 +
 				Math.max(0, spectrum.centroidVelocity) * 0.08 -
 				frame.drop.postDropDecay * 0.34
@@ -398,8 +496,8 @@ export class SignalConductor {
 		const releaseTarget = clamp01(
 			Math.max(
 				section.release,
-				frame.drop.postDropDecay * 0.94,
-				(frame.section === 'drop' || frame.section === 'chorus') ? this.impact * 0.74 : 0
+				frame.drop.postDropDecay * 0.76,
+				negativeFuture * 0.34
 			)
 		);
 		this.tension = approachAsymmetric(this.tension, tensionTarget, 0.34, 0.86, dt);
@@ -408,6 +506,9 @@ export class SignalConductor {
 		const opennessTarget = clamp01(
 			section.openness +
 				this.release * 0.2 +
+				sectionArc * (section.tension > 0.6 ? -0.055 : 0.035) -
+				positiveFuture * 0.08 +
+				negativeFuture * 0.07 +
 				spectrum.centroid * 0.11 +
 				Math.max(0, spectrum.spectralDirection) * 0.08 -
 				this.tension * 0.18
@@ -421,21 +522,49 @@ export class SignalConductor {
 		);
 		this.openness = approach(this.openness, opennessTarget, 0.72, dt);
 		this.asymmetry = approach(this.asymmetry, asymmetryTarget, 0.95, dt);
+		const asymmetryPolarity = this.phraseBias[3] >= 0 ? 1 : -1;
+		const signedAsymmetryTarget = clamp(
+			asymmetryTarget * asymmetryPolarity + spectrum.spectralDirection * 0.16,
+			-1,
+			1
+		);
+		this.signedAsymmetry = approach(
+			this.signedAsymmetry,
+			signedAsymmetryTarget,
+			clamp(beatSeconds * 1.6, 0.65, 2.4),
+			dt
+		);
 
 		const motionTarget = clamp01(
 			section.motion * 0.34 +
 				frame.motion * 0.38 +
 				spectrum.spectralMotion * 0.3 +
 				this.tempo * 0.14 +
-				frame.drop.anticipation * 0.12
+				frame.drop.anticipation * 0.12 +
+				Math.abs(frame.context.energySlope) * 0.09
 		);
 		this.motion = approachAsymmetric(this.motion, motionTarget, 0.28, 0.92, dt);
+		const traceActivity = frame.silence
+			? 0
+			: clamp01(
+					frame.energy * 3.2 +
+						spectrum.levels.kick * 0.7 +
+						spectrum.levels.body * 0.45 +
+						spectrum.levels.mids * 0.25
+				);
+		const traceSpeed =
+			0.012 + this.tempo * 0.052 + this.motion * 0.118 + spectrum.mid * 0.038;
+		this.tracePhase =
+			(this.tracePhase + dt * traceSpeed * traceActivity) % (Math.PI * 2);
 
 		writeProfileWeights(this.targetShapes, section.shapes);
 		// Phrase identity is bounded and zero-sum. Tonnetz and bands then make the
 		// same section respond differently to harmony/timbre without replacing it.
 		this.targetShapes[0] +=
-			this.phraseBias[0] + frame.tonnetz[0] * 0.025 + spectrum.levels.sub * 0.035;
+			this.phraseBias[0] +
+			frame.tonnetz[0] * 0.025 +
+			spectrum.levels.sub * 0.035 +
+			sectionArc * (1 - tensionTarget) * 0.025;
 		this.targetShapes[1] +=
 			this.phraseBias[1] + frame.tonnetz[2] * 0.035 + spectrum.levels.mids * 0.035;
 		this.targetShapes[2] +=
@@ -443,11 +572,18 @@ export class SignalConductor {
 		this.targetShapes[3] +=
 			this.phraseBias[3] +
 				this.tension * 0.065 +
+				sectionArc * tensionTarget * 0.035 +
 				spectrum.levels.presence * 0.035 +
 				spectrum.levels.air * 0.025;
 		normalizeSignalShapeWeightArray(this.targetShapes);
 
-		const shapeTau = releaseTarget > 0.72 ? 0.52 : tensionTarget > 0.7 ? 0.74 : 1.08;
+		// Macro topology takes roughly one to two bars to settle. Landings are
+		// carried by impact/openness/ringOut; they no longer accelerate a form swap.
+		const shapeTau = clamp(
+			beatSeconds * (tensionTarget > 0.7 ? 2.2 : releaseTarget > 0.72 ? 2.5 : 3),
+			0.72,
+			3.2
+		);
 		for (let i = 0; i < SHAPE_COUNT; i += 1) {
 			this.currentShapes[i] = approach(this.currentShapes[i], this.targetShapes[i], shapeTau, dt);
 		}
@@ -459,12 +595,16 @@ export class SignalConductor {
 		this.output.release = this.release;
 		this.output.openness = this.openness;
 		this.output.asymmetry = this.asymmetry;
+		this.output.signedAsymmetry = this.signedAsymmetry;
 		this.output.impact = this.impact;
+		this.output.ringOut = this.ringOut;
 		this.output.sectionPulse = this.sectionPulse;
 		this.output.tempo = this.tempo;
 		this.output.motion = this.motion;
 		this.output.phrase = clamp01(frame.clock.phrasePos);
 		this.output.phraseVariation = clamp01(0.5 + this.phraseBias[3] * 3.2);
+		this.output.spectrumTravel = this.spectrumTravel;
+		this.output.tracePhase = this.tracePhase;
 		this.output.key = this.key;
 		return this.output;
 	}

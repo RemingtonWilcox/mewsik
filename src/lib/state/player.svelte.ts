@@ -2,6 +2,7 @@ import type { PlaybackState, RepeatMode } from '$lib/types';
 import * as api from '$lib/api/tauri';
 import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
 import { useVisualizer } from '$lib/state/visualizer.svelte';
+import { visualizerPerformanceIdentity } from '$lib/visualizer/identity';
 
 const defaultState: PlaybackState = {
 	is_playing: false,
@@ -57,21 +58,6 @@ function playbackSourceChanged(previous: PlaybackState, next: PlaybackState): bo
 	);
 }
 
-function performanceIdentity(playback: PlaybackState): string | null {
-	const hasSource =
-		playback.source !== null ||
-		playback.current_recording_id !== null ||
-		playback.current_source_url !== null ||
-		playback.current_station_id !== null;
-	if (!hasSource) return null;
-	return JSON.stringify([
-		playback.source,
-		playback.current_recording_id,
-		playback.current_source_url,
-		playback.current_station_id
-	]);
-}
-
 function syncVisualScore(next: PlaybackState) {
 	setScorePlayback(next.position_ms, next.is_playing);
 
@@ -93,7 +79,10 @@ function syncVisualScore(next: PlaybackState) {
 
 	void api.requestTrackAnalysis(id).then(async (status) => {
 		if (status === 'cached' && id === scoreRecordingId) {
-			setActiveScore(await api.getTrackAnalysis(id));
+			const score = await api.getTrackAnalysis(id);
+			// The user may have switched tracks while the cached score was loading.
+			// Recheck after the await so A can never overwrite B's active journey.
+			if (id === scoreRecordingId) setActiveScore(score);
 		}
 		// 'started' resolves via the analysis:complete listener;
 		// 'unavailable' stays on the live fallback.
@@ -105,11 +94,10 @@ function mergePlaybackState(nextState: PlaybackState) {
 	// The store's 250 ms freshness timeout remains a backstop for missed polls or
 	// native analyzer stalls, while source identity protects fast track switches.
 	const sourceChanged = playbackSourceChanged(state, nextState);
-	if (!nextState.is_playing || nextState.is_buffering || sourceChanged) {
-		clearVisualizerAudio();
-	}
 	if (sourceChanged) {
-		useVisualizer().resetPerformance(performanceIdentity(nextState));
+		useVisualizer().resetPerformance(visualizerPerformanceIdentity(nextState));
+	} else if (!nextState.is_playing || nextState.is_buffering) {
+		clearVisualizerAudio();
 	}
 	if (pendingSeek) {
 		const sameTarget =

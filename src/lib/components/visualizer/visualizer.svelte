@@ -1189,7 +1189,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// ── Feature smoothing
 		// Read one freshness-checked snapshot for the entire rendered frame. When
 		// native delivery stalls, every target below eases back toward silence.
-		const feat = vis.getLatest();
+		const frameNow = performance.now();
+		const feat = vis.getLatest(frameNow);
+		// Mk1 does not consume the shared choreography directly, but it keeps the
+		// lightweight journey clock alive so Signal/Mk2 envelopes decay correctly
+		// through pauses and remain current when the user switches engines.
+		vis.getJourney(frameNow);
 		const incoming = feat?.bins ?? [];
 		const attack = 0.55;
 		const release = 0.16;

@@ -55,6 +55,10 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'mk1', 'mk1');
 		await page.keyboard.press('v');
 		await expectProductionEngine(page, 'mk2', 'mk2');
+		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+			'data-mk2-render-passes',
+			'8'
+		);
 		await page.keyboard.press('v');
 		await expectProductionEngine(page, 'signal', 'signal');
 		await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
@@ -308,5 +312,343 @@ test.describe('visualizer musical analysis', () => {
 		expect(result.repeated).toEqual(result.first);
 		expect(result.nextPhrase).not.toEqual(result.first);
 		expect(result.first.reduce((sum, value) => sum + value, 0)).toBeCloseTo(0, 6);
+	});
+
+	test('weak steady air cannot self-normalize to kick strength', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/signal/spectrum.ts';
+			const spectrum = await import(modulePath);
+			const sampleRate = 48_000;
+			const encodeMagnitude = (magnitude: number) =>
+				Math.max(0, Math.min(1, Math.log10(Math.max(magnitude, 1e-7)) * 0.4 + 1));
+			const bins = new Array(spectrum.SIGNAL_SPECTRUM_BIN_COUNT).fill(0);
+			for (let index = 0; index < bins.length; index += 1) {
+				const [low, high] = spectrum.signalAnalyzerBinRange(index, sampleRate, bins.length);
+				const center = Math.sqrt(low * high);
+				if (center >= 60 && center < 150) bins[index] = encodeMagnitude(0.5);
+				else if (center >= 6_000) bins[index] = encodeMagnitude(0.005);
+			}
+
+			const tracker = new spectrum.SignalSpectrumTracker(sampleRate);
+			let profile = tracker.update(null, 1 / 60);
+			const frame = {
+				bins,
+				rms: 0.2,
+				peak: 0.5,
+				centroid: 0.35,
+				sample_rate: sampleRate
+			};
+			for (let i = 0; i < 600; i += 1) profile = tracker.update(frame, 1 / 60);
+			return {
+				kick: profile.levels.kick,
+				air: profile.levels.air,
+				ratio: profile.levels.air / Math.max(profile.levels.kick, 1e-6)
+			};
+		});
+
+		expect(result.kick).toBeGreaterThan(0.65);
+		expect(result.air).toBeLessThan(0.2);
+		expect(result.ratio).toBeLessThan(0.25);
+	});
+
+	test('signed spectrum detail preserves broadband contrast without onset clipping', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/signal/spectrum.ts';
+			const spectrum = await import(modulePath);
+			const encodeMagnitude = (magnitude: number) =>
+				Math.max(0, Math.min(1, Math.log10(Math.max(magnitude, 1e-7)) * 0.4 + 1));
+			const magnitudes = Array.from(
+				{ length: spectrum.SIGNAL_SPECTRUM_BIN_COUNT },
+				(_, index) =>
+					0.025 +
+					0.22 *
+						(0.5 + Math.sin(index * 1.73) * 0.5) *
+						(1 - index / 96)
+			);
+			const bins = magnitudes.map(encodeMagnitude);
+			const tracker = new spectrum.SignalSpectrumTracker(48_000);
+			const profile = tracker.update(
+				{ bins, rms: 0.12, peak: 0.3, centroid: 0.38, sample_rate: 48_000 },
+				1 / 60
+			);
+			const detail = Array.from(profile.detailBins);
+			let strongestIndex = 0;
+			let weakestIndex = 0;
+			for (let index = 1; index < magnitudes.length; index += 1) {
+				if (magnitudes[index] > magnitudes[strongestIndex]) strongestIndex = index;
+				if (magnitudes[index] < magnitudes[weakestIndex]) weakestIndex = index;
+			}
+			return {
+				clipped: detail.filter((value) => Math.abs(value) >= 0.999).length,
+				strongest: detail[strongestIndex],
+				weakest: detail[weakestIndex],
+				finite: detail.every(Number.isFinite)
+			};
+		});
+
+		expect(result.finite).toBe(true);
+		expect(result.clipped).toBeLessThanOrEqual(2);
+		expect(result.strongest).toBeGreaterThan(0.45);
+		expect(result.weakest).toBeLessThan(0.2);
+		expect(result.strongest - result.weakest).toBeGreaterThan(0.3);
+	});
+
+	test('phrase polarity and spectrum travel remain continuous across a phrase wrap', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const conductorPath = '/src/lib/visualizer/signal/conductor.ts';
+			const spectrumPath = '/src/lib/visualizer/signal/spectrum.ts';
+			const conductorModule = await import(conductorPath);
+			const spectrumModule = await import(spectrumPath);
+
+			let seed: number | string = 'phrase-continuity';
+			for (let candidate = 1; candidate < 1_000; candidate += 1) {
+				const before = conductorModule.fillSignalPhraseVariation(
+					new Float32Array(4),
+					candidate,
+					7
+				);
+				const after = conductorModule.fillSignalPhraseVariation(
+					new Float32Array(4),
+					candidate,
+					8
+				);
+				if (before[3] * after[3] < 0) {
+					seed = candidate;
+					break;
+				}
+			}
+
+			const spectral = new spectrumModule.SignalSpectrumTracker(48_000);
+			const bins = new Array(64).fill(0.65);
+			let spectrum = spectral.update(
+				{ bins, rms: 0.18, peak: 0.4, centroid: 0.42, sample_rate: 48_000 },
+				1 / 60
+			);
+			for (let i = 0; i < 180; i += 1) {
+				spectrum = spectral.update(
+					{ bins, rms: 0.18, peak: 0.4, centroid: 0.42, sample_rate: 48_000 },
+					1 / 60
+				);
+			}
+
+			const makeFrame = (phraseIndex: number, phrasePos: number) =>
+				({
+					section: 'verse',
+					sectionAge: 8,
+					motif: 'organism',
+					motifIndex: 0,
+					silence: false,
+					energy: 0.45,
+					density: 0.4,
+					motion: 0.42,
+					structure: 0.6,
+					phrase: phrasePos,
+					palette: { baseHue: 0.4, accentHue: 0.58, rimHue: 0.82, saturation: 0.7, warmth: 0.5 },
+					paletteBase: 0.4,
+					paletteAccent: 0.58,
+					clock: {
+						tempoBpm: 120,
+						beatPhase: 0.9,
+						beatPulse: 0.001,
+						downbeatFlag: false,
+						barIndex: phraseIndex * 8 + 7,
+						beatIndex: 3,
+						phrasePos,
+						phraseIndex
+					},
+					drop: { buildActive: false, buildProgress: 0, dropEta: 0, anticipation: 0, postDropDecay: 0 },
+					valence: 0.5,
+					arousal: 0.45,
+					bassPunch: 0,
+					trebleSparkle: 0,
+					tonnetz: [1, 0, 0.5, 0.866, -0.5, 0.866],
+					bassRaw: 0.2,
+					midRaw: 0.3,
+					trebleRaw: 0.2,
+					centroidRaw: 0.42,
+					context: {
+						source: 'live',
+						sectionProgress: phrasePos,
+						sectionEnergy: 0.45,
+						trackProgress: 0,
+						energyCurrent: 0.45,
+						energySlope: 0,
+						energyLookahead: 0.45,
+						keyPitchClass: 0,
+						keyMode: 'unknown',
+						keyConfidence: 0.5
+					}
+				}) as any;
+
+			const conductor = new conductorModule.SignalConductor(seed);
+			let before = conductor.update(makeFrame(7, 0.99), spectrum as any, 1 / 60);
+			for (let i = 0; i < 240; i += 1) {
+				before = conductor.update(makeFrame(7, 0.99), spectrum as any, 1 / 60);
+			}
+			const beforeWeights = { ...before.shapeWeights };
+			const beforeAsymmetry = before.signedAsymmetry;
+			const beforeTravel = before.spectrumTravel;
+			const after = conductor.update(makeFrame(8, 0), spectrum as any, 1 / 60);
+			const travelDeltaRaw = Math.abs(after.spectrumTravel - beforeTravel);
+			return {
+				asymmetryDelta: Math.abs(after.signedAsymmetry - beforeAsymmetry),
+				travelDelta: Math.min(travelDeltaRaw, 1 - travelDeltaRaw),
+				shapeDelta: Math.max(
+					Math.abs(after.shapeWeights.ellipse - beforeWeights.ellipse),
+					Math.abs(after.shapeWeights.lissajous - beforeWeights.lissajous),
+					Math.abs(after.shapeWeights.ribbon - beforeWeights.ribbon),
+					Math.abs(after.shapeWeights.rosette - beforeWeights.rosette)
+				)
+			};
+		});
+
+		expect(result.asymmetryDelta).toBeLessThan(0.03);
+		expect(result.travelDelta).toBeLessThan(0.001);
+		expect(result.shapeDelta).toBeLessThan(0.01);
+	});
+
+	test('landing ring-out stays tempo-relative and does not retrigger from drop to chorus', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const conductorPath = '/src/lib/visualizer/signal/conductor.ts';
+			const spectrumPath = '/src/lib/visualizer/signal/spectrum.ts';
+			const conductorModule = await import(conductorPath);
+			const spectrumModule = await import(spectrumPath);
+			const tracker = new spectrumModule.SignalSpectrumTracker(48_000);
+			const bins = new Array(64).fill(0.62);
+			let spectrum = tracker.update(
+				{ bins, rms: 0.2, peak: 0.42, centroid: 0.45, sample_rate: 48_000 },
+				1 / 60
+			);
+			for (let i = 0; i < 120; i += 1) {
+				spectrum = tracker.update(
+					{ bins, rms: 0.2, peak: 0.42, centroid: 0.45, sample_rate: 48_000 },
+					1 / 60
+				);
+			}
+
+			const makeFrame = (
+				section: 'verse' | 'drop' | 'chorus',
+				postDropDecay: number,
+				tempoBpm: number
+			) =>
+				({
+					section,
+					sectionAge: 4,
+					motif: 'organism', motifIndex: 0, silence: false,
+					energy: 0.65, density: 0.55, motion: 0.62, structure: 0.6, phrase: 0.2,
+					palette: { baseHue: 0.4, accentHue: 0.58, rimHue: 0.82, saturation: 0.7, warmth: 0.5 },
+					paletteBase: 0.4, paletteAccent: 0.58,
+					clock: {
+						tempoBpm, beatPhase: 0.4, beatPulse: 0.08, downbeatFlag: false,
+						barIndex: 8, beatIndex: 1, phrasePos: 0.2, phraseIndex: 1
+					},
+					drop: { buildActive: false, buildProgress: 0, dropEta: 0, anticipation: 0, postDropDecay },
+					valence: 0.5, arousal: 0.65, bassPunch: 0, trebleSparkle: 0,
+					tonnetz: [1, 0, 0.5, 0.866, -0.5, 0.866],
+					bassRaw: 0.2, midRaw: 0.3, trebleRaw: 0.2, centroidRaw: 0.45,
+					context: {
+						source: 'live', sectionProgress: 0.2, sectionEnergy: 0.65, trackProgress: 0,
+						energyCurrent: 0.65, energySlope: 0, energyLookahead: 0.65,
+						keyPitchClass: 0, keyMode: 'unknown', keyConfidence: 0.5
+					}
+				}) as any;
+
+			const dt = 1 / 60;
+			// Mirrors the live director: hold the landing for 0.4s, then apply its
+			// historical 0.985-per-analyzer-frame post-drop decay.
+			const productionPostDrop = (elapsed: number) =>
+				elapsed <= 0.4 ? 1 : Math.pow(0.985, (elapsed - 0.4) * 60);
+			const runTempo = (tempoBpm: number) => {
+				const conductor = new conductorModule.SignalConductor(`ring-out-${tempoBpm}`);
+				for (let i = 0; i < 120; i += 1) {
+					conductor.update(makeFrame('verse', 0, tempoBpm), spectrum as any, dt);
+				}
+
+				let elapsed = dt;
+				let current = conductor.update(makeFrame('drop', 1, tempoBpm), spectrum as any, dt);
+				const landingRingOut = current.ringOut;
+				const advanceDropTo = (targetSeconds: number) => {
+					while (elapsed + dt <= targetSeconds + 1e-8) {
+						elapsed += dt;
+						current = conductor.update(
+							makeFrame('drop', productionPostDrop(elapsed), tempoBpm),
+							spectrum as any,
+							dt
+						);
+					}
+				};
+
+				advanceDropTo(120 / tempoBpm);
+				const twoBeatRingOut = current.ringOut;
+				// The live FSM commonly relabels the same peak from drop to chorus
+				// around here. That semantic relabel must not create another landing.
+				advanceDropTo(2.75);
+				const beforeChorus = current.ringOut;
+				elapsed += dt;
+				current = conductor.update(
+					makeFrame('chorus', productionPostDrop(elapsed), tempoBpm),
+					spectrum as any,
+					dt
+				);
+				const afterChorus = current.ringOut;
+
+				while (elapsed + dt <= 8 + 1e-8) {
+					elapsed += dt;
+					current = conductor.update(
+						makeFrame('chorus', productionPostDrop(elapsed), tempoBpm),
+						spectrum as any,
+						dt
+					);
+				}
+				return {
+					tempoBpm,
+					landingRingOut,
+					twoBeatRingOut,
+					beforeChorus,
+					afterChorus,
+					lateRingOut: current.ringOut,
+					lateRelease: current.release,
+					lateOpenness: current.openness
+				};
+			};
+
+			const handoffConductor = new conductorModule.SignalConductor('live-score-handoff');
+			for (let i = 0; i < 120; i += 1) {
+				handoffConductor.update(makeFrame('verse', 0, 120), spectrum as any, dt);
+			}
+			const scoreFrame = makeFrame('chorus', 1, 120);
+			scoreFrame.context.source = 'score';
+			const handoff = handoffConductor.update(scoreFrame, spectrum as any, dt);
+
+			return {
+				tempoRuns: [60, 120, 180].map(runTempo),
+				handoff: { sectionPulse: handoff.sectionPulse, ringOut: handoff.ringOut }
+			};
+		});
+
+		const twoBeatValues = result.tempoRuns.map((entry) => entry.twoBeatRingOut);
+		expect(Math.max(...twoBeatValues) - Math.min(...twoBeatValues)).toBeLessThan(0.03);
+		for (const entry of result.tempoRuns) {
+			expect(entry.landingRingOut).toBeGreaterThan(0.95);
+			expect(entry.twoBeatRingOut).toBeGreaterThan(0.34);
+			expect(entry.twoBeatRingOut).toBeLessThan(0.41);
+			expect(entry.afterChorus).toBeLessThanOrEqual(entry.beforeChorus);
+			expect(entry.afterChorus).toBeLessThan(0.3);
+			expect(entry.lateRingOut).toBeLessThan(0.03);
+			expect(entry.lateRelease).toBeGreaterThan(0.7);
+			expect(entry.lateOpenness).toBeGreaterThan(0.75);
+		}
+		expect(result.handoff.sectionPulse).toBeLessThan(0.05);
+		expect(result.handoff.ringOut).toBe(0);
 	});
 });

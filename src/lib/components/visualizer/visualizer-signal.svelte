@@ -1,7 +1,10 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { useVisualizer, type AudioFeatures } from '$lib/state/visualizer.svelte';
-	import { usePlayer } from '$lib/state/player.svelte';
+	import {
+		useVisualizer,
+		type AudioFeatures,
+		type VisualizerJourneySnapshot
+	} from '$lib/state/visualizer.svelte';
 	import {
 		SIGNAL_COMPOSITE_WGSL,
 		SIGNAL_DECAY_WGSL,
@@ -9,14 +12,9 @@
 		SIGNAL_TRACE_INSTANCES,
 		SIGNAL_VERTEX_COUNT
 	} from '$lib/visualizer/signal/shaders';
-	import {
-		SignalSpectrumTracker,
-		type SignalSpectrumProfile
-	} from '$lib/visualizer/signal/spectrum';
-	import { SignalConductor } from '$lib/visualizer/signal/conductor';
+	import type { SignalSpectrumProfile } from '$lib/visualizer/signal/spectrum';
 
 	const vis = useVisualizer();
-	const player = usePlayer();
 	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
@@ -29,7 +27,7 @@
 	let initializing = false;
 
 	const BIN_COUNT = 64;
-	const UNIFORM_FLOATS = 48;
+	const UNIFORM_FLOATS = 52;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 	const BINS_BYTES = BIN_COUNT * 4;
 	const FRAME_INTERVAL_MS = 1000 / 60;
@@ -37,7 +35,6 @@
 	const MAX_INTERNAL_PIXELS = 1920 * 1080;
 
 	const smoothed = {
-		bins: new Float32Array(BIN_COUNT),
 		bass: 0,
 		mid: 0,
 		treble: 0,
@@ -86,11 +83,7 @@
 	let lastRenderedAt = 0;
 	let quietFor = 0;
 	let onsetLatched = false;
-	const sessionSeed = Math.random();
-	const spectrumTracker = new SignalSpectrumTracker();
-	const conductor = new SignalConductor(sessionSeed);
-	let signalTrackKey: string | null = null;
-	let audioWarmupFrames = 0;
+	let rendererSourceEpoch = -1;
 	let feedbackResetRequested = true;
 	let hudSection = $state('intro');
 	let hudTempo = $state(0);
@@ -124,13 +117,6 @@
 		feature: AudioFeatures | null,
 		spectrum: Readonly<SignalSpectrumProfile>
 	) {
-		const incomingBins = feature?.bins ?? [];
-		for (let i = 0; i < BIN_COUNT; i += 1) {
-			const target = clamp(incomingBins[i] ?? 0, 0, 1);
-			const rate = target > smoothed.bins[i] ? 24 : 7;
-			smoothed.bins[i] = approach(smoothed.bins[i], target, rate, dt);
-		}
-
 		// The payload's historical bass/mid/treble fields slice logarithmic bins by
 		// index, so they do not describe musical bands. Signal derives real Hz
 		// ranges and adaptive levels in SignalSpectrumTracker instead.
@@ -182,47 +168,31 @@
 
 	}
 
-	function resetSignalState(seed: string | number) {
-		spectrumTracker.reset();
-		conductor.reset(seed);
-		smoothed.bins.fill(0);
-		smoothed.bass = 0;
-		smoothed.mid = 0;
-		smoothed.treble = 0;
-		smoothed.rms = 0;
-		smoothed.centroid = 0.42;
-		smoothed.chroma = 0;
-		smoothed.chromaStrength = 0;
+	function syncRendererToJourney(
+		snapshot: VisualizerJourneySnapshot,
+		feature: AudioFeatures | null
+	) {
+		if (snapshot.sourceEpoch === rendererSourceEpoch) return;
+		rendererSourceEpoch = snapshot.sourceEpoch;
+		smoothed.bass = feature ? snapshot.spectrum.bass : 0;
+		smoothed.mid = feature ? snapshot.spectrum.mid : 0;
+		smoothed.treble = feature ? snapshot.spectrum.treble : 0;
+		smoothed.rms = clamp(feature?.rms ?? 0, 0, 1);
+		smoothed.centroid = snapshot.spectrum.centroid;
+		smoothed.chroma = snapshot.signal.key;
+		smoothed.chromaStrength = Math.max(
+			clamp(feature?.chroma_strength ?? 0, 0, 1),
+			snapshot.director.context.keyConfidence
+		);
 		smoothed.transient = 0;
-		smoothed.silence = 1;
-		smoothed.phase = 0;
-		quietFor = 0;
+		smoothed.silence = feature && (feature.rms ?? 0) >= 0.009 ? 0 : 1;
+		smoothed.phase = snapshot.signal.tracePhase;
+		quietFor = smoothed.silence > 0 ? 0.45 : 0;
 		onsetLatched = false;
-		audioWarmupFrames = 3;
 		feedbackResetRequested = true;
 		lastRenderedAt = 0;
 		lastHudUpdateAt = 0;
 	}
-
-	$effect(() => {
-		const playback = player.state;
-		const hasIdentity =
-			playback.source !== null ||
-			playback.current_recording_id !== null ||
-			playback.current_source_url !== null ||
-			playback.current_station_id !== null;
-		const key = hasIdentity
-			? JSON.stringify([
-					playback.source,
-					playback.current_recording_id,
-					playback.current_source_url,
-					playback.current_station_id
-				])
-			: null;
-		if (key === signalTrackKey) return;
-		signalTrackKey = key;
-		resetSignalState(key ?? sessionSeed);
-	});
 
 	function createFeedbackTexture(device: GPUDevice, width: number, height: number) {
 		return device.createTexture({
@@ -412,6 +382,13 @@
 			canvas.width = width;
 			canvas.height = height;
 		}
+
+		// Resolve the shared source epoch before touching feedback resources. A
+		// real track change must clear the previous phosphor in this frame, while
+		// a renderer remount should create its fresh feedback pair only once.
+		const feature = vis.getLatest(now);
+		const shared = vis.getJourney(now);
+		syncRendererToJourney(shared, feature);
 		if (feedbackResetRequested) {
 			destroyTargets(state.targets);
 			state.targets = null;
@@ -425,24 +402,17 @@
 		// The persistent director is advanced once per analyzer delivery. Signal
 		// samples that shared song timeline and one freshness-checked raw frame at
 		// the same timestamp, then translates it through its own visual language.
-		const freshFeature = vis.getLatest(now);
-		const feature = audioWarmupFrames > 0 ? null : freshFeature;
-		if (audioWarmupFrames > 0) audioWarmupFrames -= 1;
-		const directed = vis.getPerformance(now);
-		const spectrum = spectrumTracker.update(feature, dt);
+		const directed = shared.director;
+		const spectrum = shared.spectrum;
 		smoothAudio(dt, feature, spectrum);
-		const journey = conductor.update(directed, spectrum, dt);
-
-		const audible = 1 - smoothed.silence;
-		const phaseSpeed =
-			0.012 + journey.tempo * 0.052 + journey.motion * 0.118 + smoothed.mid * 0.038;
-		smoothed.phase = (smoothed.phase + dt * phaseSpeed * audible) % (Math.PI * 2);
+		const journey = shared.signal;
+		smoothed.phase = journey.tracePhase;
 
 		const energy = clamp(
-			directed.energy * 0.52 +
-				smoothed.rms * 0.3 +
-				spectrum.levels.kick * 0.11 +
-				spectrum.spectralMotion * 0.09,
+			directed.energy * 0.58 +
+				smoothed.rms * 0.24 +
+				spectrum.levels.body * 0.08 +
+				spectrum.spectralMotion * 0.1,
 			0,
 			1
 		);
@@ -451,6 +421,7 @@
 				journey.tension * 0.015 +
 				(1 - journey.motion) * 0.006 -
 				journey.release * 0.026 -
+				journey.ringOut * 0.025 -
 				journey.sectionPulse * 0.024 -
 				smoothed.transient * 0.052,
 			0.83,
@@ -471,10 +442,8 @@
 			0,
 			1
 		);
-		const boundaryImpact = Math.max(journey.impact, journey.sectionPulse * 0.76);
-		const asymmetrySign = journey.phraseVariation >= 0.5 ? 1 : -1;
-		const signedAsymmetry = clamp(
-			journey.asymmetry * asymmetrySign + spectrum.spectralDirection * 0.16,
+		const lookaheadDelta = clamp(
+			directed.context.energyLookahead - directed.context.energyCurrent,
 			-1,
 			1
 		);
@@ -514,7 +483,7 @@
 		uniforms[24] = journey.tension;
 		uniforms[25] = journey.release;
 		uniforms[26] = journey.openness;
-		uniforms[27] = boundaryImpact;
+		uniforms[27] = journey.impact;
 		uniforms[28] = journey.shapeWeights.ellipse;
 		uniforms[29] = journey.shapeWeights.lissajous;
 		uniforms[30] = journey.shapeWeights.ribbon;
@@ -530,11 +499,15 @@
 		uniforms[40] = spectrum.levels.presence;
 		uniforms[41] = spectrum.levels.air;
 		uniforms[42] = spectrum.centroidVelocity;
-		uniforms[43] = signedAsymmetry;
+		uniforms[43] = journey.signedAsymmetry;
 		uniforms[44] = directed.context.sectionProgress;
 		uniforms[45] = directed.context.energySlope;
-		uniforms[46] = directed.context.energyLookahead;
+		uniforms[46] = lookaheadDelta;
 		uniforms[47] = directed.context.sectionEnergy;
+		uniforms[48] = journey.ringOut;
+		uniforms[49] = journey.sectionPulse;
+		uniforms[50] = journey.spectrumTravel;
+		uniforms[51] = directed.context.trackProgress;
 
 		state.device.queue.writeBuffer(
 			state.uniformBuffer,
@@ -546,9 +519,9 @@
 		state.device.queue.writeBuffer(
 			state.binsBuffer,
 			0,
-			smoothed.bins.buffer,
-			smoothed.bins.byteOffset,
-			smoothed.bins.byteLength
+			spectrum.detailBins.buffer,
+			spectrum.detailBins.byteOffset,
+			spectrum.detailBins.byteLength
 		);
 
 		const previous = (state.frame % 2) as 0 | 1;

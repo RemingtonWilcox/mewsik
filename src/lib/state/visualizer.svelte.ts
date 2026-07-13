@@ -2,11 +2,13 @@
 // will grow into the preset/morph/routing matrix store in later phases.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import type { AudioFeatureFrame, VisualDirectorFrame } from '$lib/visualizer/director/index.js';
 import {
-	createVisualDirector,
-	type AudioFeatureFrame,
-	type VisualDirectorFrame
-} from '$lib/visualizer/director/index.js';
+	VisualizerJourneyRuntime,
+	type VisualizerJourneySnapshot
+} from '$lib/visualizer/journey';
+
+export type { VisualizerJourneySnapshot } from '$lib/visualizer/journey';
 
 export type AudioFeatures = AudioFeatureFrame;
 
@@ -14,6 +16,8 @@ export type AudioFeatures = AudioFeatureFrame;
 // scheduling jitter, but stop treating it as live audio quickly when playback
 // pauses, buffers, or the analyzer stops emitting.
 export const AUDIO_FEATURE_FRESHNESS_MS = 250;
+export const JOURNEY_NULL_TICK_MS = 1000 / 60;
+const JOURNEY_NULL_CATCHUP_LIMIT_MS = JOURNEY_NULL_TICK_MS * 4;
 
 function featureClockNow(): number {
 	return typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -55,13 +59,10 @@ class VisualizerState {
 	private listenPromise: Promise<UnlistenFn> | null = null;
 	private subs = 0;
 	private engineHydrated = false;
-	// One performance brain survives engine switches, so every renderer samples
-	// the same bar/phrase/section history instead of starting its own timeline.
-	private performanceDirector = createVisualDirector();
-	private performanceFrame: VisualDirectorFrame | null = null;
-	private performanceIdentity: string | null = null;
-	private performanceEpochAt = featureClockNow();
-	private performanceFrameAt: number | null = null;
+	// One CPU-only journey survives renderer switches. GPU resources still live
+	// exclusively inside the currently mounted engine component.
+	private journeyRuntime = new VisualizerJourneyRuntime(Math.random(), featureClockNow());
+	private nextJourneyNullTickAt: number | null = null;
 
 	toggle() {
 		this.active = !this.active;
@@ -106,19 +107,25 @@ class VisualizerState {
 		return this.latestFrame;
 	}
 
+	/** Monotonic source revision; unlike identity text it distinguishes A -> B -> A. */
+	get performanceSourceEpoch(): number {
+		return this.journeyRuntime.sourceEpoch;
+	}
+
 	/** Publish one analyzer frame and timestamp it on the shared monotonic clock. */
-	setLatest(features: AudioFeatures) {
-		const now = featureClockNow();
+	setLatest(features: AudioFeatures, now = featureClockNow()) {
 		this.latestFrame = features;
 		this.latestFrameAt = now;
-		this.updatePerformance(features, now);
+		this.journeyRuntime.advance(features, now);
+		this.nextJourneyNullTickAt = null;
 	}
 
 	/** Immediately invalidate audio during known playback discontinuities. */
-	clearLatest() {
+	clearLatest(now = featureClockNow()) {
 		this.latestFrame = null;
 		this.latestFrameAt = null;
-		this.updatePerformance(null, featureClockNow());
+		this.journeyRuntime.advance(null, now);
+		this.nextJourneyNullTickAt = now + JOURNEY_NULL_TICK_MS;
 	}
 
 	/**
@@ -133,39 +140,51 @@ class VisualizerState {
 	}
 
 	/**
-	 * Sample the persistent musical-performance frame. Fresh analyzer events
-	 * advance it exactly once in setLatest; after delivery expires, render-time
-	 * null updates let silence gates and envelopes decay naturally.
+	 * Sample one atomic director/spectrum/Signal/Mk2 live view. Fresh analyzer
+	 * events advance it in setLatest; repeated consumers only read the cache.
 	 */
-	getPerformance(now = featureClockNow()): VisualDirectorFrame {
+	getJourney(now = featureClockNow()): VisualizerJourneySnapshot {
 		const live = this.getLatest(now);
-		if (live) {
-			// Normally setLatest already produced this frame. This fallback matters
-			// when a caller deliberately resets performance while retaining audio.
-			if (!this.performanceFrame) this.updatePerformance(live, now);
-		} else if (
-			this.performanceFrameAt === null ||
-			now - this.performanceFrameAt >= 0.5
-		) {
-			this.updatePerformance(null, now);
+		const cached = this.journeyRuntime.cachedSnapshot;
+		if (!cached) {
+			const initial = this.journeyRuntime.advance(live, now);
+			this.nextJourneyNullTickAt = live ? null : now + JOURNEY_NULL_TICK_MS;
+			return initial;
 		}
-		return this.performanceFrame!;
+		if (live) {
+			this.nextJourneyNullTickAt = null;
+			return cached;
+		}
+
+		const lastUpdate = this.journeyRuntime.lastUpdateAtMs;
+		let dueAt =
+			this.nextJourneyNullTickAt ??
+			(lastUpdate === null ? now : lastUpdate + JOURNEY_NULL_TICK_MS);
+		// Do not replay a long closed/backgrounded gap as a burst. Resume from the
+		// current time, then retain fractional display timing for a stable 60 Hz
+		// null cadence on 60/75/90/120/144 Hz monitors.
+		if (now - dueAt > JOURNEY_NULL_CATCHUP_LIMIT_MS) dueAt = now;
+		this.nextJourneyNullTickAt = dueAt;
+		if (now + 0.25 >= dueAt) {
+			const result = this.journeyRuntime.advance(null, dueAt);
+			this.nextJourneyNullTickAt = dueAt + JOURNEY_NULL_TICK_MS;
+			return result;
+		}
+		return cached;
 	}
 
-	/** Reset temporal context only when playback moves to a different source. */
-	resetPerformance(identity: string | null) {
-		if (identity === this.performanceIdentity) return;
-		this.performanceIdentity = identity;
-		this.performanceDirector = createVisualDirector();
-		this.performanceFrame = null;
-		this.performanceFrameAt = null;
-		this.performanceEpochAt = featureClockNow();
+	/** Compatibility facade for renderers that only need director intent. */
+	getPerformance(now = featureClockNow()): VisualDirectorFrame {
+		return this.getJourney(now).director;
 	}
 
-	private updatePerformance(features: AudioFeatures | null, now: number) {
-		const timeSeconds = Math.max(0, (now - this.performanceEpochAt) / 1000);
-		this.performanceFrame = this.performanceDirector.update(features, timeSeconds);
-		this.performanceFrameAt = now;
+	/** Atomically clear raw audio and every CPU rail for a true source change. */
+	resetPerformance(identity: string | null, now = featureClockNow()) {
+		if (identity === this.journeyRuntime.sourceIdentity) return;
+		this.latestFrame = null;
+		this.latestFrameAt = null;
+		this.nextJourneyNullTickAt = null;
+		this.journeyRuntime.resetSource(identity, now);
 	}
 
 	async subscribe(): Promise<() => void> {

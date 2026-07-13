@@ -30,8 +30,10 @@ struct Params {
 	bandsA: vec4<f32>,
 	// presence, air, centroid velocity, harmonic/section asymmetry
 	bandsB: vec4<f32>,
-	// section progress, energy slope, lookahead energy, section energy
+	// section progress, energy slope, lookahead-current delta, section energy
 	context: vec4<f32>,
+	// transient ring-out, section pulse, continuous spectrum travel, track progress
+	flow: vec4<f32>,
 };
 `;
 
@@ -172,6 +174,14 @@ fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
 	let centroidVelocity = params.bandsB.z;
 	let asymmetry = params.bandsB.w;
 	let spectralMotion = params.style.w;
+	let sectionProgress = clamp(params.context.x, 0.0, 1.0);
+	let energySlope = params.context.y;
+	let lookaheadDelta = params.context.z;
+	let sectionEnergy = params.context.w;
+	let ringOut = params.flow.x;
+	let sectionPulse = params.flow.y;
+	let spectrumTravel = params.flow.z;
+	let trackProgress = params.flow.w;
 	let phase = params.shape.w + echo * (0.025 + transient * 0.055 + impact * 0.045);
 
 	let formTotal = max(dot(params.forms, vec4<f32>(1.0)), 0.0001);
@@ -185,34 +195,41 @@ fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
 	// tonal strength prevents noisy/atonal material from jerking the geometry.
 	let harmonicSkew = sin(chroma * TAU + params.palette.x * TAU) * chromaStrength;
 	point.x += point.y * (harmonicSkew * 0.10 + asymmetry * 0.16);
-	point.y *= 1.0 - tension * 0.13 + release * 0.06;
-	point.x *= 1.0 + tension * 0.08 + abs(asymmetry) * 0.08;
+	// A section boundary briefly reframes the same subject instead of acting as
+	// another beat hit: horizontal posture opens while the vertical axis settles.
+	let sectionReframe = sectionPulse * (0.018 + openness * 0.012);
+	point.y *= 1.0 - tension * 0.13 + release * 0.06 - sectionReframe;
+	point.x *= 1.0 + tension * 0.08 + abs(asymmetry) * 0.08 + sectionReframe;
 	point = rotate2(
 		point,
 		sin(phraseAngle) * (0.035 + tempo * 0.045)
 			+ harmonicSkew * 0.07
 			+ centroidVelocity * 0.12
-			+ params.context.y * 0.055
+			+ energySlope * 0.055
+			+ sin(sectionProgress * 3.14159265) * lookaheadDelta * 0.045
+			+ sin(trackProgress * TAU) * 0.018
 	);
 
-	// The spectrum travels slowly around the contour over each phrase. Neighbor
-	// contrast exposes filter motion while retaining the same coherent subject.
-	let spectralPosition = fract(fraction + params.clock.y * 0.125 + params.shape.w * 0.006);
+	// The spectrum travels continuously around the contour. The CPU integrates
+	// tempo into spectrumTravel, so phrase-index corrections and 1->0 phrase
+	// wraps never move the mapping backward by a visible eighth-turn.
+	let spectralPosition = fract(fraction + spectrumTravel + params.shape.w * 0.006);
 	let bandIndex = min(u32(floor(spectralPosition * 64.0)), 63u);
 	let previousIndex = max(bandIndex, 1u) - 1u;
 	let nextIndex = min(bandIndex + 1u, 63u);
-	let band = clamp(bins[bandIndex], 0.0, 1.0);
-	let neighbor = (clamp(bins[previousIndex], 0.0, 1.0) + clamp(bins[nextIndex], 0.0, 1.0)) * 0.5;
-	let localContrast = band - neighbor;
+	let residual = clamp(bins[bandIndex], -1.0, 1.0);
+	let neighbor = (clamp(bins[previousIndex], -1.0, 1.0)
+		+ clamp(bins[nextIndex], -1.0, 1.0)) * 0.5;
+	let localContrast = residual - neighbor;
 	let radial = normalize(point + vec2<f32>(0.0001, 0.0002));
 	point += radial * (
-		(band - 0.35) * (0.010 + body * 0.018 + spectralMotion * 0.014)
+		residual * (0.012 + body * 0.018 + spectralMotion * 0.018)
 			+ localContrast * (0.018 + spectralMotion * 0.040)
 	);
 
 	// Presence and air etch detail. Tempo changes travel speed, while centroid
 	// and its velocity make opening/closing filters visibly sweep the contour.
-	let detail = band * (0.004 + presence * 0.020 + air * 0.028)
+	let detail = abs(residual) * (0.004 + presence * 0.020 + air * 0.028)
 		+ abs(localContrast) * spectralMotion * 0.022;
 	let detailSpeed = 0.18 + tempo * 0.42 + centroid * 0.18;
 	point += vec2<f32>(
@@ -224,17 +241,16 @@ fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
 	// contracts it, and release/payoff opens it. This is deliberately much wider
 	// than v1 while still leaving negative space around the trace.
 	let opennessScale = mix(0.47, 0.68, openness);
-	let impactScale = beatPulse * (0.018 + kick * 0.050)
-		+ downbeat * (0.016 + params.style.z * 0.030)
-		+ impact * 0.050;
+	let impactScale = beatPulse * (0.018 + kick * 0.050) + impact * 0.035;
 	let bodyScale = opennessScale + sub * 0.055 + body * 0.040 + rms * 0.035
-		- tension * 0.055 + release * 0.075 + params.context.z * 0.025
-		+ params.context.w * 0.020;
+		- tension * 0.055 + release * 0.075
+		- max(lookaheadDelta, 0.0) * 0.030 + max(-lookaheadDelta, 0.0) * 0.024
+		+ sectionEnergy * 0.018;
 	point *= bodyScale * (1.0 + impactScale);
 	point *= 1.0 + sin(t + phraseAngle) * bass * (0.025 + kick * 0.025);
 
 	if (instance > 0u) {
-		let echoDrive = max(transient, max(impact, release * 0.72));
+		let echoDrive = max(transient, max(impact, ringOut));
 		point = rotate2(point, -echo * (0.010 + echoDrive * 0.030 + tension * 0.008));
 		point *= 1.0 + echo * (0.009 + echoDrive * 0.025);
 	}
@@ -287,10 +303,10 @@ fn vs_main(
 		0.060 + params.style.y * 0.065 + params.bandsA.y * 0.022 + params.journey.w * 0.030
 	) * signalGate;
 	let firstEcho = (
-		params.musical.x * 0.105 + params.journey.w * 0.075 + params.journey.y * 0.035
+		params.musical.x * 0.105 + params.journey.w * 0.075 + params.flow.x * 0.038
 	) * signalGate;
 	let secondEcho = (
-		params.journey.w * 0.045 + params.journey.y * 0.055 + params.clock.w * 0.025
+		params.flow.x * 0.078 + params.clock.w * 0.020
 	) * signalGate;
 
 	var out: TraceOut;
