@@ -2,16 +2,15 @@ import { expect, test } from '@playwright/test';
 
 async function expectProductionEngine(
 	page: import('@playwright/test').Page,
-	saved: 'auto' | 'mk1' | 'mk2' | 'signal',
-	rendered: 'mk1' | 'mk2' | 'signal'
+	engine: 'mk1' | 'mk2' | 'signal'
 ) {
 	await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
 		'data-render-engine',
-		rendered
+		engine
 	);
 	await expect
 		.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.engine')))
-		.toBe(saved);
+		.toBe(engine);
 }
 
 test.describe('visualizer engine roster', () => {
@@ -20,7 +19,7 @@ test.describe('visualizer engine roster', () => {
 		await page.waitForLoadState('networkidle');
 
 		await expect(page.getByText('visualizer lab')).toBeVisible();
-		await expect(page.getByRole('button', { name: 'auto · stable' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'auto · stable' })).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'mk1', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'mk2 · experimental' })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'signal', exact: true })).toBeVisible();
@@ -34,6 +33,11 @@ test.describe('visualizer engine roster', () => {
 		await expect
 			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.engine')))
 			.toBe('signal');
+		await page.keyboard.press('a');
+		await expect(page.getByText('signal · oscilloscope / vectorscope engine')).toBeVisible();
+		await expect
+			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.engine')))
+			.toBe('signal');
 
 		await page.keyboard.press('w');
 		await expect(page.getByText('mk2 · experimental', { exact: false }).last()).toBeVisible();
@@ -41,39 +45,46 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByText(/mk1 · hyperbolic kaleidoscope/)).toBeVisible();
 	});
 
-	test('production Auto renders Mk1, V follows the roster, and Escape closes', async ({ page }) => {
+	test('removed Auto migrates to Mk1, V follows the roster, and Escape closes', async ({ page }) => {
 		await page.addInitScript(() => {
 			localStorage.setItem('mewsik.visualizer.engine', 'auto');
 		});
 		await page.goto('/');
 		await page.getByRole('button', { name: 'Visualizer' }).click();
 
-		await expectProductionEngine(page, 'auto', 'mk1');
+		await expectProductionEngine(page, 'mk1');
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toBeVisible();
 
 		await page.keyboard.press('v');
-		await expectProductionEngine(page, 'mk1', 'mk1');
-		await page.keyboard.press('v');
-		await expectProductionEngine(page, 'mk2', 'mk2');
+		await expectProductionEngine(page, 'mk2');
 		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
 			'data-mk2-render-passes',
 			'8'
 		);
+		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+			'data-mk2-uniform-bytes',
+			'288'
+		);
+		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+			'data-mk2-form',
+			/seed|sprout|winding|bloom|shedding|dormancy/
+		);
 		await page.keyboard.press('v');
-		await expectProductionEngine(page, 'signal', 'signal');
+		await expectProductionEngine(page, 'signal');
 		await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
 		await page.keyboard.press('v');
-		await expectProductionEngine(page, 'auto', 'mk1');
+		await expectProductionEngine(page, 'mk1');
 
 		await page.keyboard.press('Escape');
 		await expect(page.locator('[data-visualizer-host]')).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toHaveCount(0);
 	});
 
-	test('legacy engines migrate to their real production renderers', async ({ browser }) => {
-		for (const [legacy, expectedSaved, expectedRendered] of [
-			['mk3', 'signal', 'signal'],
-			['runtime', 'auto', 'mk1']
+	test('legacy and unknown engines migrate to supported renderers', async ({ browser }) => {
+		for (const [legacy, expectedEngine] of [
+			['mk3', 'signal'],
+			['runtime', 'mk1'],
+			['not-an-engine', 'mk1']
 		] as const) {
 			const context = await browser.newContext();
 			const page = await context.newPage();
@@ -82,7 +93,7 @@ test.describe('visualizer engine roster', () => {
 			}, legacy);
 			await page.goto('/');
 			await page.getByRole('button', { name: 'Visualizer' }).click();
-			await expectProductionEngine(page, expectedSaved, expectedRendered);
+			await expectProductionEngine(page, expectedEngine);
 			if (legacy === 'mk3') {
 				await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
 			}

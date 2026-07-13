@@ -8,7 +8,6 @@
 	import {
 		PRESET_NAMES,
 		useVisualizer,
-		type RenderVisualizerEngine,
 		type VisualizerEngine
 	} from '$lib/state/visualizer.svelte';
 	import { WebAnalyzer } from '$lib/audio/web-analyzer';
@@ -23,11 +22,10 @@
 	let raf = 0;
 	let lastObjectUrl: string | null = null;
 	let urlInput = $state('');
-	let engine = $state<VisualizerEngine>('auto');
+	let engine = $state<VisualizerEngine>('mk1');
 	let demoMode = $state(true);
 	let manualPreset = $state(-1);
 	let labReady = $state(false);
-	const renderEngine = $derived<RenderVisualizerEngine>(engine === 'auto' ? 'mk1' : engine);
 
 	function ensureSetup(): boolean {
 		if (setupDone || !audioEl) return setupDone;
@@ -154,8 +152,8 @@
 	}
 
 	onMount(() => {
-		// Restore persistence before mounting an engine; otherwise the lab briefly
-		// creates Auto/Mk1 and can race the shared native feature subscription.
+		// Restore persistence before mounting an engine so the lab does not briefly
+		// create Mk1 and race the shared native feature subscription.
 		vis.hydrateEngine();
 		engine = vis.engine;
 		vis.active = true;
@@ -181,7 +179,6 @@
 			return;
 		if (event.key === '0') manualPreset = -1;
 		else if (event.key >= '1' && event.key <= '4') manualPreset = Number(event.key) - 1;
-		else if (event.key.toLowerCase() === 'a') setEngine('auto');
 		else if (event.key.toLowerCase() === 'q') setEngine('mk1');
 		else if (event.key.toLowerCase() === 'w') setEngine('mk2');
 		else if (event.key.toLowerCase() === 'e') setEngine('signal');
@@ -196,14 +193,8 @@
 		<span class="font-mono text-white/70">visualizer lab</span>
 		<div class="flex overflow-hidden rounded border border-white/20">
 			<button
-				onclick={() => setEngine('auto')}
-				class={`px-3 py-1 ${engine === 'auto' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
-			>
-				auto · stable
-			</button>
-			<button
 				onclick={() => setEngine('mk1')}
-				class={`border-l border-white/20 px-3 py-1 ${engine === 'mk1' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
+				class={`px-3 py-1 ${engine === 'mk1' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
 			>
 				mk1
 			</button>
@@ -243,18 +234,18 @@
 	</div>
 
 	<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-white/80">
-		{#if renderEngine === 'mk1'}
+		{#if engine === 'mk1'}
 			<span>
-				<strong>{engine === 'auto' ? 'auto → mk1' : 'mk1'}</strong>
+				<strong>mk1</strong>
 				· {PRESET_NAMES[vis.preset] ?? '?'}
 				{#if manualPreset >= 0}<span class="text-amber-300">(forced)</span>{/if}
 			</span>
-		{:else if renderEngine === 'mk2'}
+		{:else if engine === 'mk2'}
 			<span class="text-amber-200"><strong>mk2 · experimental</strong> · volumetric fractal</span>
 		{:else}
 			<span><strong>signal</strong> · oscilloscope / vectorscope engine</span>
 		{/if}
-		<span class="text-white/45">keys: a auto · q mk1 · w mk2 · e signal · 0–4 mk1 presets</span>
+		<span class="text-white/45">keys: q mk1 · w mk2 · e signal · 0–4 mk1 presets</span>
 		<span class="text-white/40">|</span>
 		{#if vis.latest}
 			<span>bpm {vis.latest.bpm.toFixed(0)}</span>
@@ -270,9 +261,9 @@
 </div>
 
 {#if labReady}
-	{#if renderEngine === 'mk1'}
+	{#if engine === 'mk1'}
 		<VisualizerMk1 showHud={false} />
-	{:else if renderEngine === 'mk2'}
+	{:else if engine === 'mk2'}
 		<VisualizerMk2 showHud={false} />
 	{:else}
 		<VisualizerSignal showHud={false} />

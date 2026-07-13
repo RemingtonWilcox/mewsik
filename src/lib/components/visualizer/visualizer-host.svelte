@@ -7,9 +7,6 @@
 
 	const vis = useVisualizer();
 	let engineHydrated = $state(false);
-	// Auto remains deliberately boring and dependable until another engine
-	// reaches Mk1's quality and performance bar.
-	const renderEngine = $derived(vis.engine === 'auto' ? 'mk1' : vis.engine);
 
 	// Transient on-screen label when the user cycles engines with the V key.
 	let engineFlash = $state('');
@@ -27,8 +24,7 @@
 		const idx = order.indexOf(vis.engine);
 		const next = order[(idx + dirn + order.length) % order.length];
 		vis.setEngine(next);
-		engineFlash =
-			next === 'auto' ? 'auto (stable mk1)' : next === 'mk2' ? 'mk2 (experimental)' : next;
+		engineFlash = next === 'mk2' ? 'mk2 (experimental)' : next;
 		if (engineFlashTimer) clearTimeout(engineFlashTimer);
 		engineFlashTimer = setTimeout(() => (engineFlash = ''), 1800);
 	}
@@ -54,7 +50,7 @@
 		const isInput =
 			target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable;
 		if (isInput) return;
-		// V / Shift+V cycles engines: auto → mk1 → mk2 → signal.
+		// V / Shift+V cycles engines: mk1 → mk2 → signal.
 		if (e.key === 'v' || e.key === 'V') {
 			e.preventDefault();
 			cycleEngine(e.shiftKey ? -1 : 1);
@@ -71,12 +67,12 @@
 		</div>
 	{/if}
 	<div class="pointer-events-none fixed bottom-24 right-6 z-[106] font-mono text-[11px] text-white/35">
-		esc exit · v next engine{renderEngine === 'mk2' ? ' · experimental' : ''}
+		esc exit · v next engine{vis.engine === 'mk2' ? ' · experimental' : ''}
 	</div>
-	<div data-visualizer-host data-render-engine={renderEngine}>
-		{#if renderEngine === 'mk1'}
+	<div data-visualizer-host data-render-engine={vis.engine}>
+		{#if vis.engine === 'mk1'}
 			<VisualizerMk1 showHud={true} />
-		{:else if renderEngine === 'mk2'}
+		{:else if vis.engine === 'mk2'}
 			<VisualizerMk2 showHud={true} />
 		{:else}
 			<VisualizerSignal showHud={true} />

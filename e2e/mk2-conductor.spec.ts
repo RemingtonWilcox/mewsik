@@ -264,7 +264,34 @@ test.describe('Mk2 macro conductor', () => {
 			'shaftIntensity',
 			'backgroundFlow',
 			'postureYaw',
-			'posturePitch'
+			'posturePitch',
+			'shotZoom',
+			'closeStudy',
+			'detailFocus',
+			'perspectiveAzimuth',
+			'perspectiveElevation',
+			'shotFramingX',
+			'shotFramingY',
+			'seedForm',
+			'sproutForm',
+			'windingForm',
+			'bloomForm',
+			'sheddingForm',
+			'dormancyForm',
+			'morphRate',
+			'rootMass',
+			'axialStretch',
+			'lobeSplit',
+			'foldDepth',
+			'cavityOpen',
+			'surfaceRidges',
+			'filamentReach',
+			'spectralLean',
+			'spectralTravelRate',
+			'paletteWarmth',
+			'materialDensity',
+			'materialIridescence',
+			'materialErosion'
 		] as const;
 		for (const key of slowRails) {
 			expect(Math.abs(samples.hz30[key] - samples.hz144[key]), `30/144 ${key}`).toBeLessThan(
@@ -276,6 +303,12 @@ test.describe('Mk2 macro conductor', () => {
 		}
 		expect(Math.abs(samples.hz30.rotationPhase - samples.hz144.rotationPhase)).toBeLessThan(0.01);
 		expect(Math.abs(samples.hz60.rotationPhase - samples.hz144.rotationPhase)).toBeLessThan(0.006);
+		expect(Math.abs(samples.hz30.morphPhase - samples.hz144.morphPhase)).toBeLessThan(0.01);
+		expect(Math.abs(samples.hz60.morphPhase - samples.hz144.morphPhase)).toBeLessThan(0.006);
+		expect(
+			Math.abs(samples.hz30.spectralTravelPhase - samples.hz144.spectralTravelPhase)
+		).toBeLessThan(0.012);
+		expect(Math.abs(samples.hz30.palettePhase - samples.hz144.palettePhase)).toBeLessThan(0.01);
 	});
 
 	test('verse winds into build, then opens and releases into drop', async ({ page }) => {
@@ -330,6 +363,275 @@ test.describe('Mk2 macro conductor', () => {
 		expect(journey.drop.shaftIntensity).toBeGreaterThan(journey.build.shaftIntensity + 0.1);
 	});
 
+	test('the song crosses distinct seed, sprout, winding, bloom, shedding, and dormant forms', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const conductor = new Mk2Conductor('full-lifecycle');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			const settle = (section: string, seconds: number) => {
+				frame.section = signal.section = section;
+				frame.drop.buildActive = section === 'build';
+				frame.drop.anticipation = section === 'build' ? 0.9 : 0;
+				frame.context.energyLookahead = section === 'build' ? 0.92 : frame.energy;
+				let output: any;
+				for (let i = 0; i < seconds * 60; i += 1) {
+					frame.context.sectionProgress = (i + 1) / (seconds * 60);
+					output = conductor.update(frame, signal, spectrum, 1 / 60);
+				}
+				return { ...output };
+			};
+			const seed = { ...conductor.update(frame, signal, spectrum, 1 / 60) };
+			const sprout = settle('verse', 9);
+			const winding = settle('build', 9);
+			const bloom = settle('drop', 9);
+			const shedding = settle('bridge', 9);
+			const dormant = settle('outro', 11);
+
+			conductor.reset('boundary-crossfade');
+			settle('verse', 7);
+			const before = { ...conductor.update(frame, signal, spectrum, 1 / 60) };
+			frame.section = signal.section = 'drop';
+			frame.context.sectionProgress = 0;
+			const after = { ...conductor.update(frame, signal, spectrum, 1 / 60) };
+			const formNames = [
+				'seedForm',
+				'sproutForm',
+				'windingForm',
+				'bloomForm',
+				'sheddingForm',
+				'dormancyForm'
+			];
+			const sums = [seed, sprout, winding, bloom, shedding, dormant].map((sample) =>
+				formNames.reduce((sum, name) => sum + sample[name], 0)
+			);
+			const boundaryDelta = Math.max(
+				...formNames.map((name) => Math.abs(after[name] - before[name]))
+			);
+			return { seed, sprout, winding, bloom, shedding, dormant, sums, boundaryDelta };
+		}, FIXTURES);
+
+		expect(result.seed.seedForm).toBeGreaterThan(0.75);
+		expect(result.sprout.sproutForm).toBeGreaterThan(0.5);
+		expect(result.winding.windingForm).toBeGreaterThan(0.7);
+		expect(result.bloom.bloomForm).toBeGreaterThan(0.8);
+		expect(result.shedding.sheddingForm).toBeGreaterThan(0.58);
+		expect(result.dormant.dormancyForm).toBeGreaterThan(0.68);
+		for (const sum of result.sums) expect(sum).toBeCloseTo(1, 5);
+		expect(result.boundaryDelta).toBeLessThan(0.012);
+		expect(result.winding.foldDepth).toBeGreaterThan(result.sprout.foldDepth + 0.16);
+		expect(result.bloom.lobeSplit).toBeGreaterThan(result.winding.lobeSplit + 0.2);
+		expect(result.shedding.cavityOpen).toBeGreaterThan(result.bloom.cavityOpen + 0.3);
+		expect(result.shedding.materialErosion).toBeGreaterThan(
+			result.bloom.materialErosion + 0.3
+		);
+	});
+
+	test('sub, body, mids, presence, and air control different anatomical scales', async ({ page }) => {
+		await page.goto('/');
+		const samples = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const run = (band?: string) => {
+				const conductor = new Mk2Conductor('band-anatomy');
+				const frame: any = structuredClone(fixtures.director);
+				const signal: any = structuredClone(fixtures.signal);
+				const spectrum: any = structuredClone(fixtures.spectrum);
+				for (const name of Object.keys(spectrum.levels)) spectrum.levels[name] = 0.05;
+				spectrum.bass = spectrum.mid = spectrum.treble = 0.05;
+				if (band) spectrum.levels[band] = 1;
+				if (band === 'sub') spectrum.bass = 1;
+				if (band === 'mids') spectrum.mid = 1;
+				if (band === 'air') spectrum.treble = 1;
+				let output: any;
+				for (let i = 0; i < 5 * 60; i += 1) {
+					output = conductor.update(frame, signal, spectrum, 1 / 60);
+				}
+				return { ...output };
+			};
+			return {
+				low: run(),
+				sub: run('sub'),
+				body: run('body'),
+				mids: run('mids'),
+				presence: run('presence'),
+				air: run('air')
+			};
+		}, FIXTURES);
+
+		expect(samples.sub.rootMass).toBeGreaterThan(samples.low.rootMass + 0.5);
+		expect(samples.body.axialStretch).toBeGreaterThan(samples.low.axialStretch + 0.25);
+		expect(samples.mids.foldDepth).toBeGreaterThan(samples.low.foldDepth + 0.2);
+		expect(samples.mids.lobeSplit).toBeGreaterThan(samples.low.lobeSplit + 0.18);
+		expect(samples.presence.surfaceRidges).toBeGreaterThan(
+			samples.low.surfaceRidges + 0.42
+		);
+		expect(samples.air.filamentReach).toBeGreaterThan(samples.low.filamentReach + 0.48);
+		expect(samples.presence.rootMass - samples.low.rootMass).toBeLessThan(0.03);
+		expect(samples.sub.surfaceRidges - samples.low.surfaceRidges).toBeLessThan(0.03);
+	});
+
+	test('spectral travel and harmonic palette cross direction and hue wraps without snapping', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const conductor = new Mk2Conductor('continuous-travel');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			spectrum.spectralMotion = 0.9;
+			spectrum.spectralDirection = 1;
+			frame.context.keyPitchClass = 11.8 / 12;
+			signal.key = 11.8 / 12;
+			let output: any;
+			for (let i = 0; i < 7 * 60; i += 1) output = conductor.update(frame, signal, spectrum, 1 / 60);
+			const forward = { ...output };
+			const phaseBeforeReverse = output.spectralTravelPhase;
+			spectrum.spectralDirection = -1;
+			frame.context.keyPitchClass = 0.2 / 12;
+			signal.key = 0.2 / 12;
+			let maxPaletteStep = 0;
+			let maxTravelStep = 0;
+			let priorPalette = output.palettePhase;
+			let priorTravel = output.spectralTravelPhase;
+			for (let i = 0; i < 7 * 60; i += 1) {
+				output = conductor.update(frame, signal, spectrum, 1 / 60);
+				maxPaletteStep = Math.max(maxPaletteStep, Math.abs(output.palettePhase - priorPalette));
+				maxTravelStep = Math.max(maxTravelStep, Math.abs(output.spectralTravelPhase - priorTravel));
+				priorPalette = output.palettePhase;
+				priorTravel = output.spectralTravelPhase;
+			}
+			return {
+				forward,
+				reverse: { ...output },
+				phaseBeforeReverse,
+				maxPaletteStep,
+				maxTravelStep
+			};
+		}, FIXTURES);
+
+		expect(result.forward.spectralLean).toBeGreaterThan(0.75);
+		expect(result.forward.spectralTravelRate).toBeGreaterThan(0.1);
+		expect(result.reverse.spectralLean).toBeLessThan(-0.75);
+		expect(result.reverse.spectralTravelRate).toBeLessThan(-0.1);
+		expect(result.reverse.spectralTravelPhase).toBeLessThan(result.phaseBeforeReverse);
+		expect(result.maxTravelStep).toBeLessThan(0.003);
+		expect(result.maxPaletteStep).toBeLessThan(0.002);
+		expect(result.reverse.palettePhase).toBeGreaterThan(result.forward.palettePhase);
+	});
+
+	test('phrase-scale shot direction stays patient and reserves close studies for sustained detail', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const shotRails = [
+				'shotZoom',
+				'closeStudy',
+				'detailFocus',
+				'perspectiveAzimuth',
+				'perspectiveElevation',
+				'shotFramingX',
+				'shotFramingY'
+			];
+			const runJourney = (detailed: boolean) => {
+				const conductor = new Mk2Conductor('patient-shot-journey');
+				const frame: any = structuredClone(fixtures.director);
+				const signal: any = structuredClone(fixtures.signal);
+				const spectrum: any = structuredClone(fixtures.spectrum);
+				frame.section = signal.section = 'bridge';
+				frame.context.sectionProgress = 0.68;
+				frame.motion = 0.34;
+				Object.assign(signal, { tension: 0.24, release: 0.35, openness: 0.61, motion: 0.32 });
+				spectrum.levels.presence = spectrum.levels.air = detailed ? 1 : 0.03;
+				spectrum.treble = detailed ? 1 : 0.03;
+				spectrum.spectralMotion = detailed ? 0.92 : 0.03;
+				const maxStep: Record<string, number> = Object.fromEntries(
+					shotRails.map((name) => [name, 0])
+				);
+				const samples: any[] = [];
+				let prior: any;
+				for (let phrase = 0; phrase < 48; phrase += 1) {
+					frame.clock.phraseIndex = phrase;
+					for (let i = 0; i < 6 * 30; i += 1) {
+						frame.clock.phrasePos = (i + 1) / (6 * 30);
+						const output: any = conductor.update(frame, signal, spectrum, 1 / 30);
+						if (prior) {
+							for (const name of shotRails) {
+								maxStep[name] = Math.max(maxStep[name], Math.abs(output[name] - prior[name]));
+							}
+						}
+						prior = { ...output };
+					}
+					samples.push(prior);
+				}
+				return { samples, maxStep };
+			};
+
+			const runBeatComparison = () => {
+				const control = new Mk2Conductor('beat-independent-camera');
+				const hit = new Mk2Conductor('beat-independent-camera');
+				const controlFrame: any = structuredClone(fixtures.director);
+				const hitFrame: any = structuredClone(fixtures.director);
+				const controlSignal: any = structuredClone(fixtures.signal);
+				const hitSignal: any = structuredClone(fixtures.signal);
+				const controlSpectrum: any = structuredClone(fixtures.spectrum);
+				const hitSpectrum: any = structuredClone(fixtures.spectrum);
+				controlFrame.clock.phraseIndex = hitFrame.clock.phraseIndex = 7;
+				for (let i = 0; i < 20 * 60; i += 1) {
+					control.update(controlFrame, controlSignal, controlSpectrum, 1 / 60);
+					hit.update(hitFrame, hitSignal, hitSpectrum, 1 / 60);
+				}
+				hitFrame.clock.beatPulse = 1;
+				hitFrame.bassPunch = 1;
+				hitSignal.impact = 1;
+				hitSpectrum.deltas.kick = 1;
+				const quiet: any = control.update(controlFrame, controlSignal, controlSpectrum, 1 / 60);
+				const beat: any = hit.update(hitFrame, hitSignal, hitSpectrum, 1 / 60);
+				return Object.fromEntries(
+					shotRails.map((name) => [name, Math.abs(quiet[name] - beat[name])])
+				);
+			};
+
+			return {
+				detailed: runJourney(true),
+				flat: runJourney(false),
+				beatDelta: runBeatComparison()
+			};
+		}, FIXTURES);
+
+		const detailed = result.detailed.samples;
+		const flat = result.flat.samples;
+		const closePhrases = detailed.filter((sample: any) => sample.closeStudy > 0.5).length;
+		const heroPhrases = detailed.filter((sample: any) => sample.shotZoom < 1.32).length;
+		const max = (samples: any[], name: string) =>
+			Math.max(...samples.map((sample: any) => sample[name]));
+		expect(closePhrases).toBeGreaterThanOrEqual(2);
+		expect(closePhrases).toBeLessThan(14);
+		expect(heroPhrases).toBeGreaterThan(34);
+		expect(max(detailed, 'shotZoom')).toBeGreaterThan(1.55);
+		expect(max(detailed, 'closeStudy')).toBeGreaterThan(max(flat, 'closeStudy') + 0.12);
+		expect(max(detailed, 'detailFocus')).toBeGreaterThan(max(flat, 'detailFocus') + 0.25);
+		expect(result.detailed.maxStep.shotZoom).toBeLessThan(0.009);
+		expect(result.detailed.maxStep.closeStudy).toBeLessThan(0.009);
+		expect(result.detailed.maxStep.detailFocus).toBeLessThan(0.007);
+		expect(result.detailed.maxStep.perspectiveAzimuth).toBeLessThan(0.004);
+		expect(result.detailed.maxStep.perspectiveElevation).toBeLessThan(0.003);
+		expect(result.detailed.maxStep.shotFramingX).toBeLessThan(0.002);
+		expect(result.detailed.maxStep.shotFramingY).toBeLessThan(0.002);
+		for (const delta of Object.values(result.beatDelta)) expect(delta).toBeLessThan(1e-9);
+	});
+
 	test('macro rails cannot snap while impact attacks quickly and releases cleanly', async ({ page }) => {
 		await page.goto('/');
 		const result = await page.evaluate(async (fixtures) => {
@@ -378,7 +680,27 @@ test.describe('Mk2 macro conductor', () => {
 		expect(delta('fogDensity')).toBeLessThan(0.002);
 		expect(delta('shaftIntensity')).toBeLessThan(0.012);
 		expect(delta('backgroundFlow')).toBeLessThan(0.002);
+		expect(delta('shotZoom')).toBeLessThan(0.006);
+		expect(delta('closeStudy')).toBeLessThan(0.006);
+		expect(delta('detailFocus')).toBeLessThan(0.006);
+		expect(delta('perspectiveAzimuth')).toBeLessThan(0.003);
+		expect(delta('perspectiveElevation')).toBeLessThan(0.003);
+		expect(delta('shotFramingX')).toBeLessThan(0.002);
+		expect(delta('shotFramingY')).toBeLessThan(0.002);
+		expect(delta('seedForm')).toBeLessThan(0.012);
+		expect(delta('sproutForm')).toBeLessThan(0.012);
+		expect(delta('windingForm')).toBeLessThan(0.012);
+		expect(delta('bloomForm')).toBeLessThan(0.012);
+		expect(delta('sheddingForm')).toBeLessThan(0.012);
+		expect(delta('dormancyForm')).toBeLessThan(0.012);
+		expect(delta('axialStretch')).toBeLessThan(0.018);
+		expect(delta('lobeSplit')).toBeLessThan(0.018);
+		expect(delta('foldDepth')).toBeLessThan(0.02);
+		expect(delta('cavityOpen')).toBeLessThan(0.012);
+		expect(delta('materialDensity')).toBeLessThan(0.012);
+		expect(delta('materialErosion')).toBeLessThan(0.012);
 		expect(result.hit.impact).toBeGreaterThan(0.4);
+		expect(result.hit.rootPulse).toBeGreaterThan(0.4);
 		expect(result.hit.impact).toBeLessThanOrEqual(0.78);
 		expect(result.released.impact).toBeGreaterThan(result.hit.impact * 0.3);
 		expect(result.released.impact).toBeLessThan(result.hit.impact * 0.42);
@@ -427,9 +749,9 @@ test.describe('Mk2 macro conductor', () => {
 
 		expect(result.second).toEqual(result.first);
 		expect(result.reversed).toBe(false);
-		expect(Math.abs(result.longRun.rotationPhase)).toBeGreaterThan(Math.PI * 2);
-		expect(Math.abs(result.longRun.rotationRate)).toBeGreaterThanOrEqual(0.02);
-		expect(Math.abs(result.longRun.rotationRate)).toBeLessThanOrEqual(0.12);
+		expect(Math.abs(result.longRun.rotationPhase)).toBeGreaterThan(2.5);
+		expect(Math.abs(result.longRun.rotationRate)).toBeGreaterThanOrEqual(0.006);
+		expect(Math.abs(result.longRun.rotationRate)).toBeLessThanOrEqual(0.052);
 	});
 
 	test('tempo gently changes camera flow and phrase palette motion wraps continuously', async ({

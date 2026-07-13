@@ -24,9 +24,10 @@ export type Mk2SectionProfile = {
 };
 
 /**
- * Slow, bounded controls for Mk2. `impact` is the only intentionally fast
- * rail; the component can layer it over these values without moving the
- * camera or changing topology on individual beats.
+ * Slow, bounded controls for Mk2. `impact` and the sub/kick-specific
+ * `rootPulse` are the only intentionally fast rails; the component can layer
+ * them over these values without moving the camera or switching topology on
+ * individual beats.
  */
 export type Mk2ConductorFrame = {
 	section: VisualizerSection;
@@ -56,6 +57,58 @@ export type Mk2ConductorFrame = {
 	/** Harmony and phrase identity are confined to these slowly moving posture rails. */
 	postureYaw: number;
 	posturePitch: number;
+	/**
+	 * Patient shot-direction rails. `shotZoom` is a camera zoom multiplier:
+	 * values around one are hero shots, while the rare values above 1.5 are
+	 * deliberate close studies. None of these rails listen to beats or impact.
+	 */
+	shotZoom: number;
+	closeStudy: number;
+	detailFocus: number;
+	/** Camera-relative offsets in radians, smoothed across several seconds. */
+	perspectiveAzimuth: number;
+	perspectiveElevation: number;
+	/** Small normalized image-plane offsets for asymmetric close framing. */
+	shotFramingX: number;
+	shotFramingY: number;
+	/**
+	 * Continuous lifecycle weights. They sum to approximately one and crossfade
+	 * over seconds, so a renderer can blend genuinely different silhouettes
+	 * without switching a shape at a section boundary.
+	 */
+	seedForm: number;
+	sproutForm: number;
+	windingForm: number;
+	bloomForm: number;
+	sheddingForm: number;
+	dormancyForm: number;
+	/** Unwrapped slow organism clock; use sin/cos in the renderer, never fract(). */
+	morphPhase: number;
+	morphRate: number;
+	/** Sub and kick own the root mass. `rootPulse` is the second intentionally fast rail. */
+	rootMass: number;
+	rootPulse: number;
+	/** Body and mids own large-scale elongation, splitting, and folded topology. */
+	axialStretch: number;
+	lobeSplit: number;
+	foldDepth: number;
+	/** Shedding opens a cavity; presence and air only articulate the surface. */
+	cavityOpen: number;
+	surfaceRidges: number;
+	filamentReach: number;
+	/** Smoothed signed filter motion plus an unwrapped phase for directional travel. */
+	spectralLean: number;
+	spectralTravelPhase: number;
+	spectralTravelRate: number;
+	/**
+	 * `palettePhase` is an unwrapped hue in turns. The remaining rails describe
+	 * slow material evolution instead of beat-synchronous color flashes.
+	 */
+	palettePhase: number;
+	paletteWarmth: number;
+	materialDensity: number;
+	materialIridescence: number;
+	materialErosion: number;
 };
 
 export const MK2_CONDUCTOR_LIMITS = {
@@ -66,7 +119,7 @@ export const MK2_CONDUCTOR_LIMITS = {
 	openness: [0.18, 0.94],
 	macroEnergy: [0.08, 0.94],
 	impact: [0, 0.78],
-	rotationRateMagnitude: [0.02, 0.12],
+	rotationRateMagnitude: [0.006, 0.052],
 	cameraSpeed: [0.01, 0.045],
 	cameraDistance: [0.98, 1.1],
 	topologyBias: [-0.22, 0.35],
@@ -74,8 +127,61 @@ export const MK2_CONDUCTOR_LIMITS = {
 	shaftIntensity: [0.18, 0.8],
 	backgroundFlow: [0.005, 0.04],
 	postureYaw: [-0.1, 0.1],
-	posturePitch: [-0.07, 0.07]
+	posturePitch: [-0.07, 0.07],
+	shotZoom: [0.9, 1.85],
+	closeStudy: [0, 1],
+	detailFocus: [0, 1],
+	perspectiveAzimuth: [-0.42, 0.42],
+	perspectiveElevation: [-0.3, 0.3],
+	shotFramingX: [-0.18, 0.18],
+	shotFramingY: [-0.14, 0.14],
+	seedForm: [0, 1],
+	sproutForm: [0, 1],
+	windingForm: [0, 1],
+	bloomForm: [0, 1],
+	sheddingForm: [0, 1],
+	dormancyForm: [0, 1],
+	morphRate: [0.012, 0.055],
+	rootMass: [0, 1],
+	rootPulse: [0, 1],
+	axialStretch: [0, 1],
+	lobeSplit: [0, 1],
+	foldDepth: [0, 1],
+	cavityOpen: [0, 1],
+	surfaceRidges: [0, 1],
+	filamentReach: [0, 1],
+	spectralLean: [-1, 1],
+	spectralTravelRate: [-0.18, 0.18],
+	paletteWarmth: [-1, 1],
+	materialDensity: [0, 1],
+	materialIridescence: [0, 1],
+	materialErosion: [0, 1]
 } as const;
+
+type Mk2ShotProfile = {
+	heroZoom: number;
+	studyAffinity: number;
+	elevation: number;
+};
+
+/**
+ * Section grammar for the camera. Energetic blooms stay broad enough to read
+ * their silhouette; bridges and breakdowns are the best places to study the
+ * surface. A phrase hash still has to elect the close shot, so these are
+ * affinities rather than automatic cuts.
+ */
+const SHOT_PROFILES: Readonly<Record<VisualizerSection, Mk2ShotProfile>> = {
+	calm: { heroZoom: 0.96, studyAffinity: 0.24, elevation: 0.1 },
+	intro: { heroZoom: 1, studyAffinity: 0.3, elevation: 0.08 },
+	verse: { heroZoom: 1.04, studyAffinity: 0.52, elevation: 0.02 },
+	pre_chorus: { heroZoom: 1.07, studyAffinity: 0.22, elevation: -0.05 },
+	build: { heroZoom: 1.09, studyAffinity: 0.12, elevation: -0.09 },
+	drop: { heroZoom: 0.94, studyAffinity: 0.14, elevation: 0.06 },
+	chorus: { heroZoom: 0.98, studyAffinity: 0.3, elevation: 0.04 },
+	bridge: { heroZoom: 1.08, studyAffinity: 0.94, elevation: 0.15 },
+	breakdown: { heroZoom: 1.12, studyAffinity: 1, elevation: 0.2 },
+	outro: { heroZoom: 1.01, studyAffinity: 0.38, elevation: 0.11 }
+};
 
 const SECTION_PROFILES: Readonly<Record<VisualizerSection, Mk2SectionProfile>> = {
 	calm: {
@@ -220,6 +326,68 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, Mk2SectionProfile>> =
 	}
 };
 
+type LifecycleWeights = readonly [
+	seed: number,
+	sprout: number,
+	winding: number,
+	bloom: number,
+	shedding: number,
+	dormancy: number
+];
+
+type LifecycleArc = {
+	start: LifecycleWeights;
+	end: LifecycleWeights;
+};
+
+/**
+ * Every musical section is a journey between two form mixtures. The values
+ * deliberately overlap: Mk2 is always morphing through a body, never toggling
+ * between six presets. Each tuple sums to one.
+ */
+const LIFECYCLE_ARCS: Readonly<Record<VisualizerSection, LifecycleArc>> = {
+	calm: {
+		start: [0.4, 0, 0, 0, 0.05, 0.55],
+		end: [0.52, 0.04, 0, 0, 0.04, 0.4]
+	},
+	intro: {
+		start: [0.82, 0.06, 0, 0, 0, 0.12],
+		end: [0.25, 0.7, 0.05, 0, 0, 0]
+	},
+	verse: {
+		start: [0.05, 0.78, 0.15, 0.02, 0, 0],
+		end: [0, 0.55, 0.3, 0.15, 0, 0]
+	},
+	pre_chorus: {
+		start: [0, 0.35, 0.58, 0.07, 0, 0],
+		end: [0, 0.08, 0.85, 0.07, 0, 0]
+	},
+	build: {
+		start: [0, 0.08, 0.88, 0.04, 0, 0],
+		end: [0, 0, 0.75, 0.25, 0, 0]
+	},
+	drop: {
+		start: [0, 0, 0.2, 0.8, 0, 0],
+		end: [0, 0, 0.04, 0.94, 0.02, 0]
+	},
+	chorus: {
+		start: [0, 0.08, 0.08, 0.84, 0, 0],
+		end: [0, 0.05, 0.05, 0.84, 0.06, 0]
+	},
+	bridge: {
+		start: [0, 0.1, 0, 0.25, 0.65, 0],
+		end: [0.12, 0.08, 0, 0.1, 0.7, 0]
+	},
+	breakdown: {
+		start: [0.05, 0, 0, 0, 0.78, 0.17],
+		end: [0.28, 0, 0, 0, 0.42, 0.3]
+	},
+	outro: {
+		start: [0.2, 0, 0, 0, 0.25, 0.55],
+		end: [0.12, 0, 0, 0, 0.08, 0.8]
+	}
+};
+
 function finite(value: number | undefined, fallback = 0): number {
 	return Number.isFinite(value) ? (value as number) : fallback;
 }
@@ -242,6 +410,10 @@ function wrap01(value: number): number {
 function smoothstep(edge0: number, edge1: number, value: number): number {
 	const t = clamp01((finite(value) - edge0) / Math.max(edge1 - edge0, 1e-9));
 	return t * t * (3 - 2 * t);
+}
+
+function mix(from: number, to: number, amount: number): number {
+	return finite(from) + (finite(to, from) - finite(from)) * clamp01(amount);
 }
 
 function safeDt(dtSeconds: number): number {
@@ -276,6 +448,20 @@ function approachCircular(
 	const safeTarget = wrap01(target);
 	const delta = ((((safeTarget - safeCurrent + 0.5) % 1) + 1) % 1) - 0.5;
 	return wrap01(safeCurrent + delta * (1 - Math.exp(-dtSeconds / Math.max(tauSeconds, 1e-6))));
+}
+
+/** Circular target selection without wrapping the accumulated value itself. */
+function approachUnwrappedCircular(
+	current: number,
+	target: number,
+	tauSeconds: number,
+	dtSeconds: number
+): number {
+	const safeCurrent = finite(current);
+	const currentWrapped = wrap01(safeCurrent);
+	const safeTarget = wrap01(target);
+	const delta = ((((safeTarget - currentWrapped + 0.5) % 1) + 1) % 1) - 0.5;
+	return safeCurrent + delta * (1 - Math.exp(-dtSeconds / Math.max(tauSeconds, 1e-6)));
 }
 
 function circularMix(from: number, to: number, amount: number): number {
@@ -346,6 +532,37 @@ export class Mk2Conductor {
 	private keyPosition = 0;
 	private postureYaw = 0;
 	private posturePitch = 0;
+	private shotZoom = SHOT_PROFILES.intro.heroZoom;
+	private closeStudy = 0;
+	private detailFocus = 0.28;
+	private perspectiveAzimuth = 0;
+	private perspectiveElevation = SHOT_PROFILES.intro.elevation;
+	private shotFramingX = 0;
+	private shotFramingY = 0;
+	private seedForm = LIFECYCLE_ARCS.intro.start[0];
+	private sproutForm = LIFECYCLE_ARCS.intro.start[1];
+	private windingForm = LIFECYCLE_ARCS.intro.start[2];
+	private bloomForm = LIFECYCLE_ARCS.intro.start[3];
+	private sheddingForm = LIFECYCLE_ARCS.intro.start[4];
+	private dormancyForm = LIFECYCLE_ARCS.intro.start[5];
+	private morphPhase = 0;
+	private morphRate = 0.018;
+	private rootMass = 0.3;
+	private rootPulse = 0;
+	private axialStretch = 0.18;
+	private lobeSplit = 0.08;
+	private foldDepth = 0.12;
+	private cavityOpen = 0.06;
+	private surfaceRidges = 0.18;
+	private filamentReach = 0.12;
+	private spectralLean = 0;
+	private spectralTravelPhase = 0;
+	private spectralTravelRate = 0;
+	private palettePhase = 0;
+	private paletteWarmth = 0;
+	private materialDensity = 0.72;
+	private materialIridescence = 0.2;
+	private materialErosion = 0.04;
 
 	private readonly output: Mk2ConductorFrame = {
 		section: 'intro',
@@ -357,7 +574,7 @@ export class Mk2Conductor {
 		macroEnergy: SECTION_PROFILES.intro.macroEnergy,
 		impact: 0,
 		rotationPhase: 0,
-		rotationRate: 0.03,
+		rotationRate: 0.016,
 		cameraPhase: 0,
 		cameraSpeed: SECTION_PROFILES.intro.cameraSpeed,
 		cameraDistance: SECTION_PROFILES.intro.cameraDistance,
@@ -367,7 +584,38 @@ export class Mk2Conductor {
 		backgroundFlow: SECTION_PROFILES.intro.backgroundFlow,
 		backgroundFlowPhase: 0,
 		postureYaw: 0,
-		posturePitch: 0
+		posturePitch: 0,
+		shotZoom: SHOT_PROFILES.intro.heroZoom,
+		closeStudy: 0,
+		detailFocus: 0.28,
+		perspectiveAzimuth: 0,
+		perspectiveElevation: SHOT_PROFILES.intro.elevation,
+		shotFramingX: 0,
+		shotFramingY: 0,
+		seedForm: LIFECYCLE_ARCS.intro.start[0],
+		sproutForm: LIFECYCLE_ARCS.intro.start[1],
+		windingForm: LIFECYCLE_ARCS.intro.start[2],
+		bloomForm: LIFECYCLE_ARCS.intro.start[3],
+		sheddingForm: LIFECYCLE_ARCS.intro.start[4],
+		dormancyForm: LIFECYCLE_ARCS.intro.start[5],
+		morphPhase: 0,
+		morphRate: 0.018,
+		rootMass: 0.3,
+		rootPulse: 0,
+		axialStretch: 0.18,
+		lobeSplit: 0.08,
+		foldDepth: 0.12,
+		cavityOpen: 0.06,
+		surfaceRidges: 0.18,
+		filamentReach: 0.12,
+		spectralLean: 0,
+		spectralTravelPhase: 0,
+		spectralTravelRate: 0,
+		palettePhase: 0,
+		paletteWarmth: 0,
+		materialDensity: 0.72,
+		materialIridescence: 0.2,
+		materialErosion: 0.04
 	};
 
 	constructor(seed: Mk2Seed = 0) {
@@ -401,7 +649,7 @@ export class Mk2Conductor {
 		this.rotationPhase = 0;
 		this.rotationRate =
 			this.rotationDirection *
-			clamp(0.03 + this.seedRotation, ...MK2_CONDUCTOR_LIMITS.rotationRateMagnitude);
+			clamp(0.016 + this.seedRotation, ...MK2_CONDUCTOR_LIMITS.rotationRateMagnitude);
 		this.cameraPhase = seedPhase * 6;
 		this.cameraSpeed = intro.cameraSpeed;
 		this.cameraDistance = clamp(
@@ -419,6 +667,40 @@ export class Mk2Conductor {
 		this.keyPosition = 0;
 		this.postureYaw = 0;
 		this.posturePitch = 0;
+		this.shotZoom = SHOT_PROFILES.intro.heroZoom;
+		this.closeStudy = 0;
+		this.detailFocus = 0.28;
+		this.perspectiveAzimuth = signedHash(this.seedWord, 23) * 0.055;
+		this.perspectiveElevation =
+			SHOT_PROFILES.intro.elevation + signedHash(this.seedWord, 29) * 0.025;
+		this.shotFramingX = 0;
+		this.shotFramingY = 0;
+		[
+			this.seedForm,
+			this.sproutForm,
+			this.windingForm,
+			this.bloomForm,
+			this.sheddingForm,
+			this.dormancyForm
+		] = LIFECYCLE_ARCS.intro.start;
+		this.morphPhase = seedPhase * Math.PI * 2;
+		this.morphRate = 0.018;
+		this.rootMass = 0.3;
+		this.rootPulse = 0;
+		this.axialStretch = 0.18;
+		this.lobeSplit = 0.08;
+		this.foldDepth = 0.12;
+		this.cavityOpen = 0.06;
+		this.surfaceRidges = 0.18;
+		this.filamentReach = 0.12;
+		this.spectralLean = 0;
+		this.spectralTravelPhase = seedPhase * Math.PI * 2;
+		this.spectralTravelRate = 0;
+		this.palettePhase = 0;
+		this.paletteWarmth = 0;
+		this.materialDensity = 0.72;
+		this.materialIridescence = 0.2;
+		this.materialErosion = 0.04;
 
 		this.output.section = 'intro';
 		this.writeOutput();
@@ -464,12 +746,172 @@ export class Mk2Conductor {
 		const energy = clamp01(finite(frame.energy));
 		const sectionEnergy = clamp01(finite(context?.sectionEnergy, energy));
 		const centroid = clamp01(finite(spectrum.centroid, 0.42));
+		const sub = clamp01(finite(spectrum.levels?.sub));
+		const kick = clamp01(finite(spectrum.levels?.kick));
 		const body = clamp01(finite(spectrum.levels?.body));
 		const mids = clamp01(finite(spectrum.levels?.mids));
+		const presence = clamp01(finite(spectrum.levels?.presence));
+		const air = clamp01(finite(spectrum.levels?.air));
 		const bass = clamp01(finite(spectrum.bass));
 		const treble = clamp01(finite(spectrum.treble));
 		const spectralMotion = clamp01(finite(spectrum.spectralMotion));
 		const spectralDirection = clamp(finite(spectrum.spectralDirection), -1, 1);
+		const positiveSub = Math.max(0, finite(spectrum.deltas?.sub));
+		const positiveKick = Math.max(0, finite(spectrum.deltas?.kick));
+		const positiveBody = Math.max(0, finite(spectrum.deltas?.body));
+		const positiveMids = Math.max(0, finite(spectrum.deltas?.mids));
+		const positivePresence = Math.max(0, finite(spectrum.deltas?.presence));
+		const positiveAir = Math.max(0, finite(spectrum.deltas?.air));
+		const tempo = clamp01((finite(frame.clock?.tempoBpm, 120) - 60) / 120);
+		const signalTempo = clamp01(finite(signal.tempo, tempo));
+		const phraseIndex = Math.floor(finite(frame.clock?.phraseIndex));
+		const phraseWord = mix32(
+			this.seedWord ^ Math.imul((phraseIndex + 1) | 0, 0x85ebca6b)
+		);
+
+		// Section progress moves through a form arc; a multi-second low-pass makes
+		// even hard metadata boundaries become physical metamorphoses.
+		const lifecycleArc = LIFECYCLE_ARCS[sectionName] ?? LIFECYCLE_ARCS.intro;
+		const lifecycleProgress = smoothstep(0.02, 0.98, sectionProgress);
+		const lifecycleTau = 2.1 + (1 - signalMotion) * 0.8;
+		this.seedForm = approach(
+			this.seedForm,
+			mix(lifecycleArc.start[0], lifecycleArc.end[0], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		this.sproutForm = approach(
+			this.sproutForm,
+			mix(lifecycleArc.start[1], lifecycleArc.end[1], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		this.windingForm = approach(
+			this.windingForm,
+			mix(lifecycleArc.start[2], lifecycleArc.end[2], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		this.bloomForm = approach(
+			this.bloomForm,
+			mix(lifecycleArc.start[3], lifecycleArc.end[3], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		this.sheddingForm = approach(
+			this.sheddingForm,
+			mix(lifecycleArc.start[4], lifecycleArc.end[4], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		this.dormancyForm = approach(
+			this.dormancyForm,
+			mix(lifecycleArc.start[5], lifecycleArc.end[5], lifecycleProgress),
+			lifecycleTau,
+			dt
+		);
+		const lifecycleSum = Math.max(
+			1e-6,
+			this.seedForm +
+				this.sproutForm +
+				this.windingForm +
+				this.bloomForm +
+				this.sheddingForm +
+				this.dormancyForm
+		);
+		this.seedForm /= lifecycleSum;
+		this.sproutForm /= lifecycleSum;
+		this.windingForm /= lifecycleSum;
+		this.bloomForm /= lifecycleSum;
+		this.sheddingForm /= lifecycleSum;
+		this.dormancyForm /= lifecycleSum;
+
+		const morphRateTarget = clamp(
+			0.012 + signalTempo * 0.01 + signalMotion * 0.012 + spectralMotion * 0.012,
+			...MK2_CONDUCTOR_LIMITS.morphRate
+		);
+		this.morphRate = approach(this.morphRate, morphRateTarget, 2.6, dt);
+		this.morphPhase = finite(this.morphPhase) + this.morphRate * dt;
+
+		// Each band owns a different spatial scale. These are envelopes, not raw
+		// FFT values, so the body can answer music without fizzing frame-to-frame.
+		const rootMassTarget = clamp01(
+			0.08 + sub * 0.5 + bass * 0.2 + body * 0.08 + this.seedForm * 0.1 + this.bloomForm * 0.08
+		);
+		const rootPulseTarget = clamp01(
+			positiveSub * 0.34 +
+				positiveKick * 0.72 +
+				clamp01(finite(frame.bassPunch)) * 0.48 +
+				clamp01(finite(frame.clock?.beatPulse)) * kick * 0.32
+		);
+		const axialStretchTarget = clamp01(
+			0.06 +
+				this.sproutForm * 0.58 +
+				this.windingForm * 0.22 +
+				body * 0.34 +
+				positiveBody * 0.12 -
+				this.dormancyForm * 0.16
+		);
+		const lobeSplitTarget = clamp01(
+			0.03 + this.bloomForm * 0.66 + mids * 0.25 + positiveMids * 0.14 - this.seedForm * 0.08
+		);
+		const foldDepthTarget = clamp01(
+			0.05 +
+				this.windingForm * 0.58 +
+				mids * 0.28 +
+				spectralMotion * 0.16 +
+				positiveMids * 0.1 -
+				this.bloomForm * 0.08
+		);
+		const cavityOpenTarget = clamp01(
+			0.02 +
+				this.sheddingForm * 0.72 +
+				this.dormancyForm * 0.16 +
+				signalRelease * 0.12 -
+				this.seedForm * 0.08
+		);
+		const surfaceRidgesTarget = clamp01(
+			0.04 +
+				presence * 0.54 +
+				positivePresence * 0.26 +
+				signalTension * 0.12 +
+				this.windingForm * 0.08
+		);
+		const filamentReachTarget = clamp01(
+			0.03 +
+				air * 0.48 +
+				treble * 0.18 +
+				positiveAir * 0.22 +
+				centroid * 0.12 +
+				this.bloomForm * 0.16
+		);
+		this.rootMass = approachAsymmetric(this.rootMass, rootMassTarget, 0.34, 0.95, dt);
+		this.rootPulse = approachAsymmetric(this.rootPulse, rootPulseTarget, 0.018, 0.22, dt);
+		this.axialStretch = approachAsymmetric(this.axialStretch, axialStretchTarget, 0.62, 1.35, dt);
+		this.lobeSplit = approachAsymmetric(this.lobeSplit, lobeSplitTarget, 0.72, 1.4, dt);
+		this.foldDepth = approachAsymmetric(this.foldDepth, foldDepthTarget, 0.42, 0.9, dt);
+		this.cavityOpen = approachAsymmetric(this.cavityOpen, cavityOpenTarget, 1.15, 1.9, dt);
+		this.surfaceRidges = approachAsymmetric(this.surfaceRidges, surfaceRidgesTarget, 0.13, 0.58, dt);
+		this.filamentReach = approachAsymmetric(this.filamentReach, filamentReachTarget, 0.18, 0.78, dt);
+
+		const spectralLeanTarget = clamp(
+			spectralDirection * (0.35 + spectralMotion * 0.65),
+			...MK2_CONDUCTOR_LIMITS.spectralLean
+		);
+		const spectralTravelRateTarget = clamp(
+			spectralDirection * (0.025 + spectralMotion * 0.13) +
+				this.rotationDirection * (0.004 + air * 0.006),
+			...MK2_CONDUCTOR_LIMITS.spectralTravelRate
+		);
+		this.spectralLean = approach(this.spectralLean, spectralLeanTarget, 0.42, dt);
+		this.spectralTravelRate = approach(
+			this.spectralTravelRate,
+			spectralTravelRateTarget,
+			0.68,
+			dt
+		);
+		this.spectralTravelPhase =
+			finite(this.spectralTravelPhase) + this.spectralTravelRate * dt;
 
 		const releaseTarget = clamp(
 			profile.release * 0.58 +
@@ -525,8 +967,6 @@ export class Mk2Conductor {
 			dt
 		);
 
-		const positiveKick = Math.max(0, finite(spectrum.deltas?.kick));
-		const positiveBody = Math.max(0, finite(spectrum.deltas?.body));
 		const beatImpact =
 			clamp01(finite(frame.clock?.beatPulse)) *
 			(clamp01(finite(spectrum.levels?.kick)) * 0.28 +
@@ -544,14 +984,12 @@ export class Mk2Conductor {
 		);
 		this.impact = approachAsymmetric(this.impact, impactTarget, 0.018, 0.3, dt);
 
-		const tempo = clamp01((finite(frame.clock?.tempoBpm, 120) - 60) / 120);
-		const signalTempo = clamp01(finite(signal.tempo, tempo));
 		const directorMotion = clamp01(finite(frame.motion));
 		const motionBlend = clamp01(
 			profile.motion * 0.42 + signalMotion * 0.34 + directorMotion * 0.16 + spectralMotion * 0.08
 		);
 		const rotationMagnitudeTarget = clamp(
-			0.022 + motionBlend * 0.046 + tempo * 0.014 + mids * 0.01 + this.seedRotation,
+			0.008 + motionBlend * 0.022 + tempo * 0.007 + mids * 0.005 + this.seedRotation,
 			...MK2_CONDUCTOR_LIMITS.rotationRateMagnitude
 		);
 		const rotationRateTarget = this.rotationDirection * rotationMagnitudeTarget;
@@ -580,6 +1018,90 @@ export class Mk2Conductor {
 		this.cameraSpeed = approach(this.cameraSpeed, cameraSpeedTarget, 2.2, dt);
 		this.cameraDistance = approach(this.cameraDistance, cameraDistanceTarget, 2.7, dt);
 		this.cameraPhase = finite(this.cameraPhase) + this.cameraSpeed * dt;
+
+		// A deterministic phrase plan elects occasional close studies. Section
+		// affinity and sustained fine-detail evidence decide whether that election
+		// becomes a real shot. The several-second filters below are deliberately
+		// disconnected from beatPulse, impact, onset deltas, and rootPulse.
+		const shotProfile = SHOT_PROFILES[sectionName] ?? SHOT_PROFILES.intro;
+		const studyDraw = signedHash(phraseWord, 31) * 0.5 + 0.5;
+		const phraseStudyElection = smoothstep(0.81, 0.9, studyDraw);
+		const anatomicalDetail = clamp01(
+			presence * 0.24 +
+				air * 0.2 +
+				spectralMotion * 0.18 +
+				this.surfaceRidges * 0.13 +
+				this.filamentReach * 0.11 +
+				this.windingForm * 0.06 +
+				this.sheddingForm * 0.08
+		);
+		const closeStudyTarget = clamp(
+			phraseStudyElection *
+				shotProfile.studyAffinity *
+				(0.54 + anatomicalDetail * 0.46),
+			...MK2_CONDUCTOR_LIMITS.closeStudy
+		);
+		const shotZoomTarget = clamp(
+			shotProfile.heroZoom -
+				this.bloomForm * 0.035 +
+				closeStudyTarget * (0.61 + anatomicalDetail * 0.18),
+			...MK2_CONDUCTOR_LIMITS.shotZoom
+		);
+		const detailFocusTarget = clamp(
+			0.18 + anatomicalDetail * 0.43 + closeStudyTarget * 0.39,
+			...MK2_CONDUCTOR_LIMITS.detailFocus
+		);
+		const phraseAzimuth = signedHash(phraseWord, 37);
+		const phraseElevation = signedHash(phraseWord, 41);
+		const phraseFramingX = signedHash(phraseWord, 43);
+		const phraseFramingY = signedHash(phraseWord, 47);
+		const perspectiveAzimuthTarget = clamp(
+			phraseAzimuth * (0.075 + closeStudyTarget * 0.31) + this.spectralLean * 0.024,
+			...MK2_CONDUCTOR_LIMITS.perspectiveAzimuth
+		);
+		const perspectiveElevationTarget = clamp(
+			shotProfile.elevation +
+				phraseElevation * (0.04 + closeStudyTarget * 0.105) -
+				this.suspense * 0.025,
+			...MK2_CONDUCTOR_LIMITS.perspectiveElevation
+		);
+		const shotFramingXTarget = clamp(
+			phraseFramingX * (0.012 + closeStudyTarget * 0.16),
+			...MK2_CONDUCTOR_LIMITS.shotFramingX
+		);
+		const shotFramingYTarget = clamp(
+			phraseFramingY * (0.01 + closeStudyTarget * 0.12),
+			...MK2_CONDUCTOR_LIMITS.shotFramingY
+		);
+		this.closeStudy = approachAsymmetric(
+			this.closeStudy,
+			closeStudyTarget,
+			3.2,
+			3.8,
+			dt
+		);
+		this.shotZoom = approachAsymmetric(this.shotZoom, shotZoomTarget, 3.15, 3.9, dt);
+		this.detailFocus = approachAsymmetric(
+			this.detailFocus,
+			detailFocusTarget,
+			2.25,
+			3.2,
+			dt
+		);
+		this.perspectiveAzimuth = approach(
+			this.perspectiveAzimuth,
+			perspectiveAzimuthTarget,
+			4.2,
+			dt
+		);
+		this.perspectiveElevation = approach(
+			this.perspectiveElevation,
+			perspectiveElevationTarget,
+			4.6,
+			dt
+		);
+		this.shotFramingX = approach(this.shotFramingX, shotFramingXTarget, 3.5, dt);
+		this.shotFramingY = approach(this.shotFramingY, shotFramingYTarget, 3.8, dt);
 
 		const topologyTarget = clamp(
 			profile.topologyBias +
@@ -617,16 +1139,77 @@ export class Mk2Conductor {
 		const contextKey = wrap01(finite(context?.keyPitchClass, signalKey));
 		const keyTarget = circularMix(signalKey, contextKey, keyConfidence);
 		this.keyPosition = approachCircular(this.keyPosition, keyTarget, 2.6, dt);
-
-		const phraseIndex = Math.floor(finite(frame.clock?.phraseIndex));
-		const phraseWord = mix32(
-			this.seedWord ^ Math.imul((phraseIndex + 1) | 0, 0x85ebca6b)
+		const modeBias = context?.keyMode === 'major' ? 1 : context?.keyMode === 'minor' ? -1 : 0;
+		const directorHue = wrap01(
+			finite(frame.paletteBase, finite(frame.palette?.baseHue, keyTarget))
 		);
+		const harmonicHue = circularMix(directorHue, keyTarget, 0.25 + keyConfidence * 0.5);
+		const phraseHue = Math.sin(wrap01(finite(signal.spectrumTravel)) * Math.PI * 2) * 0.035;
+		this.palettePhase = approachUnwrappedCircular(
+			this.palettePhase,
+			wrap01(harmonicHue + phraseHue),
+			2.7,
+			dt
+		);
+		const paletteWarmthTarget = clamp(
+			(clamp01(finite(frame.valence, 0.5)) - 0.5) * 1.05 +
+				modeBias * keyConfidence * 0.22 +
+				(centroid - 0.5) * 0.28 +
+				this.bloomForm * 0.12 -
+				this.sheddingForm * 0.12,
+			...MK2_CONDUCTOR_LIMITS.paletteWarmth
+		);
+		const materialDensityTarget = clamp01(
+			0.18 +
+				this.seedForm * 0.5 +
+				this.windingForm * 0.54 +
+				this.dormancyForm * 0.38 +
+				this.rootMass * 0.18 -
+				this.sheddingForm * 0.32 -
+				this.bloomForm * 0.06
+		);
+		const materialIridescenceTarget = clamp01(
+			0.06 +
+				this.bloomForm * 0.34 +
+				keyConfidence * 0.18 +
+				presence * 0.18 +
+				air * 0.18 +
+				signalRelease * 0.08
+		);
+		const materialErosionTarget = clamp01(
+			0.02 +
+				this.sheddingForm * 0.72 +
+				this.cavityOpen * 0.14 +
+				positivePresence * 0.08 +
+				spectralMotion * 0.08
+		);
+		this.paletteWarmth = approach(this.paletteWarmth, paletteWarmthTarget, 2.9, dt);
+		this.materialDensity = approachAsymmetric(
+			this.materialDensity,
+			materialDensityTarget,
+			1.45,
+			2.25,
+			dt
+		);
+		this.materialIridescence = approachAsymmetric(
+			this.materialIridescence,
+			materialIridescenceTarget,
+			1.1,
+			1.85,
+			dt
+		);
+		this.materialErosion = approachAsymmetric(
+			this.materialErosion,
+			materialErosionTarget,
+			1.25,
+			2.4,
+			dt
+		);
+
 		const phraseYaw = signedHash(phraseWord, 11);
 		const phrasePitch = signedHash(phraseWord, 17);
 		const phraseSignal = (clamp01(finite(signal.phraseVariation, 0.5)) - 0.5) * 2;
 		const keyAngle = this.keyPosition * Math.PI * 2;
-		const modeBias = context?.keyMode === 'major' ? 1 : context?.keyMode === 'minor' ? -1 : 0;
 		const postureYawTarget = clamp(
 			Math.sin(keyAngle) * (0.032 + keyConfidence * 0.018) +
 				phraseYaw * 0.024 +
@@ -676,5 +1259,60 @@ export class Mk2Conductor {
 		this.output.backgroundFlowPhase = finite(this.backgroundFlowPhase);
 		this.output.postureYaw = clamp(this.postureYaw, ...MK2_CONDUCTOR_LIMITS.postureYaw);
 		this.output.posturePitch = clamp(this.posturePitch, ...MK2_CONDUCTOR_LIMITS.posturePitch);
+		this.output.shotZoom = clamp(this.shotZoom, ...MK2_CONDUCTOR_LIMITS.shotZoom);
+		this.output.closeStudy = clamp(this.closeStudy, ...MK2_CONDUCTOR_LIMITS.closeStudy);
+		this.output.detailFocus = clamp(this.detailFocus, ...MK2_CONDUCTOR_LIMITS.detailFocus);
+		this.output.perspectiveAzimuth = clamp(
+			this.perspectiveAzimuth,
+			...MK2_CONDUCTOR_LIMITS.perspectiveAzimuth
+		);
+		this.output.perspectiveElevation = clamp(
+			this.perspectiveElevation,
+			...MK2_CONDUCTOR_LIMITS.perspectiveElevation
+		);
+		this.output.shotFramingX = clamp(
+			this.shotFramingX,
+			...MK2_CONDUCTOR_LIMITS.shotFramingX
+		);
+		this.output.shotFramingY = clamp(
+			this.shotFramingY,
+			...MK2_CONDUCTOR_LIMITS.shotFramingY
+		);
+		this.output.seedForm = clamp(this.seedForm, ...MK2_CONDUCTOR_LIMITS.seedForm);
+		this.output.sproutForm = clamp(this.sproutForm, ...MK2_CONDUCTOR_LIMITS.sproutForm);
+		this.output.windingForm = clamp(this.windingForm, ...MK2_CONDUCTOR_LIMITS.windingForm);
+		this.output.bloomForm = clamp(this.bloomForm, ...MK2_CONDUCTOR_LIMITS.bloomForm);
+		this.output.sheddingForm = clamp(this.sheddingForm, ...MK2_CONDUCTOR_LIMITS.sheddingForm);
+		this.output.dormancyForm = clamp(this.dormancyForm, ...MK2_CONDUCTOR_LIMITS.dormancyForm);
+		this.output.morphPhase = finite(this.morphPhase);
+		this.output.morphRate = clamp(this.morphRate, ...MK2_CONDUCTOR_LIMITS.morphRate);
+		this.output.rootMass = clamp(this.rootMass, ...MK2_CONDUCTOR_LIMITS.rootMass);
+		this.output.rootPulse = clamp(this.rootPulse, ...MK2_CONDUCTOR_LIMITS.rootPulse);
+		this.output.axialStretch = clamp(this.axialStretch, ...MK2_CONDUCTOR_LIMITS.axialStretch);
+		this.output.lobeSplit = clamp(this.lobeSplit, ...MK2_CONDUCTOR_LIMITS.lobeSplit);
+		this.output.foldDepth = clamp(this.foldDepth, ...MK2_CONDUCTOR_LIMITS.foldDepth);
+		this.output.cavityOpen = clamp(this.cavityOpen, ...MK2_CONDUCTOR_LIMITS.cavityOpen);
+		this.output.surfaceRidges = clamp(this.surfaceRidges, ...MK2_CONDUCTOR_LIMITS.surfaceRidges);
+		this.output.filamentReach = clamp(this.filamentReach, ...MK2_CONDUCTOR_LIMITS.filamentReach);
+		this.output.spectralLean = clamp(this.spectralLean, ...MK2_CONDUCTOR_LIMITS.spectralLean);
+		this.output.spectralTravelPhase = finite(this.spectralTravelPhase);
+		this.output.spectralTravelRate = clamp(
+			this.spectralTravelRate,
+			...MK2_CONDUCTOR_LIMITS.spectralTravelRate
+		);
+		this.output.palettePhase = finite(this.palettePhase);
+		this.output.paletteWarmth = clamp(this.paletteWarmth, ...MK2_CONDUCTOR_LIMITS.paletteWarmth);
+		this.output.materialDensity = clamp(
+			this.materialDensity,
+			...MK2_CONDUCTOR_LIMITS.materialDensity
+		);
+		this.output.materialIridescence = clamp(
+			this.materialIridescence,
+			...MK2_CONDUCTOR_LIMITS.materialIridescence
+		);
+		this.output.materialErosion = clamp(
+			this.materialErosion,
+			...MK2_CONDUCTOR_LIMITS.materialErosion
+		);
 	}
 }

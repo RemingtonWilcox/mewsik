@@ -32,21 +32,20 @@ export const PRESET_NAMES = [
 	'nebulae flow'
 ];
 
-export type VisualizerEngine = 'auto' | 'mk1' | 'mk2' | 'signal';
-export type RenderVisualizerEngine = Exclude<VisualizerEngine, 'auto'>;
-export const VISUALIZER_ENGINES: VisualizerEngine[] = ['auto', 'mk1', 'mk2', 'signal'];
+export type VisualizerEngine = 'mk1' | 'mk2' | 'signal';
+export const VISUALIZER_ENGINES: VisualizerEngine[] = ['mk1', 'mk2', 'signal'];
 
 function migrateSavedEngine(saved: string): VisualizerEngine {
-	// Mk3's slot is now the rebuilt signal visualizer. Runtime and any unknown
-	// values fall back to the production-safe automatic mode.
+	// Mk3's slot is now the rebuilt Signal visualizer. The removed Auto and
+	// Runtime selections, plus any unknown value, safely fall back to Mk1.
 	if (saved === 'mk3') return 'signal';
 	if (VISUALIZER_ENGINES.includes(saved as VisualizerEngine)) return saved as VisualizerEngine;
-	return 'auto';
+	return 'mk1';
 }
 
 class VisualizerState {
 	active = $state(false);
-	engine = $state<VisualizerEngine>('auto');
+	engine = $state<VisualizerEngine>('mk1');
 	// `preset` tracks the currently-dominant preset for HUD display; rendering
 	// itself blends top-2 presets by softmax weight (continuous mix, not switch).
 	preset = $state(0);
@@ -90,7 +89,7 @@ class VisualizerState {
 				localStorage.setItem('mewsik.visualizer.engine', migrated);
 			}
 		} catch {
-			// Storage can be unavailable in restricted webviews; retain Auto.
+			// Storage can be unavailable in restricted webviews; retain Mk1.
 		}
 	}
 
