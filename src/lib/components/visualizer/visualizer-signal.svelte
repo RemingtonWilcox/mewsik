@@ -1,14 +1,22 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import { useVisualizer, type AudioFeatures } from '$lib/state/visualizer.svelte';
+	import { usePlayer } from '$lib/state/player.svelte';
 	import {
 		SIGNAL_COMPOSITE_WGSL,
 		SIGNAL_DECAY_WGSL,
 		SIGNAL_TRACE_WGSL,
+		SIGNAL_TRACE_INSTANCES,
 		SIGNAL_VERTEX_COUNT
 	} from '$lib/visualizer/signal/shaders';
+	import {
+		SignalSpectrumTracker,
+		type SignalSpectrumProfile
+	} from '$lib/visualizer/signal/spectrum';
+	import { SignalConductor } from '$lib/visualizer/signal/conductor';
 
 	const vis = useVisualizer();
+	const player = usePlayer();
 	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
@@ -21,7 +29,7 @@
 	let initializing = false;
 
 	const BIN_COUNT = 64;
-	const UNIFORM_FLOATS = 20;
+	const UNIFORM_FLOATS = 48;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 	const BINS_BYTES = BIN_COUNT * 4;
 	const FRAME_INTERVAL_MS = 1000 / 60;
@@ -78,6 +86,16 @@
 	let lastRenderedAt = 0;
 	let quietFor = 0;
 	let onsetLatched = false;
+	const sessionSeed = Math.random();
+	const spectrumTracker = new SignalSpectrumTracker();
+	const conductor = new SignalConductor(sessionSeed);
+	let signalTrackKey: string | null = null;
+	let audioWarmupFrames = 0;
+	let feedbackResetRequested = true;
+	let hudSection = $state('intro');
+	let hudTempo = $state(0);
+	let hudContext = $state<'live' | 'score'>('live');
+	let lastHudUpdateAt = 0;
 
 	function clamp(value: number, min: number, max: number) {
 		return Math.min(max, Math.max(min, value));
@@ -101,7 +119,11 @@
 		return value > 1 ? (((value % 12) + 12) % 12) / 12 : clamp(value, 0, 1);
 	}
 
-	function smoothAudio(dt: number, feature: AudioFeatures | null) {
+	function smoothAudio(
+		dt: number,
+		feature: AudioFeatures | null,
+		spectrum: Readonly<SignalSpectrumProfile>
+	) {
 		const incomingBins = feature?.bins ?? [];
 		for (let i = 0; i < BIN_COUNT; i += 1) {
 			const target = clamp(incomingBins[i] ?? 0, 0, 1);
@@ -109,9 +131,12 @@
 			smoothed.bins[i] = approach(smoothed.bins[i], target, rate, dt);
 		}
 
-		const bassTarget = clamp(feature?.bass ?? 0, 0, 1);
-		const midTarget = clamp(feature?.mid ?? 0, 0, 1);
-		const trebleTarget = clamp(feature?.treble ?? 0, 0, 1);
+		// The payload's historical bass/mid/treble fields slice logarithmic bins by
+		// index, so they do not describe musical bands. Signal derives real Hz
+		// ranges and adaptive levels in SignalSpectrumTracker instead.
+		const bassTarget = clamp(feature ? spectrum.bass : 0, 0, 1);
+		const midTarget = clamp(feature ? spectrum.mid : 0, 0, 1);
+		const trebleTarget = clamp(feature ? spectrum.treble : 0, 0, 1);
 		const rmsTarget = clamp(feature?.rms ?? 0, 0, 1);
 		smoothed.bass = approach(smoothed.bass, bassTarget, bassTarget > smoothed.bass ? 18 : 6, dt);
 		smoothed.mid = approach(smoothed.mid, midTarget, midTarget > smoothed.mid ? 14 : 5, dt);
@@ -124,7 +149,7 @@
 		smoothed.rms = approach(smoothed.rms, rmsTarget, rmsTarget > smoothed.rms ? 18 : 7, dt);
 		smoothed.centroid = approach(
 			smoothed.centroid,
-			clamp(feature?.centroid ?? 0.42, 0, 1),
+			clamp(feature ? spectrum.centroid : 0.42, 0, 1),
 			2.5,
 			dt
 		);
@@ -141,10 +166,11 @@
 			dt
 		);
 
-		if (feature?.onset && !onsetLatched) {
+		const transientHit = feature?.onset === true || (feature !== null && spectrum.novelty > 0.62);
+		if (transientHit && !onsetLatched) {
 			smoothed.transient = 1;
 			onsetLatched = true;
-		} else if (!feature?.onset) {
+		} else if (!transientHit) {
 			onsetLatched = false;
 		}
 		smoothed.transient *= Math.exp(-7.2 * dt);
@@ -154,10 +180,49 @@
 		const silenceTarget = quietFor > 0.45 ? 1 : 0;
 		smoothed.silence = approach(smoothed.silence, silenceTarget, silenceTarget ? 4.5 : 11, dt);
 
-		const audible = 1 - smoothed.silence;
-		const phaseSpeed = 0.028 + smoothed.mid * 0.13 + smoothed.rms * 0.035;
-		smoothed.phase = (smoothed.phase + dt * phaseSpeed * audible) % (Math.PI * 2);
 	}
+
+	function resetSignalState(seed: string | number) {
+		spectrumTracker.reset();
+		conductor.reset(seed);
+		smoothed.bins.fill(0);
+		smoothed.bass = 0;
+		smoothed.mid = 0;
+		smoothed.treble = 0;
+		smoothed.rms = 0;
+		smoothed.centroid = 0.42;
+		smoothed.chroma = 0;
+		smoothed.chromaStrength = 0;
+		smoothed.transient = 0;
+		smoothed.silence = 1;
+		smoothed.phase = 0;
+		quietFor = 0;
+		onsetLatched = false;
+		audioWarmupFrames = 3;
+		feedbackResetRequested = true;
+		lastRenderedAt = 0;
+		lastHudUpdateAt = 0;
+	}
+
+	$effect(() => {
+		const playback = player.state;
+		const hasIdentity =
+			playback.source !== null ||
+			playback.current_recording_id !== null ||
+			playback.current_source_url !== null ||
+			playback.current_station_id !== null;
+		const key = hasIdentity
+			? JSON.stringify([
+					playback.source,
+					playback.current_recording_id,
+					playback.current_source_url,
+					playback.current_station_id
+				])
+			: null;
+		if (key === signalTrackKey) return;
+		signalTrackKey = key;
+		resetSignalState(key ?? sessionSeed);
+	});
 
 	function createFeedbackTexture(device: GPUDevice, width: number, height: number) {
 		return device.createTexture({
@@ -347,25 +412,79 @@
 			canvas.width = width;
 			canvas.height = height;
 		}
+		if (feedbackResetRequested) {
+			destroyTargets(state.targets);
+			state.targets = null;
+			state.bindGroups = null;
+			state.frame = 0;
+			feedbackResetRequested = false;
+		}
 		ensureTargets(state, width, height);
 		if (!state.targets || !state.bindGroups) return;
 
-		// Signal uses the same single, freshness-checked snapshot for smoothing and
-		// beat phase so one rendered frame cannot mix two analyzer deliveries.
-		const feature = vis.getLatest();
-		smoothAudio(dt, feature);
+		// The persistent director is advanced once per analyzer delivery. Signal
+		// samples that shared song timeline and one freshness-checked raw frame at
+		// the same timestamp, then translates it through its own visual language.
+		const freshFeature = vis.getLatest(now);
+		const feature = audioWarmupFrames > 0 ? null : freshFeature;
+		if (audioWarmupFrames > 0) audioWarmupFrames -= 1;
+		const directed = vis.getPerformance(now);
+		const spectrum = spectrumTracker.update(feature, dt);
+		smoothAudio(dt, feature, spectrum);
+		const journey = conductor.update(directed, spectrum, dt);
+
+		const audible = 1 - smoothed.silence;
+		const phaseSpeed =
+			0.012 + journey.tempo * 0.052 + journey.motion * 0.118 + smoothed.mid * 0.038;
+		smoothed.phase = (smoothed.phase + dt * phaseSpeed * audible) % (Math.PI * 2);
+
 		const energy = clamp(
-			smoothed.rms * 0.78 + smoothed.bass * 0.24 + smoothed.mid * 0.18 + smoothed.treble * 0.08,
+			directed.energy * 0.52 +
+				smoothed.rms * 0.3 +
+				spectrum.levels.kick * 0.11 +
+				spectrum.spectralMotion * 0.09,
 			0,
 			1
 		);
 		const persistenceAt60Hz = clamp(
-			0.929 - energy * 0.019 - smoothed.transient * 0.058,
-			0.84,
-			0.935
+			0.928 +
+				journey.tension * 0.015 +
+				(1 - journey.motion) * 0.006 -
+				journey.release * 0.026 -
+				journey.sectionPulse * 0.024 -
+				smoothed.transient * 0.052,
+			0.83,
+			0.95
 		);
-		const lineWidth = 1.15 + smoothed.treble * 0.42 + smoothed.transient * 0.28;
-		const beatPhase = clamp(feature?.beat_phase ?? 0, 0, 1);
+		const lineWidth =
+			1.02 +
+			smoothed.treble * 0.3 +
+			spectrum.crestFactor * 0.22 +
+			journey.impact * 0.28 +
+			energy * 0.16;
+		const contextKeyStrength =
+			directed.context.source === 'score' ? directed.context.keyConfidence : 0;
+		const harmonicKey =
+			contextKeyStrength > 0.1 ? directed.context.keyPitchClass : smoothed.chroma;
+		const harmonicStrength = clamp(
+			Math.max(smoothed.chromaStrength, contextKeyStrength * 0.86),
+			0,
+			1
+		);
+		const boundaryImpact = Math.max(journey.impact, journey.sectionPulse * 0.76);
+		const asymmetrySign = journey.phraseVariation >= 0.5 ? 1 : -1;
+		const signedAsymmetry = clamp(
+			journey.asymmetry * asymmetrySign + spectrum.spectralDirection * 0.16,
+			-1,
+			1
+		);
+
+		if (now - lastHudUpdateAt >= 250) {
+			lastHudUpdateAt = now;
+			hudSection = directed.section;
+			hudTempo = directed.clock.tempoBpm;
+			hudContext = directed.context.source;
+		}
 
 		const uniforms = state.uniformData;
 		uniforms[0] = width;
@@ -377,17 +496,45 @@
 		uniforms[6] = smoothed.treble;
 		uniforms[7] = smoothed.rms;
 		uniforms[8] = smoothed.transient;
-		uniforms[9] = beatPhase;
+		uniforms[9] = directed.clock.beatPhase;
 		uniforms[10] = smoothed.centroid;
-		uniforms[11] = smoothed.chroma;
-		uniforms[12] = smoothed.chromaStrength;
+		uniforms[11] = harmonicKey;
+		uniforms[12] = harmonicStrength;
 		uniforms[13] = persistenceAt60Hz;
 		uniforms[14] = smoothed.silence;
 		uniforms[15] = smoothed.phase;
 		uniforms[16] = lineWidth;
 		uniforms[17] = energy;
-		uniforms[18] = 0;
-		uniforms[19] = 0;
+		uniforms[18] = spectrum.crestFactor;
+		uniforms[19] = spectrum.spectralMotion;
+		uniforms[20] = directed.clock.beatPulse;
+		uniforms[21] = journey.phrase;
+		uniforms[22] = journey.tempo;
+		uniforms[23] = directed.clock.downbeatFlag ? 1 : 0;
+		uniforms[24] = journey.tension;
+		uniforms[25] = journey.release;
+		uniforms[26] = journey.openness;
+		uniforms[27] = boundaryImpact;
+		uniforms[28] = journey.shapeWeights.ellipse;
+		uniforms[29] = journey.shapeWeights.lissajous;
+		uniforms[30] = journey.shapeWeights.ribbon;
+		uniforms[31] = journey.shapeWeights.rosette;
+		uniforms[32] = directed.palette.baseHue;
+		uniforms[33] = directed.palette.accentHue;
+		uniforms[34] = directed.palette.rimHue;
+		uniforms[35] = directed.palette.saturation;
+		uniforms[36] = spectrum.levels.sub;
+		uniforms[37] = spectrum.levels.kick;
+		uniforms[38] = spectrum.levels.body;
+		uniforms[39] = spectrum.levels.mids;
+		uniforms[40] = spectrum.levels.presence;
+		uniforms[41] = spectrum.levels.air;
+		uniforms[42] = spectrum.centroidVelocity;
+		uniforms[43] = signedAsymmetry;
+		uniforms[44] = directed.context.sectionProgress;
+		uniforms[45] = directed.context.energySlope;
+		uniforms[46] = directed.context.energyLookahead;
+		uniforms[47] = directed.context.sectionEnergy;
 
 		state.device.queue.writeBuffer(
 			state.uniformBuffer,
@@ -426,7 +573,7 @@
 			pass.draw(3);
 			pass.setPipeline(state.pipelines.trace);
 			pass.setBindGroup(0, state.bindGroups.trace);
-			pass.draw(SIGNAL_VERTEX_COUNT, 2);
+			pass.draw(SIGNAL_VERTEX_COUNT, SIGNAL_TRACE_INSTANCES);
 			pass.end();
 		}
 
@@ -553,7 +700,14 @@
 
 {#if vis.active}
 	<div class="fixed inset-0 z-[100] overflow-hidden bg-black">
-		<canvas bind:this={canvas} class="h-full w-full" aria-label="Signal audio visualizer"></canvas>
+		<canvas
+			bind:this={canvas}
+			class="h-full w-full"
+			aria-label="Signal audio visualizer"
+			data-signal-section={hudSection}
+			data-signal-context={hudContext}
+			data-signal-tempo={Math.round(hudTempo)}
+		></canvas>
 
 		{#if showHud}
 			<button
@@ -568,7 +722,7 @@
 			<div
 				class="pointer-events-none absolute left-6 top-6 z-20 rounded border border-emerald-200/15 bg-black/45 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.16em] text-emerald-100/65"
 			>
-				signal · vectorscope · 60 fps cap
+				signal · {hudSection} · {hudTempo > 30 ? `${Math.round(hudTempo)} bpm` : 'tempo seeking'} · {hudContext}
 			</div>
 			<div class="pointer-events-none absolute right-6 top-6 z-20 text-xs text-white/40">
 				click anywhere or press esc to exit

@@ -71,17 +71,21 @@ export class DropDetector {
 				break;
 			}
 			case 'building': {
+				// Check the landing before cancelling a build. A real drop collapses
+				// the riser signature that created buildScore, so testing cancellation
+				// first discarded the exact bass/RMS jump we were waiting for.
+				if (subBassMean > subBassBaseline * 1.2 && rmsSlope > 0.003) {
+					this.phase = 'dropped';
+					this.dropTime = time;
+					this.postDropDecay = 1;
+					break;
+				}
 				if (buildScore <= 1) {
 					this.phase = 'idle';
 					this.confidence = 0;
 					break;
 				}
 				this.confidence = Math.max(this.confidence, buildScore / 4);
-				if (subBassMean > subBassBaseline * 1.2 && rmsSlope > 0.003) {
-					this.phase = 'dropped';
-					this.dropTime = time;
-					this.postDropDecay = 1;
-				}
 				break;
 			}
 			case 'dropped': {

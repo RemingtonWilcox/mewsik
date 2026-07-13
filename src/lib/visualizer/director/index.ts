@@ -1,14 +1,27 @@
 // Director v2 — composes the three-tier pipeline into one update(features, time)
 // call returning a VisualDirectorFrame consumed by every renderer.
 
-import type { AudioFeatures } from '$lib/state/visualizer.svelte.js';
-import type { VisualDirectorFrame, MusicalClock, DropState, VisualizerSection } from './types.js';
+import type {
+	AudioFeatureFrame,
+	VisualDirectorFrame,
+	MusicalClock,
+	DropState,
+	VisualizerSection,
+	MusicalPerformanceContext,
+	PerformanceKeyMode
+} from './types.js';
 import { clamp01, AsymmetricEnvelope } from './util.js';
 import { ClockTracker } from './clock.js';
 import { DropDetector } from './drop.js';
 import { PaletteEngine } from './palette.js';
 import { StructureTracker, motifForSection } from './structure.js';
-import { scoreContext, sectionAt, nextDropAfter, lastDropBefore } from './score.js';
+import {
+	scoreContext,
+	scorePerformanceAt,
+	sectionAt,
+	nextDropAfter,
+	lastDropBefore
+} from './score.js';
 
 export * from './types.js';
 export { hsvToRgb } from './util.js';
@@ -20,6 +33,7 @@ export {
 
 const SILENCE_THRESHOLD = 0.02;
 const SILENCE_HOLD_S = 0.45;
+const SCORE_KEY_CONFIDENCE_MIN = 0.1;
 
 export class VisualDirector {
 	private clock = new ClockTracker();
@@ -45,7 +59,7 @@ export class VisualDirector {
 	private rawTreble = 0;
 	private rawCentroid = 0.5;
 
-	update(features: AudioFeatures | null | undefined, time: number): VisualDirectorFrame {
+	update(features: AudioFeatureFrame | null | undefined, time: number): VisualDirectorFrame {
 		const rms = features?.rms ?? 0;
 		const bass = features?.bass ?? 0;
 		const mid = features?.mid ?? 0;
@@ -108,13 +122,39 @@ export class VisualDirector {
 		// Score section boundaries are ground truth where they exist; the FSM
 		// keeps running underneath as the fallback (radio, unanalyzed tracks).
 		let section: VisualizerSection = struct.section;
+		let sectionAge = struct.sectionAge;
+		const scorePerformance = scored
+			? scorePerformanceAt(scored.score, scored.positionMs)
+			: null;
 		if (scored && !silence) {
 			const fromScore = sectionAt(scored.score, scored.positionMs);
-			if (fromScore) section = fromScore;
+			if (fromScore) {
+				section = fromScore;
+				// The old frame returned the live FSM age even while a scored section
+				// label was active. Use the actual offline boundary for coherent
+				// section-scale choreography.
+				sectionAge = Math.max(
+					0,
+					(scored.positionMs - (scorePerformance?.section?.start_ms ?? scored.positionMs)) /
+						1000
+				);
+			}
 		}
+
+		// A confident full-track key is much more stable than the dominant note
+		// in each live FFT frame. Keep live chroma as the radio/stream fallback.
+		const offlineKey = scored?.score.key;
+		const useOfflineKey =
+			offlineKey !== undefined && offlineKey.confidence >= SCORE_KEY_CONFIDENCE_MIN;
+		const paletteChromaKey = useOfflineKey
+			? normalizePitchClass(offlineKey.pitch_class)
+			: chromaKey;
+		const paletteChromaStrength = useOfflineKey
+			? clamp01(0.4 + offlineKey.confidence * 0.6)
+			: chromaStrength;
 		const palette = this.palette.update({
-			chromaKey,
-			chromaStrength,
+			chromaKey: paletteChromaKey,
+			chromaStrength: paletteChromaStrength,
 			valence,
 			arousal,
 			energy: rms
@@ -146,10 +186,37 @@ export class VisualDirector {
 
 		const phrase = clock.phrasePos;
 		const structureScalar = clamp01(0.7 - treble * 0.25 + chromaStrength * 0.35);
+		const context: MusicalPerformanceContext = scored && scorePerformance
+			? {
+					source: 'score',
+					sectionProgress: scorePerformance.sectionProgress,
+					sectionEnergy: scorePerformance.sectionEnergy,
+					trackProgress: scorePerformance.trackProgress,
+					energyCurrent: scorePerformance.energyCurrent,
+					energySlope: scorePerformance.energySlope,
+					energyLookahead: scorePerformance.energyLookahead,
+					keyPitchClass: normalizePitchClass(scored.score.key.pitch_class),
+					keyMode: normalizeKeyMode(scored.score.key.mode),
+					keyConfidence: clamp01(scored.score.key.confidence)
+				}
+			: {
+					source: 'live',
+					// Live sections have no known end; phrase position is the most useful
+					// bounded progress rail until an offline score is available.
+					sectionProgress: clock.phrasePos,
+					sectionEnergy: energy,
+					trackProgress: 0,
+					energyCurrent: energy,
+					energySlope: 0,
+					energyLookahead: energy,
+					keyPitchClass: normalizeLiveChroma(chromaKey),
+					keyMode: 'unknown',
+					keyConfidence: clamp01(chromaStrength)
+				};
 
 		return {
 			section,
-			sectionAge: struct.sectionAge,
+			sectionAge,
 			motif,
 			motifIndex,
 			silence,
@@ -171,7 +238,8 @@ export class VisualDirector {
 			bassRaw: this.rawBass,
 			midRaw: this.rawMid,
 			trebleRaw: this.rawTreble,
-			centroidRaw: this.rawCentroid
+			centroidRaw: this.rawCentroid,
+			context
 		};
 	}
 }
@@ -272,4 +340,18 @@ function approxFlatness(
 	const total = bass + mid + treble + 1e-5;
 	const dominance = Math.max(bass, mid, treble) / total;
 	return clamp01(1 - dominance);
+}
+
+function normalizePitchClass(pitchClass: number): number {
+	if (!Number.isFinite(pitchClass)) return 0;
+	return (((pitchClass % 12) + 12) % 12) / 12;
+}
+
+function normalizeLiveChroma(value: number): number {
+	if (!Number.isFinite(value)) return 0;
+	return value > 1 ? normalizePitchClass(value) : clamp01(value);
+}
+
+function normalizeKeyMode(mode: string): PerformanceKeyMode {
+	return mode === 'major' || mode === 'minor' ? mode : 'unknown';
 }

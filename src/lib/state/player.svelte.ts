@@ -57,6 +57,21 @@ function playbackSourceChanged(previous: PlaybackState, next: PlaybackState): bo
 	);
 }
 
+function performanceIdentity(playback: PlaybackState): string | null {
+	const hasSource =
+		playback.source !== null ||
+		playback.current_recording_id !== null ||
+		playback.current_source_url !== null ||
+		playback.current_station_id !== null;
+	if (!hasSource) return null;
+	return JSON.stringify([
+		playback.source,
+		playback.current_recording_id,
+		playback.current_source_url,
+		playback.current_station_id
+	]);
+}
+
 function syncVisualScore(next: PlaybackState) {
 	setScorePlayback(next.position_ms, next.is_playing);
 
@@ -89,8 +104,12 @@ function mergePlaybackState(nextState: PlaybackState) {
 	// Clear immediately when playback is no longer producing trustworthy audio.
 	// The store's 250 ms freshness timeout remains a backstop for missed polls or
 	// native analyzer stalls, while source identity protects fast track switches.
-	if (!nextState.is_playing || nextState.is_buffering || playbackSourceChanged(state, nextState)) {
+	const sourceChanged = playbackSourceChanged(state, nextState);
+	if (!nextState.is_playing || nextState.is_buffering || sourceChanged) {
 		clearVisualizerAudio();
+	}
+	if (sourceChanged) {
+		useVisualizer().resetPerformance(performanceIdentity(nextState));
 	}
 	if (pendingSeek) {
 		const sameTarget =

@@ -2,22 +2,13 @@
 // will grow into the preset/morph/routing matrix store in later phases.
 
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import {
+	createVisualDirector,
+	type AudioFeatureFrame,
+	type VisualDirectorFrame
+} from '$lib/visualizer/director/index.js';
 
-export type AudioFeatures = {
-	bins: number[];
-	rms: number;
-	peak: number;
-	centroid: number;
-	onset: boolean;
-	bass: number;
-	mid: number;
-	treble: number;
-	sample_rate: number;
-	bpm: number;
-	beat_phase: number;
-	chroma_key: number;
-	chroma_strength: number;
-};
+export type AudioFeatures = AudioFeatureFrame;
 
 // Native analysis normally arrives at ~60 Hz. Keep the last frame through brief
 // scheduling jitter, but stop treating it as live audio quickly when playback
@@ -64,6 +55,13 @@ class VisualizerState {
 	private listenPromise: Promise<UnlistenFn> | null = null;
 	private subs = 0;
 	private engineHydrated = false;
+	// One performance brain survives engine switches, so every renderer samples
+	// the same bar/phrase/section history instead of starting its own timeline.
+	private performanceDirector = createVisualDirector();
+	private performanceFrame: VisualDirectorFrame | null = null;
+	private performanceIdentity: string | null = null;
+	private performanceEpochAt = featureClockNow();
+	private performanceFrameAt: number | null = null;
 
 	toggle() {
 		this.active = !this.active;
@@ -110,14 +108,17 @@ class VisualizerState {
 
 	/** Publish one analyzer frame and timestamp it on the shared monotonic clock. */
 	setLatest(features: AudioFeatures) {
+		const now = featureClockNow();
 		this.latestFrame = features;
-		this.latestFrameAt = featureClockNow();
+		this.latestFrameAt = now;
+		this.updatePerformance(features, now);
 	}
 
 	/** Immediately invalidate audio during known playback discontinuities. */
 	clearLatest() {
 		this.latestFrame = null;
 		this.latestFrameAt = null;
+		this.updatePerformance(null, featureClockNow());
 	}
 
 	/**
@@ -129,6 +130,42 @@ class VisualizerState {
 		if (!frame || this.latestFrameAt === null) return null;
 		const age = now - this.latestFrameAt;
 		return age >= 0 && age <= AUDIO_FEATURE_FRESHNESS_MS ? frame : null;
+	}
+
+	/**
+	 * Sample the persistent musical-performance frame. Fresh analyzer events
+	 * advance it exactly once in setLatest; after delivery expires, render-time
+	 * null updates let silence gates and envelopes decay naturally.
+	 */
+	getPerformance(now = featureClockNow()): VisualDirectorFrame {
+		const live = this.getLatest(now);
+		if (live) {
+			// Normally setLatest already produced this frame. This fallback matters
+			// when a caller deliberately resets performance while retaining audio.
+			if (!this.performanceFrame) this.updatePerformance(live, now);
+		} else if (
+			this.performanceFrameAt === null ||
+			now - this.performanceFrameAt >= 0.5
+		) {
+			this.updatePerformance(null, now);
+		}
+		return this.performanceFrame!;
+	}
+
+	/** Reset temporal context only when playback moves to a different source. */
+	resetPerformance(identity: string | null) {
+		if (identity === this.performanceIdentity) return;
+		this.performanceIdentity = identity;
+		this.performanceDirector = createVisualDirector();
+		this.performanceFrame = null;
+		this.performanceFrameAt = null;
+		this.performanceEpochAt = featureClockNow();
+	}
+
+	private updatePerformance(features: AudioFeatures | null, now: number) {
+		const timeSeconds = Math.max(0, (now - this.performanceEpochAt) / 1000);
+		this.performanceFrame = this.performanceDirector.update(features, timeSeconds);
+		this.performanceFrameAt = now;
 	}
 
 	async subscribe(): Promise<() => void> {
