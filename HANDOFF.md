@@ -5,12 +5,11 @@
 
 This repo is a Tauri 2 + SvelteKit music app with a WebGPU/WGSL visualizer. The goal is still **label-grade procedural release visualizers**: real 3D space, procedural growth, musical phrasing, drops/builds/hooks/bridges, and visuals that feel authored instead of like a spectrum toy.
 
-Important repo status:
-- `origin/main` is still `700f410`, tagged `visualizer-mk1`.
-- Local active branch is `visualizer-runtime`.
-- `visualizer-lab` is the checkpoint branch at `37b3043`.
-- `visualizer-runtime` contains the director v2 + unified runtime work. It is local-only unless explicitly pushed.
-- Current work after the 2026-05-15 repair pass fixes mk2/runtime WebGPU blockers and should be committed as the next local checkpoint.
+Important repo status (updated 2026-06-09):
+- All visualizer work (director v2, unified runtime + six motifs, mk2 AAA pass) is now **merged to `main` and pushed** — `main` == `origin/main` at `a135e82`.
+- The `visualizer-runtime` and `visualizer-lab` branches no longer exist; everything below describing them as local-only is historical.
+- Recent `main` work beyond the visualizer: radio station reliability hardening (self-healing URLs via radio-browser UUID, playlist unwrapping).
+- The art-direction targets, anti-targets, and architectural axioms in this doc remain current.
 
 Current direction:
 - The visualizer now has `auto`, `mk1`, `mk2`, `mk3`, and `runtime`.

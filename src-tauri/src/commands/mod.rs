@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod discovery;
 pub mod downloads;
 pub mod external_search;

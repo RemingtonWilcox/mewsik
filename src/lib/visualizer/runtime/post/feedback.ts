@@ -92,15 +92,24 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 	let clamped = clamp(sampleUv, vec2<f32>(0.0), vec2<f32>(1.0));
 	let prev = textureSample(src, samp, clamped).rgb;
 
-	// Decay + slight hue rotation per frame so trails don't pile to white.
-	// AgX downstream tone-maps everything together so we keep this linear.
+	// Decay so trails don't pile to white. AgX downstream tone-maps
+	// everything together so we keep this linear.
 	let decayed = prev * decay;
+
+	// Soft luminance cap on the underlay. The loop's steady-state gain on
+	// STATIC content is 1/(1 - decay*mix) — moving particles leave decaying
+	// trails, but stationary glow (atmosphere gradients, held blooms)
+	// accumulates multiplicatively; this was the "fog dominating subject"
+	// mechanism. Reinhard-style compression bounds accumulation (~4.5 HDR
+	// luma asymptote) while leaving dim trails (<1.0) nearly untouched.
+	let underLuma = dot(decayed, vec3<f32>(0.2126, 0.7152, 0.0722));
+	let capped = decayed / (1.0 + 0.22 * underLuma);
 
 	// Soft edge fade so warped pixels near the frame border don't smear in.
 	let edgeUv = abs(sampleUv - vec2<f32>(0.5)) * 2.0;
 	let edgeFade = 1.0 - smoothstep(0.85, 1.05, max(edgeUv.x, edgeUv.y));
 
-	return vec4<f32>(decayed * mix * edgeFade, 1.0);
+	return vec4<f32>(capped * mix * edgeFade, 1.0);
 }
 `;
 

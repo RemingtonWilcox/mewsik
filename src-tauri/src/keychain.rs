@@ -48,4 +48,7 @@ mod imp {
     }
 }
 
+// Not consumed by any feature yet (intended for upcoming credential needs,
+// e.g. Last.fm API keys); kept so the cross-platform API surface stays compiled.
+#[allow(unused_imports)]
 pub use imp::{delete_credential, get_credential, store_credential};

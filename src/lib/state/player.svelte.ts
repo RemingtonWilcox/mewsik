@@ -1,5 +1,6 @@
 import type { PlaybackState, RepeatMode } from '$lib/types';
 import * as api from '$lib/api/tauri';
+import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
 
 const defaultState: PlaybackState = {
 	is_playing: false,
@@ -34,6 +35,41 @@ function clearPendingSeek() {
 	pendingSeek = null;
 }
 
+// ---- Visual score lifecycle ----
+// On every state merge the director's playback anchor is refreshed; when the
+// playing recording changes, the cached offline analysis is fetched (or
+// kicked off) and handed to the director. Null score = live-FSM fallback.
+let scoreRecordingId: string | null = null;
+let analysisListenerStarted = false;
+
+function syncVisualScore(next: PlaybackState) {
+	setScorePlayback(next.position_ms, next.is_playing);
+
+	const id = next.source === 'radio' ? null : next.current_recording_id;
+	if (id === scoreRecordingId) return;
+	scoreRecordingId = id;
+	setActiveScore(null);
+	if (!id) return;
+
+	if (!analysisListenerStarted) {
+		analysisListenerStarted = true;
+		void api.listenAnalysisComplete((payload) => {
+			if (payload.recording_id !== scoreRecordingId) return;
+			void api.getTrackAnalysis(payload.recording_id).then((score) => {
+				if (payload.recording_id === scoreRecordingId) setActiveScore(score);
+			});
+		});
+	}
+
+	void api.requestTrackAnalysis(id).then(async (status) => {
+		if (status === 'cached' && id === scoreRecordingId) {
+			setActiveScore(await api.getTrackAnalysis(id));
+		}
+		// 'started' resolves via the analysis:complete listener;
+		// 'unavailable' stays on the live fallback.
+	});
+}
+
 function mergePlaybackState(nextState: PlaybackState) {
 	if (pendingSeek) {
 		const sameTarget =
@@ -50,6 +86,7 @@ function mergePlaybackState(nextState: PlaybackState) {
 	}
 
 	state = nextState;
+	syncVisualScore(nextState);
 }
 
 async function refreshState() {

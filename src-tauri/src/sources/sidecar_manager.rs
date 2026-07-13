@@ -1,23 +1,32 @@
 use crate::external_tools::find_binary;
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
+
+/// Upper bound on a single sidecar round-trip. Stream resolution can chain
+/// several upstream fetches (InnerTube client fallbacks), so this is generous.
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+type PendingMap = Arc<Mutex<HashMap<u64, Sender<JsonRpcResponse>>>>;
 
 pub struct SidecarManager {
     inner: Arc<Mutex<Inner>>,
+    pending: PendingMap,
     request_id: AtomicU64,
 }
 
 struct Inner {
     child: Option<Child>,
     stdin: Option<BufWriter<ChildStdin>>,
-    stdout: Option<BufReader<ChildStdout>>,
 }
 
 #[derive(Serialize)]
@@ -32,7 +41,6 @@ struct JsonRpcRequest {
 struct JsonRpcResponse {
     #[allow(dead_code)]
     jsonrpc: Option<String>,
-    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<Value>,
     error: Option<JsonRpcError>,
@@ -51,14 +59,15 @@ impl SidecarManager {
             inner: Arc::new(Mutex::new(Inner {
                 child: None,
                 stdin: None,
-                stdout: None,
             })),
+            pending: Arc::new(Mutex::new(HashMap::new())),
             request_id: AtomicU64::new(1),
         }
     }
 
     pub fn start(&self) -> Result<(), String> {
         let mut inner = self.inner.lock();
+        reap_if_dead(&mut inner, &self.pending);
         if inner.child.is_some() {
             return Ok(());
         }
@@ -96,8 +105,46 @@ impl SidecarManager {
         let stderr = child.stderr.take();
 
         inner.stdin = Some(BufWriter::new(stdin));
-        inner.stdout = Some(BufReader::new(stdout));
         inner.child = Some(child);
+
+        // Route responses to waiting callers by request id. The thread exits
+        // when the child's stdout closes, failing any in-flight calls fast.
+        let pending = Arc::clone(&self.pending);
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(_) => break,
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<JsonRpcResponse>(trimmed) {
+                    Ok(response) => {
+                        let waiter = response.id.and_then(|id| pending.lock().remove(&id));
+                        match waiter {
+                            Some(tx) => {
+                                let _ = tx.send(response);
+                            }
+                            None => log::debug!(
+                                target: "mewsik::sidecar",
+                                "response with no waiter (timed out caller?): {}",
+                                trimmed
+                            ),
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        target: "mewsik::sidecar",
+                        "unparseable sidecar line: {} ({})",
+                        trimmed,
+                        e
+                    ),
+                }
+            }
+            pending.lock().clear();
+        });
 
         // Drain stderr in the background so a chatty child can't block on a full pipe.
         if let Some(stderr) = stderr {
@@ -123,41 +170,49 @@ impl SidecarManager {
 
         let request_str = serde_json::to_string(&request).map_err(|e| e.to_string())? + "\n";
 
-        let mut inner = self.inner.lock();
-        if inner.child.is_none() {
-            return Err("Sidecar not running".to_string());
-        }
+        let (tx, rx) = bounded(1);
+        self.pending.lock().insert(id, tx);
 
-        {
-            let stdin = inner
-                .stdin
-                .as_mut()
-                .ok_or_else(|| "Sidecar stdin missing".to_string())?;
-            stdin
-                .write_all(request_str.as_bytes())
-                .map_err(|e| format!("Failed to write to sidecar: {}", e))?;
-            stdin
-                .flush()
-                .map_err(|e| format!("Failed to flush sidecar stdin: {}", e))?;
-        }
-
-        let mut line = String::new();
-        let bytes_read = {
-            let stdout = inner
-                .stdout
-                .as_mut()
-                .ok_or_else(|| "Sidecar stdout missing".to_string())?;
-            stdout
-                .read_line(&mut line)
-                .map_err(|e| format!("Failed to read from sidecar: {}", e))?
+        // Hold the inner lock only for the write; the response arrives via the
+        // reader thread, so slow calls don't serialize unrelated requests.
+        let write_result = {
+            let mut inner = self.inner.lock();
+            if inner.child.is_none() {
+                Err("Sidecar not running".to_string())
+            } else {
+                inner
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| "Sidecar stdin missing".to_string())
+                    .and_then(|stdin| {
+                        stdin
+                            .write_all(request_str.as_bytes())
+                            .map_err(|e| format!("Failed to write to sidecar: {}", e))?;
+                        stdin
+                            .flush()
+                            .map_err(|e| format!("Failed to flush sidecar stdin: {}", e))
+                    })
+            }
         };
-
-        if bytes_read == 0 {
-            return Err("Sidecar closed stdout before responding".to_string());
+        if let Err(e) = write_result {
+            self.pending.lock().remove(&id);
+            return Err(e);
         }
 
-        let response: JsonRpcResponse = serde_json::from_str(line.trim())
-            .map_err(|e| format!("Invalid response: {} (raw: {})", e, line.trim()))?;
+        let response = match rx.recv_timeout(CALL_TIMEOUT) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                self.pending.lock().remove(&id);
+                return Err(format!(
+                    "Sidecar request '{}' timed out after {}s",
+                    method,
+                    CALL_TIMEOUT.as_secs()
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err("Sidecar exited before responding".to_string());
+            }
+        };
 
         if let Some(error) = response.error {
             return Err(format!("Sidecar error: {}", error.message));
@@ -171,15 +226,31 @@ impl SidecarManager {
     pub fn stop(&self) {
         let mut inner = self.inner.lock();
         inner.stdin.take();
-        inner.stdout.take();
         if let Some(mut child) = inner.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        self.pending.lock().clear();
     }
 
     pub fn is_running(&self) -> bool {
-        self.inner.lock().child.is_some()
+        let mut inner = self.inner.lock();
+        reap_if_dead(&mut inner, &self.pending);
+        inner.child.is_some()
+    }
+}
+
+/// Detect a child that exited on its own (crash, OOM) and clean up so callers
+/// see "not running" instead of writing into a dead pipe forever.
+fn reap_if_dead(inner: &mut Inner, pending: &PendingMap) {
+    let dead = match inner.child.as_mut() {
+        Some(child) => !matches!(child.try_wait(), Ok(None)),
+        None => return,
+    };
+    if dead {
+        inner.child = None;
+        inner.stdin = None;
+        pending.lock().clear();
     }
 }
 

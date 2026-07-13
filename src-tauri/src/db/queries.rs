@@ -1409,3 +1409,58 @@ pub fn find_active_download_for_recording(
         None => Ok(None),
     }
 }
+
+// ---- Track analysis (visual score) cache ----
+
+pub fn get_track_analysis(
+    db: &DbPool,
+    recording_id: &str,
+    min_version: i64,
+) -> Result<Option<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT score_json FROM track_analysis WHERE recording_id = ?1 AND version >= ?2",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recording_id, min_version])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn upsert_track_analysis(
+    db: &DbPool,
+    recording_id: &str,
+    version: i64,
+    score_json: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "INSERT INTO track_analysis (recording_id, version, score_json, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(recording_id) DO UPDATE SET
+           version = excluded.version,
+           score_json = excluded.score_json,
+           created_at = excluded.created_at",
+        rusqlite::params![recording_id, version, score_json, now()],
+    )?;
+    Ok(())
+}
+
+/// First playable local file for a recording, if any.
+pub fn get_local_file_for_recording(
+    db: &DbPool,
+    recording_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT file_path FROM track_sources
+         WHERE recording_id = ?1 AND file_path IS NOT NULL AND is_available = 1
+         ORDER BY quality_score DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recording_id])?;
+    match rows.next()? {
+        Some(row) => Ok(Some(row.get(0)?)),
+        None => Ok(None),
+    }
+}

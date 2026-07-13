@@ -2,15 +2,21 @@
 // call returning a VisualDirectorFrame consumed by every renderer.
 
 import type { AudioFeatures } from '$lib/state/visualizer.svelte.js';
-import type { VisualDirectorFrame } from './types.js';
+import type { VisualDirectorFrame, MusicalClock, DropState, VisualizerSection } from './types.js';
 import { clamp01, AsymmetricEnvelope } from './util.js';
 import { ClockTracker } from './clock.js';
 import { DropDetector } from './drop.js';
 import { PaletteEngine } from './palette.js';
 import { StructureTracker, motifForSection } from './structure.js';
+import { scoreContext, sectionAt, nextDropAfter, lastDropBefore } from './score.js';
 
 export * from './types.js';
 export { hsvToRgb } from './util.js';
+export {
+	setActiveScore,
+	setScorePlayback,
+	type TrackScore
+} from './score.js';
 
 const SILENCE_THRESHOLD = 0.02;
 const SILENCE_HOLD_S = 0.45;
@@ -60,14 +66,22 @@ export class VisualDirector {
 		const silence = this.silenceStart > 0 && time - this.silenceStart > SILENCE_HOLD_S;
 
 		// Tier 0/1 — clock + mid-level features.
-		const clock = this.clock.update({ time, tempoBpm, beatPhase, onset });
+		let clock = this.clock.update({ time, tempoBpm, beatPhase, onset });
+
+		// Visual score: when offline analysis exists for the playing track,
+		// the beat grid is ground truth — replace the live clock estimate.
+		// The live trackers keep ticking underneath so fallback is seamless.
+		const scored = scoreContext();
+		if (scored && scored.score.beat_confidence >= 0.15 && !silence) {
+			clock = scoreClock(scored.score, scored.positionMs, clock);
+		}
 
 		// Approximate spectral flatness from FFT bins when available; otherwise
 		// fall back to a coarse estimate from (treble / (bass + mid + treble)).
 		const flatness = approxFlatness(features?.bins, bass, mid, treble);
 		const subBass = this.subBassEnv.tick(bass);
 		const onsetDensity = this.onsetDensityEnv.tick(onset ? 1 : 0);
-		const dropState = this.drop.update({
+		let dropState = this.drop.update({
 			time,
 			rms,
 			flatness,
@@ -76,6 +90,14 @@ export class VisualDirector {
 			clock
 		});
 
+		// Scheduled drops beat predicted drops: with a score we KNOW where the
+		// next drop lands, so anticipation ramps over the 8s before it and the
+		// post-drop watershed decays over 2.5s after — fused with the live
+		// detector via max so genuinely surprising moments still register.
+		if (scored && !silence) {
+			dropState = scoreDropState(scored.score, scored.positionMs, dropState);
+		}
+
 		// Valence (mood polarity) and arousal (energy intensity) from coarse
 		// proxies — full MLP belongs in the sidecar later.
 		const valence = this.valenceEnv.tick(clamp01(0.4 + mid * 0.5 - treble * 0.2));
@@ -83,6 +105,13 @@ export class VisualDirector {
 
 		// Tier 2 — high-level intent.
 		const struct = this.structure.update({ time, rms, drop: dropState, clock, silence });
+		// Score section boundaries are ground truth where they exist; the FSM
+		// keeps running underneath as the fallback (radio, unanalyzed tracks).
+		let section: VisualizerSection = struct.section;
+		if (scored && !silence) {
+			const fromScore = sectionAt(scored.score, scored.positionMs);
+			if (fromScore) section = fromScore;
+		}
 		const palette = this.palette.update({
 			chromaKey,
 			chromaStrength,
@@ -91,7 +120,7 @@ export class VisualDirector {
 			energy: rms
 		});
 
-		const { motif, motifIndex } = motifForSection(struct.section, chromaKey, clock.phraseIndex);
+		const { motif, motifIndex } = motifForSection(section, chromaKey, clock.phraseIndex);
 
 		// Smoothed scalars for the renderer uniform. Drop anticipation + post-drop
 		// decay add tension on top of raw energy so visuals pre-charge and ride out.
@@ -119,7 +148,7 @@ export class VisualDirector {
 		const structureScalar = clamp01(0.7 - treble * 0.25 + chromaStrength * 0.35);
 
 		return {
-			section: struct.section,
+			section,
 			sectionAge: struct.sectionAge,
 			motif,
 			motifIndex,
@@ -149,6 +178,73 @@ export class VisualDirector {
 
 export function createVisualDirector() {
 	return new VisualDirector();
+}
+
+/// Deterministic clock from the offline beat grid: bpm and phase come from
+/// arithmetic on the playback position, not live estimation.
+function scoreClock(
+	score: import('./score.js').TrackScore,
+	positionMs: number,
+	live: MusicalClock
+): MusicalClock {
+	const beatMs = 60_000 / score.bpm;
+	const beatsIn = (positionMs - score.beat_offset_ms) / beatMs;
+	if (!Number.isFinite(beatsIn) || beatsIn < 0) return live;
+	const beatPhase = beatsIn - Math.floor(beatsIn);
+	const beatIndexAbs = Math.floor(beatsIn);
+	const beatIndex = beatIndexAbs % 4;
+	const barIndex = Math.floor(beatIndexAbs / 4);
+	const phraseBars = 8;
+	return {
+		tempoBpm: score.bpm,
+		beatPhase,
+		// Sharp attack at the beat, cubic falloff — same shape the live
+		// tracker produces, so renderers can't tell which rail fed them.
+		beatPulse: Math.pow(1 - beatPhase, 3),
+		downbeatFlag: beatIndex === 0 && beatPhase < 0.12,
+		barIndex,
+		beatIndex,
+		phrasePos: (barIndex % phraseBars) / phraseBars + beatPhase / (4 * phraseBars),
+		phraseIndex: Math.floor(barIndex / phraseBars)
+	};
+}
+
+/// Fuse scheduled drops with the live detector (max of both rails).
+function scoreDropState(
+	score: import('./score.js').TrackScore,
+	positionMs: number,
+	live: DropState
+): DropState {
+	const ANTICIPATION_MS = 8000;
+	const POST_DROP_MS = 2500;
+	let anticipation = live.anticipation;
+	let postDropDecay = live.postDropDecay;
+	let dropEta = live.dropEta;
+	let buildActive = live.buildActive;
+	let buildProgress = live.buildProgress;
+
+	const next = nextDropAfter(score, positionMs);
+	if (next) {
+		const untilMs = next.at_ms - positionMs;
+		if (untilMs <= ANTICIPATION_MS) {
+			const ramp = clamp01(1 - untilMs / ANTICIPATION_MS) * next.strength;
+			if (ramp > anticipation) {
+				anticipation = ramp;
+				dropEta = untilMs / 1000;
+				buildActive = true;
+				buildProgress = clamp01(1 - untilMs / ANTICIPATION_MS);
+			}
+		}
+	}
+	const last = lastDropBefore(score, positionMs);
+	if (last) {
+		const sinceMs = positionMs - last.at_ms;
+		if (sinceMs <= POST_DROP_MS) {
+			postDropDecay = Math.max(postDropDecay, clamp01(1 - sinceMs / POST_DROP_MS) * last.strength);
+		}
+	}
+
+	return { buildActive, buildProgress, dropEta, anticipation, postDropDecay };
 }
 
 function approxFlatness(

@@ -417,3 +417,17 @@ export const playStationSearchResult = (station: RadioBrowserStation) =>
 		bitrate: station.bitrate,
 		stationuuid: station.stationuuid
 	});
+
+// ---- Visual score (offline track analysis) ----
+
+import type { TrackScore } from '$lib/visualizer/director/score';
+
+export const getTrackAnalysis = (recordingId: string) =>
+	safeInvoke<TrackScore | null>('get_track_analysis', { recordingId }, null);
+
+/** Returns 'cached' | 'started' | 'unavailable'. */
+export const requestTrackAnalysis = (recordingId: string) =>
+	safeInvoke<string>('request_track_analysis', { recordingId }, 'unavailable');
+
+export const listenAnalysisComplete = (handler: (payload: { recording_id: string }) => void) =>
+	listenDesktopEvent<{ recording_id: string }>('analysis:complete', handler);

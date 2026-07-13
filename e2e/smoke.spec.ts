@@ -15,6 +15,7 @@ test.describe('app smoke', () => {
 		});
 
 		await page.goto('/');
+		await page.waitForLoadState('networkidle');
 		await expect(page.getByRole('heading', { name: 'mewsik' })).toBeVisible();
 		await expect(page.getByText('Library, search, radio, and recommendations in one player.')).toBeVisible();
 		expect(consoleErrors).toEqual([]);
@@ -45,12 +46,34 @@ test.describe('app smoke', () => {
 
 	test('command palette opens from app event wiring', async ({ page }) => {
 		await page.goto('/');
-		await page.waitForTimeout(200);
-		await page.evaluate(() => {
-			window.dispatchEvent(new CustomEvent('toggle-command', { bubbles: true }));
-		});
-		const dialog = page.locator('[data-slot="dialog-content"]');
+		await page.waitForLoadState('networkidle');
+		await page.keyboard.press('Control+k');
+		const dialog = page.getByRole('dialog', { name: 'Command Palette' });
 		await expect(dialog).toBeVisible();
 		await expect(dialog.getByPlaceholder('Search songs, artists, albums...')).toBeVisible();
+	});
+
+	test('space on an interactive control does not toggle playback', async ({ page }) => {
+		await page.goto('/');
+		await page.waitForLoadState('networkidle');
+		await page.evaluate(() => {
+			(window as Window & { __playbackToggleCount?: number }).__playbackToggleCount = 0;
+			window.addEventListener('toggle-playback', () => {
+				const auditWindow = window as Window & { __playbackToggleCount?: number };
+				auditWindow.__playbackToggleCount = (auditWindow.__playbackToggleCount ?? 0) + 1;
+			});
+		});
+
+		const settingsLink = page.getByRole('link', { name: 'Settings' }).first();
+		await settingsLink.focus();
+		await page.keyboard.press('Space');
+
+		await expect
+			.poll(() =>
+				page.evaluate(
+					() => (window as Window & { __playbackToggleCount?: number }).__playbackToggleCount
+				)
+			)
+			.toBe(0);
 	});
 });

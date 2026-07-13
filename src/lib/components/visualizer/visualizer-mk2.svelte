@@ -31,9 +31,12 @@
 
 	import { onMount, onDestroy } from 'svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
+	import { usePlayer } from '$lib/state/player.svelte';
 	import { createVisualDirector } from '$lib/visualizer/visual-director';
+	import { stringHash01 } from '$lib/visualizer/director/util';
 
 	const vis = useVisualizer();
+	const player = usePlayer();
 	const director = createVisualDirector();
 	let { showHud = false } = $props<{ showHud?: boolean }>();
 
@@ -44,9 +47,32 @@
 	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
 	// returns instead of touching destroyed GPU resources mid-frame.
 	let running = false;
-	// Per-session seed → picks the palette family on mount. Different mounts
-	// (engine swap in lab, app remount) reroll the colour world.
-	const mk2SongSeed = Math.random();
+	// Per-TRACK identity seed (Lomas principle): hashed from the recording id,
+	// so the same song always grows the same organism — palette family, camera
+	// identity, FOV, roll — and every different song gets a different world.
+	// Falls back to a random session seed when nothing identifiable plays.
+	let mk2SongSeed = Math.random();
+	let mk2TrackKey: string | null = null;
+
+	// Discrete evolution events — the mk1-style variety engine. Phrase
+	// boundaries advance the framing; drops cut camera + palette family.
+	let paletteFamilyShift = 0;
+	let camPhaseJump = 0;
+	let lastPhraseIndex = -1;
+	let lastDirSection = '';
+
+	$effect(() => {
+		const key = player.state.current_recording_id ?? player.state.current_source_url;
+		if (key === mk2TrackKey) return;
+		mk2TrackKey = key;
+		if (!key) return;
+		mk2SongSeed = stringHash01(key);
+		CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
+		paletteFamilyShift = 0;
+		camPhaseJump = 0;
+		lastPhraseIndex = -1;
+		lastDirSection = '';
+	});
 
 	// ──────────────────────────────────────────────────────────────────────────
 	// Audio smoothing — multiple timescales per research recommendation.
@@ -227,7 +253,7 @@
 	//   2 dive       — figure-eight passes THROUGH the organism each loop
 	//   3 spiral     — radius decays then snaps back; spirals inward
 	//   4 perched    — high overhead, slow yaw, looking down
-	const CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
+	let CAM_MODE = Math.floor(mk2SongSeed * 5) % 5;
 
 	function getCameraPos(time: number, speedMul: number): [number, number, number] {
 		const baseSpeed = 0.020 + smoothed.bpmNormSlow * 0.025 + smoothed.rmsSlow * 0.015;
@@ -1907,6 +1933,40 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		} else if (dirSec === 'breakdown' || dirSec === 'calm') {
 			growthBias = -0.20; tensionBias = -0.15;
 		}
+
+		// ── Discrete evolution events ──────────────────────────────────────
+		// Continuous envelopes alone read as drift; mk1 feels alive because
+		// things change DECISIVELY. With the visual score, phrase boundaries
+		// and drops are beat-exact, so cuts land on the music.
+		const phraseIdx = directed.clock?.phraseIndex ?? 0;
+		if (phraseIdx !== lastPhraseIndex) {
+			if (lastPhraseIndex >= 0) {
+				// Every 8 bars: glide-cut to a fresh waypoint framing.
+				camPhaseJump += 0.55 + mk2SongSeed * 0.6;
+			}
+			lastPhraseIndex = phraseIdx;
+		}
+		// Alternate phrases bias the fractal power so the organism's topology
+		// breathes on a 16-bar cycle instead of holding one shape forever.
+		const phrasePowerBias = phraseIdx % 2 === 1 ? 0.9 : -0.45;
+		if (dirSec !== lastDirSection) {
+			if (dirSec === 'drop') {
+				// Drop: hard cut — new camera identity, next palette family,
+				// impact flash. The scene transforms when the song does.
+				CAM_MODE = (CAM_MODE + 1 + Math.floor(mk2SongSeed * 3)) % 5;
+				paletteFamilyShift = (paletteFamilyShift + 1) % 6;
+				camPhaseJump += 2.4;
+				smoothed.flash = Math.min(1, smoothed.flash + 0.7);
+			} else if (dirSec === 'chorus' && lastDirSection !== 'drop') {
+				// Chorus entry without a drop still earns a palette move + reframe.
+				paletteFamilyShift = (paletteFamilyShift + 1) % 6;
+				camPhaseJump += 1.1;
+			} else if (dirSec === 'breakdown' || dirSec === 'bridge') {
+				// Quiet sections pull back to a distant framing — negative space.
+				camPhaseJump += 0.8;
+			}
+			lastDirSection = dirSec;
+		}
 		const growth = Math.max(0, Math.min(1,
 			directed.energy * 0.72 + smoothed.bass * 0.24 + smoothed.rmsSlow * 0.18 + smoothed.flash * 0.18 + antic * 0.42 + postDrop * 0.35 + growthBias
 		));
@@ -1924,7 +1984,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// genuine SHAPE variety per section. Driven by smoothEnergy (slow)
 		// so the topology change is smooth and visible, not jittery.
 		const mandelbulbPower =
-			3.5 + smoothed.smoothEnergy * 5.0 + tension * 2.5 + smoothed.sustain * 2.0 + directed.energy * 1.5;
+			3.5 +
+			smoothed.smoothEnergy * 5.0 +
+			tension * 2.5 +
+			smoothed.sustain * 2.0 +
+			directed.energy * 1.5 +
+			phrasePowerBias * (0.4 + smoothed.sustain * 0.6);
 		const chromaAngleSlow = Math.atan2(smoothed.chromaYSlow, smoothed.chromaXSlow) / (2 * Math.PI);
 		// Tonnetz palette (V2): baseHue + accent blend for harmonically-aware drift.
 		const tonnetzBlend = 0.5 + 0.5 * Math.sin(phrasePos * Math.PI * 2);
@@ -1945,7 +2010,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// roll on camUp, and offsets the traversal start phase so different
 		// mounts visit the waypoints in different orders → genuinely different
 		// camera identity.
-		const sessionPhaseOffset = mk2SongSeed * 6.28318; // 0..2π start offset
+		// Track seed sets the start phase; phrase/drop cuts accumulate jumps so
+		// the camera visits genuinely new framings as the song develops.
+		const sessionPhaseOffset = mk2SongSeed * 6.28318 + camPhaseJump;
 		const sessionTargetY = -0.05 + (mk2SongSeed - 0.5) * 0.45; // -0.275..+0.20
 		const sessionRoll = (mk2SongSeed - 0.5) * 0.55; // ±0.275 rad ≈ ±16°
 		const camPosRaw = getCameraPos(time + sessionPhaseOffset, moodCamSpeedMul);
@@ -2039,10 +2106,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[29] = lightShaftIntensity;
 		u[30] = growth;
 		u[31] = tension;
-		// Per-session palette family — mk2SongSeed picks one of six totally
-		// distinct colour worlds (dusk / aurora / synthwave / volcanic /
-		// bioluminous / oil-on-water). Reload or switch engines to reroll.
-		u[32] = Math.floor(mk2SongSeed * 6) % 6;
+		// Per-TRACK palette family — the seed picks one of six distinct colour
+		// worlds (dusk / aurora / synthwave / volcanic / bioluminous /
+		// oil-on-water); drops and chorus entries advance to the next family
+		// so the colour world transforms at the song's structural moments.
+		u[32] = (Math.floor(mk2SongSeed * 6) + paletteFamilyShift) % 6;
 		// ADSR + reverb channels — staccato spike, sustain mood envelope,
 		// reverb time-since-onset normalized 0..1 over 2s.
 		u[33] = smoothed.staccato;

@@ -335,12 +335,16 @@ export class VisualizerRuntime {
 				let scene = vec3<f32>(sceneR, sceneG, sceneB);
 				let bloom = vec3<f32>(bloomR, bloomG, bloomB);
 
-				// Bloom intensity rides energy and pumps on the drop watershed,
-				// but stays restrained so the runtime keeps contrast.
-				let bloomAmount = (0.12 + energy * 0.20 + postDrop * 0.26) * bloomCtl;
+				// Bloom composited by lerp, not addition (Jimenez 2014): the
+				// blurred layer replaces a small fraction of the scene instead
+				// of stacking energy on top, so highlights glow without ever
+				// clipping to undifferentiated white. Weight rides energy and
+				// the drop watershed but stays an order of magnitude below the
+				// old additive amounts.
+				let bloomMix = clamp((0.035 + energy * 0.030 + postDrop * 0.045) * bloomCtl, 0.0, 0.16);
 
-				let exposure = (0.66 + postDrop * 0.08) * exposureCtl;
-				let combined = scene * exposure + bloom * bloomAmount;
+				let exposure = (0.80 + postDrop * 0.08) * exposureCtl;
+				let combined = mix(scene, bloom, bloomMix) * exposure;
 				var mapped = agx(combined) * vig;
 
 				// Contrast and saturation trim: recover black space after AgX so the
@@ -474,7 +478,11 @@ export class VisualizerRuntime {
 
 	update(frame: VisualDirectorFrame, time: number): void {
 		if (!this.device || !this.uniformBuf || !this.context_) return;
-		const dt = Math.max(0, time - this.lastTime);
+		// Clamp dt at the source: rAF pauses while backgrounded, so the first
+		// frame back (and the very first frame, lastTime=0) can be seconds long.
+		// flowfield/feedback re-clamp in-shader, but new motifs shouldn't have
+		// to remember to. mk3 does the same (Math.min(0.05, ...)).
+		const dt = Math.min(1 / 30, Math.max(0, time - this.lastTime));
 		this.lastTime = time;
 
 		// Two-rail weight LERP — fast attack so kicks/drops can promote a motif
@@ -546,9 +554,20 @@ export class VisualizerRuntime {
 		// → 0.06: anything below that is invisible but still pays full overdraw
 		// and dilutes the lead motif's read. Skipping clears the "pale soup"
 		// failure mode where 5+ motifs each contribute 0.10-0.30.
+		//
+		// Energy budget: all motifs blend one/one additive into the HDR target,
+		// so total injected energy scales with the SUM of weights — section
+		// policies legitimately sum to ~2.5 at drops, which (multiplied by the
+		// feedback loop's steady-state gain) is the blown-white-core mechanism.
+		// Normalize so the sum never exceeds the budget; relative motif balance
+		// is preserved.
+		const ENERGY_BUDGET = 1.35;
+		let totalWeight = 0;
+		for (const m of this.motifs) totalWeight += this.weights.get(m.id) ?? 0;
+		const budgetScale = totalWeight > ENERGY_BUDGET ? ENERGY_BUDGET / totalWeight : 1;
 		for (const m of this.motifs) {
 			const w = this.weights.get(m.id) ?? 0;
-			if (w > 0.06) m.render(encoder, this.context_, w);
+			if (w > 0.06) m.render(encoder, this.context_, w * budgetScale);
 		}
 
 		// Snapshot the post-motif scene HDR into the WRITE feedback texture so

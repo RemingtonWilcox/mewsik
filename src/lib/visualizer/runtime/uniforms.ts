@@ -22,7 +22,7 @@
 //     phrase: vec4<f32>,          // phrase, sectionAge, silence(0/1), _
 //     controls: vec4<f32>,        // master, exposure, bloom, background
 //     post: vec4<f32>,            // contrast, saturation, vignette, edge
-//     fx: vec4<f32>,              // chromaticAberration, grain, bloomThreshold, feedbackMix
+//     fx: vec4<f32>,              // chromaticAberration, grain, (free), feedbackMix
 //     feedback: vec4<f32>,        // decay, warp, rotation, _
 //     motifA: vec4<f32>,          // mandalaKFold, mandalaRingDensity, flowStrength, flowCurlScale
 //     motifB: vec4<f32>,          // physarumSense, _, _, _
@@ -152,7 +152,7 @@ export function packDirectorUniform(
 	// fx controls + feedbackMix (was free slot fx.w)
 	out[64] = c.chromaticAberration;
 	out[65] = c.grain;
-	out[66] = c.bloomThreshold;
+	out[66] = 0; // fx.z free (was bloomThreshold; bloom is threshold-free now)
 	out[67] = c.feedbackMix;
 	// feedback vec4 (was _pad3)
 	out[68] = c.feedbackDecay;

@@ -13,7 +13,6 @@ export const DEFAULT_RUNTIME_CONTROLS: RuntimeControls = {
 	edge: 1,
 	chromaticAberration: 1,
 	grain: 1,
-	bloomThreshold: 1.35,
 	feedbackMix: 0.55,
 	feedbackDecay: 0.94,
 	feedbackWarp: 0.5,
@@ -41,11 +40,6 @@ export function normalizeRuntimeControls(input?: Partial<RuntimeControls> | null
 			2
 		),
 		grain: clamp(input?.grain ?? DEFAULT_RUNTIME_CONTROLS.grain, 0, 2),
-		bloomThreshold: clamp(
-			input?.bloomThreshold ?? DEFAULT_RUNTIME_CONTROLS.bloomThreshold,
-			0.2,
-			3
-		),
 		feedbackMix: clamp(input?.feedbackMix ?? DEFAULT_RUNTIME_CONTROLS.feedbackMix, 0, 1),
 		feedbackDecay: clamp(input?.feedbackDecay ?? DEFAULT_RUNTIME_CONTROLS.feedbackDecay, 0.5, 0.999),
 		feedbackWarp: clamp(input?.feedbackWarp ?? DEFAULT_RUNTIME_CONTROLS.feedbackWarp, 0, 1.5),

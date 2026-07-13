@@ -60,7 +60,6 @@
 	let ctlEdge = $state(DEFAULT_RUNTIME_CONTROLS.edge);
 	let ctlChromatic = $state(DEFAULT_RUNTIME_CONTROLS.chromaticAberration);
 	let ctlGrain = $state(DEFAULT_RUNTIME_CONTROLS.grain);
-	let ctlBloomThreshold = $state(DEFAULT_RUNTIME_CONTROLS.bloomThreshold);
 	// Feedback bank — the "live together" controls.
 	let ctlFeedbackMix = $state(DEFAULT_RUNTIME_CONTROLS.feedbackMix);
 	let ctlFeedbackDecay = $state(DEFAULT_RUNTIME_CONTROLS.feedbackDecay);
@@ -95,7 +94,6 @@
 		edge: ctlEdge,
 		chromaticAberration: ctlChromatic,
 		grain: ctlGrain,
-		bloomThreshold: ctlBloomThreshold,
 		feedbackMix: ctlFeedbackMix,
 		feedbackDecay: ctlFeedbackDecay,
 		feedbackWarp: ctlFeedbackWarp,
@@ -118,7 +116,6 @@
 		ctlEdge = DEFAULT_RUNTIME_CONTROLS.edge;
 		ctlChromatic = DEFAULT_RUNTIME_CONTROLS.chromaticAberration;
 		ctlGrain = DEFAULT_RUNTIME_CONTROLS.grain;
-		ctlBloomThreshold = DEFAULT_RUNTIME_CONTROLS.bloomThreshold;
 		ctlFeedbackMix = DEFAULT_RUNTIME_CONTROLS.feedbackMix;
 		ctlFeedbackDecay = DEFAULT_RUNTIME_CONTROLS.feedbackDecay;
 		ctlFeedbackWarp = DEFAULT_RUNTIME_CONTROLS.feedbackWarp;
@@ -585,18 +582,6 @@
 				<span class="w-12 text-white/60">grain</span>
 				<input type="range" min="0" max="2" step="0.01" bind:value={ctlGrain} class="w-24" />
 				<span class="w-10 text-white/70">{ctlGrain.toFixed(2)}</span>
-			</div>
-			<div class="flex items-center gap-1">
-				<span class="w-12 text-white/60">thresh</span>
-				<input
-					type="range"
-					min="0.2"
-					max="3"
-					step="0.01"
-					bind:value={ctlBloomThreshold}
-					class="w-24"
-				/>
-				<span class="w-10 text-white/70">{ctlBloomThreshold.toFixed(2)}</span>
 			</div>
 		</div>
 		<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-xs">

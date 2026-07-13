@@ -304,7 +304,6 @@ impl AudioEngine {
         state: &Arc<Mutex<PlaybackState>>,
         event_tx: &Sender<AudioEvent>,
         db: &DbPool,
-        play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
@@ -317,10 +316,8 @@ impl AudioEngine {
         sink.append(TappedSource::new(source, tap_tx.clone()));
         if desired_playing {
             sink.play();
-            *play_started = Some(Instant::now());
         } else {
             sink.pause();
-            *play_started = None;
         }
         *position_offset_ms = initial_position_ms;
         *current_position_reports_relative = position_reports_relative;
@@ -356,7 +353,6 @@ impl AudioEngine {
         state: &Arc<Mutex<PlaybackState>>,
         event_tx: &Sender<AudioEvent>,
         db: &DbPool,
-        play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
@@ -369,10 +365,8 @@ impl AudioEngine {
         sink.append(TappedSource::new(source, tap_tx.clone()));
         if desired_playing {
             sink.play();
-            *play_started = Some(Instant::now());
         } else {
             sink.pause();
-            *play_started = None;
         }
         *position_offset_ms = 0;
         *current_position_reports_relative = false;
@@ -462,7 +456,6 @@ impl AudioEngine {
         state: &Arc<Mutex<PlaybackState>>,
         db: &DbPool,
         playback_session: &Arc<AtomicU64>,
-        play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
@@ -474,7 +467,6 @@ impl AudioEngine {
             sink,
             playback_session,
             db,
-            play_started,
             position_offset_ms,
             current_position_reports_relative,
             current_play_id,
@@ -622,7 +614,6 @@ impl AudioEngine {
         }
 
         sink.play();
-        *play_started = Some(Instant::now());
         *position_offset_ms = 0;
         *current_play_id =
             db::queries::record_play(db, Some(&entry.recording_id), Some(&entry.source), None).ok();
@@ -670,7 +661,6 @@ impl AudioEngine {
         analyzer::spawn_analyzer(tap_rx, Arc::clone(&app_handle));
         let playback_session = Arc::new(AtomicU64::new(0));
         let mut queue = PlayQueue::new();
-        let mut play_started: Option<Instant> = None;
         let mut position_offset_ms: u64 = 0;
         let mut current_position_reports_relative = false;
         let mut current_play_id: Option<String> = None;
@@ -687,7 +677,6 @@ impl AudioEngine {
                         &sink,
                         &playback_session,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -703,7 +692,6 @@ impl AudioEngine {
                                     sink.stop();
                                     sink.append(TappedSource::new(source, tap_tx.clone()));
                                     sink.play();
-                                    play_started = Some(Instant::now());
                                     position_offset_ms = 0;
                                     current_position_reports_relative = false;
 
@@ -772,7 +760,6 @@ impl AudioEngine {
                         &state,
                         &db,
                         &playback_session,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -803,9 +790,7 @@ impl AudioEngine {
                             }
                             if desired_playing {
                                 sink.play();
-                                play_started = Some(Instant::now());
                             } else {
-                                play_started = None;
                                 sink.pause();
                             }
                             position_offset_ms = 0;
@@ -860,7 +845,6 @@ impl AudioEngine {
                         &state,
                         &event_tx,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -874,7 +858,6 @@ impl AudioEngine {
                         &sink,
                         &playback_session,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -959,7 +942,6 @@ impl AudioEngine {
                         })
                         .ok();
 
-                    play_started = None;
                     position_offset_ms = 0;
                 }
                 Ok(AudioCommand::PlayPreparedRadio(
@@ -984,7 +966,6 @@ impl AudioEngine {
                         &state,
                         &event_tx,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -1002,7 +983,6 @@ impl AudioEngine {
                         current_position_reports_relative,
                         awaiting_source,
                     );
-                    play_started = None;
                     let mut s = state.lock();
                     s.is_playing = false;
                     s.position_ms = position_ms;
@@ -1022,7 +1002,6 @@ impl AudioEngine {
                         let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     } else if !sink.empty() {
                         sink.play();
-                        play_started = Some(Instant::now());
                         let mut s = state.lock();
                         s.is_playing = true;
                         s.is_buffering = false;
@@ -1036,7 +1015,6 @@ impl AudioEngine {
                         &sink,
                         &playback_session,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -1045,7 +1023,6 @@ impl AudioEngine {
                     awaiting_source = false;
                     desired_playing = false;
                     playback_kind = PlaybackKind::Idle;
-                    play_started = None;
                     position_offset_ms = 0;
                     current_position_reports_relative = false;
                     let mut s = state.lock();
@@ -1073,7 +1050,6 @@ impl AudioEngine {
                                 &sink,
                                 &playback_session,
                                 &db,
-                                &mut play_started,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
                                 &mut current_play_id,
@@ -1081,7 +1057,6 @@ impl AudioEngine {
                             );
                             awaiting_source = true;
                             desired_playing = resume_after_seek;
-                            play_started = None;
                             position_offset_ms = ms;
                             current_position_reports_relative = true;
 
@@ -1128,11 +1103,6 @@ impl AudioEngine {
                         Ok(()) => {
                             current_position_reports_relative = false;
                             desired_playing = state.lock().is_playing;
-                            play_started = if state.lock().is_playing {
-                                Some(Instant::now())
-                            } else {
-                                None
-                            };
                             let mut s = state.lock();
                             s.position_ms = ms;
                             let state_clone = s.clone();
@@ -1174,7 +1144,6 @@ impl AudioEngine {
                             &state,
                             &db,
                             &playback_session,
-                            &mut play_started,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
                             &mut current_play_id,
@@ -1206,7 +1175,6 @@ impl AudioEngine {
                                 &state,
                                 &db,
                                 &playback_session,
-                                &mut play_started,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
                                 &mut current_play_id,
@@ -1228,7 +1196,6 @@ impl AudioEngine {
                             &state,
                             &db,
                             &playback_session,
-                            &mut play_started,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
                             &mut current_play_id,
@@ -1283,7 +1250,6 @@ impl AudioEngine {
                             &state,
                             &db,
                             &playback_session,
-                            &mut play_started,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
                             &mut current_play_id,
@@ -1318,7 +1284,6 @@ impl AudioEngine {
                             &state,
                             &db,
                             &playback_session,
-                            &mut play_started,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
                             &mut current_play_id,
@@ -1339,7 +1304,6 @@ impl AudioEngine {
                         &sink,
                         &playback_session,
                         &db,
-                        &mut play_started,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
                         &mut current_play_id,
@@ -1352,7 +1316,10 @@ impl AudioEngine {
             }
 
             // Update position periodically
-            if last_position_update.elapsed() >= Duration::from_millis(250) {
+            // 100ms keeps the shared state fresh enough that the frontend's own
+            // 250ms poll never sees a position more than ~350ms stale; at 250ms
+            // the two cadences stacked to ~500ms of disagreement after a seek.
+            if last_position_update.elapsed() >= Duration::from_millis(100) {
                 let is_active = {
                     let state_guard = state.lock();
                     state_guard.is_playing || state_guard.is_buffering
@@ -1396,7 +1363,6 @@ impl AudioEngine {
                                 &state,
                                 &db,
                                 &playback_session,
-                                &mut play_started,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
                                 &mut current_play_id,
@@ -1459,7 +1425,6 @@ impl AudioEngine {
         sink: &Sink,
         playback_session: &Arc<AtomicU64>,
         db: &DbPool,
-        play_started: &mut Option<Instant>,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
         current_play_id: &mut Option<String>,
@@ -1475,7 +1440,6 @@ impl AudioEngine {
             let _ = db::queries::complete_play(db, &play_id, pos as i64);
         }
 
-        *play_started = None;
         *position_offset_ms = 0;
         *current_position_reports_relative = false;
         sink.stop();
