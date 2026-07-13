@@ -31,6 +31,7 @@
 
 	import { onMount, onDestroy } from 'svelte';
 	import {
+		VISUALIZER_RESPONSE_PROFILES,
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
@@ -38,7 +39,6 @@
 
 	const vis = useVisualizer();
 	const t0 = performance.now();
-	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -92,7 +92,11 @@
 		bpmNormSlow: 0.4,
 		flash: 0,
 		staccato: 0,
-		sustain: 0
+		sustain: 0,
+		responseMotion: 1,
+		responseImpact: 1,
+		responseFog: 1,
+		responseShafts: 1
 	};
 
 	function lerp(a: number, b: number, t: number) {
@@ -1842,6 +1846,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const frameScale = frameDt * 60;
 		const alpha = (at60Hz: number) => 1 - Math.pow(1 - at60Hz, frameScale);
 		const chromaAngle = signalJourney.key * Math.PI * 2;
+		const response = VISUALIZER_RESPONSE_PROFILES.mk2[vis.response];
+		const responseMotionTarget = response.motion;
+		const responseImpactTarget = response.impact;
+		const responseFogTarget = response.fog;
+		const responseShaftsTarget = response.shafts;
 		if (rendererSyncRequested) {
 			smoothed.bass = spectrum.bass;
 			smoothed.mid = spectrum.mid;
@@ -1854,6 +1863,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.sustain = journey.openness;
 			smoothed.chromaXSlow = Math.cos(chromaAngle);
 			smoothed.chromaYSlow = Math.sin(chromaAngle);
+			smoothed.responseMotion = responseMotionTarget;
+			smoothed.responseImpact = responseImpactTarget;
+			smoothed.responseFog = responseFogTarget;
+			smoothed.responseShafts = responseShaftsTarget;
 			rendererSyncRequested = false;
 		} else {
 			smoothed.bass = lerp(smoothed.bass, spectrum.bass, alpha(0.12));
@@ -1867,6 +1880,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.sustain = lerp(smoothed.sustain, journey.openness, alpha(0.035));
 			smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.025));
 			smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.025));
+			// Response changes are instrument gestures, not edits to the camera cut.
+			// Glide them onto the renderer so changing modes cannot dolly-jump Soma.
+			smoothed.responseMotion = lerp(smoothed.responseMotion, responseMotionTarget, alpha(0.045));
+			smoothed.responseImpact = lerp(smoothed.responseImpact, responseImpactTarget, alpha(0.07));
+			smoothed.responseFog = lerp(smoothed.responseFog, responseFogTarget, alpha(0.04));
+			smoothed.responseShafts = lerp(smoothed.responseShafts, responseShaftsTarget, alpha(0.04));
 		}
 
 		const growth = journey.growth;
@@ -1880,9 +1899,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
 		const paletteOffset =
 			baseHue + hueDelta * tonnetzBlend + (smoothed.centroidSlow - 0.5) * 0.055;
-		const fogDensity = journey.fogDensity;
-		const lightShaftIntensity = journey.shaftIntensity;
-		const shotZoom = Math.max(0.9, Math.min(1.85, journey.shotZoom));
+		const responseMotion = smoothed.responseMotion;
+		const responseImpact = smoothed.responseImpact;
+		const fogDensity = Math.max(
+			0.032,
+			Math.min(0.088, journey.fogDensity * smoothed.responseFog)
+		);
+		const lightShaftIntensity = Math.max(
+			0.18,
+			Math.min(0.8, journey.shaftIntensity * smoothed.responseShafts)
+		);
+		const responseShotZoom = 1 + (journey.shotZoom - 1) * responseMotion;
+		const shotZoom = Math.max(0.9, Math.min(1.85, responseShotZoom));
+		const closeStudy = Math.max(0, Math.min(1, journey.closeStudy * responseMotion));
+		const detailFocus = Math.max(0, Math.min(1, journey.detailFocus * responseMotion));
 		const zoomDelta = shotZoom - 1;
 		// Combine a safe dolly with a mild optical push. Even at the closest
 		// elected study the camera remains outside the organism's scene bound.
@@ -1991,7 +2021,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// Per-track palette family stays stable; harmonic analysis moves within
 		// it, so the track develops without looking like a preset roulette.
 		u[32] = Math.floor(mk2SongSeed * 6);
-		u[33] = smoothed.staccato;
+		u[33] = Math.min(1, smoothed.staccato * responseImpact);
 		u[34] = smoothed.sustain;
 		u[35] = journey.rotationPhase;
 		u[36] = journey.backgroundFlowPhase;
@@ -2007,7 +2037,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[46] = journey.morphPhase;
 		u[47] = journey.morphRate;
 		u[48] = journey.rootMass;
-		u[49] = journey.rootPulse;
+		u[49] = Math.min(1, journey.rootPulse * responseImpact);
 		u[50] = journey.axialStretch;
 		u[51] = journey.lobeSplit;
 		u[52] = journey.foldDepth;
@@ -2023,8 +2053,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[62] = journey.materialIridescence;
 		u[63] = journey.materialErosion;
 		u[64] = shotZoom;
-		u[65] = journey.closeStudy;
-		u[66] = journey.detailFocus;
+		u[65] = closeStudy;
+		u[66] = detailFocus;
 		u[67] = journey.perspectiveAzimuth;
 		u[68] = journey.perspectiveElevation;
 		u[69] = journey.shotFramingX;
@@ -2261,31 +2291,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			bind:this={canvas}
 			class="relative z-10 h-full w-full transition-opacity duration-300"
 			class:opacity-0={!gpuReady}
-			aria-label="Mk2 audio visualizer"
+			aria-label="Soma audio visualizer"
 			data-mk2-section={currentSection}
 			data-mk2-form={currentForm}
 			data-mk2-uniform-bytes={UNIFORM_BYTES}
 			data-mk2-render-passes="8"
 		></canvas>
-		{#if showHud}
-			<button
-				type="button"
-				class="absolute inset-0 z-20 cursor-default border-0 bg-transparent p-0"
-				aria-label="Close visualizer"
-				onclick={() => vis.toggle()}
-				onkeydown={(event) => {
-					if (event.key === 'Escape') vis.toggle();
-				}}
-			></button>
-			<div class="pointer-events-none absolute right-6 top-6 z-30 text-xs text-white/40">
-				mk2 — fractal atmosphere — click anywhere or press esc to exit
-			</div>
-			<div
-				class="pointer-events-none absolute left-6 top-6 z-30 rounded border border-white/15 bg-black/40 px-2 py-1 font-mono text-xs uppercase tracking-wider text-white/70"
-			>
-				section: <strong>{currentSection}</strong> · form: <strong>{currentForm}</strong>
-			</div>
-		{/if}
 		{#if errorMsg}
 			<div class="pointer-events-none absolute left-6 top-16 z-30 max-w-md text-xs text-red-300/80">
 				Visualizer error: {errorMsg}

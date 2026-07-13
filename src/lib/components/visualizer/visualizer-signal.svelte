@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import {
+		VISUALIZER_RESPONSE_PROFILES,
 		useVisualizer,
 		type AudioFeatures,
 		type VisualizerJourneySnapshot
@@ -15,7 +16,6 @@
 	import type { SignalSpectrumProfile } from '$lib/visualizer/signal/spectrum';
 
 	const vis = useVisualizer();
-	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -408,6 +408,9 @@
 		const journey = shared.signal;
 		smoothed.phase = journey.tracePhase;
 
+		const response = VISUALIZER_RESPONSE_PROFILES.signal[vis.response];
+		const responseMotion = response.motion;
+		const responseImpact = response.impact;
 		const energy = clamp(
 			directed.energy * 0.58 +
 				smoothed.rms * 0.24 +
@@ -416,6 +419,7 @@
 			0,
 			1
 		);
+		const responseEnergy = clamp(energy * responseMotion, 0, 1);
 		const persistenceAt60Hz = clamp(
 			0.928 +
 				journey.tension * 0.015 +
@@ -423,16 +427,18 @@
 				journey.release * 0.026 -
 				journey.ringOut * 0.025 -
 				journey.sectionPulse * 0.024 -
-				smoothed.transient * 0.052,
+				smoothed.transient * 0.052 +
+				response.persistenceOffset,
 			0.83,
 			0.95
 		);
-		const lineWidth =
+		const lineWidth = clamp((
 			1.02 +
 			smoothed.treble * 0.3 +
 			spectrum.crestFactor * 0.22 +
 			journey.impact * 0.28 +
-			energy * 0.16;
+			responseEnergy * 0.16
+		) * response.stroke, 0.75, 2.05);
 		const contextKeyStrength =
 			directed.context.source === 'score' ? directed.context.keyConfidence : 0;
 		const harmonicKey =
@@ -473,7 +479,7 @@
 		uniforms[14] = smoothed.silence;
 		uniforms[15] = smoothed.phase;
 		uniforms[16] = lineWidth;
-		uniforms[17] = energy;
+		uniforms[17] = responseEnergy;
 		uniforms[18] = spectrum.crestFactor;
 		uniforms[19] = spectrum.spectralMotion;
 		uniforms[20] = directed.clock.beatPulse;
@@ -483,7 +489,7 @@
 		uniforms[24] = journey.tension;
 		uniforms[25] = journey.release;
 		uniforms[26] = journey.openness;
-		uniforms[27] = journey.impact;
+		uniforms[27] = clamp(journey.impact * responseImpact, 0, 1);
 		uniforms[28] = journey.shapeWeights.ellipse;
 		uniforms[29] = journey.shapeWeights.lissajous;
 		uniforms[30] = journey.shapeWeights.ribbon;
@@ -491,7 +497,11 @@
 		uniforms[32] = directed.palette.baseHue;
 		uniforms[33] = directed.palette.accentHue;
 		uniforms[34] = directed.palette.rimHue;
-		uniforms[35] = directed.palette.saturation;
+		uniforms[35] = clamp(
+			directed.palette.saturation * response.saturation,
+			0.32,
+			0.94
+		);
 		uniforms[36] = spectrum.levels.sub;
 		uniforms[37] = spectrum.levels.kick;
 		uniforms[38] = spectrum.levels.body;
@@ -505,7 +515,7 @@
 		uniforms[46] = lookaheadDelta;
 		uniforms[47] = directed.context.sectionEnergy;
 		uniforms[48] = journey.ringOut;
-		uniforms[49] = journey.sectionPulse;
+		uniforms[49] = clamp(journey.sectionPulse * responseImpact, 0, 1);
 		uniforms[50] = journey.spectrumTravel;
 		uniforms[51] = directed.context.trackProgress;
 
@@ -682,26 +692,6 @@
 			data-signal-tempo={Math.round(hudTempo)}
 		></canvas>
 
-		{#if showHud}
-			<button
-				type="button"
-				class="absolute inset-0 z-10 cursor-default border-0 bg-transparent p-0"
-				aria-label="Close visualizer"
-				onclick={() => vis.toggle()}
-				onkeydown={(event) => {
-					if (event.key === 'Escape') vis.toggle();
-				}}
-			></button>
-			<div
-				class="pointer-events-none absolute left-6 top-6 z-20 rounded border border-emerald-200/15 bg-black/45 px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-[0.16em] text-emerald-100/65"
-			>
-				signal · {hudSection} · {hudTempo > 30 ? `${Math.round(hudTempo)} bpm` : 'tempo seeking'} · {hudContext}
-			</div>
-			<div class="pointer-events-none absolute right-6 top-6 z-20 text-xs text-white/40">
-				click anywhere or press esc to exit
-			</div>
-		{/if}
-
 		{#if !ready && !errorMsg}
 			<div
 				class="pointer-events-none absolute inset-0 grid place-items-center font-mono text-[11px] uppercase tracking-[0.2em] text-emerald-100/40"
@@ -720,9 +710,6 @@
 						Signal unavailable
 					</p>
 					<p class="mt-3 text-sm leading-6 text-white/55">{errorMsg}</p>
-					{#if showHud}
-						<p class="mt-5 text-xs text-white/35">Click or press Escape to return.</p>
-					{/if}
 				</div>
 			</div>
 		{/if}

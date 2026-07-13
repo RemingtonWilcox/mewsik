@@ -20,32 +20,32 @@ test.describe('visualizer engine roster', () => {
 
 		await expect(page.getByText('visualizer lab')).toBeVisible();
 		await expect(page.getByRole('button', { name: 'auto · stable' })).toHaveCount(0);
-		await expect(page.getByRole('button', { name: 'mk1', exact: true })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'mk2 · experimental' })).toBeVisible();
-		await expect(page.getByRole('button', { name: 'signal', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Prism · mk1', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Soma · mk2', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Signal', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'mk3', exact: true })).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'runtime', exact: true })).toHaveCount(0);
 		// Lab engines are embedded canvases, not fake full-screen buttons.
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toHaveCount(0);
 
-		await page.getByRole('button', { name: 'signal', exact: true }).click();
-		await expect(page.getByText('signal · oscilloscope / vectorscope engine')).toBeVisible();
+		await page.getByRole('button', { name: 'Signal', exact: true }).click();
+		await expect(page.getByText(/Signal · phosphor score/)).toBeVisible();
 		await expect
 			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.engine')))
 			.toBe('signal');
 		await page.keyboard.press('a');
-		await expect(page.getByText('signal · oscilloscope / vectorscope engine')).toBeVisible();
+		await expect(page.getByText(/Signal · phosphor score/)).toBeVisible();
 		await expect
 			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.engine')))
 			.toBe('signal');
 
 		await page.keyboard.press('w');
-		await expect(page.getByText('mk2 · experimental', { exact: false }).last()).toBeVisible();
+		await expect(page.getByText(/Soma · mk2/).last()).toBeVisible();
 		await page.keyboard.press('q');
-		await expect(page.getByText(/mk1 · hyperbolic kaleidoscope/)).toBeVisible();
+		await expect(page.getByText(/Prism · mk1/).last()).toBeVisible();
 	});
 
-	test('removed Auto migrates to Mk1, V follows the roster, and Escape closes', async ({ page }) => {
+	test('named production rail uses arrows, retires V, persists response, and Escape closes', async ({ page }) => {
 		await page.addInitScript(() => {
 			localStorage.setItem('mewsik.visualizer.engine', 'auto');
 		});
@@ -53,31 +53,160 @@ test.describe('visualizer engine roster', () => {
 		await page.getByRole('button', { name: 'Visualizer' }).click();
 
 		await expectProductionEngine(page, 'mk1');
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute('data-engine-name', 'Prism');
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toBeVisible();
+		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
+		await page.keyboard.press('Control+k');
+		await expect(page.getByPlaceholder('Search songs, artists, albums...')).toHaveCount(0);
 
 		await page.keyboard.press('v');
+		await expectProductionEngine(page, 'mk1');
+		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk2');
-		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute('data-engine-name', 'Soma');
+		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-render-passes',
 			'8'
 		);
-		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
 			'288'
 		);
-		await expect(page.getByLabel('Mk2 audio visualizer')).toHaveAttribute(
+		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',
 			/seed|sprout|winding|bloom|shedding|dormancy/
 		);
-		await page.keyboard.press('v');
+		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'signal');
 		await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
-		await page.keyboard.press('v');
+		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk1');
-
+		await page.keyboard.press('ArrowLeft');
+		await expectProductionEngine(page, 'signal');
+		await page.getByRole('button', { name: 'Show visualizer details' }).click();
+		await page.getByRole('button', { name: 'Calm', exact: true }).click();
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
+			'data-visualizer-response',
+			'still'
+		);
+		await expect
+			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
+			.toBe('still');
 		await page.keyboard.press('Escape');
 		await expect(page.locator('[data-visualizer-host]')).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toHaveCount(0);
+		await expect(page.locator('[data-app-content]')).not.toHaveAttribute('inert', '');
+	});
+
+	test('rail preserves keyboard focus, restores its opener, and still auto-hides after pointer use', async ({ page }) => {
+		await page.goto('/');
+		const opener = page.getByRole('button', { name: 'Visualizer' });
+		await opener.click();
+		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
+		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
+
+		await page.keyboard.press('ArrowRight');
+		await expectProductionEngine(page, 'mk2');
+		await page.keyboard.press('i');
+		await expect(page.getByRole('region', { name: 'Soma visualizer details' })).toBeVisible();
+		await page.keyboard.press('i');
+
+		const title = page.getByRole('button', { name: /Evolution · Living fractal SOMA/ });
+		await title.focus();
+		await expect(title).toBeFocused();
+		await page.waitForTimeout(8_200);
+		await expect(page.getByRole('navigation', { name: 'Visualizer engines' })).toBeVisible();
+
+		const close = page.getByRole('button', { name: 'Close visualizer' });
+		await close.hover();
+		await close.click();
+		await expect(opener).toBeFocused();
+
+		await opener.click();
+		await page.getByRole('button', { name: /Next visualizer/ }).click();
+		await page.mouse.move(12, 700);
+		await page.waitForTimeout(6_800);
+		await expect(page.getByRole('navigation', { name: 'Visualizer engines' })).toHaveCount(0);
+	});
+
+	test('response mode repairs invalid storage and hydrates across a reload', async ({ page }) => {
+		await page.addInitScript(() => {
+			if (sessionStorage.getItem('response-seeded')) return;
+			sessionStorage.setItem('response-seeded', 'true');
+			localStorage.setItem('mewsik.visualizer.response', 'maximum-chaos');
+		});
+		await page.goto('/');
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
+			'data-visualizer-response',
+			'flow'
+		);
+		await expect
+			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
+			.toBe('flow');
+
+		await page.keyboard.press('i');
+		await page.getByRole('button', { name: 'Surge', exact: true }).click();
+		await page.keyboard.press('Escape');
+		await page.reload();
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
+			'data-visualizer-response',
+			'surge'
+		);
+	});
+
+	test('response profiles preserve Flow and scale Calm through Surge monotonically', async ({ page }) => {
+		await page.goto('/');
+		const profiles = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/catalog.ts';
+			const { VISUALIZER_RESPONSE_PROFILES } = await import(modulePath);
+			return VISUALIZER_RESPONSE_PROFILES;
+		});
+
+		expect(profiles.mk1.flow).toEqual({
+			motion: 1,
+			impact: 1,
+			bloomThresholdOffset: 0,
+			feedbackFadeOffset: 0
+		});
+		expect(profiles.mk2.flow).toEqual({ motion: 1, impact: 1, fog: 1, shafts: 1 });
+		expect(profiles.signal.flow).toEqual({
+			motion: 1,
+			impact: 1,
+			persistenceOffset: 0,
+			stroke: 1,
+			saturation: 1
+		});
+
+		for (const rail of ['motion', 'impact'] as const) {
+			expect(profiles.mk1.still[rail]).toBeLessThan(profiles.mk1.flow[rail]);
+			expect(profiles.mk1.flow[rail]).toBeLessThan(profiles.mk1.surge[rail]);
+			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
+			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
+			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
+			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
+		}
+		for (const rail of ['fog', 'shafts'] as const) {
+			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
+			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
+		}
+		for (const rail of ['persistenceOffset', 'stroke', 'saturation'] as const) {
+			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
+			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
+		}
+		expect(profiles.mk1.still.feedbackFadeOffset).toBeLessThan(
+			profiles.mk1.flow.feedbackFadeOffset
+		);
+		expect(profiles.mk1.flow.feedbackFadeOffset).toBeLessThan(
+			profiles.mk1.surge.feedbackFadeOffset
+		);
+		expect(profiles.mk1.still.bloomThresholdOffset).toBeGreaterThan(
+			profiles.mk1.flow.bloomThresholdOffset
+		);
+		expect(profiles.mk1.flow.bloomThresholdOffset).toBeGreaterThan(
+			profiles.mk1.surge.bloomThresholdOffset
+		);
 	});
 
 	test('legacy and unknown engines migrate to supported renderers', async ({ browser }) => {

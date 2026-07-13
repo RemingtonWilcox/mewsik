@@ -4,21 +4,36 @@ _Last updated: 2026-07-13_
 
 ## Product direction
 
-The visualizer now has three deliberate roles:
+The visualizer now has three named, deliberate roles:
 
-- **Mk1** is the production anchor and current quality bar.
-- **Mk2** is the experimental volumetric/fractal engine. It remains manually selectable while it is measured and tuned.
-- **Signal** is the audio-first oscilloscope/vectorscope engine built around one crisp trace, phosphor persistence, controlled transient echoes, and negative space.
+- **Prism** (`mk1`) is rhythmic geometry and the production impact anchor.
+- **Soma** (`mk2`) is a living fractal focused on cinematic evolution.
+- **Signal** (`signal`) is the audio-first phosphor score built around one crisp trace, controlled persistence, transient echoes, and negative space.
 
 The former Mk3 particle plane and layered Runtime were removed. Git history is the archive for those experiments.
 
 ## Active implementation
 
 - Branch: `codex/visualizer-rebuild`
+- Approved pre-shell checkpoint: `ac6886d feat: give Mk2 a musical lifecycle`
 - Engine order: `mk1 -> mk2 -> signal`
 - Saved `auto`, `runtime`, or unknown selections migrate to `mk1`.
 - Saved `mk3` selections migrate to `signal`.
 - The visualizer lab at `/visualizer-test` exposes only Mk1, Mk2, and Signal, with synthetic/real audio input and live analysis diagnostics.
+
+### Production instrument shell
+
+Production now mounts one renderer plus one shared host-owned control layer. The renderers no longer stack their own close targets, names, telemetry, and shortcut text over the artwork.
+
+- A compact top rail names Prism, Soma, and Signal and exposes previous/next arrows, details, hide, and close controls.
+- `Left` / `Right` cycle with wrapping, `I` toggles details, `H` hides/reveals controls, and `Escape` closes. The old `V` shortcut is retired.
+- Clicking empty artwork toggles the chrome instead of accidentally closing the visualizer.
+- Details show the engine's role, live section, tempo, and one engine-specific state without exposing lab diagnostics.
+- Shared **Calm**, **Flow**, and **Surge** response profiles scale each engine around its authored identity. Flow is exactly neutral; Soma glides response changes to prevent camera jumps.
+- The rail auto-hides after pointer inactivity, stays mounted while keyboard focus or expanded details need it, and resets hover/focus state on every close/reopen.
+- Opening moves focus into the overlay, closing restores the player-bar opener, and covered app content becomes inert while the visualizer is active. The player bar remains available.
+- Command search is suppressed while the visualizer owns the screen, avoiding a focused dialog behind the GPU surface.
+- Desktop and 390 px mobile layouts were visually inspected in a real Chromium WebGPU session; the browser console reported zero errors.
 
 ### Shared musical journey
 
@@ -75,7 +90,7 @@ Completed on the combined branch and packaged native release:
 
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
-- `pnpm test:e2e`: 31/31 pass
+- `pnpm test:e2e`: 34/34 pass
 - `cargo test`: 46/46 pass
 - Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
 - Shared journey: cached-reader idempotence, Mk1 advancement, Signal/Mk2 remount continuity, A -> B -> A reset, pause decay, 60/144 Hz null-cadence invariance, and zero synthetic startup-impact coverage
@@ -83,6 +98,7 @@ Completed on the combined branch and packaged native release:
 - Signal: all three WGSL modules and pipelines validated on a real Chrome WebGPU adapter; exact 208-byte uniforms, 256-byte spectrum buffer, both RGBA16F feedback directions, and both production passes completed with zero GPU errors
 - Mk2: all five WGSL modules and pipelines validated in Chromium WebGPU; exact 288-byte lifecycle/shot uniforms, bind groups, targets, and eight-pass render order completed with zero GPU errors; a surfaced NaN tile was fixed and the fresh pipeline was revalidated
 - Legacy engine migration and supported engine roster: covered by Playwright
+- Named rail navigation, retired `V`, response repair/persistence, Flow-neutral response profiles, focus retention/restoration, pointer-vs-keyboard auto-hide, and close/reopen state reset: covered by Playwright
 - Native Windows release rebuilt successfully; the exact new workspace EXE was launched for user visual review (the previous checkpoint had live Liquid DnB inspection across Mk1, Mk2, and Signal)
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
@@ -103,9 +119,9 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (19,944,960 bytes): SHA-256 `FF2708C6F565906B41F8995A9AB6DF1CBE3D7426470ECD00A8C4027827B8C92F`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,356,553 bytes): SHA-256 `88EAEF26ADB578AD122A8A6A4B42C497488F9A919A1FEDFA280294F38B1C735C`
-- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (71,733,248 bytes): SHA-256 `819545849CF423E4BFF51B56858BAE7B06F775CEF270D5CF6740A9BD8D9C6302`
+- `src-tauri/target/release/mewsik.exe` (19,949,056 bytes): SHA-256 `688709CBB3C8B56672895296F6D1B248A05C216F1F5799ACD9FEBA00F49BDF14`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,370,630 bytes): SHA-256 `42F57E7D8A62CF9C70F8C0183150D3D7688903CB3BD9384D5F531006A3F8BE4A`
+- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (71,737,344 bytes): SHA-256 `B4D73F3FA6A1FB8117AC3083F07FC37AE8252DE40391560EB877AC9C89C53845`
 
 The executable and both installers are currently unsigned. Code signing remains release-distribution work, not a visualizer merge blocker.
 
@@ -116,12 +132,14 @@ The executable and both installers are currently unsigned. Code signing remains 
 - `src/lib/components/visualizer/visualizer-mk2.svelte`
 - `src/lib/components/visualizer/visualizer-signal.svelte`
 - `src/lib/visualizer/mk2/conductor.ts`
+- `src/lib/visualizer/catalog.ts`
 - `src/lib/visualizer/journey.ts`
 - `src/lib/visualizer/identity.ts`
 - `src/lib/visualizer/signal/conductor.ts`
 - `src/lib/visualizer/signal/spectrum.ts`
 - `src/lib/visualizer/signal/shaders.ts`
 - `src/lib/state/visualizer.svelte.ts`
+- `src/routes/+layout.svelte`
 - `src/routes/visualizer-test/+page.svelte`
 - `e2e/visualizer.spec.ts`
 - `e2e/journey-runtime.spec.ts`

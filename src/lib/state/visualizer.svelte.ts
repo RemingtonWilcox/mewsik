@@ -7,8 +7,24 @@ import {
 	VisualizerJourneyRuntime,
 	type VisualizerJourneySnapshot
 } from '$lib/visualizer/journey';
+import {
+	VISUALIZER_ENGINES,
+	VISUALIZER_RESPONSES,
+	type VisualizerEngine,
+	type VisualizerResponse
+} from '$lib/visualizer/catalog';
 
 export type { VisualizerJourneySnapshot } from '$lib/visualizer/journey';
+export {
+	VISUALIZER_CATALOG,
+	VISUALIZER_ENGINES,
+	VISUALIZER_RESPONSE_LABELS,
+	VISUALIZER_RESPONSE_PROFILES,
+	VISUALIZER_RESPONSES,
+	adjacentVisualizer,
+	type VisualizerEngine,
+	type VisualizerResponse
+} from '$lib/visualizer/catalog';
 
 export type AudioFeatures = AudioFeatureFrame;
 
@@ -32,9 +48,6 @@ export const PRESET_NAMES = [
 	'nebulae flow'
 ];
 
-export type VisualizerEngine = 'mk1' | 'mk2' | 'signal';
-export const VISUALIZER_ENGINES: VisualizerEngine[] = ['mk1', 'mk2', 'signal'];
-
 function migrateSavedEngine(saved: string): VisualizerEngine {
 	// Mk3's slot is now the rebuilt Signal visualizer. The removed Auto and
 	// Runtime selections, plus any unknown value, safely fall back to Mk1.
@@ -46,11 +59,11 @@ function migrateSavedEngine(saved: string): VisualizerEngine {
 class VisualizerState {
 	active = $state(false);
 	engine = $state<VisualizerEngine>('mk1');
-	// `preset` tracks the currently-dominant preset for HUD display; rendering
-	// itself blends top-2 presets by softmax weight (continuous mix, not switch).
+	response = $state<VisualizerResponse>('flow');
+	// Prism keeps one production scene; `preset` reports the actual rendered
+	// scene so the browser lab can truthfully inspect its alternate generators.
 	preset = $state(0);
-	// `forcedPreset` overrides auto-mix when ≥0 (used by the lab page's 1-4 keys
-	// to audit a single preset in isolation). -1 = auto-blend.
+	// `forcedPreset` is a lab-only scene override. -1 restores production Prism.
 	forcedPreset = $state(-1);
 	private latestFrame = $state<AudioFeatures | null>(null);
 	private latestFrameAt: number | null = null;
@@ -67,10 +80,23 @@ class VisualizerState {
 		this.active = !this.active;
 	}
 
+	close() {
+		this.active = false;
+	}
+
 	setEngine(engine: VisualizerEngine) {
 		this.engine = engine;
 		try {
 			localStorage.setItem('mewsik.visualizer.engine', engine);
+		} catch {
+			// Storage can be unavailable in restricted webviews; keep runtime state.
+		}
+	}
+
+	setResponse(response: VisualizerResponse) {
+		this.response = response;
+		try {
+			localStorage.setItem('mewsik.visualizer.response', response);
 		} catch {
 			// Storage can be unavailable in restricted webviews; keep runtime state.
 		}
@@ -82,11 +108,18 @@ class VisualizerState {
 		this.engineHydrated = true;
 		try {
 			const saved = localStorage.getItem('mewsik.visualizer.engine');
-			if (saved === null) return;
-			const migrated = migrateSavedEngine(saved);
-			this.engine = migrated;
-			if (migrated !== saved) {
-				localStorage.setItem('mewsik.visualizer.engine', migrated);
+			if (saved !== null) {
+				const migrated = migrateSavedEngine(saved);
+				this.engine = migrated;
+				if (migrated !== saved) {
+					localStorage.setItem('mewsik.visualizer.engine', migrated);
+				}
+			}
+			const savedResponse = localStorage.getItem('mewsik.visualizer.response');
+			if (VISUALIZER_RESPONSES.includes(savedResponse as VisualizerResponse)) {
+				this.response = savedResponse as VisualizerResponse;
+			} else if (savedResponse !== null) {
+				localStorage.setItem('mewsik.visualizer.response', this.response);
 			}
 		} catch {
 			// Storage can be unavailable in restricted webviews; retain Mk1.

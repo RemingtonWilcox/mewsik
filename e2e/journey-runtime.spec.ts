@@ -75,7 +75,7 @@ test.describe('shared visualizer journey runtime', () => {
 		page
 	}) => {
 		await page.goto('/visualizer-test');
-		await page.getByRole('button', { name: 'signal', exact: true }).click();
+		await page.getByRole('button', { name: 'Signal', exact: true }).click();
 		await page.waitForTimeout(120);
 		const readJourney = () =>
 			page.evaluate(async () => {
@@ -91,10 +91,10 @@ test.describe('shared visualizer journey runtime', () => {
 			});
 
 		const before = await readJourney();
-		await page.getByRole('button', { name: 'mk2 · experimental' }).click();
+		await page.getByRole('button', { name: 'Soma · mk2', exact: true }).click();
 		await page.waitForTimeout(120);
 		const duringMk2 = await readJourney();
-		await page.getByRole('button', { name: 'signal', exact: true }).click();
+		await page.getByRole('button', { name: 'Signal', exact: true }).click();
 		await page.waitForTimeout(120);
 		const after = await readJourney();
 

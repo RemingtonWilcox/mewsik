@@ -1,9 +1,8 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { useVisualizer } from '$lib/state/visualizer.svelte';
+	import { VISUALIZER_RESPONSE_PROFILES, useVisualizer } from '$lib/state/visualizer.svelte';
 
 	const vis = useVisualizer();
-	let { showHud = false } = $props<{ showHud?: boolean }>();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -33,13 +32,6 @@
 		chromaStrength: 0,
 		bpmNorm: 0
 	};
-
-	// Music-character → preset auto-pick. Very slowly smoothed so it doesn't
-	// flicker on transients; intent must hold for ~1s before we actually switch.
-	const PRESET_COUNT_LOCAL = 4;
-	const presetSmoothed = [0, 0, 0, 0]; // smoothed score per preset
-	let presetIntentTarget = 0; // currently leading preset
-	let presetIntentFrames = 0;
 
 	// Per-song seed. Detect new-track via RMS pattern (sustained quiet then a
 	// climb back to audible). On detection, regenerate seed — shaders use it to
@@ -1191,6 +1183,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// native delivery stalls, every target below eases back toward silence.
 		const frameNow = performance.now();
 		const feat = vis.getLatest(frameNow);
+		const response = VISUALIZER_RESPONSE_PROFILES.mk1[vis.response];
+		const responseMotion = response.motion;
+		const responseImpact = response.impact;
 		// Mk1 does not consume the shared choreography directly, but it keeps the
 		// lightweight journey clock alive so Signal/Mk2 envelopes decay correctly
 		// through pauses and remain current when the user switches engines.
@@ -1209,7 +1204,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		smoothed.centroid = lerp(smoothed.centroid, feat?.centroid ?? 0.5, 0.04);
 		smoothed.rms = lerp(smoothed.rms, feat?.rms ?? 0, 0.22);
 		if (feat?.onset) {
-			smoothed.flash = 1.0;
+			smoothed.flash = responseImpact;
 			// Onset roulette: each onset rolls for one of N organic events.
 			// 30% chance: trail clear (feedback fade momentarily drops).
 			// 30% chance: palette jump (color phase suddenly shifts and decays back).
@@ -1241,16 +1236,23 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// This kills the "always clockwise loop" feel and reads as alive.
 		const tSec = (performance.now() - t0) / 1000;
 		const rotOsc = Math.sin(tSec * 0.07 + songSeed * 6.28) * 0.7 + Math.sin(tSec * 0.023 + songSeed * 11.0) * 0.5;
-		const rotRate = (0.04 + smoothed.mid * 0.55 + smoothed.bpmNorm * 0.15) * rotOsc;
+		const rotRate =
+			(0.04 + smoothed.mid * 0.55 + smoothed.bpmNorm * 0.15) * rotOsc * responseMotion;
 		smoothed.rotation += rotRate * (1 / 60);
 
 		// Audio-conditional post params. Tuned for clarity over smear — feedback
 		// punctuates, doesn't blanket; bloom only bites the brightest edges.
 		// onsetEventStrip momentarily slashes feedback fade → trail snap-clears
 		// on a randomly-chosen subset of onsets ("surprise moments of clarity").
-		const bloomThreshold = 1.7 - smoothed.rms * 0.25; // 1.45-1.70 — pickier
-		const feedbackFade = 0.78 + smoothed.bass * 0.08 - onsetEventStrip * 0.22;
-		const feedbackZoom = 0.997 - smoothed.bass * 0.005; // <1 = outward drift
+		const bloomThreshold = 1.7 - smoothed.rms * 0.25 + response.bloomThresholdOffset;
+		const feedbackFade = Math.max(
+			0.5,
+			Math.min(
+				0.9,
+				0.78 + smoothed.bass * 0.08 - onsetEventStrip * 0.22 + response.feedbackFadeOffset
+			)
+		);
+		const feedbackZoom = 1 - (0.003 + smoothed.bass * 0.005) * responseMotion;
 
 		// Beat phase taken raw — we want the snap, not a smoothed drift.
 		const beatPhase = feat?.beat_phase ?? 0;
@@ -1270,30 +1272,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			quietFrames = 0;
 		}
 
-		// ── 4-way auto-pick preset from music character.
-		// Kaleidoscope: tonal, melodic, mid tempo
-		// Cathedral:    energetic, percussive, fast bass-heavy
-		// Voronoi:      ambient, textural, treble-rich, slow & atonal
-		// Nebulae:      atmospheric, melodic, medium-energy with bass body
-		const kaleidoInstant =
-			smoothed.chromaStrength * 1.8 + smoothed.mid * 0.4 - smoothed.bpmNorm * 0.4;
-		const cathedralInstant =
-			smoothed.bpmNorm * 1.2 + smoothed.bass * 0.9 + smoothed.treble * 0.2 - smoothed.chromaStrength * 0.5;
-		const voronoiInstant =
-			smoothed.treble * 1.0 + (1.0 - smoothed.bpmNorm) * 0.5 - smoothed.chromaStrength * 0.4 - smoothed.bass * 0.5;
-		const nebulaeInstant =
-			smoothed.chromaStrength * 0.9 + smoothed.bass * 0.5 + smoothed.mid * 0.5 - smoothed.treble * 0.3 - smoothed.bpmNorm * 0.2;
-		presetSmoothed[0] = lerp(presetSmoothed[0], kaleidoInstant, 0.008);
-		presetSmoothed[1] = lerp(presetSmoothed[1], cathedralInstant, 0.008);
-		presetSmoothed[2] = lerp(presetSmoothed[2], voronoiInstant, 0.008);
-		presetSmoothed[3] = lerp(presetSmoothed[3], nebulaeInstant, 0.008);
-		// Auto-pick disabled — switching between distinct presets created snap
-		// transitions even with smoothing. Auto stays on kaleidoscope (idx 0);
-		// lab keys force any preset for development. mk2 is the path forward.
-		const autoLeader = 0;
-		if (vis.forcedPreset < 0 && vis.preset !== 0) {
-			vis.setPreset(0);
-		}
+		// Prism's production identity stays on its refined hyperbolic scene.
+		// The lab can still inspect the other generators, with a clamped index and
+		// an honest HUD label instead of the old ignored auto-score scaffolding.
+		const selectedPreset = Math.max(0, Math.min(3, vis.forcedPreset >= 0 ? vis.forcedPreset : 0));
+		if (vis.preset !== selectedPreset) vis.setPreset(selectedPreset);
 
 		// ── Upload uniforms (bins go separately)
 		const u = gpu.uniformData;
@@ -1318,7 +1301,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[17] = smoothed.chromaStrength;
 		u[18] = smoothed.bpmNorm;
 		u[19] = songSeed;
-		u[20] = onsetEventPalJump;
+		u[20] = onsetEventPalJump * responseImpact;
 		// u[21] = sceneWeight — set per scene pass below.
 		u[21] = 1;
 		u[22] = 0;
@@ -1328,7 +1311,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// generators produced visible overlay/competition instead of evolution.
 		// Whichever preset has the highest score wins; transitions snap at the
 		// score boundary (but slow smoothing makes the snap a rare event).
-		let sceneIdxA = vis.forcedPreset >= 0 ? vis.forcedPreset : autoLeader;
+		let sceneIdxA = selectedPreset;
 		const sceneIdxB = sceneIdxA;
 		const weightA = 1;
 		const weightB = 0;
@@ -1549,21 +1532,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 {#if vis.active}
 	<div class="fixed inset-0 z-[100] bg-black">
-		<canvas bind:this={canvas} class="h-full w-full"></canvas>
-		{#if showHud}
-			<button
-				type="button"
-				class="absolute inset-0 z-10 cursor-default border-0 bg-transparent p-0"
-				aria-label="Close visualizer"
-				onclick={() => vis.toggle()}
-				onkeydown={(event) => {
-					if (event.key === 'Escape') vis.toggle();
-				}}
-			></button>
-			<div class="pointer-events-none absolute right-6 top-6 z-20 text-xs text-white/40">
-				click anywhere or press esc to exit
-			</div>
-		{/if}
+		<canvas bind:this={canvas} class="h-full w-full" aria-label="Prism audio visualizer"></canvas>
 		{#if errorMsg}
 			<div class="pointer-events-none absolute left-6 top-6 z-20 max-w-md text-xs text-red-300/80">
 				Visualizer error: {errorMsg}

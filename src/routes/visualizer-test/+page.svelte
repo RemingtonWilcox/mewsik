@@ -7,6 +7,9 @@
 	import VisualizerSignal from '$lib/components/visualizer/visualizer-signal.svelte';
 	import {
 		PRESET_NAMES,
+		VISUALIZER_CATALOG,
+		VISUALIZER_RESPONSE_LABELS,
+		VISUALIZER_RESPONSES,
 		useVisualizer,
 		type VisualizerEngine
 	} from '$lib/state/visualizer.svelte';
@@ -196,20 +199,30 @@
 				onclick={() => setEngine('mk1')}
 				class={`px-3 py-1 ${engine === 'mk1' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
 			>
-				mk1
+				{VISUALIZER_CATALOG.mk1.name} · mk1
 			</button>
 			<button
 				onclick={() => setEngine('mk2')}
 				class={`border-l border-white/20 px-3 py-1 ${engine === 'mk2' ? 'bg-amber-300 text-black' : 'bg-black/40 text-amber-200 hover:bg-white/10'}`}
 			>
-				mk2 · experimental
+				{VISUALIZER_CATALOG.mk2.name} · mk2
 			</button>
 			<button
 				onclick={() => setEngine('signal')}
 				class={`border-l border-white/20 px-3 py-1 ${engine === 'signal' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
 			>
-				signal
+				{VISUALIZER_CATALOG.signal.name}
 			</button>
+		</div>
+		<div class="flex overflow-hidden rounded border border-white/20">
+			{#each VISUALIZER_RESPONSES as response}
+				<button
+					onclick={() => vis.setResponse(response)}
+					class={`border-l border-white/20 px-2 py-1 first:border-l-0 ${vis.response === response ? 'bg-white text-black' : 'bg-black/40 text-white/60 hover:bg-white/10'}`}
+				>
+					{VISUALIZER_RESPONSE_LABELS[response]}
+				</button>
+			{/each}
 		</div>
 		<label class="flex items-center gap-2 rounded border border-white/20 bg-black/40 px-2 py-1">
 			<input type="checkbox" bind:checked={demoMode} />
@@ -236,16 +249,16 @@
 	<div class="pointer-events-auto flex flex-wrap items-center gap-3 font-mono text-white/80">
 		{#if engine === 'mk1'}
 			<span>
-				<strong>mk1</strong>
+				<strong>{VISUALIZER_CATALOG.mk1.name} · mk1</strong>
 				· {PRESET_NAMES[vis.preset] ?? '?'}
 				{#if manualPreset >= 0}<span class="text-amber-300">(forced)</span>{/if}
 			</span>
 		{:else if engine === 'mk2'}
-			<span class="text-amber-200"><strong>mk2 · experimental</strong> · volumetric fractal</span>
+			<span class="text-amber-200"><strong>{VISUALIZER_CATALOG.mk2.name} · mk2</strong> · living fractal</span>
 		{:else}
-			<span><strong>signal</strong> · oscilloscope / vectorscope engine</span>
+			<span><strong>{VISUALIZER_CATALOG.signal.name}</strong> · phosphor score</span>
 		{/if}
-		<span class="text-white/45">keys: q mk1 · w mk2 · e signal · 0–4 mk1 presets</span>
+		<span class="text-white/45">keys: q prism · w soma · e signal · 0–4 prism scenes</span>
 		<span class="text-white/40">|</span>
 		{#if vis.latest}
 			<span>bpm {vis.latest.bpm.toFixed(0)}</span>
@@ -262,10 +275,10 @@
 
 {#if labReady}
 	{#if engine === 'mk1'}
-		<VisualizerMk1 showHud={false} />
+		<VisualizerMk1 />
 	{:else if engine === 'mk2'}
-		<VisualizerMk2 showHud={false} />
+		<VisualizerMk2 />
 	{:else}
-		<VisualizerSignal showHud={false} />
+		<VisualizerSignal />
 	{/if}
 {/if}
