@@ -9,7 +9,6 @@ use crate::db::{
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, Sink, Source};
-use tauri::AppHandle;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -23,21 +22,21 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use tauri::AppHandle;
 
 pub enum AudioCommand {
     PlayFile(String, String), // recording_id, file_path
     PlayEntry(QueueEntry),
     PlayFetchedRemote(QueueEntry, Vec<u8>, u64, u64),
     PlayPreparedRemote(QueueEntry, Box<dyn Source<Item = i16> + Send>, u64, u64),
-    PlayUrl(String, String, String, Option<String>), // station_id, url, name, favicon
+    PlayUrl(String, String, String), // station_id, url, name
     PlayPreparedRadio(
         String,
         String,
-        Option<String>,
         String,
         Box<dyn Source<Item = i16> + Send>,
         u64,
-    ), // station_id, name, favicon, url, source, session
+    ), // station_id, name, url, source, session
     Pause,
     Resume,
     Stop,
@@ -71,12 +70,71 @@ enum PlaybackKind {
     Radio,
 }
 
+#[cfg(test)]
+mod play_request_tests {
+    use super::PlayRequestGate;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn newer_request_invalidates_older_finish() {
+        let gate = PlayRequestGate::default();
+        let first = gate.begin();
+        let second = gate.begin();
+        let actions = AtomicUsize::new(0);
+
+        assert!(gate
+            .finish_if_current(first, || actions.fetch_add(1, Ordering::SeqCst))
+            .is_none());
+        assert!(gate
+            .finish_if_current(second, || actions.fetch_add(1, Ordering::SeqCst))
+            .is_some());
+        assert_eq!(actions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stop_style_invalidation_prevents_pending_finish() {
+        let gate = PlayRequestGate::default();
+        let pending = gate.begin();
+        gate.invalidate_and(|| ());
+        assert!(gate.finish_if_current(pending, || ()).is_none());
+    }
+}
+
+#[derive(Default)]
+struct PlayRequestGate {
+    generation: Mutex<u64>,
+}
+
+impl PlayRequestGate {
+    fn begin(&self) -> u64 {
+        let mut generation = self.generation.lock();
+        *generation = generation.saturating_add(1);
+        *generation
+    }
+
+    fn invalidate_and<T>(&self, action: impl FnOnce() -> T) -> T {
+        let mut generation = self.generation.lock();
+        *generation = generation.saturating_add(1);
+        action()
+    }
+
+    fn finish_if_current<T>(&self, expected: u64, action: impl FnOnce() -> T) -> Option<T> {
+        let mut generation = self.generation.lock();
+        if *generation != expected {
+            return None;
+        }
+        *generation = generation.saturating_add(1);
+        Some(action())
+    }
+}
+
 pub struct AudioEngine {
     cmd_tx: Sender<AudioCommand>,
     event_rx: Receiver<AudioEvent>,
     state: Arc<Mutex<PlaybackState>>,
     queue_items: Arc<Mutex<Vec<QueueItem>>>,
     app_handle: Arc<Mutex<Option<AppHandle>>>,
+    play_request_gate: PlayRequestGate,
 }
 
 impl AudioEngine {
@@ -112,6 +170,7 @@ impl AudioEngine {
             state,
             queue_items,
             app_handle,
+            play_request_gate: PlayRequestGate::default(),
         }
     }
 
@@ -121,7 +180,38 @@ impl AudioEngine {
     }
 
     pub fn send(&self, cmd: AudioCommand) {
-        let _ = self.cmd_tx.send(cmd);
+        if matches!(
+            &cmd,
+            AudioCommand::PlayFile(..)
+                | AudioCommand::PlayEntry(..)
+                | AudioCommand::PlayUrl(..)
+                | AudioCommand::Stop
+                | AudioCommand::Next
+                | AudioCommand::Prev
+                | AudioCommand::PlayQueueIndex(..)
+                | AudioCommand::SetQueue(..)
+                | AudioCommand::Shutdown
+        ) {
+            self.play_request_gate.invalidate_and(|| {
+                let _ = self.cmd_tx.send(cmd);
+            });
+        } else {
+            let _ = self.cmd_tx.send(cmd);
+        }
+    }
+
+    /// Reserve ownership of the next async play. Any subsequent play/stop
+    /// command invalidates this token before its engine command is queued.
+    pub fn begin_play_request(&self) -> u64 {
+        self.play_request_gate.begin()
+    }
+
+    /// Atomically verify request ownership and enqueue its play command. The
+    /// gate lock makes ordering with a simultaneous Stop/new play unambiguous.
+    pub fn finish_play_request(&self, request: u64, cmd: AudioCommand) -> bool {
+        self.play_request_gate
+            .finish_if_current(request, || self.cmd_tx.send(cmd).is_ok())
+            .unwrap_or(false)
     }
 
     pub fn try_recv_event(&self) -> Option<AudioEvent> {
@@ -330,6 +420,7 @@ impl AudioEngine {
         s.is_buffering = false;
         s.can_seek = can_seek;
         s.current_recording_id = Some(entry.recording_id.clone());
+        s.current_station_id = None;
         s.current_title = Some(entry.title.clone());
         s.current_artist = Some(entry.artist.clone());
         s.current_album_art = entry.cover_art.clone();
@@ -347,7 +438,6 @@ impl AudioEngine {
         tap_tx: &Sender<analyzer::TapFrame>,
         station_id: &str,
         name: &str,
-        favicon: &Option<String>,
         url: &str,
         source: Box<dyn Source<Item = i16> + Send>,
         state: &Arc<Mutex<PlaybackState>>,
@@ -381,9 +471,10 @@ impl AudioEngine {
         s.is_buffering = false;
         s.can_seek = false;
         s.current_recording_id = None;
+        s.current_station_id = Some(station_id.to_string());
         s.current_title = Some(name.to_string());
         s.current_artist = Some("Radio".to_string());
-        s.current_album_art = favicon.clone();
+        s.current_album_art = None;
         s.current_source_url = Some(url.to_string());
         s.position_ms = 0;
         s.duration_ms = 0;
@@ -477,6 +568,7 @@ impl AudioEngine {
         {
             let mut s = state.lock();
             s.current_recording_id = Some(entry.recording_id.clone());
+            s.current_station_id = None;
             s.current_title = Some(entry.title.clone());
             s.current_artist = Some(entry.artist.clone());
             s.current_album_art = entry.cover_art.clone();
@@ -624,6 +716,7 @@ impl AudioEngine {
         s.is_buffering = false;
         s.can_seek = true;
         s.current_recording_id = Some(entry.recording_id.clone());
+        s.current_station_id = None;
         s.current_title = Some(entry.title.clone());
         s.current_artist = Some(entry.artist.clone());
         s.current_album_art = entry.cover_art.clone();
@@ -723,6 +816,7 @@ impl AudioEngine {
                                     s.is_buffering = false;
                                     s.can_seek = true;
                                     s.current_recording_id = Some(recording_id);
+                                    s.current_station_id = None;
                                     s.current_title = rec.as_ref().map(|r| r.title.clone());
                                     s.current_artist = artist;
                                     s.current_album_art = rec.as_ref().and_then(|r| {
@@ -809,6 +903,7 @@ impl AudioEngine {
                             s.is_buffering = false;
                             s.can_seek = can_seek;
                             s.current_recording_id = Some(entry.recording_id.clone());
+                            s.current_station_id = None;
                             s.current_title = Some(entry.title.clone());
                             s.current_artist = Some(entry.artist.clone());
                             s.current_album_art = entry.cover_art.clone();
@@ -853,7 +948,7 @@ impl AudioEngine {
                         desired_playing,
                     );
                 }
-                Ok(AudioCommand::PlayUrl(station_id, url, name, favicon)) => {
+                Ok(AudioCommand::PlayUrl(station_id, url, name)) => {
                     let session_id = Self::reset_playback_session(
                         &sink,
                         &playback_session,
@@ -877,7 +972,6 @@ impl AudioEngine {
                     let cmd_tx_clone = cmd_tx.clone();
                     let station_id_clone = station_id.clone();
                     let name_clone = name.clone();
-                    let favicon_clone = favicon.clone();
                     let db_clone = db.clone();
 
                     // Update state immediately to show "loading"
@@ -887,9 +981,10 @@ impl AudioEngine {
                         s.is_buffering = true;
                         s.can_seek = false;
                         s.current_recording_id = None;
+                        s.current_station_id = Some(station_id.clone());
                         s.current_title = Some(name);
                         s.current_artist = Some("Radio - Connecting...".to_string());
-                        s.current_album_art = favicon;
+                        s.current_album_art = None;
                         s.current_source_url = Some(url.clone());
                         s.source = Some("radio".to_string());
                         s.duration_ms = 0;
@@ -916,7 +1011,6 @@ impl AudioEngine {
                                     let _ = cmd_tx_clone.send(AudioCommand::PlayPreparedRadio(
                                         station_id_clone,
                                         name_clone,
-                                        favicon_clone,
                                         url_clone,
                                         source,
                                         session_id,
@@ -944,14 +1038,7 @@ impl AudioEngine {
 
                     position_offset_ms = 0;
                 }
-                Ok(AudioCommand::PlayPreparedRadio(
-                    station_id,
-                    name,
-                    favicon,
-                    url,
-                    source,
-                    session_id,
-                )) => {
+                Ok(AudioCommand::PlayPreparedRadio(station_id, name, url, source, session_id)) => {
                     if playback_session.load(Ordering::SeqCst) != session_id {
                         continue;
                     }
@@ -960,7 +1047,6 @@ impl AudioEngine {
                         &tap_tx,
                         &station_id,
                         &name,
-                        &favicon,
                         &url,
                         source,
                         &state,

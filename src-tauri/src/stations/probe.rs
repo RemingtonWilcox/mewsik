@@ -2,10 +2,15 @@
 //! actually are (audio, playlist, HLS, HTML error page), and unwrap playlist
 //! redirects to the direct stream URL the audio engine can decode.
 
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use super::network::{parse_public_http_url, send_public_get};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, LOCATION};
 
 const STATION_PROBE_BYTES: usize = 8 * 1024;
 const STATION_PLAYLIST_DEPTH: usize = 2;
+const STATION_REDIRECT_LIMIT: usize = 5;
+const MAX_GLOBAL_STATION_PROBES: usize = 8;
+static STATION_PROBE_SEMAPHORE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_GLOBAL_STATION_PROBES);
 
 fn normalize_content_type(content_type: &str) -> String {
     content_type
@@ -154,6 +159,28 @@ fn resolve_playlist_target(bytes: &[u8], base_url: &reqwest::Url) -> Option<Stri
     None
 }
 
+fn resolve_redirect_target(base_url: &reqwest::Url, location: &str) -> Option<reqwest::Url> {
+    let target = reqwest::Url::parse(location)
+        .or_else(|_| base_url.join(location))
+        .ok()?;
+    parse_public_http_url(target.as_str()).ok()
+}
+
+fn is_followable_redirect(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+async fn send_probe_request(url: &reqwest::Url) -> Option<reqwest::Response> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "audio/*,application/ogg;q=0.9,application/octet-stream;q=0.8,*/*;q=0.1",
+        ),
+    );
+    send_public_get(url, headers).await.ok()
+}
+
 async fn read_probe_bytes(response: &mut reqwest::Response) -> Result<Vec<u8>, reqwest::Error> {
     let mut bytes = Vec::with_capacity(STATION_PROBE_BYTES);
 
@@ -179,23 +206,27 @@ async fn read_probe_bytes(response: &mut reqwest::Response) -> Result<Vec<u8>, r
 /// cannot decode playlist text, so callers should play/persist this URL,
 /// not the original.
 pub(crate) async fn probe_station_stream(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     initial_url: &str,
 ) -> Option<String> {
-    let mut current_url = initial_url.to_string();
+    // This is process-wide, not per Tauri invocation. Overlapping search,
+    // favorite-health and play requests therefore share one hard ceiling.
+    let _permit = STATION_PROBE_SEMAPHORE.acquire().await.ok()?;
+    let mut current_url = parse_public_http_url(initial_url).ok()?;
+    let mut redirect_count = 0usize;
 
     for _ in 0..=STATION_PLAYLIST_DEPTH {
-        let mut response = match client
-            .get(&current_url)
-            .header(
-                ACCEPT,
-                "audio/*,application/ogg;q=0.9,application/octet-stream;q=0.8,*/*;q=0.1",
-            )
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(_) => return None,
+        let mut response = loop {
+            let response = send_probe_request(&current_url).await?;
+            if !is_followable_redirect(response.status()) {
+                break response;
+            }
+            if redirect_count >= STATION_REDIRECT_LIMIT {
+                return None;
+            }
+            let location = response.headers().get(LOCATION)?.to_str().ok()?;
+            current_url = resolve_redirect_target(&current_url, location)?;
+            redirect_count += 1;
         };
 
         if !response.status().is_success() {
@@ -208,7 +239,6 @@ pub(crate) async fn probe_station_stream(
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let final_url = response.url().clone();
         let bytes = match read_probe_bytes(&mut response).await {
             Ok(bytes) => bytes,
             Err(_) => return None,
@@ -224,8 +254,8 @@ pub(crate) async fn probe_station_stream(
             if bytes_look_like_hls(&bytes) {
                 return None;
             }
-            if let Some(next_url) = resolve_playlist_target(&bytes, &final_url) {
-                current_url = next_url;
+            if let Some(next_url) = resolve_playlist_target(&bytes, &current_url) {
+                current_url = parse_public_http_url(&next_url).ok()?;
                 continue;
             }
             return None;
@@ -236,14 +266,14 @@ pub(crate) async fn probe_station_stream(
         }
 
         if is_audio_content_type(&content_type) {
-            return looks_like_audio_payload(&bytes).then_some(current_url);
+            return looks_like_audio_payload(&bytes).then(|| current_url.to_string());
         }
 
         if normalize_content_type(&content_type).starts_with("text/") {
             return None;
         }
 
-        return looks_like_audio_payload(&bytes).then_some(current_url);
+        return looks_like_audio_payload(&bytes).then(|| current_url.to_string());
     }
 
     None
@@ -323,6 +353,35 @@ mod tests {
     }
 
     #[test]
+    fn private_playlist_and_redirect_targets_are_rejected_before_request() {
+        let base = reqwest::Url::parse("https://radio.example/list.m3u").unwrap();
+        let playlist = b"#EXTM3U\nhttp://169.254.169.254/latest/meta-data\n";
+        let target = resolve_playlist_target(playlist, &base).unwrap();
+        assert!(parse_public_http_url(&target).is_err());
+
+        assert!(resolve_redirect_target(&base, "http://127.0.0.1/admin").is_none());
+        assert!(resolve_redirect_target(&base, "//192.168.1.1/stream").is_none());
+        assert_eq!(
+            resolve_redirect_target(&base, "/live").unwrap().as_str(),
+            "https://radio.example/live"
+        );
+    }
+
+    #[test]
+    fn only_standard_get_redirect_statuses_are_followed() {
+        for status in [301, 302, 303, 307, 308] {
+            assert!(is_followable_redirect(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+        for status in [200, 300, 304, 305, 306, 400] {
+            assert!(!is_followable_redirect(
+                reqwest::StatusCode::from_u16(status).unwrap()
+            ));
+        }
+    }
+
+    #[test]
     fn hls_markers_detected() {
         assert!(bytes_look_like_hls(
             b"#EXTM3U\n#EXT-X-TARGETDURATION:6\nseg0.ts"
@@ -350,5 +409,19 @@ mod tests {
         assert!(is_playlist_content_type("audio/x-mpegurl"));
         assert!(is_playlist_content_type("application/pls+xml; v=2"));
         assert!(!is_playlist_content_type("audio/mpeg"));
+    }
+
+    #[tokio::test]
+    async fn probe_limit_is_process_wide() {
+        let permits = STATION_PROBE_SEMAPHORE
+            .acquire_many(MAX_GLOBAL_STATION_PROBES as u32)
+            .await
+            .unwrap();
+        assert_eq!(STATION_PROBE_SEMAPHORE.available_permits(), 0);
+        drop(permits);
+        assert_eq!(
+            STATION_PROBE_SEMAPHORE.available_permits(),
+            MAX_GLOBAL_STATION_PROBES
+        );
     }
 }

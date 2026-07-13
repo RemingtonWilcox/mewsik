@@ -43,11 +43,11 @@
 		return item.source;
 	}
 
-	async function openDownload(path: string, downloadId: string) {
+	async function openDownload(downloadId: string) {
 		if (actioning[downloadId]) return;
 		actioning = { ...actioning, [downloadId]: true };
 		try {
-			await api.revealDownloadPath(path);
+			await api.revealDownloadPath(downloadId);
 		} catch (e) {
 			toast.error(`Failed to reveal download: ${e}`);
 			await loadDownloads();
@@ -179,10 +179,10 @@
 								variant="ghost"
 								size="sm"
 								disabled={Boolean(actioning[item.id])}
-								onclick={() => openDownload(item.file_path!, item.id)}
+								onclick={() => openDownload(item.id)}
 							>
 								<FolderOpen class="mr-1 size-4" />
-								Show in Finder
+								Show in folder
 							</Button>
 						{/if}
 						{#if isActive}

@@ -25,12 +25,14 @@
 	let results = $state<RadioBrowserStation[]>([]);
 	let favorites = $state<Station[]>([]);
 	let savedStationIds = $state<Set<string>>(new Set());
+	let searchStationIds = $state<Record<string, string>>({});
 	let searching = $state(false);
 	let debounceTimer: ReturnType<typeof setTimeout>;
 	let favoritesError = $state('');
 	let searchError = $state('');
 	let searchRequest = 0;
 	let stationHealthRequest = 0;
+	let stationPlayRequest = 0;
 	let verifyingStations = $state(false);
 	let searchHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 
@@ -41,6 +43,17 @@
 	async function loadFavorites() {
 		try {
 			favorites = await api.getFavoriteStations();
+			searchStationIds = {
+				...searchStationIds,
+				...Object.fromEntries(
+					favorites.flatMap((station) => {
+						const keys = [station.url, station.radio_browser_id].filter(
+							(key): key is string => Boolean(key)
+						);
+						return keys.map((key) => [key, station.id] as const);
+					})
+				)
+			};
 			favoritesError = '';
 		} catch (error) {
 			favorites = [];
@@ -103,37 +116,48 @@
 	}
 
 	async function playSearchResult(station: RadioBrowserStation) {
+		const requestId = ++stationPlayRequest;
 		try {
-			if (isStationActive(station.url)) {
+			if (isSearchStationActive(station)) {
 				await stopPlaying();
 				return;
 			}
-			await api.playStationSearchResult(station);
-			toast.success(`Playing: ${station.name}`);
+			const stationId = await api.playStationSearchResult(station);
+			searchStationIds = {
+				...searchStationIds,
+				[station.stationuuid || station.url]: stationId,
+				[station.url]: stationId
+			};
+			if (requestId === stationPlayRequest) {
+				toast.success(`Playing: ${station.name}`);
+			}
 		} catch (e) {
-			toast.error(`Failed to play station: ${e}`);
+			if (requestId === stationPlayRequest && !String(e).includes('superseded')) {
+				toast.error(`Failed to play station: ${e}`);
+			}
 		}
 	}
 
 	async function playFavorite(station: Station) {
+		const requestId = ++stationPlayRequest;
 		try {
-			if (isStationActive(station.url)) {
+			if (isStationActive(station.id)) {
 				await stopPlaying();
 				return;
 			}
-			await api.playStation(
-				station.id,
-				station.url,
-				station.name,
-				station.favicon_url ?? undefined
-			);
-			toast.success(`Playing: ${station.name}`);
+			await api.playStation(station.id, station.url, station.name);
+			if (requestId === stationPlayRequest) {
+				toast.success(`Playing: ${station.name}`);
+			}
 		} catch (e) {
-			toast.error(`Failed to play station: ${e}`);
+			if (requestId === stationPlayRequest && !String(e).includes('superseded')) {
+				toast.error(`Failed to play station: ${e}`);
+			}
 		}
 	}
 
 	async function stopPlaying() {
+		stationPlayRequest += 1;
 		try {
 			await player.stop();
 		} catch {
@@ -141,10 +165,15 @@
 		}
 	}
 
-	function isStationActive(url: string): boolean {
+	function isStationActive(stationId: string): boolean {
 		return player.state.source === 'radio' &&
-			player.state.current_source_url === url &&
+			player.state.current_station_id === stationId &&
 			(player.state.is_playing || player.state.is_buffering);
+	}
+
+	function isSearchStationActive(station: RadioBrowserStation): boolean {
+		const stationId = searchStationIds[station.stationuuid || station.url] ?? searchStationIds[station.url];
+		return stationId ? isStationActive(stationId) : false;
 	}
 
 	async function saveToFavorites(station: RadioBrowserStation) {
@@ -155,7 +184,6 @@
 				station.name,
 				station.url,
 				station.homepage ?? undefined,
-				station.favicon ?? undefined,
 				station.country ?? undefined,
 				station.language ?? undefined,
 				station.tags ?? undefined,
@@ -368,22 +396,18 @@
 						<CardContent class="flex min-w-0 items-center gap-3 p-3">
 							<button
 								class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90"
-								onclick={() => isStationActive(station.url) ? stopPlaying() : playFavorite(station)}
+								onclick={() => isStationActive(station.id) ? stopPlaying() : playFavorite(station)}
 							>
-								{#if isStationActive(station.url)}
+								{#if isStationActive(station.id)}
 									<Square class="size-4" />
 								{:else}
 									<Play class="size-4 pl-0.5" />
 								{/if}
 							</button>
 
-							{#if station.favicon_url}
-								<img src={station.favicon_url} alt="" class="size-10 rounded-lg object-cover" />
-							{:else}
-								<div class="flex size-10 items-center justify-center rounded-lg bg-muted">
-									<Radio class="size-5 text-muted-foreground" />
-								</div>
-							{/if}
+							<div class="flex size-10 items-center justify-center rounded-lg bg-muted">
+								<Radio class="size-5 text-muted-foreground" />
+							</div>
 
 							<div class="min-w-0 flex-1 overflow-hidden">
 								<div class="flex min-w-0 items-center gap-2">
@@ -393,7 +417,7 @@
 											class={`size-2 shrink-0 rounded-full ${getStationHealth(station) === 'dead' ? 'bg-zinc-500' : 'bg-amber-400'}`}
 										></span>
 									{/if}
-									{#if isStationActive(station.url)}
+									{#if isStationActive(station.id)}
 										{#if player.state.is_buffering}
 											<LoaderCircle class="size-3 shrink-0 animate-spin text-primary" />
 										{:else}
@@ -443,20 +467,16 @@
 							class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-colors hover:bg-primary/90"
 							onclick={() => playSearchResult(station)}
 						>
-							{#if isStationActive(station.url)}
+							{#if isSearchStationActive(station)}
 								<Square class="size-4" />
 							{:else}
 								<Play class="size-4 pl-0.5" />
 							{/if}
 						</button>
 
-						{#if station.favicon}
-							<img src={station.favicon} alt="" class="size-10 rounded-lg object-cover" />
-						{:else}
-							<div class="flex size-10 items-center justify-center rounded-lg bg-muted">
-								<Radio class="size-5 text-muted-foreground" />
-							</div>
-						{/if}
+						<div class="flex size-10 items-center justify-center rounded-lg bg-muted">
+							<Radio class="size-5 text-muted-foreground" />
+						</div>
 
 						<div class="min-w-0 flex-1 overflow-hidden">
 							<div class="flex min-w-0 items-center gap-2">
@@ -466,7 +486,7 @@
 										class={`size-2 shrink-0 rounded-full ${searchStationHealth(station.url) === 'dead' ? 'bg-zinc-500' : searchStationHealth(station.url) === 'stale' ? 'bg-amber-400' : 'bg-emerald-400'}`}
 									></span>
 								{/if}
-								{#if isStationActive(station.url)}
+								{#if isSearchStationActive(station)}
 									{#if player.state.is_buffering}
 										<LoaderCircle class="size-3 shrink-0 animate-spin text-primary" />
 									{:else}

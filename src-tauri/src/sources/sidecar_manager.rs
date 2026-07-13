@@ -1,4 +1,4 @@
-use crate::external_tools::find_binary;
+use crate::external_tools::{find_binary, find_bundled_resource};
 use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -261,37 +261,31 @@ impl Drop for SidecarManager {
 }
 
 fn resolve_sidecar_script() -> Result<PathBuf, String> {
-    let cwd_candidate = std::env::current_dir()
-        .map_err(|e| format!("Failed to read current dir: {}", e))?
-        .join("sidecar/dist/index.cjs");
-    if cwd_candidate.exists() {
-        return Ok(cwd_candidate);
-    }
-
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to resolve current executable: {}", e))?;
-
-    let mut candidates = Vec::new();
-    if let Some(dir) = exe.parent() {
-        candidates.push(dir.join("sidecar/dist/index.cjs"));
-        candidates.push(dir.join("resources/sidecar/dist/index.cjs"));
-        if let Some(contents_dir) = dir.parent() {
-            candidates.push(contents_dir.join("Resources/sidecar/dist/index.cjs"));
+    #[cfg(debug_assertions)]
+    {
+        let cwd_candidate = std::env::current_dir()
+            .map_err(|e| format!("Failed to read current dir: {}", e))?
+            .join("sidecar/dist/index.cjs");
+        if cwd_candidate.is_file() {
+            return cwd_candidate
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve development sidecar script: {e}"));
         }
     }
 
-    for candidate in candidates {
-        if candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-
-    Err("Unable to locate sidecar/dist/index.cjs".to_string())
+    find_bundled_resource(std::path::Path::new("sidecar/dist/index.cjs")).ok_or_else(|| {
+        "Unable to locate the packaged sidecar at sidecar/dist/index.cjs in the app resource directory"
+            .to_string()
+    })
 }
 
 fn resolve_node_binary() -> Result<PathBuf, String> {
     find_binary("node").ok_or_else(|| {
-        "Unable to locate a Node.js binary for the sidecar. Checked bundled app resources and PATH."
-            .to_string()
+        if cfg!(debug_assertions) {
+            "Unable to locate a Node.js binary for the sidecar in PATH, packaged resources, or development resources."
+        } else {
+            "Unable to locate the packaged Node.js binary in the app resource directory."
+        }
+        .to_string()
     })
 }

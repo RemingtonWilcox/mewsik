@@ -6,6 +6,7 @@ use crate::stations::health::{
     build_station_health_client, try_heal_station, verify_favorite_stations_inner,
     verify_station_urls_inner, StationHealthResult,
 };
+use crate::stations::network::{parse_public_http_url, validate_public_http_url};
 use crate::stations::probe::{probe_station_stream, url_looks_like_playlist};
 use std::sync::Arc;
 use tauri::State;
@@ -112,6 +113,9 @@ async fn search_radio_stations_with_mode(
     // Prefer the resolved direct stream URL over playlist redirects —
     // playlist URLs go stale far more often.
     for station in &mut stations {
+        // Directory metadata is untrusted and must not be loaded directly by
+        // the WebView or carried into player state.
+        station.favicon = None;
         if let Some(resolved) = station.url_resolved.take() {
             let trimmed = resolved.trim();
             if !trimmed.is_empty() {
@@ -145,12 +149,14 @@ pub fn save_station(
     bitrate: Option<i32>,
     radio_browser_id: Option<String>,
 ) -> Result<Station, String> {
+    let _ = favicon_url;
+    let url = parse_public_http_url(&url)?.to_string();
     upsert_station(
         &db,
         name,
         url,
         homepage,
-        favicon_url,
+        None,
         country,
         language,
         tags,
@@ -164,7 +170,11 @@ pub fn save_station(
 
 #[tauri::command]
 pub fn get_favorite_stations(db: State<'_, DbPool>) -> Result<Vec<Station>, String> {
-    queries::get_favorite_stations(&db).map_err(|e| e.to_string())
+    let mut stations = queries::get_favorite_stations(&db).map_err(|e| e.to_string())?;
+    for station in &mut stations {
+        station.favicon_url = None;
+    }
+    Ok(stations)
 }
 
 #[tauri::command]
@@ -194,17 +204,59 @@ pub async fn play_station(
     name: String,
     favicon: Option<String>,
 ) -> Result<(), String> {
+    let _ = favicon;
+    let play_request = engine.begin_play_request();
     let db = db.inner().clone();
     let mut play_url = url;
+    let station = queries::get_station_by_id(&db, &station_id).map_err(|err| err.to_string())?;
 
-    if let Ok(Some(station)) = queries::get_station_by_id(&db, &station_id) {
+    if let Some(station) = station.as_ref() {
         // DB may hold a fresher URL than the frontend's cached copy
         // (e.g. healed by the launch-time health check).
         play_url = station.url.clone();
+    }
 
-        // Report the click to the directory (fire-and-forget). This keeps
-        // radio-browser's popularity/liveness data fresh — required API
-        // etiquette for apps that play directory stations.
+    let client = build_station_health_client()?;
+    // Ordinary direct streams need only DNS validation here: the actual
+    // downloader safely follows and revalidates every redirect. Playlist and
+    // previously failing URLs still need a bounded content probe/unwrap.
+    let should_probe = url_looks_like_playlist(&play_url)
+        || station
+            .as_ref()
+            .map(|station| station.fail_count > 0)
+            .unwrap_or(false);
+    let playable = if should_probe {
+        probe_station_stream(&client, &play_url).await
+    } else {
+        validate_public_http_url(&play_url).await.ok()
+    };
+    play_url = match playable {
+        Some(playable_url) => playable_url,
+        None => {
+            if let Some(station) = station.as_ref() {
+                try_heal_station(&db, &client, station)
+                    .await
+                    .ok_or_else(|| {
+                        "Station URL is unsafe or not a playable audio stream".to_string()
+                    })?
+            } else {
+                return Err("Station URL is unsafe or not a playable audio stream".to_string());
+            }
+        }
+    };
+
+    if !engine.finish_play_request(
+        play_request,
+        AudioCommand::PlayUrl(station_id.clone(), play_url.clone(), name),
+    ) {
+        return Err("Station play request was superseded".to_string());
+    }
+
+    if let Some(station) = station.as_ref() {
+        if play_url != station.url {
+            let _ = queries::update_station_url(&db, &station.id, &play_url);
+        }
+        // Report only a station that actually won the async play race.
         if let Some(uuid) = station.radio_browser_id.clone() {
             tauri::async_runtime::spawn(async move {
                 if let Ok(client) = build_station_health_client() {
@@ -213,25 +265,9 @@ pub async fn play_station(
                 }
             });
         }
-
-        // The engine can only decode raw audio: unwrap playlist URLs to the
-        // direct stream first. Also re-resolve known-failing stations.
-        if url_looks_like_playlist(&play_url) || station.fail_count > 0 {
-            if let Ok(client) = build_station_health_client() {
-                if let Some(playable_url) = probe_station_stream(&client, &play_url).await {
-                    if playable_url != station.url {
-                        let _ = queries::update_station_url(&db, &station.id, &playable_url);
-                    }
-                    play_url = playable_url;
-                } else if let Some(fresh_url) = try_heal_station(&db, &client, &station).await {
-                    play_url = fresh_url;
-                }
-            }
-        }
     }
 
     let _ = queries::update_station_last_played(&db, &station_id, &queries::now());
-    engine.send(AudioCommand::PlayUrl(station_id, play_url, name, favicon));
     Ok(())
 }
 
@@ -249,17 +285,17 @@ pub async fn play_station_search_result(
     codec: Option<String>,
     bitrate: Option<i32>,
     stationuuid: String,
-) -> Result<(), String> {
-    // Unwrap playlist URLs before saving/playing — the engine decodes raw
-    // audio only.
-    let mut url = url;
-    if url_looks_like_playlist(&url) {
-        if let Ok(client) = build_station_health_client() {
-            if let Some(playable_url) = probe_station_stream(&client, &url).await {
-                url = playable_url;
-            }
-        }
-    }
+) -> Result<String, String> {
+    let _ = favicon;
+    let play_request = engine.begin_play_request();
+    let client = build_station_health_client()?;
+    let url = if url_looks_like_playlist(&url) {
+        probe_station_stream(&client, &url)
+            .await
+            .ok_or_else(|| "Station URL is unsafe or not a playable audio stream".to_string())?
+    } else {
+        validate_public_http_url(&url).await?
+    };
 
     let now = queries::now();
     let station = upsert_station(
@@ -267,7 +303,7 @@ pub async fn play_station_search_result(
         name.clone(),
         url.clone(),
         homepage,
-        favicon.clone(),
+        None,
         country,
         language,
         tags,
@@ -278,6 +314,11 @@ pub async fn play_station_search_result(
         Some(now),
     )?;
 
-    engine.send(AudioCommand::PlayUrl(station.id, url, name, favicon));
-    Ok(())
+    if !engine.finish_play_request(
+        play_request,
+        AudioCommand::PlayUrl(station.id.clone(), url, name),
+    ) {
+        return Err("Station play request was superseded".to_string());
+    }
+    Ok(station.id)
 }

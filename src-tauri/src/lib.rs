@@ -21,6 +21,7 @@ use download::DownloadManager;
 use parking_lot::Mutex;
 use sources::{SidecarManager, StreamCache};
 use std::sync::Arc;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -54,8 +55,8 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
-        .plugin(tauri_plugin_shell::init())
         .setup(move |app| {
+            external_tools::configure_runtime_resource_dir(app.path().resource_dir()?)?;
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

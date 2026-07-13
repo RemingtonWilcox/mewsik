@@ -1,6 +1,44 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
+use std::sync::OnceLock;
+
+static RUNTIME_RESOURCE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeSource {
+    Bundled,
+    System,
+    Workspace,
+}
+
+/// Register Tauri's platform-specific resource directory before any external
+/// runtime is resolved. Canonicalizing it once lets every later lookup reject
+/// symlinks that escape the signed/packaged resource tree.
+pub(crate) fn configure_runtime_resource_dir(resource_dir: PathBuf) -> std::io::Result<()> {
+    let canonical = resource_dir.canonicalize()?;
+
+    match RUNTIME_RESOURCE_DIR.set(canonical.clone()) {
+        Ok(()) => Ok(()),
+        Err(_) if RUNTIME_RESOURCE_DIR.get() == Some(&canonical) => Ok(()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "runtime resource directory was already configured differently",
+        )),
+    }
+}
+
+fn runtime_source_policy(allow_dev_fallbacks: bool) -> Vec<RuntimeSource> {
+    if allow_dev_fallbacks {
+        vec![
+            RuntimeSource::System,
+            RuntimeSource::Bundled,
+            RuntimeSource::Workspace,
+        ]
+    } else {
+        vec![RuntimeSource::Bundled]
+    }
+}
 
 fn binary_names(binary_name: &str) -> Vec<String> {
     let mut names = vec![binary_name.to_string()];
@@ -13,6 +51,40 @@ fn binary_names(binary_name: &str) -> Vec<String> {
     names
 }
 
+fn is_safe_resource_path(relative_path: &Path) -> bool {
+    !relative_path.as_os_str().is_empty()
+        && relative_path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Resolve a regular file inside the canonical Tauri resource directory.
+/// Both the root and target are canonicalized so a packaged symlink cannot
+/// redirect execution to PATH, the working directory, or another writable
+/// location.
+pub(crate) fn find_bundled_resource(relative_path: &Path) -> Option<PathBuf> {
+    if !is_safe_resource_path(relative_path) {
+        return None;
+    }
+
+    let resource_dir = RUNTIME_RESOURCE_DIR.get()?;
+    let candidate = resource_dir.join(relative_path).canonicalize().ok()?;
+
+    if candidate.starts_with(resource_dir) && candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn bundled_app_binary_paths(binary_name: &str) -> Vec<PathBuf> {
+    binary_names(binary_name)
+        .into_iter()
+        .filter_map(|name| find_bundled_resource(&Path::new("bin").join(name)))
+        .collect()
+}
+
+#[cfg(debug_assertions)]
 fn workspace_binary_paths(binary_name: &str) -> Vec<PathBuf> {
     let names = binary_names(binary_name);
     let mut candidates = Vec::new();
@@ -28,26 +100,7 @@ fn workspace_binary_paths(binary_name: &str) -> Vec<PathBuf> {
     candidates
 }
 
-fn bundled_app_binary_paths(binary_name: &str) -> Vec<PathBuf> {
-    let names = binary_names(binary_name);
-    let mut candidates = Vec::new();
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for name in &names {
-                candidates.push(exe_dir.join("bin").join(name));
-
-                if let Some(contents_dir) = exe_dir.parent() {
-                    candidates.push(contents_dir.join("Resources/bin").join(name));
-                    candidates.push(contents_dir.join("resources/bin").join(name));
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
+#[cfg(debug_assertions)]
 fn system_binary_paths(binary_name: &str) -> Vec<PathBuf> {
     let names = binary_names(binary_name);
     let mut candidates = Vec::new();
@@ -75,18 +128,17 @@ fn system_binary_paths(binary_name: &str) -> Vec<PathBuf> {
 fn candidate_binary_paths(binary_name: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
-    match binary_name {
-        // Prefer known-good local toolchains during development, but keep the
-        // packaged app self-contained with bundled fallbacks.
-        "ffmpeg" | "node" => {
-            candidates.extend(system_binary_paths(binary_name));
-            candidates.extend(bundled_app_binary_paths(binary_name));
-            candidates.extend(workspace_binary_paths(binary_name));
-        }
-        _ => {
-            candidates.extend(bundled_app_binary_paths(binary_name));
-            candidates.extend(system_binary_paths(binary_name));
-            candidates.extend(workspace_binary_paths(binary_name));
+    for source in runtime_source_policy(cfg!(debug_assertions)) {
+        match source {
+            RuntimeSource::Bundled => candidates.extend(bundled_app_binary_paths(binary_name)),
+            #[cfg(debug_assertions)]
+            RuntimeSource::System => candidates.extend(system_binary_paths(binary_name)),
+            #[cfg(debug_assertions)]
+            RuntimeSource::Workspace => candidates.extend(workspace_binary_paths(binary_name)),
+            #[cfg(not(debug_assertions))]
+            RuntimeSource::System | RuntimeSource::Workspace => unreachable!(
+                "release runtime policy must never include development fallback sources"
+            ),
         }
     }
 
@@ -114,4 +166,36 @@ pub(crate) fn format_ffmpeg_headers(headers: &HashMap<String, String>) -> Option
     }
 
     Some(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_policy_only_allows_bundled_resources() {
+        assert_eq!(runtime_source_policy(false), vec![RuntimeSource::Bundled]);
+    }
+
+    #[test]
+    fn development_policy_keeps_ergonomic_fallback_order() {
+        assert_eq!(
+            runtime_source_policy(true),
+            vec![
+                RuntimeSource::System,
+                RuntimeSource::Bundled,
+                RuntimeSource::Workspace,
+            ]
+        );
+    }
+
+    #[test]
+    fn bundled_resource_paths_must_be_strictly_relative() {
+        assert!(is_safe_resource_path(Path::new("bin/node")));
+        assert!(is_safe_resource_path(Path::new("sidecar/dist/index.cjs")));
+        assert!(!is_safe_resource_path(Path::new("../node")));
+        assert!(!is_safe_resource_path(Path::new("bin/../node")));
+        assert!(!is_safe_resource_path(Path::new("")));
+        assert!(!is_safe_resource_path(Path::new("/tmp/node")));
+    }
 }

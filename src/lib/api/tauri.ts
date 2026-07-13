@@ -59,6 +59,7 @@ const defaultPlaybackState: PlaybackState = {
 	current_artist: null,
 	current_album_art: null,
 	current_source_url: null,
+	current_station_id: null,
 	position_ms: 0,
 	duration_ms: 0,
 	volume: 1,
@@ -334,17 +335,8 @@ export const cancelDownload = (downloadId: string) =>
 	safeInvoke('cancel_download', { downloadId });
 export const deleteDownload = (downloadId: string) =>
 	safeInvoke('delete_download', { downloadId });
-export const revealDownloadPath = (path: string) =>
-	safeInvoke('reveal_download_path', { path });
-
-export async function openPath(path: string): Promise<void> {
-	if (!hasTauriRuntime()) {
-		return desktopOnly();
-	}
-
-	const { open } = await import('@tauri-apps/plugin-shell');
-	await open(path);
-}
+export const revealDownloadPath = (downloadId: string) =>
+	safeInvoke('reveal_download_path', { downloadId });
 
 // Stations
 export interface RadioBrowserStation {
@@ -371,7 +363,6 @@ export const saveStation = (
 	name: string,
 	url: string,
 	homepage?: string,
-	faviconUrl?: string,
 	country?: string,
 	language?: string,
 	tags?: string,
@@ -383,7 +374,7 @@ export const saveStation = (
 		name,
 		url,
 		homepage,
-		faviconUrl,
+		faviconUrl: null,
 		country,
 		language,
 		tags,
@@ -401,15 +392,15 @@ export const verifyStationUrls = (urls: string[]) =>
 export const toggleStationFavorite = (stationId: string) =>
 	safeInvoke<boolean>('toggle_station_favorite', { stationId });
 
-export const playStation = (stationId: string, url: string, name: string, favicon?: string) =>
-	safeInvoke('play_station', { stationId, url, name, favicon });
+export const playStation = (stationId: string, url: string, name: string) =>
+	safeInvoke('play_station', { stationId, url, name, favicon: null });
 
 export const playStationSearchResult = (station: RadioBrowserStation) =>
-	safeInvoke('play_station_search_result', {
+	safeInvoke<string>('play_station_search_result', {
 		name: station.name,
 		url: station.url,
 		homepage: station.homepage,
-		favicon: station.favicon,
+		favicon: null,
 		country: station.country,
 		language: station.language,
 		tags: station.tags,
