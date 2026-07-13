@@ -4,6 +4,7 @@
 //! station's permanent radio-browser UUID before being declared unhealthy.
 
 use super::directory::resolve_station_urls_by_uuid;
+use super::network::MAX_STATION_URL_BYTES;
 use super::probe::probe_station_stream;
 use crate::db::models::Station;
 use crate::db::{queries, DbPool};
@@ -13,6 +14,8 @@ use tokio::task::JoinSet;
 
 const STATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const STATION_RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const MAX_STATION_VERIFY_URLS: usize = 100;
+const MAX_CONCURRENT_STATION_PROBES: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationHealthResult {
@@ -41,7 +44,9 @@ pub(crate) fn build_station_health_client() -> Result<reqwest::Client, String> {
         .timeout(STATION_PROBE_TIMEOUT)
         .connect_timeout(STATION_PROBE_TIMEOUT)
         .user_agent("mewsik/0.1.0")
-        .redirect(reqwest::redirect::Policy::limited(5))
+        // Probe and directory requests handle redirects manually so every
+        // hop can be resolved, classified and DNS-pinned before it is sent.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| format!("Failed to build station health client: {}", e))
 }
@@ -79,7 +84,8 @@ async fn probe_station_targets(
     targets: Vec<StationVerifyTarget>,
 ) -> Result<Vec<(StationVerifyTarget, Option<String>)>, String> {
     let mut probes = JoinSet::new();
-    for target in targets {
+    let mut remaining = targets.into_iter();
+    for target in remaining.by_ref().take(MAX_CONCURRENT_STATION_PROBES) {
         let client = client.clone();
         probes.spawn(async move {
             let playable_url = probe_station_stream(&client, &target.url).await;
@@ -90,17 +96,33 @@ async fn probe_station_targets(
     let mut results = Vec::new();
     while let Some(result) = probes.join_next().await {
         results.push(result.map_err(|err| format!("Station verification task failed: {}", err))?);
+        if let Some(target) = remaining.next() {
+            let client = client.clone();
+            probes.spawn(async move {
+                let playable_url = probe_station_stream(&client, &target.url).await;
+                (target, playable_url)
+            });
+        }
     }
 
     Ok(results)
 }
 
-pub(crate) async fn verify_station_urls_inner(
-    urls: Vec<String>,
-) -> Result<Vec<StationHealthResult>, String> {
+fn prepare_verify_targets(urls: Vec<String>) -> Result<Vec<StationVerifyTarget>, String> {
+    if urls.len() > MAX_STATION_VERIFY_URLS {
+        return Err(format!(
+            "Too many station URLs: the maximum is {MAX_STATION_VERIFY_URLS}"
+        ));
+    }
+
     let mut deduped = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for url in urls {
+        if url.len() > MAX_STATION_URL_BYTES {
+            return Err(format!(
+                "Station URL is too long (maximum {MAX_STATION_URL_BYTES} bytes)"
+            ));
+        }
         let trimmed = url.trim();
         if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
             continue;
@@ -110,6 +132,13 @@ pub(crate) async fn verify_station_urls_inner(
             url: trimmed.to_string(),
         });
     }
+    Ok(deduped)
+}
+
+pub(crate) async fn verify_station_urls_inner(
+    urls: Vec<String>,
+) -> Result<Vec<StationHealthResult>, String> {
+    let deduped = prepare_verify_targets(urls)?;
 
     if deduped.is_empty() {
         return Ok(Vec::new());
@@ -213,4 +242,47 @@ pub(crate) fn spawn_favorite_station_health_check(db: DbPool) {
             tokio::time::sleep(STATION_RECHECK_INTERVAL).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_targets_are_trimmed_deduplicated_and_bounded() {
+        let targets = prepare_verify_targets(vec![
+            " https://example.com/one ".to_string(),
+            "".to_string(),
+            "https://example.com/one".to_string(),
+            "https://example.com/two".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].url, "https://example.com/one");
+        assert_eq!(targets[1].url, "https://example.com/two");
+
+        let oversized = vec!["https://example.com".to_string(); MAX_STATION_VERIFY_URLS + 1];
+        assert!(prepare_verify_targets(oversized).is_err());
+
+        let oversized_url = vec![format!(
+            "https://example.com/{}",
+            "a".repeat(MAX_STATION_URL_BYTES)
+        )];
+        assert!(prepare_verify_targets(oversized_url).is_err());
+    }
+
+    #[tokio::test]
+    async fn private_targets_fail_without_opening_network_connections() {
+        let client = build_station_health_client().unwrap();
+        let targets = (0..(MAX_CONCURRENT_STATION_PROBES * 3))
+            .map(|index| StationVerifyTarget {
+                station_id: Some(index.to_string()),
+                url: format!("http://127.0.0.1:{}/stream", 8000 + index),
+            })
+            .collect();
+
+        let results = probe_station_targets(&client, targets).await.unwrap();
+        assert_eq!(results.len(), MAX_CONCURRENT_STATION_PROBES * 3);
+        assert!(results.iter().all(|(_, playable)| playable.is_none()));
+    }
 }

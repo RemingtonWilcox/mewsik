@@ -4,6 +4,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::network::{
+    parse_public_http_url, send_public_get_following_redirects, MAX_PUBLIC_REDIRECTS,
+};
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RadioBrowserStation {
     pub name: String,
@@ -32,16 +36,19 @@ const RADIO_BROWSER_SERVERS: [&str; 3] = [
 
 /// GET from the radio-browser directory with mirror failover.
 pub(crate) async fn radio_browser_get(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     path_and_query: &str,
 ) -> Option<reqwest::Response> {
     for server in RADIO_BROWSER_SERVERS {
-        match client
-            .get(format!("{}{}", server, path_and_query))
-            .send()
-            .await
+        let url = parse_public_http_url(&format!("{}{}", server, path_and_query)).ok()?;
+        match send_public_get_following_redirects(
+            &url,
+            reqwest::header::HeaderMap::new(),
+            MAX_PUBLIC_REDIRECTS,
+        )
+        .await
         {
-            Ok(response) if response.status().is_success() => return Some(response),
+            Ok((response, _)) if response.status().is_success() => return Some(response),
             _ => continue,
         }
     }
@@ -75,7 +82,10 @@ pub(crate) async fn resolve_station_urls_by_uuid(
 
     let mut candidates = Vec::new();
     for value in [station.url_resolved, station.url] {
-        if let Some(trimmed) = value.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) {
+        if let Some(trimmed) = value
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
             if !candidates.contains(&trimmed) {
                 candidates.push(trimmed);
             }

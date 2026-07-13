@@ -270,21 +270,24 @@ fn spawn_download_worker(
         .spawn(move || {
             use std::io::Read as _;
 
-            let mut builder =
-                reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(10));
-            if !is_live {
-                builder = builder.timeout(Duration::from_secs(120));
-            }
-
-            let client = match builder.build() {
-                Ok(client) => client,
-                Err(err) => {
-                    shared.fail(format!("Failed to build streaming client: {}", err));
-                    let _ = event_tx.send(AudioEvent::Error(format!(
-                        "{} failed before playback: {}",
-                        label, err
-                    )));
-                    return;
+            let client = if is_live {
+                None
+            } else {
+                match reqwest::blocking::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(120))
+                    .build()
+                    .map_err(|err| format!("Failed to build streaming client: {err}"))
+                {
+                    Ok(client) => Some(client),
+                    Err(err) => {
+                        shared.fail(err.clone());
+                        let _ = event_tx.send(AudioEvent::Error(format!(
+                            "{} failed before playback: {}",
+                            label, err
+                        )));
+                        return;
+                    }
                 }
             };
 
@@ -316,8 +319,21 @@ fn spawn_download_worker(
                 };
 
                 let requested_bytes = range.map(|(start, end)| end.saturating_sub(start) + 1);
-                let mut response = match open_http_response(&client, &url, &headers, is_live, range)
-                {
+                let response_result = if is_live {
+                    // Resolve, classify and pin every hop in the actual radio
+                    // connection. Ordinary direct streams therefore do not
+                    // need a separate throwaway content probe first.
+                    crate::stations::network::open_blocking_public_stream(&url, &headers)
+                } else {
+                    open_http_response(
+                        client.as_ref().expect("non-live client exists"),
+                        &url,
+                        &headers,
+                        false,
+                        range,
+                    )
+                };
+                let mut response = match response_result {
                     Ok(response) => response,
                     Err(err) => {
                         shared.fail(err.clone());

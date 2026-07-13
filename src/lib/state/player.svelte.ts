@@ -11,6 +11,7 @@ const defaultState: PlaybackState = {
 	current_artist: null,
 	current_album_art: null,
 	current_source_url: null,
+	current_station_id: null,
 	position_ms: 0,
 	duration_ms: 0,
 	volume: 1.0,

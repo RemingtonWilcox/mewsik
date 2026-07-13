@@ -173,6 +173,7 @@ export interface PlaybackState {
 	current_artist: string | null;
 	current_album_art: string | null;
 	current_source_url: string | null;
+	current_station_id: string | null;
 	position_ms: number;
 	duration_ms: number;
 	volume: number;
