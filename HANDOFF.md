@@ -96,7 +96,8 @@ The current analyzer exposes mono spectral features rather than raw stereo sampl
 
 The product surfaces were rebuilt around explicit jobs instead of overlapping dashboards.
 
-- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial. Official Last.fm and YouTube signals activate only when their optional API keys are configured; the UI reports them as unavailable rather than inventing data.
+- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial. Official Last.fm and YouTube signals activate only when developer/runtime keys are configured; listeners are not expected to provide them, and the UI reports missing signals as unavailable rather than inventing data.
+- Cold Search and Discover loads now show an accessible staged status panel with real elapsed time and an indeterminate progress bar. Apple territories refresh concurrently and remain deterministically ordered, reducing their worst-case cold delay from four serial request windows to one.
 - Every source has bounded requests, a declared refresh cadence, typed track/release/editorial records, stable provider IDs, and separately stored listeners, plays, views, and likes. A stale Bandcamp feed is rejected instead of presented as current.
 - Source cadences are enforced independently: a one-hour YouTube refresh does not re-fetch daily ListenBrainz releases or four-hour Apple charts. Missing Apple territories can be filled from their own recent saved frame without relabeling the partial response as complete.
 - Canonical entities, external IDs, source observations, snapshots, and interaction events live in dedicated SQLite tables. External-ID collisions fail atomically instead of silently merging unrelated music.

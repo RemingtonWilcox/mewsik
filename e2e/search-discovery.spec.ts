@@ -4,11 +4,12 @@ type SearchMockScenario = 'success' | 'fail-once' | 'partial-then-fail' | 'multi
 
 interface SearchMockOptions {
 	discoveryPick?: 'daft-punk' | 'ella-langley';
+	discoveryDelayMs?: number;
 	scenario?: SearchMockScenario;
 }
 
 async function installTauriSearchMock(page: Page, options: SearchMockOptions = {}) {
-	await page.addInitScript(({ discoveryPick, scenario }) => {
+	await page.addInitScript(({ discoveryDelayMs, discoveryPick, scenario }) => {
 		type MockInvocation = { command: string; args: Record<string, unknown> };
 		const runtimeWindow = window as Window & { __MEWSIK_TEST_INVOCATIONS__?: MockInvocation[] };
 		runtimeWindow.__MEWSIK_TEST_INVOCATIONS__ = [];
@@ -109,6 +110,9 @@ async function installTauriSearchMock(page: Page, options: SearchMockOptions = {
 				if (command === 'plugin:event|unlisten') return null;
 				if (command === 'get_playback_state') return playbackState;
 				if (command === 'get_search_discovery_feed') {
+					if (discoveryDelayMs > 0) {
+						await new Promise((resolve) => window.setTimeout(resolve, discoveryDelayMs));
+					}
 					return {
 						snapshot_id: 'snapshot-v2-search',
 						generated_at: 1,
@@ -246,10 +250,35 @@ async function installTauriSearchMock(page: Page, options: SearchMockOptions = {
 			}
 		};
 	}, {
+		discoveryDelayMs: options.discoveryDelayMs ?? 0,
 		discoveryPick: options.discoveryPick ?? 'daft-punk',
 		scenario: options.scenario ?? 'success'
 	});
 }
+
+test('a slow first discovery refresh shows honest staged progress and elapsed time', async ({ page }) => {
+	await installTauriSearchMock(page, { discoveryDelayMs: 5_000 });
+	await page.goto('/search');
+
+	const loadingStatus = page.getByTestId('discovery-loading-status');
+	await expect(loadingStatus).toBeVisible({ timeout: 15_000 });
+	await expect(loadingStatus).toContainText('Checking saved discovery');
+	await expect(loadingStatus).toContainText('Looking for a recent snapshot');
+
+	const progress = loadingStatus.getByRole('progressbar', { name: 'Loading discovery sources' });
+	await expect(progress).toBeVisible();
+	expect(await progress.getAttribute('aria-valuenow')).toBeNull();
+	await expect(loadingStatus).not.toContainText('%');
+
+	await expect(loadingStatus).toContainText('Loading discovery sources', { timeout: 4_500 });
+	await expect(loadingStatus).toContainText(
+		'Combining recent saved snapshots with any Apple Music, ListenBrainz, and Bandcamp updates that are due.'
+	);
+	await expect(page.getByTestId('discovery-loading-elapsed')).toContainText(/[2-4]s/);
+
+	await expect(page.getByRole('heading', { name: 'Top now' })).toBeVisible({ timeout: 5_000 });
+	await expect(loadingStatus).toBeHidden();
+});
 
 test('a chart pick runs a real provider search and renders its result', async ({ page }) => {
 	await installTauriSearchMock(page);

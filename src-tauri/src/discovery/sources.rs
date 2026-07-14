@@ -404,10 +404,33 @@ pub async fn fetch_apple_charts(
         ));
     }
 
-    let mut items = Vec::new();
+    // Markets are independent public feeds. Fetch them concurrently so one
+    // slow territory cannot turn the first discovery load into four serial
+    // request timeouts. Preserve configured market order after the joins so
+    // downstream ranking and snapshots remain deterministic.
+    let mut requests = tokio::task::JoinSet::new();
+    for (index, market) in markets.iter().cloned().enumerate() {
+        let client = client.clone();
+        let request_now = now;
+        requests.spawn(async move {
+            let result = fetch_apple_market(&client, &market, limit, request_now).await;
+            (index, market, result)
+        });
+    }
+
+    let mut market_results = Vec::with_capacity(markets.len());
     let mut failures = Vec::new();
-    for market in markets {
-        match fetch_apple_market(client, market, limit, now).await {
+    while let Some(result) = requests.join_next().await {
+        match result {
+            Ok(result) => market_results.push(result),
+            Err(error) => failures.push(format!("Apple market worker failed: {error}")),
+        }
+    }
+    market_results.sort_by_key(|(index, _, _)| *index);
+
+    let mut items = Vec::new();
+    for (_, market, result) in market_results {
+        match result {
             Ok(mut market_items) => items.append(&mut market_items),
             Err(error) => failures.push(format!("{}: {error}", market.to_uppercase())),
         }

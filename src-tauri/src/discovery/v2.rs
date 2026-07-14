@@ -500,8 +500,9 @@ fn build_source_statuses(
                     .get(spec.id)
                     .map(|message| (*message).to_string())
                     .or_else(|| {
-                        (skipped.contains(spec.id) || spec.optional)
-                            .then(|| "Optional API key is not configured".to_string())
+                        (skipped.contains(spec.id) || spec.optional).then(|| {
+                            "Not enabled in this build; no listener setup is required".to_string()
+                        })
                     });
                 DiscoverySourceStatus {
                     id: spec.id.to_string(),

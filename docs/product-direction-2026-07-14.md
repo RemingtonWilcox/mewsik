@@ -84,6 +84,7 @@ Queue planning must therefore move into the backend instead of introducing a sec
 - Personal Discover is primarily deterministic and library/listening-history driven: rotation, rediscovery, affinities, unfinished exploration, and useful bridges beyond the library.
 - Internet trend data may seed exploration or autoplay candidates, but should not masquerade as a deeply personalized black-box feed.
 - Every recommendation needs an inspectable reason and honest source freshness.
+- Installed apps must not contain shared provider secrets or require ordinary listeners to create developer accounts. Public discovery should move behind one credentialed, cadence-aware mewsik snapshot service; see [Discovery provider strategy](discovery-provider-strategy-2026-07-14.md).
 
 ## Track D: visualizer evolution
 
