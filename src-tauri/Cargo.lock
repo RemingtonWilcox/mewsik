@@ -2475,6 +2475,7 @@ dependencies = [
  "lofty",
  "log",
  "parking_lot",
+ "quick-xml",
  "rand 0.8.5",
  "realfft",
  "reqwest 0.12.28",

@@ -2,15 +2,20 @@ import { expect, test, type Page } from '@playwright/test';
 
 async function installDiscoveryProfileRuntime(page: Page) {
 	await page.addInitScript(() => {
+		type DiscoveryInvocation = { command: string; args: Record<string, unknown> };
 		const runtimeWindow = window as Window & {
 			__DISCOVERY_PROFILE_READY__?: boolean;
+			__DISCOVERY_FEED_FAIL__?: boolean;
+			__DISCOVERY_INVOCATIONS__?: DiscoveryInvocation[];
 			__TAURI_INTERNALS__?: {
-				invoke: (command: string) => Promise<unknown>;
+				invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
 				transformCallback: () => number;
 				unregisterCallback: () => void;
 			};
 		};
 		runtimeWindow.__DISCOVERY_PROFILE_READY__ = false;
+		runtimeWindow.__DISCOVERY_FEED_FAIL__ = false;
+		runtimeWindow.__DISCOVERY_INVOCATIONS__ = [];
 		const track = {
 			id: 'saved-track',
 			title: 'Saved Track',
@@ -45,7 +50,8 @@ async function installDiscoveryProfileRuntime(page: Page) {
 			source: null
 		};
 		runtimeWindow.__TAURI_INTERNALS__ = {
-			invoke: async (command) => {
+			invoke: async (command, args = {}) => {
+				runtimeWindow.__DISCOVERY_INVOCATIONS__?.push({ command, args });
 				switch (command) {
 					case 'get_daily_mix':
 					case 'get_recently_played':
@@ -63,11 +69,18 @@ async function installDiscoveryProfileRuntime(page: Page) {
 							profile_ready: runtimeWindow.__DISCOVERY_PROFILE_READY__
 						};
 					case 'get_search_discovery_feed':
+						if (runtimeWindow.__DISCOVERY_FEED_FAIL__ && args.force === true) {
+							throw new Error('simulated refresh failure');
+						}
 						return {
+							snapshot_id: 'snapshot-v2-discover',
 							generated_at: 0,
 							source: 'Test picks',
 							is_stale: false,
 							is_fallback: true,
+							has_history: false,
+							next_refresh_at: null,
+							source_statuses: [],
 							sections: []
 						};
 					case 'get_playback_state':
@@ -100,13 +113,13 @@ test.describe('Discover and Settings fallback experience', () => {
 		);
 
 		await expect(page.getByText('Beyond your library', { exact: true })).toBeVisible();
-		for (const section of ['editorial-starts', 'editorial-detours', 'editorial-rabbit-holes']) {
+		for (const section of ['fallback-starts', 'fallback-detours', 'fallback-rabbit-holes']) {
 			const shelf = page.getByTestId(`discovery-section-${section}`);
 			await expect(shelf).toBeVisible();
 			await expect(shelf.getByTestId(`discovery-card-${section}`).first()).toBeVisible();
 		}
 
-		await page.getByTestId('discovery-card-editorial-starts').first().click();
+		await page.getByTestId('discovery-card-fallback-starts').first().click();
 		await expect.poll(() => new URL(page.url()).pathname).toBe('/search');
 		expect(new URL(page.url()).searchParams.get('q')).toBe('Daft Punk One More Time');
 	});
@@ -115,14 +128,38 @@ test.describe('Discover and Settings fallback experience', () => {
 		await installDiscoveryProfileRuntime(page);
 		await page.goto('/discover');
 
-		await expect(page.getByText('Learning your rotation', { exact: true })).toBeVisible();
+		await expect(page.getByText('Learning your rotation', { exact: true })).toBeVisible({
+			timeout: 15_000
+		});
 		await expect(page.getByText(/5\/5 different tracks played/)).toBeVisible();
 
 		await page.evaluate(() => {
-			(window as Window & { __DISCOVERY_PROFILE_READY__?: boolean }).__DISCOVERY_PROFILE_READY__ = true;
+			const runtimeWindow = window as Window & {
+				__DISCOVERY_PROFILE_READY__?: boolean;
+				__DISCOVERY_FEED_FAIL__?: boolean;
+			};
+			runtimeWindow.__DISCOVERY_PROFILE_READY__ = true;
+			runtimeWindow.__DISCOVERY_FEED_FAIL__ = true;
 		});
 		await page.getByRole('button', { name: 'Refresh' }).click();
 		await expect(page.getByText('Your rotation is active', { exact: true })).toBeVisible();
+		await expect(page.getByText('Test picks', { exact: true })).toBeVisible();
+		await expect(page.getByText(/previous picks are still shown/)).toBeVisible();
+		await expect
+			.poll(() =>
+				page.evaluate(() => {
+					const calls = (window as Window & {
+						__DISCOVERY_INVOCATIONS__?: Array<{
+							command: string;
+							args: Record<string, unknown>;
+						}>;
+					}).__DISCOVERY_INVOCATIONS__ ?? [];
+					return calls
+						.filter(({ command }) => command === 'get_search_discovery_feed')
+						.map(({ args }) => args.force);
+				})
+			)
+			.toEqual([false, true]);
 	});
 
 	test('Settings exposes the library summary and keeps repair tools out of the way', async ({ page }) => {

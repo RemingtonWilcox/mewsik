@@ -152,10 +152,8 @@ pub fn segment(features: &FrameFeatures) -> (Vec<Section>, Vec<DropEvent>) {
         } else {
             // Rising internal slope reads as a build into the next section.
             let third = ((hi - lo) / 3).max(1);
-            let head: f32 =
-                sec_rms[lo..lo + third].iter().sum::<f32>() / third as f32;
-            let tail: f32 =
-                sec_rms[hi - third..hi].iter().sum::<f32>() / third as f32;
+            let head: f32 = sec_rms[lo..lo + third].iter().sum::<f32>() / third as f32;
+            let tail: f32 = sec_rms[hi - third..hi].iter().sum::<f32>() / third as f32;
             if tail > head * 1.35 {
                 "build"
             } else {
@@ -217,9 +215,15 @@ mod tests {
     #[test]
     fn finds_the_loud_section_and_drop() {
         let (sections, drops) = segment(&synthetic());
-        assert!(sections.len() >= 3, "expected >=3 sections, got {}", sections.len());
         assert!(
-            sections.iter().any(|s| s.label == "drop" || s.label == "chorus"),
+            sections.len() >= 3,
+            "expected >=3 sections, got {}",
+            sections.len()
+        );
+        assert!(
+            sections
+                .iter()
+                .any(|s| s.label == "drop" || s.label == "chorus"),
             "no high-energy section found: {:?}",
             sections.iter().map(|s| s.label.clone()).collect::<Vec<_>>()
         );

@@ -2,6 +2,9 @@ import { expect, test, type Page } from '@playwright/test';
 
 async function installTauriSearchMock(page: Page) {
 	await page.addInitScript(() => {
+		type MockInvocation = { command: string; args: Record<string, unknown> };
+		const runtimeWindow = window as Window & { __MEWSIK_TEST_INVOCATIONS__?: MockInvocation[] };
+		runtimeWindow.__MEWSIK_TEST_INVOCATIONS__ = [];
 		const callbacks = new Map<number, (payload: unknown) => void>();
 		let nextCallbackId = 1;
 		const playbackState = {
@@ -23,6 +26,7 @@ async function installTauriSearchMock(page: Page) {
 		};
 		const discoveryItem = {
 			id: 'apple-1',
+			item_kind: 'track',
 			title: 'One More Time',
 			artist: 'Daft Punk',
 			album: null,
@@ -31,35 +35,66 @@ async function installTauriSearchMock(page: Page) {
 			listen_count: null,
 			rank: 1,
 			momentum: null,
-			context: 'U.S. chart'
+			context: 'Apple Music chart',
+			reason: '#1 Apple US',
+			source_labels: ['Apple Music'],
+			release_date: null,
+			audience_delta: null,
+			audience_label: null
 		};
 
 		(window as any).__TAURI_INTERNALS__ = {
 			invoke: async (command: string, args: Record<string, unknown> = {}) => {
+				runtimeWindow.__MEWSIK_TEST_INVOCATIONS__?.push({ command, args });
 				if (command === 'get_playback_state') return playbackState;
 				if (command === 'get_search_discovery_feed') {
 					return {
+						snapshot_id: 'snapshot-v2-search',
 						generated_at: 1,
-						source: 'Apple Music charts (U.S.) + Mewsik editorial',
+						source: 'Apple Music + ListenBrainz + Bandcamp Daily',
 						is_stale: false,
 						is_fallback: false,
+						has_history: false,
+						next_refresh_at: 61,
+						source_statuses: [
+							{
+								id: 'apple',
+								label: 'Apple Music',
+								state: 'live',
+								updated_at: 1,
+								detail: 'Public charts'
+							},
+							{
+								id: 'listenbrainz',
+								label: 'ListenBrainz',
+								state: 'live',
+								updated_at: 1,
+								detail: 'Fresh releases'
+							}
+						],
 						sections: [
 							{
-								id: 'us-top',
-								title: 'Top songs in the U.S.',
-								subtitle: 'Apple Music public chart, one song per artist',
+								id: 'top-now',
+								kind: 'top_now',
+								personalized: false,
+								title: 'Top now',
+								subtitle: 'What is landing across current public charts',
 								items: [discoveryItem]
 							},
 							{
-								id: 'world',
-								title: 'Around the world',
-								subtitle: 'Apple Music charts in the United Kingdom, Japan, and Brazil',
+								id: 'new-and-worth-a-look',
+								kind: 'new_and_rising',
+								personalized: false,
+								title: 'New and worth a look',
+								subtitle: 'Recent releases with a real signal behind them',
 								items: []
 							},
 							{
-								id: 'editorial',
-								title: 'Reliable rabbit holes',
-								subtitle: 'Mewsik editorial; not personalized',
+								id: 'editors-found-this',
+								kind: 'editors_found',
+								personalized: false,
+								title: 'Editors found this',
+								subtitle: 'Current trails from Bandcamp Daily',
 								items: []
 							}
 						]
@@ -85,6 +120,7 @@ async function installTauriSearchMock(page: Page) {
 						}
 					];
 				}
+				if (command === 'record_discovery_event') return null;
 				if (command === 'start_sidecar' || command.startsWith('plugin:event|')) return null;
 				return [];
 			},
@@ -108,11 +144,13 @@ test('a chart pick runs a real provider search and renders its result', async ({
 	const input = page.getByPlaceholder('Search songs, artists...');
 	await expect(input).toBeVisible({ timeout: 15_000 });
 	await expect(page.getByTestId('search-discovery-feed')).toBeVisible();
-	await expect(page.getByRole('heading', { name: 'Top songs in the U.S.' })).toBeVisible();
-	await expect(page.getByRole('heading', { name: 'Around the world' })).toBeVisible();
-	await expect(page.getByRole('heading', { name: 'Reliable rabbit holes' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Top now' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'New and worth a look' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Editors found this' })).toBeVisible();
+	await expect(page.getByText('#1 Apple US', { exact: true })).toBeVisible();
+	await expect(page.getByText('2 live signals', { exact: true })).toBeVisible();
 
-	const pick = page.getByTestId('discovery-card-us-top').first();
+	const pick = page.getByTestId('discovery-card-top-now').first();
 	await expect(pick).toHaveAccessibleName('Search for One More Time by Daft Punk');
 	await pick.click();
 
@@ -120,6 +158,35 @@ test('a chart pick runs a real provider search and renders its result', async ({
 	await expect(page.getByTestId('search-discovery-feed')).toBeHidden();
 	await expect(page.getByText('One More Time', { exact: true })).toBeVisible();
 	await expect(page.getByText(/No results for/)).toBeHidden();
+	await expect
+		.poll(() =>
+			page.evaluate(() => {
+				const invocations = (window as Window & {
+					__MEWSIK_TEST_INVOCATIONS__?: Array<{
+						command: string;
+						args: Record<string, unknown>;
+					}>;
+				}).__MEWSIK_TEST_INVOCATIONS__ ?? [];
+				return invocations
+					.filter(({ command }) => command === 'record_discovery_event' || command === 'search_all_sources')
+					.map(({ command, args }) => ({ command, args }));
+			})
+		)
+		.toEqual([
+			{
+				command: 'record_discovery_event',
+				args: {
+					itemId: 'apple-1',
+					eventType: 'click',
+					sectionId: 'top-now',
+					snapshotId: 'snapshot-v2-search'
+				}
+			},
+			{
+				command: 'search_all_sources',
+				args: { query: 'Daft Punk One More Time' }
+			}
+		]);
 });
 
 test('a q URL auto-runs once and opens directly on real results', async ({ page }) => {
@@ -131,4 +198,14 @@ test('a q URL auto-runs once and opens directly on real results', async ({ page 
 	);
 	await expect(page.getByText('Weird Fishes / Arpeggi', { exact: true })).toBeVisible();
 	await expect(page.getByText(/No results for/)).toBeHidden();
+	await expect
+		.poll(() =>
+			page.evaluate(() => {
+				const invocations = (window as Window & {
+					__MEWSIK_TEST_INVOCATIONS__?: Array<{ command: string }>;
+				}).__MEWSIK_TEST_INVOCATIONS__ ?? [];
+				return invocations.filter(({ command }) => command === 'search_all_sources').length;
+			})
+		)
+		.toBe(1);
 });

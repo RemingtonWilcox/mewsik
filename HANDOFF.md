@@ -1,6 +1,6 @@
-# mewsik visualizer handoff
+# mewsik project handoff
 
-_Last updated: 2026-07-13_
+_Last updated: 2026-07-14_
 
 ## Product direction
 
@@ -17,6 +17,7 @@ The former Mk3 particle plane and layered Runtime were removed. Git history is t
 - Branch: `codex/visualizer-rebuild`
 - Approved pre-shell checkpoint: `ac6886d feat: give Mk2 a musical lifecycle`
 - Approved instrument-shell checkpoint: `881991c feat: unify visualizer instrument controls`
+- Approved project-surface checkpoint: `e6730fa feat: rebuild discovery and product surfaces`
 - Engine order: `mk1 -> mk2 -> signal`
 - Saved `auto`, `runtime`, or unknown selections migrate to `mk1`.
 - Saved `mk3` selections migrate to `signal`.
@@ -95,12 +96,23 @@ The current analyzer exposes mono spectral features rather than raw stereo sampl
 
 The product surfaces were rebuilt around explicit jobs instead of overlapping dashboards.
 
-- Search's live shelves now use Apple's public U.S., U.K., Japan, and Brazil song charts, with a strict one-artist-per-shelf/global cap so one fandom cannot consume the page. The third shelf is clearly labeled Mewsik editorial rather than pretending to be personalized.
-- Apple chart requests have a four-hour cache, response limits, stale recovery, HTTPS artwork validation, and bundled editorial fallbacks. Each card states why it is present.
-- Healthy chart data stays cached for four hours, while stale or fallback data retries after one minute so a brief network failure cannot pin the offline shelf all afternoon.
+- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial. Official Last.fm and YouTube signals activate only when their optional API keys are configured; the UI reports them as unavailable rather than inventing data.
+- Every source has bounded requests, a declared refresh cadence, typed track/release/editorial records, stable provider IDs, and separately stored listeners, plays, views, and likes. A stale Bandcamp feed is rejected instead of presented as current.
+- Source cadences are enforced independently: a one-hour YouTube refresh does not re-fetch daily ListenBrainz releases or four-hour Apple charts. Missing Apple territories can be filled from their own recent saved frame without relabeling the partial response as complete.
+- Canonical entities, external IDs, source observations, snapshots, and interaction events live in dedicated SQLite tables. External-ID collisions fail atomically instead of silently merging unrelated music.
+- Observation history keeps the latest 48 coherent frames per source/scope, interaction events expire after 400 days, and orphaned provider entities are cleaned up so hourly refreshes cannot grow the database forever.
+- Shelves have distinct jobs: **Top now**, **Moving fast**, **New and worth a look**, **For you**, **Outside your bubble**, and **Editors found this**. Personal shelves remain absent until the five-qualified-track profile boundary is met.
+- **Moving fast** is never fabricated on the first sample. It appears only after a saved prior observation proves rank or audience growth. Apple markets count as one source family, so four regional charts cannot fake independent-source agreement.
+- Fresh releases need actual traction, editorial support, or taste affinity; a zero-play release dump cannot fill the page. Entity and lead-artist caps prevent one artist and their collaborations from consuming a shelf, while known group names are preserved.
+- Each card exposes one plain-English reason, such as chart rank, release age, measured movement, or editorial origin. Source health is visible as live, cached, or unavailable, with a persistent snapshot and one-minute forced-refresh guard.
+- Healthy source data stays cached by source cadence, while failed refreshes fall back to recent observations, then the last saved feed, then explicitly labeled static picks. Stale data is never relabeled as live.
 - Selecting a discovery card writes `/search?q=...` and runs the normal YouTube, SoundCloud, and Bandcamp search exactly once. The page keeps its loader visible while providers work, preserves partial results, exposes provider failures with Retry, and only says **No results** after a conclusive completed search.
+- Discovery clicks are recorded with item, shelf, and snapshot IDs for future ranking evaluation. A click remains a click; it is not mislabeled as a save, completed listen, or recommendation success.
 - External search validates queries and provider names, rejects malformed sidecar responses, and no longer converts total provider failure into a fake successful empty result. Incomplete failures are not cached.
-- Discover now has three honest states: useful onboarding with no library, qualified-listen profile progress, and a personal rotation once enough listening exists. Thirty-second plays drive affinity, history, rediscovery, and play statistics; short skips do not tune the profile.
+- Discover now has three honest states: useful onboarding with no library, qualified-listen profile progress, and a personal rotation once enough listening exists. Thirty seconds of actual audible time drives affinity, history, rediscovery, and play statistics; paused time and short skips do not tune the profile.
+- Playback history now separates track length from audible listening time and records why a play ended. Natural end, stop, next/previous, source replacement, errors, and shutdown are finalized distinctly and idempotently; only a natural end is a completion.
+- Playback errors carry their originating session ID, so a late failure from an old asynchronous fetch cannot stop or falsely finalize the newer song that replaced it.
+- Schema migrations and their version markers now commit in one transaction. A crash between `ALTER TABLE` and the marker rolls the schema back cleanly instead of leaving the next launch stuck on a duplicate column.
 - Discover provides a stable local rotation, recent listening, long-unplayed saves, and a permanent **Beyond your library** search-inspiration shelf. Refresh remains deterministic until the listening history actually changes.
 - The learning boundary is canonical end to end: five distinct tracks listened to for at least 30 seconds. Repeating one track five times no longer activates a profile that the UI still calls unfinished.
 - Stations has dedicated **Discover / Favorites / Directory** views. Discover is curated, Favorites is saved radio, and Directory is the global catalog; clearing directory search no longer throws the user back into another view.
@@ -124,7 +136,8 @@ Completed on the combined branch and packaged native release:
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
 - `pnpm test:e2e`: 44/44 pass on a clean Vite server
-- `cargo test --lib`: 69/69 pass, including the process-wide station probe limit under the normal parallel test runner
+- `cargo test --lib`: 98 pass, 0 fail, 2 intentionally ignored live-provider tests
+- Discovery live integration: Apple, ListenBrainz, and Bandcamp Daily refreshed successfully, produced real shelves, and persisted a compatible snapshot
 - Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, material-density floor and differentiated material signatures, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
 - Shared journey: cached-reader idempotence, Mk1 advancement, Signal/Mk2 remount continuity, A -> B -> A reset, pause decay, 60/144 Hz null-cadence invariance, and zero synthetic startup-impact coverage
 - Signal conductor: weak-air selectivity, broadband-detail preservation, phrase-wrap continuity, tempo-relative landing ring-out, drop-to-chorus de-duplication, and live-to-score handoff coverage
@@ -133,10 +146,11 @@ Completed on the combined branch and packaged native release:
 - Legacy engine migration and supported engine roster: covered by Playwright
 - Named rail navigation, retired `V`, response repair/persistence, Flow-neutral response profiles, synchronized player/engine auto-hide, app-surface-only wake behavior, locked manual Hide, interaction holds, and close/reopen state reset: covered by Playwright
 - Stations: dedicated Discover/Favorites/Directory navigation, directory persistence, ranking-specific metrics, saved-state behavior, and compact local health covered by Playwright.
-- Search discovery: all fallback shelves, cover-card rendering, query URL handoff, in-progress loading, real-result rendering, and conclusive no-result handling covered by Playwright.
+- Search discovery: v2 shelf contracts, source status, one-reason cards, click-event payloads, forced refresh, fallback shelves, query URL handoff, in-progress loading, real-result rendering, and conclusive no-result handling covered by Playwright.
 - Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
 - Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
-- Native Windows release rebuilt successfully; the exact new workspace EXE was launched for user visual review (the previous checkpoint had live Liquid DnB inspection across Mk1, Mk2, and Signal)
+- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 14,899,712-byte `.text` code section as the workspace executable and differs by only the expected three-byte Tauri bundle discriminator (`UNK` workspace artifact vs `NSS` installed payload).
+- The real user database migrated to version 7 successfully after a pre-upgrade backup; `PRAGMA quick_check` returned `ok`, and the installed process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
 - Mk2's 60 FPS accumulator was checked at 60, 75, 90, 120, and 144 Hz without the old high-refresh over-rendering bug
@@ -156,9 +170,10 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (20,288,000 bytes): SHA-256 `FA753079F4ED32211B6017F9FED9699D5BD338DF103E3D7B529E02691524D233`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,474,841 bytes): SHA-256 `8E14D87612C55E63BAAC4E0661D8E30CD688B61C14F999D666D4DD0A211D9676`
-- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (71,860,224 bytes): SHA-256 `B81A3AE14CE8491050F74D5B27373C4D489CC521121A462E3A42C92EB73A815D`
+- `src-tauri/target/release/mewsik.exe` (20,988,928 bytes): SHA-256 `43907547A1CA0CE28E7DD789786B929026CC7C9C2B2F97C38C7C301205166D3B`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,685,219 bytes): SHA-256 `1A56DB4CDEFEE74FFB90CB2D485250429B19C6789EDEC5FD592D02D2EE513A8E`
+- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,142,848 bytes): SHA-256 `E4A54F73E0ECE36AC9EDC19CEA34784F3DE417BA45E87448F8D98823E538004C`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (20,988,928 bytes): SHA-256 `77F347C8CC80AA4FB1B890D37286BB403E6EC5991867987A27341039FEBAA5B6`
 
 The executable and both installers are currently unsigned. Code signing remains release-distribution work, not a visualizer merge blocker.
 
@@ -184,7 +199,11 @@ The executable and both installers are currently unsigned. Code signing remains 
 - `src-tauri/src/commands/stations.rs`
 - `src-tauri/src/stations/directory.rs`
 - `src-tauri/src/stations/health.rs`
-- `src-tauri/src/discovery/feed.rs`
+- `src-tauri/src/discovery/v2.rs`
+- `src-tauri/src/discovery/sources.rs`
+- `src-tauri/src/discovery/store.rs`
+- `src-tauri/src/commands/discovery.rs`
+- `src-tauri/src/db/migrations.rs`
 - `src/routes/+layout.svelte`
 - `src/routes/search/+page.svelte`
 - `src/routes/stations/+page.svelte`

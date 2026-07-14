@@ -17,7 +17,8 @@ use audio::AudioEngine;
 use commands::external_search::ExternalSearchRuntime;
 use commands::settings::ConfigState;
 use config::AppConfig;
-use discovery::feed::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
+use discovery::sources::SourceConfig;
+use discovery::v2::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
 use download::DownloadManager;
 use parking_lot::Mutex;
 use sources::{SidecarManager, StreamCache};
@@ -51,11 +52,13 @@ pub fn run() {
     let stream_cache: StreamCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let external_search_runtime = Arc::new(ExternalSearchRuntime::default());
-    let discovery_feed_runtime: SharedDiscoveryFeedRuntime =
-        Arc::new(DiscoveryFeedRuntime::default());
+    let discovery_feed_runtime: SharedDiscoveryFeedRuntime = Arc::new(DiscoveryFeedRuntime::new(
+        db.clone(),
+        SourceConfig::from_env(),
+    ));
     let startup_db = db.clone();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
         .setup(move |app| {
@@ -142,6 +145,7 @@ pub fn run() {
             commands::discovery::get_play_stats,
             commands::discovery::get_recently_played,
             commands::discovery::get_search_discovery_feed,
+            commands::discovery::record_discovery_event,
             // Downloads
             commands::downloads::get_downloads,
             commands::downloads::download_recording,
@@ -164,6 +168,12 @@ pub fn run() {
             commands::stations::play_station,
             commands::stations::play_station_search_result,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            app_handle.state::<Arc<AudioEngine>>().shutdown();
+        }
+    });
 }

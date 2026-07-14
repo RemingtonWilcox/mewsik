@@ -117,7 +117,13 @@ pub struct PlayHistory {
     pub station_id: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
+    /// Length of the media item, when known.
     pub duration_ms: Option<i64>,
+    /// Time that audio was actually playing for this history entry.
+    pub listened_ms: Option<i64>,
+    /// Why playback ended. `None` means the play is still active.
+    pub end_reason: Option<String>,
+    /// True only when the source reached its natural end.
     pub completed: bool,
 }
 

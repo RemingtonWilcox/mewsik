@@ -1,19 +1,23 @@
 <script lang="ts">
 	import type { SearchDiscoveryItem } from '$lib/api/tauri';
+	import * as api from '$lib/api/tauri';
 	import { ArrowUpRight, Search } from '@lucide/svelte';
 
 	let {
 		item,
 		sectionId,
+		snapshotId,
 		onselect
 	}: {
 		item: SearchDiscoveryItem;
 		sectionId: string;
+		snapshotId: string;
 		onselect: (item: SearchDiscoveryItem) => void;
 	} = $props();
 
 	let imageFailed = $state(false);
 	let artworkUrl = $derived(validatedArtworkUrl(item.artwork_url));
+	let why = $derived(item.reason || item.context || item.album);
 
 	function validatedArtworkUrl(value: string | null): string | null {
 		if (!value) return null;
@@ -22,10 +26,16 @@
 			if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')) return null;
 			const isCoverArtArchive =
 				url.hostname === 'coverartarchive.org' &&
-				/^\/release\/[0-9a-f-]{36}\/[0-9]+-250\.jpg$/i.test(url.pathname);
+				(/^\/release\/[0-9a-f-]{36}\/[0-9]+-(250|500)\.jpg$/i.test(url.pathname) ||
+					/^\/release\/[0-9a-f-]{36}\/front-(250|500)$/i.test(url.pathname));
 			const isAppleArtwork =
 				url.hostname === 'mzstatic.com' || url.hostname.endsWith('.mzstatic.com');
-			if (!isCoverArtArchive && !isAppleArtwork) return null;
+			const isYouTubeArtwork =
+				(url.hostname === 'i.ytimg.com' || url.hostname === 'i1.ytimg.com') &&
+				url.pathname.startsWith('/vi/');
+			const isLastFmArtwork = url.hostname === 'lastfm.freetls.fastly.net';
+			const isBandcampArtwork = /^f\d+\.bcbits\.com$/i.test(url.hostname);
+			if (!isCoverArtArchive && !isAppleArtwork && !isYouTubeArtwork && !isLastFmArtwork && !isBandcampArtwork) return null;
 			return url.toString();
 		} catch {
 			return null;
@@ -48,12 +58,17 @@
 			.join('')
 			.toUpperCase();
 	}
+
+	function selectItem() {
+		void api.recordDiscoveryEvent(item.id, 'click', sectionId, snapshotId).catch(() => {});
+		onselect(item);
+	}
 </script>
 
 <button
 	type="button"
-	class="group w-[9.75rem] shrink-0 text-left focus-visible:outline-none"
-	onclick={() => onselect(item)}
+	class="group w-[10.25rem] shrink-0 text-left focus-visible:outline-none"
+	onclick={selectItem}
 	aria-label={`Search for ${item.title} by ${item.artist}`}
 	data-testid={`discovery-card-${sectionId}`}
 >
@@ -92,12 +107,10 @@
 	<div class="mt-2 min-w-0 px-0.5">
 		<p class="truncate text-sm font-medium leading-5 text-foreground transition-colors group-hover:text-primary">{item.title}</p>
 		<p class="truncate text-xs leading-4 text-muted-foreground">{item.artist}</p>
-		{#if item.listen_count}
-			<p class="mt-0.5 text-[10px] text-muted-foreground/70">{compactCount(item.listen_count)} weekly listens</p>
-		{:else if item.album}
-			<p class="mt-0.5 truncate text-[10px] text-muted-foreground/70">{item.album}</p>
-		{:else if item.context}
-			<p class="mt-0.5 truncate text-[10px] text-muted-foreground/70">{item.context}</p>
+		{#if why}
+			<p class="mt-0.5 truncate text-[10px] text-muted-foreground/75" title={why}>{why}</p>
+		{:else if item.listen_count}
+			<p class="mt-0.5 text-[10px] text-muted-foreground/70">{compactCount(item.listen_count)} {item.audience_label || 'audience'}</p>
 		{/if}
 	</div>
 </button>

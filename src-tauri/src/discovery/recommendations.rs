@@ -39,7 +39,7 @@ impl RecommendationEngine {
                         MAX(started_at) AS last_played
                     FROM play_history
                     WHERE recording_id IS NOT NULL
-                      AND COALESCE(duration_ms, 0) >= 30000
+                      AND COALESCE(listened_ms, duration_ms, 0) >= 30000
                       AND started_at > datetime('now', '-90 days')
                     GROUP BY recording_id
                 ),
@@ -52,7 +52,7 @@ impl RecommendationEngine {
                       ON ra.recording_id = ph.recording_id
                      AND ra.role = 'primary'
                     WHERE ph.recording_id IS NOT NULL
-                      AND COALESCE(ph.duration_ms, 0) >= 30000
+                      AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
                       AND ph.started_at > datetime('now', '-45 days')
                     GROUP BY ra.artist_id
                 ),
@@ -63,7 +63,7 @@ impl RecommendationEngine {
                     FROM play_history ph
                     JOIN recordings r ON r.id = ph.recording_id
                     WHERE ph.recording_id IS NOT NULL
-                      AND COALESCE(ph.duration_ms, 0) >= 30000
+                      AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
                       AND ph.started_at > datetime('now', '-45 days')
                       AND r.genre IS NOT NULL
                       AND TRIM(r.genre) <> ''
@@ -81,7 +81,7 @@ impl RecommendationEngine {
                         JOIN play_history ph
                           ON ph.recording_id = rs.recording_id_a
                         WHERE ph.started_at > datetime('now', '-30 days')
-                          AND COALESCE(ph.duration_ms, 0) >= 30000
+                          AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
 
                         UNION ALL
 
@@ -92,7 +92,7 @@ impl RecommendationEngine {
                         JOIN play_history ph
                           ON ph.recording_id = rs.recording_id_b
                         WHERE ph.started_at > datetime('now', '-30 days')
-                          AND COALESCE(ph.duration_ms, 0) >= 30000
+                          AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
                     )
                     GROUP BY recording_id
                 )
@@ -265,7 +265,7 @@ impl RecommendationEngine {
                 LEFT JOIN album_tracks at2 ON at2.recording_id = r.id
                 LEFT JOIN albums al ON al.id = at2.album_id
                 WHERE r.is_in_library = 1
-                  AND COALESCE(ph.duration_ms, 0) >= 30000
+                  AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
                 GROUP BY
                     r.id,
                     r.title,
@@ -363,7 +363,7 @@ impl RecommendationEngine {
                             SELECT 1
                             FROM play_history ph
                             WHERE ph.recording_id = r.id
-                              AND COALESCE(ph.duration_ms, 0) >= 30000
+                              AND COALESCE(ph.listened_ms, ph.duration_ms, 0) >= 30000
                         ) THEN 1
                         ELSE 0
                     END,
@@ -406,7 +406,7 @@ impl RecommendationEngine {
 
         let total_time_ms: i64 = conn
             .query_row(
-                "SELECT COALESCE(SUM(duration_ms), 0) FROM play_history WHERE duration_ms IS NOT NULL",
+                "SELECT COALESCE(SUM(COALESCE(listened_ms, duration_ms, 0)), 0) FROM play_history",
                 [],
                 |row| row.get(0),
             )
@@ -521,7 +521,7 @@ pub struct PlayStats {
 
 fn qualified_recording_count(conn: &Connection) -> i64 {
     conn.query_row(
-        "SELECT COUNT(DISTINCT recording_id) FROM play_history WHERE recording_id IS NOT NULL AND COALESCE(duration_ms, 0) >= ?1",
+        "SELECT COUNT(DISTINCT recording_id) FROM play_history WHERE recording_id IS NOT NULL AND COALESCE(listened_ms, duration_ms, 0) >= ?1",
         params![QUALIFIED_LISTEN_MIN_MS],
         |row| row.get(0),
     )
@@ -641,7 +641,7 @@ mod tests {
     fn record_play(db: &DbPool, play_id: &str, recording_id: &str, duration_ms: i64) {
         db.lock()
             .execute(
-                "INSERT INTO play_history (id, recording_id, source_used, started_at, ended_at, duration_ms, completed) VALUES (?1, ?2, 'local', datetime('now'), datetime('now'), ?3, 1)",
+                "INSERT INTO play_history (id, recording_id, source_used, started_at, ended_at, duration_ms, listened_ms, end_reason, completed) VALUES (?1, ?2, 'local', datetime('now'), datetime('now'), 180000, ?3, 'natural_end', 1)",
                 params![play_id, recording_id, duration_ms],
             )
             .unwrap();

@@ -40,6 +40,7 @@ pub enum AudioCommand {
     Pause,
     Resume,
     Stop,
+    StopForError(u64),
     Seek(u64), // ms
     SetVolume(f32),
     Next,
@@ -70,10 +71,88 @@ enum PlaybackKind {
     Radio,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlayEndReason {
+    NaturalEnd,
+    Stopped,
+    SkippedNext,
+    SkippedPrevious,
+    Restarted,
+    QueueChanged,
+    SourceChanged,
+    PlaybackError,
+    Shutdown,
+    StreamEnded,
+}
+
+impl PlayEndReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NaturalEnd => "natural_end",
+            Self::Stopped => "stopped",
+            Self::SkippedNext => "skipped_next",
+            Self::SkippedPrevious => "skipped_previous",
+            Self::Restarted => "restarted",
+            Self::QueueChanged => "queue_changed",
+            Self::SourceChanged => "source_changed",
+            Self::PlaybackError => "playback_error",
+            Self::Shutdown => "shutdown",
+            Self::StreamEnded => "stream_ended",
+        }
+    }
+}
+
+/// One database history row plus an audible-time clock. Playback position is
+/// deliberately not used as listened time: seeking can jump that position by
+/// minutes without the listener hearing those minutes.
+#[derive(Debug)]
+struct ActivePlay {
+    id: String,
+    duration_ms: Option<i64>,
+    listened_ms: u64,
+    listening_since: Option<Instant>,
+}
+
+impl ActivePlay {
+    fn new(id: String, duration_ms: Option<i64>, is_listening: bool) -> Self {
+        Self {
+            id,
+            duration_ms: duration_ms.map(|value| value.max(0)),
+            listened_ms: 0,
+            listening_since: is_listening.then(Instant::now),
+        }
+    }
+
+    fn set_listening(&mut self, is_listening: bool) {
+        self.accrue();
+        if is_listening {
+            self.listening_since = Some(Instant::now());
+        }
+    }
+
+    fn accrue(&mut self) {
+        if let Some(started_at) = self.listening_since.take() {
+            let elapsed = started_at.elapsed().as_millis();
+            self.listened_ms = self
+                .listened_ms
+                .saturating_add(elapsed.min(u64::MAX as u128) as u64);
+        }
+    }
+
+    fn finish(mut self) -> (String, i64, Option<i64>) {
+        self.accrue();
+        (
+            self.id,
+            self.listened_ms.min(i64::MAX as u64) as i64,
+            self.duration_ms,
+        )
+    }
+}
+
 #[cfg(test)]
 mod play_request_tests {
-    use super::PlayRequestGate;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use super::{ActivePlay, AudioEngine, PlayEndReason, PlayRequestGate};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     #[test]
     fn newer_request_invalidates_older_finish() {
@@ -97,6 +176,51 @@ mod play_request_tests {
         let pending = gate.begin();
         gate.invalidate_and(|| ());
         assert!(gate.finish_if_current(pending, || ()).is_none());
+    }
+
+    #[test]
+    fn audible_clock_excludes_paused_time() {
+        let mut play = ActivePlay::new("play".to_string(), Some(180_000), false);
+        play.listening_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(25));
+        play.set_listening(false);
+        let heard_before_pause = play.listened_ms;
+        play.listening_since = None;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        let (_, listened_ms, duration_ms) = play.finish();
+        assert!(heard_before_pause >= 20);
+        assert_eq!(listened_ms as u64, heard_before_pause);
+        assert_eq!(duration_ms, Some(180_000));
+    }
+
+    #[test]
+    fn early_source_exhaustion_is_not_called_a_natural_end() {
+        assert_eq!(
+            super::AudioEngine::source_exhaustion_reason(20_000, Some(180_000)),
+            PlayEndReason::StreamEnded
+        );
+        assert_eq!(
+            super::AudioEngine::source_exhaustion_reason(176_000, Some(180_000)),
+            PlayEndReason::NaturalEnd
+        );
+        assert_eq!(
+            super::AudioEngine::source_exhaustion_reason(20_000, None),
+            PlayEndReason::NaturalEnd
+        );
+    }
+
+    #[test]
+    fn stale_playback_error_cannot_target_a_newer_session() {
+        let playback_session = AtomicU64::new(41);
+        assert!(AudioEngine::error_session_is_current(&playback_session, 41));
+
+        playback_session.store(42, Ordering::SeqCst);
+        assert!(!AudioEngine::error_session_is_current(
+            &playback_session,
+            41
+        ));
+        assert!(AudioEngine::error_session_is_current(&playback_session, 42));
     }
 }
 
@@ -135,6 +259,7 @@ pub struct AudioEngine {
     queue_items: Arc<Mutex<Vec<QueueItem>>>,
     app_handle: Arc<Mutex<Option<AppHandle>>>,
     play_request_gate: PlayRequestGate,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl AudioEngine {
@@ -149,7 +274,7 @@ impl AudioEngine {
         let app_handle_clone = Arc::clone(&app_handle);
         let loop_cmd_tx = cmd_tx.clone();
 
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("audio-engine".to_string())
             .spawn(move || {
                 Self::run_loop(
@@ -171,6 +296,7 @@ impl AudioEngine {
             queue_items,
             app_handle,
             play_request_gate: PlayRequestGate::default(),
+            worker: Mutex::new(Some(worker)),
         }
     }
 
@@ -186,6 +312,7 @@ impl AudioEngine {
                 | AudioCommand::PlayEntry(..)
                 | AudioCommand::PlayUrl(..)
                 | AudioCommand::Stop
+                | AudioCommand::StopForError(..)
                 | AudioCommand::Next
                 | AudioCommand::Prev
                 | AudioCommand::PlayQueueIndex(..)
@@ -224,6 +351,17 @@ impl AudioEngine {
 
     pub fn get_queue(&self) -> Vec<QueueItem> {
         self.queue_items.lock().clone()
+    }
+
+    /// Flush the active play before application teardown. Joining the worker
+    /// makes the database write deterministic instead of racing process exit.
+    pub fn shutdown(&self) {
+        self.play_request_gate.invalidate_and(|| {
+            let _ = self.cmd_tx.send(AudioCommand::Shutdown);
+        });
+        if let Some(worker) = self.worker.lock().take() {
+            let _ = worker.join();
+        }
     }
 
     fn should_prefer_full_fetch(entry: &QueueEntry) -> bool {
@@ -396,23 +534,33 @@ impl AudioEngine {
         db: &DbPool,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
-        current_play_id: &mut Option<String>,
+        active_play: &mut Option<ActivePlay>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
         desired_playing: bool,
     ) {
         *awaiting_source = false;
         sink.stop();
+        sink.pause();
         sink.append(TappedSource::new(source, tap_tx.clone()));
-        if desired_playing {
-            sink.play();
-        } else {
-            sink.pause();
-        }
         *position_offset_ms = initial_position_ms;
         *current_position_reports_relative = position_reports_relative;
-        *current_play_id =
-            db::queries::record_play(db, Some(&entry.recording_id), Some(&entry.source), None).ok();
+        if active_play.is_none() {
+            *active_play = Self::begin_active_play(
+                db,
+                Some(&entry.recording_id),
+                Some(&entry.source),
+                None,
+                entry.duration_ms,
+                false,
+            );
+        }
+        if desired_playing {
+            sink.play();
+        }
+        if let Some(play) = active_play.as_mut() {
+            play.set_listening(desired_playing);
+        }
         *playback_kind = PlaybackKind::Queue;
 
         let mut s = state.lock();
@@ -445,24 +593,26 @@ impl AudioEngine {
         db: &DbPool,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
-        current_play_id: &mut Option<String>,
+        active_play: &mut Option<ActivePlay>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
         desired_playing: bool,
     ) {
         *awaiting_source = false;
         sink.stop();
+        sink.pause();
         sink.append(TappedSource::new(source, tap_tx.clone()));
-        if desired_playing {
-            sink.play();
-        } else {
-            sink.pause();
-        }
         *position_offset_ms = 0;
         *current_position_reports_relative = false;
-        if current_play_id.is_none() {
-            *current_play_id =
-                db::queries::record_play(db, None, Some("radio"), Some(station_id)).ok();
+        if active_play.is_none() {
+            *active_play =
+                Self::begin_active_play(db, None, Some("radio"), Some(station_id), None, false);
+        }
+        if desired_playing {
+            sink.play();
+        }
+        if let Some(play) = active_play.as_mut() {
+            play.set_listening(desired_playing);
         }
         *playback_kind = PlaybackKind::Radio;
 
@@ -530,7 +680,7 @@ impl AudioEngine {
                         if playback_session.load(Ordering::SeqCst) != session_id {
                             return;
                         }
-                        let _ = cmd_tx.send(AudioCommand::Stop);
+                        let _ = cmd_tx.send(AudioCommand::StopForError(session_id));
                         let _ = event_tx.send(AudioEvent::Error(fetch_err));
                     }
                 }
@@ -549,10 +699,11 @@ impl AudioEngine {
         playback_session: &Arc<AtomicU64>,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
-        current_play_id: &mut Option<String>,
+        active_play: &mut Option<ActivePlay>,
         playback_kind: &mut PlaybackKind,
         awaiting_source: &mut bool,
         desired_playing: &mut bool,
+        replacement_reason: PlayEndReason,
     ) -> Result<(), String> {
         let session_id = Self::reset_playback_session(
             sink,
@@ -560,8 +711,9 @@ impl AudioEngine {
             db,
             position_offset_ms,
             current_position_reports_relative,
-            current_play_id,
+            active_play,
             *awaiting_source,
+            replacement_reason,
         );
         *desired_playing = true;
 
@@ -589,6 +741,7 @@ impl AudioEngine {
             let file = File::open(path).map_err(|e| format!("File open error: {}", e))?;
             let reader = BufReader::new(file);
             let source = Decoder::new(reader).map_err(|e| format!("Decode error: {}", e))?;
+            sink.pause();
             sink.append(TappedSource::new(source, tap_tx.clone()));
         } else if let Some(url) = entry.source_url.as_ref() {
             *awaiting_source = true;
@@ -648,7 +801,7 @@ impl AudioEngine {
                                 if playback_session.load(Ordering::SeqCst) != session_id {
                                     return;
                                 }
-                                let _ = cmd_tx.send(AudioCommand::Stop);
+                                let _ = cmd_tx.send(AudioCommand::StopForError(session_id));
                                 let _ = event_tx.send(AudioEvent::Error(fetch_err));
                             }
                         }
@@ -691,7 +844,7 @@ impl AudioEngine {
                                     if playback_session.load(Ordering::SeqCst) != session_id {
                                         return;
                                     }
-                                    let _ = cmd_tx.send(AudioCommand::Stop);
+                                    let _ = cmd_tx.send(AudioCommand::StopForError(session_id));
                                     let _ = event_tx.send(AudioEvent::Error(fetch_err));
                                 }
                             }
@@ -705,10 +858,19 @@ impl AudioEngine {
             return Err("No playable source for queue entry".to_string());
         }
 
-        sink.play();
         *position_offset_ms = 0;
-        *current_play_id =
-            db::queries::record_play(db, Some(&entry.recording_id), Some(&entry.source), None).ok();
+        *active_play = Self::begin_active_play(
+            db,
+            Some(&entry.recording_id),
+            Some(&entry.source),
+            None,
+            entry.duration_ms,
+            false,
+        );
+        sink.play();
+        if let Some(play) = active_play.as_mut() {
+            play.set_listening(true);
+        }
         *playback_kind = PlaybackKind::Queue;
 
         let mut s = state.lock();
@@ -756,7 +918,7 @@ impl AudioEngine {
         let mut queue = PlayQueue::new();
         let mut position_offset_ms: u64 = 0;
         let mut current_position_reports_relative = false;
-        let mut current_play_id: Option<String> = None;
+        let mut active_play: Option<ActivePlay> = None;
         let mut last_position_update = Instant::now();
         let mut playback_kind = PlaybackKind::Idle;
         let mut awaiting_source = false;
@@ -772,8 +934,9 @@ impl AudioEngine {
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         awaiting_source,
+                        PlayEndReason::SourceChanged,
                     );
                     awaiting_source = false;
                     desired_playing = true;
@@ -783,8 +946,8 @@ impl AudioEngine {
                             match Decoder::new(reader) {
                                 Ok(source) => {
                                     sink.stop();
+                                    sink.pause();
                                     sink.append(TappedSource::new(source, tap_tx.clone()));
-                                    sink.play();
                                     position_offset_ms = 0;
                                     current_position_reports_relative = false;
 
@@ -801,14 +964,22 @@ impl AudioEngine {
                                         ).ok()
                                     };
 
-                                    // Record play history
-                                    current_play_id = db::queries::record_play(
+                                    let track_duration_ms =
+                                        rec.as_ref().and_then(|recording| recording.duration_ms);
+
+                                    // Record play history when audible playback starts.
+                                    active_play = Self::begin_active_play(
                                         &db,
                                         Some(&recording_id),
                                         Some("local"),
                                         None,
-                                    )
-                                    .ok();
+                                        track_duration_ms,
+                                        false,
+                                    );
+                                    sink.play();
+                                    if let Some(play) = active_play.as_mut() {
+                                        play.set_listening(true);
+                                    }
                                     playback_kind = PlaybackKind::Queue;
 
                                     let mut s = state.lock();
@@ -824,9 +995,7 @@ impl AudioEngine {
                                     });
                                     s.current_source_url = None;
                                     s.position_ms = 0;
-                                    s.duration_ms =
-                                        rec.as_ref().and_then(|r| r.duration_ms).unwrap_or(0)
-                                            as u64;
+                                    s.duration_ms = track_duration_ms.unwrap_or(0) as u64;
                                     s.source = Some("local".to_string());
                                     let state_clone = s.clone();
                                     drop(s);
@@ -856,10 +1025,11 @@ impl AudioEngine {
                         &playback_session,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         &mut playback_kind,
                         &mut awaiting_source,
                         &mut desired_playing,
+                        PlayEndReason::QueueChanged,
                     ) {
                         let _ = event_tx.send(AudioEvent::Error(err));
                     }
@@ -878,24 +1048,29 @@ impl AudioEngine {
                     match Self::decode_fetched_audio(&entry, bytes) {
                         Ok((source, can_seek)) => {
                             sink.stop();
+                            sink.pause();
                             sink.append(TappedSource::new(source, tap_tx.clone()));
                             if initial_position_ms > 0 {
                                 let _ = sink.try_seek(Duration::from_millis(initial_position_ms));
                             }
-                            if desired_playing {
-                                sink.play();
-                            } else {
-                                sink.pause();
-                            }
                             position_offset_ms = 0;
                             current_position_reports_relative = false;
-                            current_play_id = db::queries::record_play(
-                                &db,
-                                Some(&entry.recording_id),
-                                Some(&entry.source),
-                                None,
-                            )
-                            .ok();
+                            if active_play.is_none() {
+                                active_play = Self::begin_active_play(
+                                    &db,
+                                    Some(&entry.recording_id),
+                                    Some(&entry.source),
+                                    None,
+                                    entry.duration_ms,
+                                    false,
+                                );
+                            }
+                            if desired_playing {
+                                sink.play();
+                            }
+                            if let Some(play) = active_play.as_mut() {
+                                play.set_listening(desired_playing);
+                            }
                             playback_kind = PlaybackKind::Queue;
 
                             let mut s = state.lock();
@@ -916,6 +1091,7 @@ impl AudioEngine {
                             let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                         }
                         Err(err) => {
+                            let _ = cmd_tx.send(AudioCommand::StopForError(session_id));
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
                     }
@@ -942,7 +1118,7 @@ impl AudioEngine {
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         &mut playback_kind,
                         &mut awaiting_source,
                         desired_playing,
@@ -955,16 +1131,23 @@ impl AudioEngine {
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         awaiting_source,
+                        PlayEndReason::SourceChanged,
                     );
                     queue.clear();
                     Self::sync_queue_state(&queue, &queue_items);
                     playback_kind = PlaybackKind::Radio;
                     awaiting_source = true;
                     desired_playing = true;
-                    current_play_id =
-                        db::queries::record_play(&db, None, Some("radio"), Some(&station_id)).ok();
+                    active_play = Self::begin_active_play(
+                        &db,
+                        None,
+                        Some("radio"),
+                        Some(&station_id),
+                        None,
+                        false,
+                    );
 
                     let url_clone = url.clone();
                     let event_tx_clone = event_tx.clone();
@@ -1026,7 +1209,8 @@ impl AudioEngine {
                                     if playback_session_ref.load(Ordering::SeqCst) != session_id {
                                         return;
                                     }
-                                    let _ = cmd_tx_clone.send(AudioCommand::Stop);
+                                    let _ =
+                                        cmd_tx_clone.send(AudioCommand::StopForError(session_id));
                                     let _ = event_tx_clone.send(AudioEvent::Error(format!(
                                         "Failed to start station stream: {}",
                                         err
@@ -1054,7 +1238,7 @@ impl AudioEngine {
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         &mut playback_kind,
                         &mut awaiting_source,
                         desired_playing,
@@ -1063,6 +1247,9 @@ impl AudioEngine {
                 Ok(AudioCommand::Pause) => {
                     desired_playing = false;
                     sink.pause();
+                    if let Some(play) = active_play.as_mut() {
+                        play.set_listening(false);
+                    }
                     let position_ms = Self::playback_position_ms(
                         &sink,
                         position_offset_ms,
@@ -1088,6 +1275,9 @@ impl AudioEngine {
                         let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     } else if !sink.empty() {
                         sink.play();
+                        if let Some(play) = active_play.as_mut() {
+                            play.set_listening(true);
+                        }
                         let mut s = state.lock();
                         s.is_playing = true;
                         s.is_buffering = false;
@@ -1096,15 +1286,25 @@ impl AudioEngine {
                         let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     }
                 }
-                Ok(AudioCommand::Stop) => {
+                Ok(stop_command @ (AudioCommand::Stop | AudioCommand::StopForError(..))) => {
+                    let end_reason = match stop_command {
+                        AudioCommand::StopForError(session_id) => {
+                            if !Self::error_session_is_current(&playback_session, session_id) {
+                                continue;
+                            }
+                            PlayEndReason::PlaybackError
+                        }
+                        _ => PlayEndReason::Stopped,
+                    };
                     Self::reset_playback_session(
                         &sink,
                         &playback_session,
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         awaiting_source,
+                        end_reason,
                     );
                     awaiting_source = false;
                     desired_playing = false;
@@ -1132,14 +1332,14 @@ impl AudioEngine {
                             let url = entry.source_url.clone().unwrap_or_default();
                             let headers = entry.source_headers.clone();
                             let resume_after_seek = state.lock().is_playing;
-                            let session_id = Self::reset_playback_session(
+                            if let Some(play) = active_play.as_mut() {
+                                play.set_listening(false);
+                            }
+                            let session_id = Self::reset_source_session(
                                 &sink,
                                 &playback_session,
-                                &db,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
-                                &mut current_play_id,
-                                awaiting_source,
                             );
                             awaiting_source = true;
                             desired_playing = resume_after_seek;
@@ -1232,13 +1432,34 @@ impl AudioEngine {
                             &playback_session,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
-                            &mut current_play_id,
+                            &mut active_play,
                             &mut playback_kind,
                             &mut awaiting_source,
                             &mut desired_playing,
+                            PlayEndReason::SkippedNext,
                         ) {
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
+                    } else {
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut active_play,
+                            awaiting_source,
+                            PlayEndReason::SkippedNext,
+                        );
+                        awaiting_source = false;
+                        desired_playing = false;
+                        playback_kind = PlaybackKind::Idle;
+                        let mut s = state.lock();
+                        *s = PlaybackState::default();
+                        s.volume = sink.volume();
+                        let state_clone = s.clone();
+                        drop(s);
+                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     }
                 }
                 Ok(AudioCommand::Prev) => {
@@ -1249,9 +1470,11 @@ impl AudioEngine {
                         current_position_reports_relative,
                         awaiting_source,
                     );
+                    let mut changed_track = false;
                     if pos > 3000 {
                         // Restart current track
                         if let Some(entry) = queue.current() {
+                            changed_track = true;
                             if let Err(err) = Self::play_queue_entry(
                                 &sink,
                                 &tap_tx,
@@ -1263,15 +1486,17 @@ impl AudioEngine {
                                 &playback_session,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
-                                &mut current_play_id,
+                                &mut active_play,
                                 &mut playback_kind,
                                 &mut awaiting_source,
                                 &mut desired_playing,
+                                PlayEndReason::Restarted,
                             ) {
                                 let _ = event_tx.send(AudioEvent::Error(err));
                             }
                         }
                     } else if let Some(entry) = queue.prev().cloned() {
+                        changed_track = true;
                         Self::sync_queue_state(&queue, &queue_items);
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
@@ -1284,13 +1509,40 @@ impl AudioEngine {
                             &playback_session,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
-                            &mut current_play_id,
+                            &mut active_play,
                             &mut playback_kind,
                             &mut awaiting_source,
                             &mut desired_playing,
+                            PlayEndReason::SkippedPrevious,
                         ) {
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
+                    }
+                    if !changed_track {
+                        let end_reason = if pos > 3000 {
+                            PlayEndReason::Restarted
+                        } else {
+                            PlayEndReason::SkippedPrevious
+                        };
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut active_play,
+                            awaiting_source,
+                            end_reason,
+                        );
+                        awaiting_source = false;
+                        desired_playing = false;
+                        playback_kind = PlaybackKind::Idle;
+                        let mut s = state.lock();
+                        *s = PlaybackState::default();
+                        s.volume = sink.volume();
+                        let state_clone = s.clone();
+                        drop(s);
+                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     }
                 }
                 Ok(AudioCommand::SetShuffle(val)) => {
@@ -1338,10 +1590,11 @@ impl AudioEngine {
                             &playback_session,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
-                            &mut current_play_id,
+                            &mut active_play,
                             &mut playback_kind,
                             &mut awaiting_source,
                             &mut desired_playing,
+                            PlayEndReason::QueueChanged,
                         ) {
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
@@ -1372,13 +1625,34 @@ impl AudioEngine {
                             &playback_session,
                             &mut position_offset_ms,
                             &mut current_position_reports_relative,
-                            &mut current_play_id,
+                            &mut active_play,
                             &mut playback_kind,
                             &mut awaiting_source,
                             &mut desired_playing,
+                            PlayEndReason::QueueChanged,
                         ) {
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
+                    } else {
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut active_play,
+                            awaiting_source,
+                            PlayEndReason::QueueChanged,
+                        );
+                        awaiting_source = false;
+                        desired_playing = false;
+                        playback_kind = PlaybackKind::Idle;
+                        let mut s = state.lock();
+                        *s = PlaybackState::default();
+                        s.volume = sink.volume();
+                        let state_clone = s.clone();
+                        drop(s);
+                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     }
                 }
                 Ok(AudioCommand::GetState) => {
@@ -1392,8 +1666,9 @@ impl AudioEngine {
                         &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut current_play_id,
+                        &mut active_play,
                         awaiting_source,
+                        PlayEndReason::Shutdown,
                     );
                     break;
                 }
@@ -1432,10 +1707,11 @@ impl AudioEngine {
                         drop(s);
                         let _ = event_tx.send(AudioEvent::TrackEnded);
 
-                        // Complete play history
-                        if let Some(play_id) = current_play_id.take() {
-                            let _ = db::queries::complete_play(&db, &play_id, pos as i64);
-                        }
+                        let end_reason = Self::source_exhaustion_reason(
+                            pos,
+                            active_play.as_ref().and_then(|play| play.duration_ms),
+                        );
+                        Self::finalize_active_play(&db, &mut active_play, end_reason);
 
                         // Auto-advance to next track
                         if let Some(entry) = queue.next().cloned() {
@@ -1451,10 +1727,11 @@ impl AudioEngine {
                                 &playback_session,
                                 &mut position_offset_ms,
                                 &mut current_position_reports_relative,
-                                &mut current_play_id,
+                                &mut active_play,
                                 &mut playback_kind,
                                 &mut awaiting_source,
                                 &mut desired_playing,
+                                PlayEndReason::QueueChanged,
                             ) {
                                 let _ = event_tx.send(AudioEvent::Error(err));
                             }
@@ -1472,9 +1749,11 @@ impl AudioEngine {
                         let state_clone = s.clone();
                         drop(s);
 
-                        if let Some(play_id) = current_play_id.take() {
-                            let _ = db::queries::complete_play(&db, &play_id, pos as i64);
-                        }
+                        Self::finalize_active_play(
+                            &db,
+                            &mut active_play,
+                            PlayEndReason::StreamEnded,
+                        );
 
                         playback_kind = PlaybackKind::Idle;
                         let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
@@ -1507,29 +1786,95 @@ impl AudioEngine {
         }
     }
 
+    fn source_exhaustion_reason(position_ms: u64, duration_ms: Option<i64>) -> PlayEndReason {
+        let Some(duration_ms) = duration_ms.filter(|duration| *duration > 0) else {
+            // With no duration metadata, reaching the end of a healthy decoder
+            // is the only evidence available and is treated as a natural end.
+            return PlayEndReason::NaturalEnd;
+        };
+        let duration_ms = duration_ms as u64;
+        let tolerance_ms = (duration_ms / 20).clamp(2_000, 10_000);
+        if position_ms.saturating_add(tolerance_ms) >= duration_ms {
+            PlayEndReason::NaturalEnd
+        } else {
+            PlayEndReason::StreamEnded
+        }
+    }
+
+    fn error_session_is_current(playback_session: &AtomicU64, session_id: u64) -> bool {
+        playback_session.load(Ordering::SeqCst) == session_id
+    }
+
     fn reset_playback_session(
         sink: &Sink,
         playback_session: &Arc<AtomicU64>,
         db: &DbPool,
         position_offset_ms: &mut u64,
         current_position_reports_relative: &mut bool,
-        current_play_id: &mut Option<String>,
-        awaiting_source: bool,
+        active_play: &mut Option<ActivePlay>,
+        _awaiting_source: bool,
+        end_reason: PlayEndReason,
     ) -> u64 {
-        let pos = Self::playback_position_ms(
-            sink,
-            *position_offset_ms,
-            *current_position_reports_relative,
-            awaiting_source,
-        );
-        if let Some(play_id) = current_play_id.take() {
-            let _ = db::queries::complete_play(db, &play_id, pos as i64);
+        if let Some(play) = active_play.as_mut() {
+            play.set_listening(false);
         }
+        let session_id = Self::reset_source_session(
+            sink,
+            playback_session,
+            position_offset_ms,
+            current_position_reports_relative,
+        );
+        Self::finalize_active_play(db, active_play, end_reason);
+        session_id
+    }
 
+    fn reset_source_session(
+        sink: &Sink,
+        playback_session: &Arc<AtomicU64>,
+        position_offset_ms: &mut u64,
+        current_position_reports_relative: &mut bool,
+    ) -> u64 {
         *position_offset_ms = 0;
         *current_position_reports_relative = false;
         sink.stop();
         playback_session.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn begin_active_play(
+        db: &DbPool,
+        recording_id: Option<&str>,
+        source_used: Option<&str>,
+        station_id: Option<&str>,
+        duration_ms: Option<i64>,
+        is_listening: bool,
+    ) -> Option<ActivePlay> {
+        match db::queries::record_play(db, recording_id, source_used, station_id, duration_ms) {
+            Ok(id) => Some(ActivePlay::new(id, duration_ms, is_listening)),
+            Err(err) => {
+                log::warn!(
+                    "Failed to start play history for {}: {}",
+                    recording_id.or(station_id).unwrap_or("unknown item"),
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    fn finalize_active_play(
+        db: &DbPool,
+        active_play: &mut Option<ActivePlay>,
+        end_reason: PlayEndReason,
+    ) {
+        let Some(play) = active_play.take() else {
+            return;
+        };
+        let (play_id, listened_ms, duration_ms) = play.finish();
+        if let Err(err) =
+            db::queries::finalize_play(db, &play_id, listened_ms, duration_ms, end_reason.as_str())
+        {
+            log::warn!("Failed to finalize play history {}: {}", play_id, err);
+        }
     }
 
     fn sync_queue_state(queue: &PlayQueue, queue_items: &Arc<Mutex<Vec<QueueItem>>>) {
@@ -1548,5 +1893,11 @@ impl AudioEngine {
                 is_current: current_index == Some(index),
             })
             .collect();
+    }
+}
+
+impl Drop for AudioEngine {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

@@ -66,9 +66,8 @@ pub fn decode_to_mono(path: &Path) -> Result<Vec<f32>, String> {
         };
         let spec = *decoded.spec();
         let channels = spec.channels.count().max(1);
-        let buf = sample_buf.get_or_insert_with(|| {
-            SampleBuffer::<f32>::new(decoded.capacity() as u64, spec)
-        });
+        let buf = sample_buf
+            .get_or_insert_with(|| SampleBuffer::<f32>::new(decoded.capacity() as u64, spec));
         buf.copy_interleaved_ref(decoded);
         let samples = buf.samples();
         for frame in samples.chunks_exact(channels) {

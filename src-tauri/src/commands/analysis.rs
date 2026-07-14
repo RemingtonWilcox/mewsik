@@ -45,8 +45,8 @@ pub fn request_track_analysis(
         return Ok("cached".to_string());
     }
 
-    let Some(file_path) = queries::get_local_file_for_recording(&db, &recording_id)
-        .map_err(|e| e.to_string())?
+    let Some(file_path) =
+        queries::get_local_file_for_recording(&db, &recording_id).map_err(|e| e.to_string())?
     else {
         // No local bytes — streamed-only track. The director falls back to
         // the live FSM. (Analyzing fetched remote bytes is Phase 2b.)
@@ -68,32 +68,33 @@ pub fn request_track_analysis(
             let result = analyze_file(&PathBuf::from(&file_path));
             in_flight().lock().remove(&recording_id);
             match result {
-                Ok(score) => {
-                    match serde_json::to_string(&score) {
-                        Ok(json) => {
-                            if let Err(e) =
-                                queries::upsert_track_analysis(&db, &recording_id, ANALYSIS_VERSION, &json)
-                            {
-                                log::warn!("analysis cache write failed: {}", e);
-                                return;
-                            }
-                            log::info!(
-                                "analyzed {} in {:.1}s — {} sections, {} drops, {:.0} bpm (conf {:.2})",
-                                recording_id,
-                                started.elapsed().as_secs_f32(),
-                                score.sections.len(),
-                                score.drops.len(),
-                                score.bpm,
-                                score.beat_confidence
-                            );
-                            let _ = app.emit(
-                                "analysis:complete",
-                                serde_json::json!({ "recording_id": recording_id }),
-                            );
+                Ok(score) => match serde_json::to_string(&score) {
+                    Ok(json) => {
+                        if let Err(e) = queries::upsert_track_analysis(
+                            &db,
+                            &recording_id,
+                            ANALYSIS_VERSION,
+                            &json,
+                        ) {
+                            log::warn!("analysis cache write failed: {}", e);
+                            return;
                         }
-                        Err(e) => log::warn!("score serialization failed: {}", e),
+                        log::info!(
+                            "analyzed {} in {:.1}s — {} sections, {} drops, {:.0} bpm (conf {:.2})",
+                            recording_id,
+                            started.elapsed().as_secs_f32(),
+                            score.sections.len(),
+                            score.drops.len(),
+                            score.bpm,
+                            score.beat_confidence
+                        );
+                        let _ = app.emit(
+                            "analysis:complete",
+                            serde_json::json!({ "recording_id": recording_id }),
+                        );
                     }
-                }
+                    Err(e) => log::warn!("score serialization failed: {}", e),
+                },
                 Err(e) => log::warn!("track analysis failed for {}: {}", recording_id, e),
             }
         })

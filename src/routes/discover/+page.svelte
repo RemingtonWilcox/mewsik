@@ -32,6 +32,7 @@
 	let loading = $state(true);
 	let loadingFeed = $state(true);
 	let loadError = $state('');
+	let feedError = $state('');
 
 	const hasSavedMusic = $derived(dailyMix.length > 0 || recentlyPlayed.length > 0 || rediscover.length > 0);
 	const learningGoal = $derived(stats?.profile_track_goal ?? 5);
@@ -48,10 +49,12 @@
 		void loadDiscovery();
 	});
 
-	async function loadDiscovery() {
-		loading = true;
+	async function loadDiscovery(force = false) {
+		const previousFeed = discoveryFeed;
+		if (!force) loading = true;
 		loadingFeed = true;
 		loadError = '';
+		feedError = '';
 
 		const localTask = Promise.all([
 			api.getDailyMix(),
@@ -59,7 +62,10 @@
 			api.getRecentlyPlayed(),
 			api.getPlayStats()
 		]);
-		const feedTask = api.getSearchDiscoveryFeed();
+		const feedTask = api
+			.getSearchDiscoveryFeed(force)
+			.then((feed) => ({ feed, error: null }))
+			.catch((error: unknown) => ({ feed: null, error }));
 
 		try {
 			const [mix, redis, recent, playStats] = await localTask;
@@ -73,13 +79,16 @@
 			loading = false;
 		}
 
-		try {
-			discoveryFeed = await feedTask;
-		} catch {
-			discoveryFeed = null;
-		} finally {
-			loadingFeed = false;
+		const feedResult = await feedTask;
+		if (feedResult.feed) {
+			discoveryFeed = feedResult.feed;
+		} else {
+			discoveryFeed = previousFeed;
+			feedError = previousFeed
+				? 'Fresh discovery signals could not be loaded, so the previous picks are still shown.'
+				: `Discovery picks could not be loaded${feedResult.error ? `: ${feedResult.error}` : ''}`;
 		}
+		loadingFeed = false;
 	}
 
 	function playMix() {
@@ -98,7 +107,7 @@
 			<h1 class="text-2xl font-bold">Discover</h1>
 			<p class="mt-1 text-sm text-muted-foreground">Your own rotation plus honest, outside-the-library inspiration.</p>
 		</div>
-		<Button variant="outline" size="sm" onclick={loadDiscovery} disabled={loading || loadingFeed}>
+		<Button variant="outline" size="sm" onclick={() => loadDiscovery(true)} disabled={loading || loadingFeed}>
 			<RefreshCw class={`size-4 ${loading || loadingFeed ? 'animate-spin' : ''}`} /> Refresh
 		</Button>
 	</div>
@@ -206,6 +215,12 @@
 		</span>
 		<div class="h-px flex-1 bg-border/70"></div>
 	</div>
+
+	{#if feedError}
+		<p class="rounded-lg border border-amber-500/25 bg-amber-500/8 px-3 py-2 text-xs text-muted-foreground">
+			{feedError}
+		</p>
+	{/if}
 
 	<SearchDiscoveryFeedView
 		feed={discoveryFeed}

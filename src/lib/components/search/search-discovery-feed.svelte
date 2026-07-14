@@ -12,6 +12,23 @@
 		loading?: boolean;
 		onselect: (item: SearchDiscoveryItem) => void;
 	} = $props();
+
+	let liveSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'live').length);
+	let cachedSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'cached').length);
+	let unavailableSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'unavailable').length);
+	let hasPersonalizedShelves = $derived((feed?.sections ?? []).some((section) => section.personalized));
+	let sourceSummary = $derived(
+		liveSourceCount > 0
+			? `${liveSourceCount} live signal${liveSourceCount === 1 ? '' : 's'}${cachedSourceCount > 0 ? ` · ${cachedSourceCount} cached` : ''}`
+			: cachedSourceCount > 0
+				? `${cachedSourceCount} cached signal${cachedSourceCount === 1 ? '' : 's'}`
+				: feed?.source || 'Source status'
+	);
+	let sourceTooltip = $derived(
+		(feed?.source_statuses ?? [])
+			.map((source) => `${source.label}: ${source.state}${source.detail ? ` — ${source.detail}` : ''}`)
+			.join('\n') || feed?.source || ''
+	);
 </script>
 
 <section class="min-w-0 space-y-7 pb-6" aria-label="Search inspiration" data-testid="search-discovery-feed">
@@ -20,16 +37,38 @@
 			<h2 class="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-foreground/85">
 				<Sparkles class="size-3.5 text-primary" /> Find your next rabbit hole
 			</h2>
-			<p class="mt-1 text-xs text-muted-foreground">Apple Music charts are labeled; rabbit holes are Mewsik editorial. Nothing here is personalized yet.</p>
+			<p class="mt-1 text-xs text-muted-foreground">Charts, release feeds, and editorial signals{hasPersonalizedShelves ? ', shaped by your listening history' : ''}—every pick says why it is here.</p>
 		</div>
 		{#if loading}
 			<span class="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
 				<LoaderCircle class="size-3 animate-spin" /> Refreshing picks
 			</span>
+		{:else if feed && feed.source_statuses.length > 0}
+			<details class="group/source relative max-w-full">
+				<summary
+					class="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 rounded-full border border-border/70 bg-muted/25 px-2.5 py-1 text-[10px] text-muted-foreground marker:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+					aria-label={`Discovery sources. ${sourceTooltip}`}
+				>
+					<Radio class="size-2.5 {feed.is_fallback || liveSourceCount === 0 ? '' : 'text-primary'}" />
+					<span class="truncate">
+						{feed.is_stale ? `Stale snapshot · ${sourceSummary}` : `${sourceSummary}${feed.has_history ? ' · movement on' : ''}`}
+					</span>
+				</summary>
+				<div class="absolute right-0 z-20 mt-1.5 w-72 max-w-[80vw] rounded-lg border border-border bg-popover p-2.5 text-[10px] text-popover-foreground shadow-xl">
+					{#each feed.source_statuses as source (source.id)}
+						<p class="flex gap-2 py-0.5">
+							<span class="w-14 shrink-0 font-semibold uppercase tracking-wide text-muted-foreground">{source.state}</span>
+							<span><strong>{source.label}</strong>{source.detail ? ` — ${source.detail}` : ''}</span>
+						</p>
+					{/each}
+					{#if unavailableSourceCount > 0}
+						<p class="mt-1 border-t border-border pt-1 text-muted-foreground">Unavailable optional sources do not weaken the live ones above.</p>
+					{/if}
+				</div>
+			</details>
 		{:else if feed}
-			<span class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-muted/25 px-2.5 py-1 text-[10px] text-muted-foreground" title={feed.source}>
-				<Radio class="size-2.5 {feed.is_fallback ? '' : 'text-primary'}" />
-				<span class="truncate">{feed.is_stale ? `Cached · ${feed.source}` : feed.source}</span>
+			<span class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-muted/25 px-2.5 py-1 text-[10px] text-muted-foreground">
+				<Radio class="size-2.5" /> <span class="truncate">{feed.source}</span>
 			</span>
 		{/if}
 	</div>
@@ -46,7 +85,12 @@
 				</div>
 				<div class="discovery-rail flex gap-3 overflow-x-auto pb-2">
 					{#each section.items as item (`${section.id}-${item.id}`)}
-						<SearchDiscoveryCard {item} sectionId={section.id} {onselect} />
+						<SearchDiscoveryCard
+							{item}
+							sectionId={section.id}
+							snapshotId={feed.snapshot_id || String(feed.generated_at)}
+							{onselect}
+						/>
 					{/each}
 				</div>
 			</section>

@@ -319,6 +319,7 @@ export async function pickFolder(defaultPath?: string): Promise<string | null> {
 // Discovery
 export interface SearchDiscoveryItem {
 	id: string;
+	item_kind: 'track' | 'release' | 'editorial';
 	title: string;
 	artist: string;
 	album: string | null;
@@ -328,21 +329,40 @@ export interface SearchDiscoveryItem {
 	rank: number | null;
 	momentum: number | null;
 	context: string | null;
+	reason: string | null;
+	source_labels: string[];
+	release_date: string | null;
+	audience_delta: number | null;
+	audience_label: string | null;
 }
 
 export interface SearchDiscoverySection {
 	id: string;
+	kind: 'top_now' | 'moving_fast' | 'new_and_rising' | 'for_you' | 'outside_your_bubble' | 'editors_found' | 'fallback';
+	personalized: boolean;
 	title: string;
 	subtitle: string;
 	items: SearchDiscoveryItem[];
 }
 
 export interface SearchDiscoveryFeed {
+	snapshot_id: string;
 	generated_at: number;
 	source: string;
 	is_stale: boolean;
 	is_fallback: boolean;
+	has_history: boolean;
+	next_refresh_at: number | null;
+	source_statuses: DiscoverySourceStatus[];
 	sections: SearchDiscoverySection[];
+}
+
+export interface DiscoverySourceStatus {
+	id: string;
+	label: string;
+	state: 'live' | 'cached' | 'unavailable' | 'stale';
+	updated_at: number | null;
+	detail: string | null;
 }
 
 export interface PlayStats {
@@ -383,6 +403,7 @@ const SEARCH_DISCOVERY_PICKS: Array<[artist: string, title: string, album: strin
 function fallbackSearchDiscoveryFeed(): SearchDiscoveryFeed {
 	const items = SEARCH_DISCOVERY_PICKS.map(([artist, title, album], index) => ({
 		id: `browser-fallback-${index}`,
+		item_kind: 'track' as const,
 		title,
 		artist,
 		album,
@@ -391,28 +412,43 @@ function fallbackSearchDiscoveryFeed(): SearchDiscoveryFeed {
 		listen_count: null,
 		rank: null,
 		momentum: null,
-		context: 'Mewsik editorial'
+		context: 'Mewsik editorial',
+		reason: 'Mewsik editorial fallback',
+		source_labels: ['Mewsik'],
+		release_date: null,
+		audience_delta: null,
+		audience_label: null
 	}));
 	return {
+		snapshot_id: `browser-${Math.floor(Date.now() / 1000)}`,
 		generated_at: Math.floor(Date.now() / 1000),
 		source: 'Mewsik editorial',
 		is_stale: false,
 		is_fallback: true,
+		has_history: false,
+		next_refresh_at: null,
+		source_statuses: [],
 		sections: [
 			{
-				id: 'editorial-starts',
+				id: 'fallback-starts',
+				kind: 'fallback',
+				personalized: false,
 				title: 'Reliable starts',
 				subtitle: 'Handpicked by Mewsik while live charts refresh',
 				items: items.slice(0, 8)
 			},
 			{
-				id: 'editorial-detours',
+				id: 'fallback-detours',
+				kind: 'fallback',
+				personalized: false,
 				title: 'Worth the detour',
 				subtitle: 'Strong records from different corners of music',
 				items: items.slice(8, 16)
 			},
 			{
-				id: 'editorial-rabbit-holes',
+				id: 'fallback-rabbit-holes',
+				kind: 'fallback',
+				personalized: false,
 				title: 'Reliable rabbit holes',
 				subtitle: 'Broad on purpose and not personalized',
 				items: items.slice(16, 24)
@@ -421,12 +457,19 @@ function fallbackSearchDiscoveryFeed(): SearchDiscoveryFeed {
 	};
 }
 
-export const getSearchDiscoveryFeed = () =>
+export const getSearchDiscoveryFeed = (force = false) =>
 	safeInvoke<SearchDiscoveryFeed>(
 		'get_search_discovery_feed',
-		undefined,
+		{ force },
 		fallbackSearchDiscoveryFeed
 	);
+
+export const recordDiscoveryEvent = (
+	itemId: string,
+	eventType: 'click' | 'impression' | 'hide' | 'save',
+	sectionId?: string,
+	snapshotId?: string
+) => safeInvoke<void>('record_discovery_event', { itemId, eventType, sectionId, snapshotId }, () => undefined);
 
 export const getDailyMix = () => safeInvoke<LibraryTrack[]>('get_daily_mix', undefined, []);
 export const getRediscover = () => safeInvoke<LibraryTrack[]>('get_rediscover', undefined, []);
