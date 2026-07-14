@@ -47,7 +47,7 @@ pub(crate) fn build_station_health_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(STATION_PROBE_TIMEOUT)
         .connect_timeout(STATION_PROBE_TIMEOUT)
-        .user_agent("mewsik/0.1.0")
+        .user_agent(concat!("mewsik/", env!("CARGO_PKG_VERSION")))
         // Probe and directory requests handle redirects manually so every
         // hop can be resolved, classified and DNS-pinned before it is sent.
         .redirect(reqwest::redirect::Policy::none())

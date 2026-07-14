@@ -41,6 +41,7 @@ const lastFmPayload = {
       artist: {
         name: 'Another Artist',
         mbid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        url: 'https://www.last.fm/music/Another+Artist',
       },
       image: [{ '#text': 'https://lastfm.freetls.fastly.net/secret-art.jpg', size: 'large' }],
     }],
@@ -53,23 +54,37 @@ function jsonResponse(value) {
   });
 }
 
-function successfulFetch(request) {
+function successfulFetch(request, options) {
   const url = new URL(request);
+  assert.equal(options.headers.get('accept'), 'application/json');
   if (url.hostname === 'www.googleapis.com') {
     assert.equal(url.searchParams.get('chart'), 'mostPopular');
     assert.equal(url.searchParams.get('videoCategoryId'), '10');
     assert.equal(url.searchParams.get('regionCode'), 'US');
-    assert.equal(url.searchParams.get('key'), YOUTUBE_KEY);
+    assert.equal(url.searchParams.get('key'), null);
+    assert.equal(options.headers.get('x-goog-api-key'), YOUTUBE_KEY);
     return Promise.resolve(jsonResponse(youtubePayload));
   }
   assert.equal(url.hostname, 'ws.audioscrobbler.com');
   assert.equal(url.searchParams.get('method'), 'chart.getTopTracks');
   assert.equal(url.searchParams.get('api_key'), LASTFM_KEY);
+  assert.equal(
+    options.headers.get('user-agent'),
+    'mewsik-discovery-snapshot/1 (+https://github.com/RemingtonWilcox/mewsik)',
+  );
   return Promise.resolve(jsonResponse(lastFmPayload));
 }
 
+function buildEnabledSnapshot(options = {}) {
+  return buildSnapshot({
+    youtubeEnabled: true,
+    lastfmEnabled: true,
+    ...options,
+  });
+}
+
 test('builds the credential-free v1 envelope and omits Last.fm artwork', async () => {
-  const snapshot = await buildSnapshot({
+  const snapshot = await buildEnabledSnapshot({
     now: NOW,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
@@ -87,6 +102,8 @@ test('builds the credential-free v1 envelope and omits Last.fm artwork', async (
 
   const youtube = snapshot.sources[0].batch.items[0];
   assert.equal(youtube.market, 'US');
+  assert.equal(youtube.rank, null);
+  assert.equal(youtube.audience_count, null);
   assert.equal(youtube.metrics.view_count, 1_234_567);
   assert.equal(youtube.release_date, '2026-07-12');
   assert.deepEqual(youtube.tags, ['Music', 'Pop']);
@@ -95,6 +112,7 @@ test('builds the credential-free v1 envelope and omits Last.fm artwork', async (
   assert.equal(lastfm.artwork_url, null);
   assert.equal(lastfm.metrics.listener_count, 456_789);
   assert.equal(lastfm.metrics.play_count, 987_654);
+  assert.equal(lastfm.editorial_url, 'https://www.last.fm/music/Example/_/Another+Great+Song');
   assert.equal(lastfm.external_ids.musicbrainz_recording_id, '11111111-2222-3333-4444-555555555555');
 
   const published = JSON.stringify(snapshot);
@@ -102,15 +120,54 @@ test('builds the credential-free v1 envelope and omits Last.fm artwork', async (
   assert.doesNotMatch(published, /lastfm\.freetls/u);
 });
 
+test('uses a validated Last.fm artist linkback when the track URL is unsafe', async () => {
+  const payload = structuredClone(lastFmPayload);
+  payload.tracks.track[0].url = 'http://www.last.fm/music/unsafe';
+  const snapshot = await buildEnabledSnapshot({
+    now: NOW,
+    lastfmApiKey: LASTFM_KEY,
+    fetchImpl: async (request, options) => {
+      const url = new URL(request);
+      assert.equal(url.hostname, 'ws.audioscrobbler.com');
+      assert.equal(
+        options.headers.get('user-agent'),
+        'mewsik-discovery-snapshot/1 (+https://github.com/RemingtonWilcox/mewsik)',
+      );
+      return jsonResponse(payload);
+    },
+  });
+
+  const lastfm = snapshot.sources[1].batch.items[0];
+  assert.equal(lastfm.editorial_url, 'https://www.last.fm/music/Another+Artist');
+  assert.equal(lastfm.external_ids.lastfm_track_url, undefined);
+});
+
+test('drops a live Last.fm response when no item has a safe provider linkback', async () => {
+  const payload = structuredClone(lastFmPayload);
+  payload.tracks.track[0].url = 'http://www.last.fm/music/unsafe';
+  payload.tracks.track[0].artist.url = 'https://example.test/not-lastfm';
+  const snapshot = await buildEnabledSnapshot({
+    now: NOW,
+    lastfmApiKey: LASTFM_KEY,
+    fetchImpl: async (request) => {
+      assert.equal(new URL(request).hostname, 'ws.audioscrobbler.com');
+      return jsonResponse(payload);
+    },
+  });
+
+  assert.equal(snapshot.sources[1].state, 'unavailable');
+  assert.equal(snapshot.sources[1].batch, null);
+});
+
 test('keeps in-cadence batches cached without calling either provider', async () => {
-  const previous = await buildSnapshot({
+  const previous = await buildEnabledSnapshot({
     now: NOW - 1_800,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
     fetchImpl: successfulFetch,
   });
   let requests = 0;
-  const snapshot = await buildSnapshot({
+  const snapshot = await buildEnabledSnapshot({
     now: NOW,
     previous,
     youtubeApiKey: YOUTUBE_KEY,
@@ -128,13 +185,13 @@ test('keeps in-cadence batches cached without calling either provider', async ()
 });
 
 test('retains bounded last-known-good data when a due provider refresh fails', async () => {
-  const previous = await buildSnapshot({
+  const previous = await buildEnabledSnapshot({
     now: NOW - 7_200,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
     fetchImpl: successfulFetch,
   });
-  const snapshot = await buildSnapshot({
+  const snapshot = await buildEnabledSnapshot({
     now: NOW,
     previous,
     youtubeApiKey: YOUTUBE_KEY,
@@ -152,13 +209,13 @@ test('retains bounded last-known-good data when a due provider refresh fails', a
 });
 
 test('drops provider observations older than three source cadences', async () => {
-  const previous = await buildSnapshot({
+  const previous = await buildEnabledSnapshot({
     now: NOW - 50_000,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
     fetchImpl: successfulFetch,
   });
-  const snapshot = await buildSnapshot({ now: NOW, previous });
+  const snapshot = await buildEnabledSnapshot({ now: NOW, previous });
   assert.deepEqual(snapshot.sources.map(({ state, batch }) => [state, batch]), [
     ['unavailable', null],
     ['unavailable', null],
@@ -172,6 +229,25 @@ test('reports unavailable honestly when no credential or previous batch exists',
     fetchImpl: async () => {
       requests += 1;
       throw new Error('not expected');
+    },
+  });
+
+  assert.equal(requests, 0);
+  assert.deepEqual(snapshot.sources.map(({ state, batch }) => [state, batch]), [
+    ['unavailable', null],
+    ['unavailable', null],
+  ]);
+});
+
+test('does not call a provider when a key exists but its activation gate is off', async () => {
+  let requests = 0;
+  const snapshot = await buildSnapshot({
+    now: NOW,
+    youtubeApiKey: YOUTUBE_KEY,
+    lastfmApiKey: LASTFM_KEY,
+    fetchImpl: async () => {
+      requests += 1;
+      throw new Error('disabled provider must not be called');
     },
   });
 
@@ -196,7 +272,7 @@ test('refuses to serialize a credential even if a provider echoes it', async () 
     return jsonResponse(lastFmPayload);
   };
   await assert.rejects(
-    buildSnapshot({
+    buildEnabledSnapshot({
       now: NOW,
       youtubeApiKey: YOUTUBE_KEY,
       lastfmApiKey: LASTFM_KEY,
@@ -207,7 +283,7 @@ test('refuses to serialize a credential even if a provider echoes it', async () 
 });
 
 test('sanitizes previous batches instead of republishing extra fields', async () => {
-  const previous = await buildSnapshot({
+  const previous = await buildEnabledSnapshot({
     now: NOW - 1_800,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
@@ -217,17 +293,39 @@ test('sanitizes previous batches instead of republishing extra fields', async ()
   previous.sources[0].batch.items[0].secret = LASTFM_KEY;
   previous.sources[0].batch.items[0].external_ids.api_key = YOUTUBE_KEY;
   previous.sources[1].batch.items[0].artwork_url = 'https://lastfm.freetls.fastly.net/not-licensed.jpg';
+  previous.sources[1].batch.items[0].editorial_url = 'https://www.last.fm/music/Another+Artist';
+  previous.sources[1].batch.items[0].external_ids.lastfm_track_url = 'http://www.last.fm/unsafe';
   previous.sources[1].batch.items[0].metrics.view_count = 999;
 
-  const snapshot = await buildSnapshot({ now: NOW, previous });
+  const snapshot = await buildEnabledSnapshot({ now: NOW, previous });
   const published = JSON.stringify(snapshot);
   assert.doesNotMatch(published, /top-secret-value|not-licensed/u);
   assert.equal(snapshot.sources[1].batch.items[0].artwork_url, null);
+  assert.equal(
+    snapshot.sources[1].batch.items[0].editorial_url,
+    'https://www.last.fm/music/Another+Artist',
+  );
+  assert.equal(snapshot.sources[1].batch.items[0].external_ids.lastfm_track_url, undefined);
   assert.equal(snapshot.sources[1].batch.items[0].metrics.view_count, null);
 });
 
+test('drops cached Last.fm data after its required linkback becomes unsafe', async () => {
+  const previous = await buildEnabledSnapshot({
+    now: NOW - 1_800,
+    lastfmApiKey: LASTFM_KEY,
+    fetchImpl: successfulFetch,
+  });
+  previous.sources[1].batch.items[0].editorial_url = 'https://example.test/not-lastfm';
+  previous.sources[1].batch.items[0].external_ids.lastfm_track_url = 'http://www.last.fm/unsafe';
+
+  const snapshot = await buildEnabledSnapshot({ now: NOW, previous });
+
+  assert.equal(snapshot.sources[1].state, 'unavailable');
+  assert.equal(snapshot.sources[1].batch, null);
+});
+
 test('drops a retained Last.fm item whose source id conflicts with its recording id', async () => {
-  const previous = await buildSnapshot({
+  const previous = await buildEnabledSnapshot({
     now: NOW - 1_800,
     youtubeApiKey: YOUTUBE_KEY,
     lastfmApiKey: LASTFM_KEY,
@@ -235,7 +333,7 @@ test('drops a retained Last.fm item whose source id conflicts with its recording
   });
   previous.sources[1].batch.items[0].source_item_id = 'lastfm-text-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
-  const snapshot = await buildSnapshot({ now: NOW, previous });
+  const snapshot = await buildEnabledSnapshot({ now: NOW, previous });
   assert.equal(snapshot.sources[1].state, 'unavailable');
   assert.equal(snapshot.sources[1].batch, null);
 });

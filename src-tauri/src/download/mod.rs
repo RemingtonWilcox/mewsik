@@ -383,7 +383,9 @@ fn fetch_remote_file(
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
-    let mut request = client.get(url).header("User-Agent", "mewsik/0.1");
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("mewsik/", env!("CARGO_PKG_VERSION")));
     for (key, value) in headers {
         request = request.header(key, value);
     }

@@ -215,12 +215,22 @@ impl SourceConfig {
     /// snapshot. Ordinary listeners never need to configure provider secrets.
     pub fn from_env() -> Self {
         Self {
-            lastfm_api_key: first_nonempty_env(&["MEWSIK_LASTFM_API_KEY", "LASTFM_API_KEY"]),
-            youtube_api_key: first_nonempty_env(&["MEWSIK_YOUTUBE_API_KEY", "YOUTUBE_API_KEY"]),
+            // A key alone is deliberately inert. This prevents a stray shell or
+            // packaging environment variable from activating a parked provider.
+            lastfm_api_key: env_flag("MEWSIK_ENABLE_LASTFM_DISCOVERY")
+                .then(|| first_nonempty_env(&["MEWSIK_LASTFM_API_KEY", "LASTFM_API_KEY"]))
+                .flatten(),
+            youtube_api_key: env_flag("MEWSIK_ENABLE_YOUTUBE_DISCOVERY")
+                .then(|| first_nonempty_env(&["MEWSIK_YOUTUBE_API_KEY", "YOUTUBE_API_KEY"]))
+                .flatten(),
             hosted_snapshot_url: Some(HOSTED_DISCOVERY_SNAPSHOT_URL.to_string()),
             ..Self::default()
         }
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 fn first_nonempty_env(names: &[&str]) -> Option<String> {
@@ -303,8 +313,14 @@ pub fn build_source_client() -> Result<Client, SourceError> {
     Client::builder()
         .connect_timeout(Duration::from_secs(4))
         .timeout(Duration::from_secs(15))
-        .redirect(Policy::limited(3))
-        .user_agent("Mewsik/0.1 (documented music discovery sources)")
+        // Discovery endpoints are pinned. Following a redirect could forward a
+        // provider-specific credential header to a different origin.
+        .redirect(Policy::none())
+        .user_agent(concat!(
+            "mewsik/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/RemingtonWilcox/mewsik)"
+        ))
         .build()
         .map_err(request_error)
 }
@@ -1151,8 +1167,6 @@ struct LastFmTrack {
     listeners: Option<String>,
     playcount: Option<String>,
     artist: LastFmArtist,
-    #[serde(default)]
-    image: Vec<LastFmImage>,
 }
 
 #[derive(Deserialize)]
@@ -1161,14 +1175,8 @@ struct LastFmArtist {
     name: String,
     #[serde(default)]
     mbid: String,
-}
-
-#[derive(Deserialize)]
-struct LastFmImage {
-    #[serde(rename = "#text", default)]
-    url: String,
     #[serde(default)]
-    size: String,
+    url: String,
 }
 
 fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem>, SourceError> {
@@ -1184,6 +1192,9 @@ fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem
             let artist = nonempty(track.artist.name)?;
             let recording_mbid = nonempty(track.mbid);
             let artist_mbid = nonempty(track.artist.mbid);
+            let track_url = valid_lastfm_url(track.url);
+            let artist_url = valid_lastfm_url(track.artist.url);
+            let editorial_url = track_url.clone().or(artist_url)?;
             let source_item_id = recording_mbid
                 .clone()
                 .unwrap_or_else(|| stable_text_id(&artist, &title));
@@ -1194,10 +1205,9 @@ fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem
             if let Some(value) = artist_mbid {
                 external_ids.insert("musicbrainz_artist_id".to_string(), value);
             }
-            if let Some(value) = nonempty(track.url) {
+            if let Some(value) = track_url.clone() {
                 external_ids.insert("lastfm_track_url".to_string(), value);
             }
-            let artwork_url = best_lastfm_image(track.image);
             let listener_count = parse_u64_text(track.listeners);
             let play_count = parse_u64_text(track.playcount);
             Some(SourceItem {
@@ -1208,7 +1218,9 @@ fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem
                 title,
                 artist: Some(artist),
                 album: None,
-                artwork_url,
+                // Last.fm artwork is outside the standard API license. The provider
+                // link remains available for the required attribution/linkback UI.
+                artwork_url: None,
                 release_date: None,
                 rank: u32::try_from(index + 1).ok(),
                 audience_count: listener_count,
@@ -1220,7 +1232,7 @@ fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem
                 tags: Vec::new(),
                 market: None,
                 observed_at: now.timestamp(),
-                editorial_url: None,
+                editorial_url: Some(editorial_url),
                 external_ids,
             })
         })
@@ -1230,17 +1242,6 @@ fn parse_lastfm_tracks(body: &[u8], now: DateTime<Utc>) -> Result<Vec<SourceItem
     } else {
         Ok(items)
     }
-}
-
-fn best_lastfm_image(images: Vec<LastFmImage>) -> Option<String> {
-    const ORDER: [&str; 6] = ["mega", "extralarge", "large", "medium", "small", ""];
-    ORDER.into_iter().find_map(|wanted| {
-        images
-            .iter()
-            .find(|image| image.size.eq_ignore_ascii_case(wanted))
-            .and_then(|image| nonempty(image.url.clone()))
-            .filter(|url| is_https_url(url))
-    })
 }
 
 /// Official YouTube Data API `videos.list?chart=mostPopular` call, narrowed to
@@ -1261,17 +1262,7 @@ pub async fn fetch_youtube_most_popular_music(
         ));
     }
     let market = validate_market(market)?;
-    let request = client
-        .get("https://www.googleapis.com/youtube/v3/videos")
-        .header("Accept", "application/json")
-        .query(&[
-            ("part", "snippet,statistics"),
-            ("chart", "mostPopular"),
-            ("regionCode", market.as_str()),
-            ("videoCategoryId", "10"),
-            ("maxResults", &limit.to_string()),
-            ("key", api_key),
-        ]);
+    let request = youtube_videos_request(client, api_key, &market, limit);
     let body = get_limited(request, MAX_JSON_BYTES).await?;
     let items = parse_youtube_videos(&body, &market, now)?;
     Ok(SourceBatch {
@@ -1281,6 +1272,25 @@ pub async fn fetch_youtube_most_popular_music(
         cadence_secs: YOUTUBE_CADENCE_SECS,
         items,
     })
+}
+
+fn youtube_videos_request(
+    client: &Client,
+    api_key: &str,
+    market: &str,
+    limit: u16,
+) -> RequestBuilder {
+    client
+        .get("https://www.googleapis.com/youtube/v3/videos")
+        .header("Accept", "application/json")
+        .header("x-goog-api-key", api_key)
+        .query(&[
+            ("part", "snippet,statistics"),
+            ("chart", "mostPopular"),
+            ("regionCode", market),
+            ("videoCategoryId", "10"),
+            ("maxResults", &limit.to_string()),
+        ])
 }
 
 #[derive(Deserialize)]
@@ -1336,8 +1346,7 @@ fn parse_youtube_videos(
     let items = response
         .items
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, video)| {
+        .filter_map(|video| {
             let id = nonempty(video.id)?;
             let title = nonempty(video.snippet.title)?;
             let channel = nonempty(video.snippet.channel_title)?;
@@ -1370,8 +1379,10 @@ fn parse_youtube_videos(
                     .and_then(|value| value.get(..10))
                     .map(str::to_string)
                     .and_then(valid_iso_date),
-                rank: u32::try_from(index + 1).ok(),
-                audience_count: parse_u64_text(video.statistics.view_count.clone()),
+                // The response order is meaningful, but the API does not return
+                // a numeric rank. Do not manufacture one or a shared headline metric.
+                rank: None,
+                audience_count: None,
                 metrics: SourceMetrics {
                     view_count: parse_u64_text(video.statistics.view_count),
                     like_count: parse_u64_text(video.statistics.like_count),
@@ -1505,6 +1516,23 @@ fn normalize_id_component(value: &str) -> String {
 
 fn is_https_url(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| url.scheme() == "https")
+}
+
+fn valid_lastfm_url(value: String) -> Option<String> {
+    let value = nonempty(value)?;
+    reqwest::Url::parse(&value)
+        .ok()
+        .filter(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port_or_known_default() == Some(443)
+                && url.host_str().is_some_and(|host| {
+                    let host = host.to_ascii_lowercase();
+                    host == "last.fm" || host.ends_with(".last.fm")
+                })
+        })
+        .map(|_| value)
 }
 
 #[cfg(test)]
@@ -1656,7 +1684,7 @@ mod tests {
             "url": "https://www.last.fm/music/Kanye+West/_/Dark+Fantasy",
             "listeners": "1234",
             "playcount": "9876",
-            "artist": {"name": "Kanye West", "mbid": "22222222-2222-2222-2222-222222222222"},
+            "artist": {"name": "Kanye West", "mbid": "22222222-2222-2222-2222-222222222222", "url": "https://www.last.fm/music/Kanye+West"},
             "image": [{"#text":"https://lastfm.freetls.fastly.net/i/u/300x300/test.jpg", "size":"extralarge"}]
           }]}
         }"##;
@@ -1667,6 +1695,11 @@ mod tests {
         assert_eq!(items[0].rank, Some(1));
         assert_eq!(items[0].metrics.listener_count, Some(1234));
         assert_eq!(items[0].metrics.play_count, Some(9876));
+        assert_eq!(items[0].artwork_url, None);
+        assert_eq!(
+            items[0].editorial_url.as_deref(),
+            Some("https://www.last.fm/music/Kanye+West/_/Dark+Fantasy")
+        );
         assert!(items[0].tags.is_empty());
         assert_eq!(
             items[0]
@@ -1682,6 +1715,22 @@ mod tests {
                 .map(String::as_str),
             Some("https://www.last.fm/music/Kanye+West/_/Dark+Fantasy")
         );
+    }
+
+    #[test]
+    fn lastfm_parser_drops_items_without_a_safe_linkback() {
+        let json = br##"{
+          "tracks": {"track": [{
+            "name": "Unsafe",
+            "url": "http://www.last.fm/music/unsafe",
+            "artist": {"name": "Artist", "url": "https://example.test/not-lastfm"}
+          }]}
+        }"##;
+
+        assert!(matches!(
+            parse_lastfm_tracks(json, now()),
+            Err(SourceError::Empty)
+        ));
     }
 
     #[test]
@@ -1705,10 +1754,69 @@ mod tests {
         assert_eq!(items[0].item_kind, SourceItemKind::Track);
         assert_eq!(items[0].artist.as_deref(), Some("ArtistVEVO"));
         assert_eq!(items[0].release_date.as_deref(), Some("2026-07-10"));
-        assert_eq!(items[0].audience_count, Some(450_000));
+        assert_eq!(items[0].rank, None);
+        assert_eq!(items[0].audience_count, None);
         assert_eq!(items[0].metrics.view_count, Some(450_000));
         assert_eq!(items[0].metrics.like_count, Some(12_000));
         assert_eq!(items[0].market.as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn youtube_request_keeps_api_key_out_of_the_url() {
+        let client = build_source_client().expect("client");
+        let request = youtube_videos_request(&client, "top-secret", "us", 50)
+            .build()
+            .expect("request");
+
+        assert!(request
+            .url()
+            .query_pairs()
+            .all(|(name, value)| name != "key" && value != "top-secret"));
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("top-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_client_does_not_follow_redirects_with_custom_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("first request");
+            let mut request = vec![0; 2_048];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write redirect");
+            tokio::time::timeout(Duration::from_millis(250), listener.accept())
+                .await
+                .is_err()
+        });
+
+        let response = build_source_client()
+            .expect("client")
+            .get(format!("http://{address}/start"))
+            .header("x-goog-api-key", "must-not-follow")
+            .send()
+            .await
+            .expect("redirect response");
+
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert!(server.await.expect("server task"));
     }
 
     #[test]

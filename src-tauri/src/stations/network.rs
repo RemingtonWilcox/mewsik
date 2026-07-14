@@ -201,7 +201,7 @@ fn pin_async_client(url: &Url, addrs: &[SocketAddr]) -> Result<reqwest::Client, 
     reqwest::Client::builder()
         .timeout(STATION_NETWORK_TIMEOUT)
         .connect_timeout(STATION_NETWORK_TIMEOUT)
-        .user_agent("mewsik/0.1.0")
+        .user_agent(concat!("mewsik/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::none())
         .no_proxy()
         .resolve_to_addrs(host, addrs)
@@ -285,7 +285,7 @@ fn build_blocking_public_client(url: &Url) -> Result<reqwest::blocking::Client, 
 
     reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .user_agent("mewsik/0.1.0")
+        .user_agent(concat!("mewsik/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::none())
         .no_proxy()
         .resolve_to_addrs(host, &addrs)
@@ -306,7 +306,7 @@ pub(crate) fn open_blocking_public_stream(
         let client = build_blocking_public_client(&current_url)?;
         let mut request = client
             .get(current_url.clone())
-            .header("User-Agent", "mewsik/0.1")
+            .header("User-Agent", concat!("mewsik/", env!("CARGO_PKG_VERSION")))
             .header("Icy-MetaData", "0");
         for (key, value) in headers {
             request = request.header(key, value);

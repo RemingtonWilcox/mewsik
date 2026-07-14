@@ -1,6 +1,7 @@
 import { readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { assertProviderDistributionApproved } from './release-policy.mjs';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const outputPath = path.join(repoRoot, 'src-tauri', 'tauri.release.generated.conf.json');
@@ -181,6 +182,10 @@ async function validateReleaseContract() {
   if (repository.toLowerCase() !== 'remingtonwilcox/mewsik') {
     throw new Error('Stable releases may only be created in RemingtonWilcox/mewsik');
   }
+
+  // This checked-in fail-closed review gate cannot be bypassed by adding a
+  // repository secret or dispatching the workflow with different inputs.
+  await assertProviderDistributionApproved(repoRoot, version);
 
   const updaterPublicKey = validateUpdaterPublicKey(requiredEnv('MEWSIK_UPDATER_PUBLIC_KEY'));
   validateUpdaterPrivateKey(requiredEnv('TAURI_SIGNING_PRIVATE_KEY'));

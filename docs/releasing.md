@@ -8,8 +8,10 @@ Normal local builds deliberately have no updater endpoint or public key. They re
 
 - The installed/local Windows 0.2.0 build is unsigned private-test output. It is current enough for local testing, but it is not the signed public bootstrap installer.
 - The updater UI, native shutdown gate, and draft workflow exist. The protected `release` environment is restricted to `main`, requires owner approval, and contains a cryptographically verified Tauri updater keypair. The encrypted recovery material is stored outside the repository under the current Windows account, but still needs one separate disaster-recovery copy because its local password envelope is DPAPI-bound to this account. Azure Artifact Signing account/profile credentials are still absent, so the public `latest.json` feed is not live.
-- GitHub Pages is enabled for the separate credential-free discovery snapshot. Its workflow and client contract are implemented; YouTube and Last.fm remain `unavailable` until the workflow is on the default branch and the repository provider secrets are configured.
-- No distributable Mac build is current. The reachable Apple Silicon Mac lacks pnpm, a Developer ID Application identity, and the `mewsik-notary` Keychain profile; the MacBook that may hold the signing identity was unreachable during the audit.
+- `.github/workflows/ci.yml` runs the version, Svelte/type, discovery publisher, Rust format/test, production build, and four-worker Playwright gates for pull requests and `main`. GitHub secret scanning, push protection, and Dependabot security updates are enabled for the public repository.
+- `release/provider-policy.json` is a checked-in fail-closed distribution gate. It currently blocks the draft workflow because the prototype's unofficial YouTube audio extraction/download, SoundCloud multi-provider playback/download, and Bandcamp scraping paths are not suitable for distribution. Azure credentials or a workflow dispatch cannot bypass this code-reviewed gate.
+- GitHub Pages is enabled and the credential-free discovery snapshot is live. YouTube and Last.fm intentionally remain `unavailable`: keys are absent, activation switches are off, and their data is excluded from mewsik-derived shelves until the policy gates below pass.
+- No distributable Mac build is current. A fresh clean Apple Silicon release checkout now passes dependency, Svelte, sidecar, runtime-resource, and Rust checks with the pinned toolchains. The Mac mini still lacks the Developer ID Application identity/private key and the `mewsik-notary` Keychain profile; the MacBook that may hold the signing identity was unreachable during the audit.
 
 ## Supported release targets
 
@@ -31,16 +33,18 @@ The Windows deliverable is the NSIS `setup.exe`; that installer is the setup exp
 
 ## Shared discovery publication
 
-After it is merged to the default branch, `.github/workflows/deploy-discovery-snapshot.yml` runs hourly and publishes `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json` through GitHub Pages. It contains normalized public aggregate batches only; it must never contain user history, library contents, interactions, or provider credentials.
+`.github/workflows/deploy-discovery-snapshot.yml` runs hourly from the default branch and publishes `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json` through GitHub Pages. It contains normalized public aggregate batches only; it must never contain user history, library contents, interactions, or provider credentials.
 
-Configure these repository Actions secrets only after the corresponding provider account and terms are approved:
+Configure these repository Actions secrets only after the corresponding provider account, product UI, and terms gates are approved. A secret alone does not activate a provider:
 
 | Name | Purpose |
 | --- | --- |
-| `MEWSIK_YOUTUBE_API_KEY` | Shared YouTube Data API v3 Music-category chart refresh. Restrict it to the YouTube Data API v3, not runner IP addresses. |
-| `MEWSIK_LASTFM_API_KEY` | Shared Last.fm top-tracks refresh. Do not enable it for a public/commercial release until the intended use is covered by Last.fm's terms or written approval. |
+| `MEWSIK_YOUTUBE_API_KEY` | Shared YouTube Data API v3 Music-category chart refresh. Restrict it to the YouTube Data API v3, not runner IP addresses. Keep absent until the separate branded shelf, versioned Terms/Privacy acceptance, and policy review are complete. |
+| `MEWSIK_LASTFM_API_KEY` | Shared Last.fm top-tracks refresh. Keep absent until written public-use approval and visible attribution/linkbacks are complete. |
 
-The workflow publishes an honest `unavailable` source when its key is absent, reuses a still-fresh prior batch as `cached`, and retains a failed batch as `stale` for at most three provider cadences. Ordinary app users configure nothing. Local environment keys are developer fallback only and must never be bundled into an installer.
+The repository variables `MEWSIK_ENABLE_YOUTUBE_DISCOVERY` and `MEWSIK_ENABLE_LASTFM_DISCOVERY` must also equal the literal string `true` before the publisher will call those providers. Their safe/default value is `false`. Never use these switches to bypass the approval gates.
+
+The workflow publishes an honest `unavailable` source when its activation gate is off or its key is absent, reuses a still-fresh prior batch as `cached`, and retains a failed batch as `stale` for at most three provider cadences. YouTube keys travel in `x-goog-api-key`, not request URLs. Last.fm requests identify mewsik, preserve validated provider linkbacks, and omit provider artwork/audio. Ordinary app users configure nothing. Local environment keys are developer fallback only and must never be bundled into an installer.
 
 ## Version and toolchain gate
 
@@ -66,6 +70,14 @@ The NSIS installer installs for the current user without elevation. Downgrades a
 Tauri's uninstall checkbox clears interface/WebView preferences and cache derived from the bundle identifier; its text explicitly says the SQLite library and downloaded music are preserved. Core JSON config also remains in private data, while browser-backed preferences such as visualizer choices can be cleared. Do not add an installer hook that silently deletes or moves user-owned data.
 
 Public Windows drafts use Azure Artifact Signing through Tauri's `bundle.windows.signCommand`. Tauri signs the application executable and installer while bundling, before updater signatures and `latest.json` are produced. The guarded workflow has no unsigned fallback. A deliberately unsigned private build must be built locally, labeled unmistakably, and never published through the stable updater feed.
+
+### Distribution provider gate
+
+Signing makes an installer attributable and tamper-evident; it does not grant rights to provider content. The current local prototype uses unofficial YouTube InnerTube audio extraction, scraped SoundCloud credentials/streams, and Bandcamp page scraping. Those paths remain available only for local development while product alternatives are built. Do not send the current build to friends or publish it with those features enabled.
+
+The Windows preflight and macOS release script read `release/provider-policy.json` before using any signing identity or secret. A distributable version remains blocked until a reviewed pull request either replaces those paths with approved integrations or disables them server-side for distributed builds, adds real user Terms/Privacy, and binds the approval file to that exact release version and review reference. Do not flip the JSON boolean as a paperwork shortcut.
+
+The provider-by-provider evidence and safe product alternatives are recorded in [Provider distribution strategy](provider-distribution-strategy-2026-07-14.md).
 
 ## Windows updater behavior
 
@@ -164,4 +176,4 @@ Do not publish if an upgrade changes the Tauri identifier, Windows installer sco
 - Every macOS DMG is signed, notarized, stapled, and tested on clean matching hardware.
 - SHA-256 hashes are published with the release.
 - Release notes list supported OS/architecture, known limitations, and storage behavior.
-- Provider terms and redistribution/licensing obligations for Node, FFmpeg, YouTube, SoundCloud, Bandcamp, and radio-directory integrations have been reviewed for the intended release model.
+- `release/provider-policy.json` approves this exact version after YouTube, SoundCloud, Bandcamp, radio-directory, Node, and FFmpeg obligations have been reviewed and all listed blockers are actually closed.
