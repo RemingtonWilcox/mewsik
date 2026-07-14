@@ -1,1 +1,2 @@
 scripts/runtime-licenses/*.LICENSE -text -diff
+*.sh text eol=lf

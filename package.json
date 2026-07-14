@@ -2,12 +2,18 @@
   "name": "mewsik",
   "private": true,
   "version": "0.1.0",
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": "24.15.0",
+    "pnpm": "10.11.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite dev",
+    "version:check": "node scripts/check-version-consistency.mjs",
     "prepare:runtime": "node scripts/prepare-runtime-resources.mjs",
     "sidecar:build": "pnpm --filter mewsik-sidecar build",
-    "build": "pnpm sidecar:build && vite build",
+    "build": "pnpm version:check && pnpm sidecar:build && vite build",
     "preview": "vite preview",
     "prepare": "svelte-kit sync || echo ''",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",

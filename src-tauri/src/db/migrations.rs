@@ -357,16 +357,35 @@ ALTER TABLE discovery_observations ADD COLUMN view_count INTEGER
     CHECK (view_count IS NULL OR view_count >= 0);
 "#;
 
+pub(crate) fn latest_version() -> i64 {
+    MIGRATIONS.len() as i64
+}
+
+pub(crate) fn current_version(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    let has_migration_table: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = '_migrations'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+
+    if !has_migration_table {
+        return Ok(0);
+    }
+
+    conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+        [],
+        |row| row.get(0),
+    )
+}
+
 pub fn run_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS _migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")?;
 
-    let current_version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM _migrations",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+    let current_version = current_version(conn)?;
 
     for (i, migration) in MIGRATIONS.iter().enumerate() {
         let version = (i + 1) as i64;
