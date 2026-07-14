@@ -222,13 +222,20 @@ export interface ExternalSearchPage {
 	has_more: boolean;
 }
 
+export interface ExternalSearchResponse {
+	items: ExternalSearchResult[];
+	failed_sources: string[];
+}
+
 export interface ExternalSearchPartialEvent {
+	request_id: string;
 	query: string;
 	source: string;
 	results: ExternalSearchResult[];
 }
 
 export interface ExternalSearchCompleteEvent {
+	request_id: string;
 	query: string;
 	results: ExternalSearchResult[];
 }
@@ -252,8 +259,12 @@ export const searchExternal = (query: string, source: string, page = 0) =>
 		{ items: [], has_more: false }
 	);
 
-export const searchAllSources = (query: string) =>
-	safeInvoke<ExternalSearchResult[]>('search_all_sources', { query }, []);
+export const searchAllSources = (query: string, requestId: string) =>
+	safeInvoke<ExternalSearchResponse>(
+		'search_all_sources',
+		{ query, requestId },
+		{ items: [], failed_sources: [] }
+	);
 
 export const listenExternalSearchPartial = (
 	handler: (payload: ExternalSearchPartialEvent) => void

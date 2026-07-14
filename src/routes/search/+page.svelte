@@ -99,8 +99,11 @@
 		});
 
 		void api.listenExternalSearchPartial((payload) => {
-			if (disposed || payload.query !== query.trim()) return;
-			externalError = '';
+			if (
+				disposed ||
+				payload.request_id !== String(externalSearchRequest) ||
+				payload.query !== query.trim()
+			) return;
 			externalResults = mergeExternalResults(externalResults, payload.results);
 		}).then((unlisten) => {
 			if (disposed) {
@@ -111,7 +114,11 @@
 		});
 
 		void api.listenExternalSearchComplete((payload) => {
-			if (disposed || payload.query !== query.trim()) return;
+			if (
+				disposed ||
+				payload.request_id !== String(externalSearchRequest) ||
+				payload.query !== query.trim()
+			) return;
 			externalResults = payload.results;
 			completedExternalQuery = payload.query;
 		}).then((unlisten) => {
@@ -263,6 +270,24 @@
 		await sidecarStartPromise;
 	}
 
+	function formatExternalSearchError(error: unknown, hasResults: boolean): string {
+		const detail = error instanceof Error ? error.message : String(error ?? '').trim();
+		if (hasResults) {
+			return `Some music sources could not finish. Showing the results that did arrive${detail ? `: ${detail}` : '.'}`;
+		}
+		return `Search is unavailable${detail ? `: ${detail}` : ''}`;
+	}
+
+	function formatProviderWarning(failedSources: string[]): string {
+		const labels = [...new Set(failedSources)]
+			.map((source) => SOURCE_LABELS[source as ProviderSource] ?? source)
+			.sort();
+		const joined = labels.length > 2
+			? `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
+			: labels.join(' and ');
+		const verb = labels.length === 1 ? 'is' : 'are';
+		return `Some music sources could not finish. Showing the results that did arrive: ${joined || 'another provider'} ${verb} temporarily unavailable.`;
+	}
 
 	async function searchExternal(searchQuery = query.trim()) {
 		searchQuery = searchQuery.trim().replace(/\s+/g, ' ');
@@ -277,17 +302,22 @@
 		resetPaginationState();
 		try {
 			await ensureSidecarReady();
-			const results = await api.searchAllSources(searchQuery);
+			const response = await api.searchAllSources(searchQuery, String(requestId));
 			if (requestId === externalSearchRequest) {
-				externalResults = results;
-				externalError = '';
+				externalResults = response.items;
+				externalError = response.failed_sources.length > 0 && response.items.length > 0
+					? formatProviderWarning(response.failed_sources)
+					: '';
 				completedExternalQuery = searchQuery;
 			}
 		} catch (e) {
 			if (requestId === externalSearchRequest) {
-				externalResults = [];
-				externalError = `Search is unavailable${e ? `: ${e}` : ''}`;
-				completedExternalQuery = '';
+				// The managed provider process may have exited after it was first
+				// started. Force the next attempt to health-check it, and never erase
+				// useful partial results that arrived before another provider failed.
+				sidecarReady = false;
+				externalError = formatExternalSearchError(e, externalResults.length > 0);
+				completedExternalQuery = externalResults.length > 0 ? searchQuery : '';
 			}
 		} finally {
 			if (requestId === externalSearchRequest) {
@@ -629,6 +659,15 @@
 					{/if}
 				</button>
 			{/each}
+		</div>
+	{/if}
+
+	{#if externalError && externalResults.length > 0}
+		<div class="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2" role="status">
+			<p class="text-xs text-muted-foreground">{externalError}</p>
+			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
+				Retry missing sources
+			</Button>
 		</div>
 	{/if}
 

@@ -2470,6 +2470,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "directories",
+ "dunce",
  "ebur128",
  "fuzzy-matcher",
  "lofty",

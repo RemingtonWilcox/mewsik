@@ -18,6 +18,7 @@ use tauri::{Emitter, State};
 
 const SEARCH_RESULTS_CACHE_TTL: Duration = Duration::from_secs(90);
 const MAX_SEARCH_CACHE_ENTRIES: usize = 24;
+const EXTERNAL_SEARCH_SOURCES: [&str; 3] = ["youtube", "soundcloud", "bandcamp"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalSearchResult {
@@ -41,6 +42,12 @@ pub struct ExternalSearchResult {
 pub struct ExternalSearchPage {
     pub items: Vec<ExternalSearchResult>,
     pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalSearchResponse {
+    pub items: Vec<ExternalSearchResult>,
+    pub failed_sources: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -68,6 +75,7 @@ struct CachedExternalSearch {
 
 #[derive(Debug, Clone, Serialize)]
 struct ExternalSearchPartialEvent {
+    request_id: String,
     query: String,
     source: String,
     results: Vec<ExternalSearchResult>,
@@ -75,14 +83,52 @@ struct ExternalSearchPartialEvent {
 
 #[derive(Debug, Clone, Serialize)]
 struct ExternalSearchCompleteEvent {
+    request_id: String,
     query: String,
     results: Vec<ExternalSearchResult>,
+}
+
+#[derive(Debug)]
+struct ExternalSearchBatch {
+    results: Vec<ExternalSearchResult>,
+    failures: Vec<(String, String)>,
+}
+
+impl ExternalSearchBatch {
+    fn failed_sources(&self) -> Vec<String> {
+        self.failures
+            .iter()
+            .map(|(source, _)| source.clone())
+            .collect()
+    }
+
+    fn should_restart_sidecar(&self) -> bool {
+        self.results.is_empty()
+            && self
+                .failures
+                .iter()
+                .any(|(_, error)| is_sidecar_process_failure(error))
+    }
+}
+
+fn is_sidecar_process_failure(error: &str) -> bool {
+    [
+        "Sidecar not running",
+        "Sidecar stdin missing",
+        "Sidecar exited before responding",
+        "Failed to write to sidecar",
+        "Failed to flush sidecar stdin",
+        "No result from sidecar",
+    ]
+    .iter()
+    .any(|prefix| error.starts_with(prefix))
 }
 
 pub struct ExternalSearchRuntime {
     latest_generation: AtomicU64,
     cache: Mutex<HashMap<String, CachedExternalSearch>>,
     inflight_preresolve: Mutex<HashSet<String>>,
+    sidecar_recovery: Mutex<()>,
 }
 
 impl Default for ExternalSearchRuntime {
@@ -91,12 +137,16 @@ impl Default for ExternalSearchRuntime {
             latest_generation: AtomicU64::new(0),
             cache: Mutex::new(HashMap::new()),
             inflight_preresolve: Mutex::new(HashSet::new()),
+            sidecar_recovery: Mutex::new(()),
         }
     }
 }
 
 impl ExternalSearchRuntime {
     fn next_generation(&self) -> u64 {
+        // Serialize generation changes with process recovery so an older
+        // search can never restart the sidecar underneath a newer request.
+        let _recovery_guard = self.sidecar_recovery.lock();
         self.latest_generation.fetch_add(1, Ordering::SeqCst) + 1
     }
 
@@ -147,6 +197,19 @@ impl ExternalSearchRuntime {
     fn finish_preresolve(&self, cache_key: &str) {
         self.inflight_preresolve.lock().remove(cache_key);
     }
+
+    fn restart_sidecar_if_current(
+        &self,
+        generation: u64,
+        sidecar: &SidecarManager,
+    ) -> Result<bool, String> {
+        let _recovery_guard = self.sidecar_recovery.lock();
+        if !self.is_current(generation) {
+            return Ok(false);
+        }
+        sidecar.restart()?;
+        Ok(true)
+    }
 }
 
 fn normalize_query(value: &str) -> String {
@@ -178,6 +241,19 @@ fn validated_search_query(value: &str) -> Result<String, String> {
         return Err("Search query must be 200 characters or fewer".to_string());
     }
     Ok(query)
+}
+
+fn validated_search_request_id(value: &str) -> Result<String, String> {
+    let request_id = value.trim();
+    if request_id.is_empty()
+        || request_id.len() > 64
+        || !request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("Invalid search request id".to_string());
+    }
+    Ok(request_id.to_string())
 }
 
 fn validated_search_source(value: &str) -> Result<&'static str, String> {
@@ -674,6 +750,112 @@ fn ensure_external_recording_inner(
     Ok(recording_id)
 }
 
+fn run_external_search_batch(
+    app: &tauri::AppHandle,
+    db: &DbPool,
+    sidecar: &Arc<SidecarManager>,
+    cache: &StreamCache,
+    search_runtime: &Arc<ExternalSearchRuntime>,
+    query: &str,
+    request_id: &str,
+    generation: u64,
+    attempt: usize,
+) -> ExternalSearchBatch {
+    let (tx, rx) = mpsc::channel();
+
+    for source in EXTERNAL_SEARCH_SOURCES {
+        let source_name = source.to_string();
+        let query_value = query.to_string();
+        let manager = Arc::clone(sidecar);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let method = format!("{}.search", source_name);
+            let payload = manager
+                .call(&method, json!({ "query": query_value, "page": 0 }))
+                .and_then(|result| {
+                    let items = result.get("items").cloned().ok_or_else(|| {
+                        format!(
+                            "{} returned a search response without items",
+                            provider_label(&source_name)
+                        )
+                    })?;
+                    serde_json::from_value::<Vec<ExternalSearchResult>>(items).map_err(|error| {
+                        format!(
+                            "{} returned an invalid search response: {error}",
+                            provider_label(&source_name)
+                        )
+                    })
+                });
+
+            let _ = tx.send((source_name, payload));
+        });
+    }
+    drop(tx);
+
+    let mut all_results = Vec::new();
+    let mut completed_sources = HashSet::new();
+    let mut failures = Vec::new();
+    for (source, payload) in rx {
+        completed_sources.insert(source.clone());
+        match payload {
+            Ok(items) => {
+                let items = enrich_external_results(db, items);
+                if search_runtime.is_current(generation) {
+                    let _ = app.emit(
+                        "external-search-partial",
+                        ExternalSearchPartialEvent {
+                            request_id: request_id.to_string(),
+                            query: query.to_string(),
+                            source,
+                            results: items.clone(),
+                        },
+                    );
+                }
+                let warm_candidates = rank_external_results(query, items.clone());
+                spawn_preresolve_for_results(
+                    Arc::clone(sidecar),
+                    Arc::clone(cache),
+                    Arc::clone(search_runtime),
+                    generation,
+                    &warm_candidates,
+                    2,
+                );
+                all_results.extend(items);
+            }
+            Err(error) => {
+                log::warn!(
+                    target: "mewsik::search",
+                    "provider search failed on attempt {} for {}: {}",
+                    attempt,
+                    source,
+                    error
+                );
+                failures.push((source, error));
+            }
+        }
+    }
+
+    for source in EXTERNAL_SEARCH_SOURCES {
+        if completed_sources.contains(source) {
+            continue;
+        }
+        let error = "search worker exited without a response".to_string();
+        log::warn!(
+            target: "mewsik::search",
+            "provider search failed on attempt {} for {}: {}",
+            attempt,
+            source,
+            error
+        );
+        failures.push((source.to_string(), error));
+    }
+
+    ExternalSearchBatch {
+        results: all_results,
+        failures,
+    }
+}
+
 #[tauri::command]
 pub fn search_external(
     db: State<'_, DbPool>,
@@ -724,14 +906,17 @@ pub fn search_all_sources(
     cache: State<'_, StreamCache>,
     search_runtime: State<'_, Arc<ExternalSearchRuntime>>,
     query: String,
-) -> Result<Vec<ExternalSearchResult>, String> {
+    request_id: String,
+) -> Result<ExternalSearchResponse, String> {
     let query = validated_search_query(&query)?;
+    let request_id = validated_search_request_id(&request_id)?;
     let generation = search_runtime.next_generation();
     if let Some(cached_results) = search_runtime.get_cached_results(&query) {
         let cached_results = enrich_external_results(&db, cached_results);
         let _ = app.emit(
             "external-search-complete",
             ExternalSearchCompleteEvent {
+                request_id: request_id.clone(),
                 query: query.clone(),
                 results: cached_results.clone(),
             },
@@ -744,97 +929,84 @@ pub fn search_all_sources(
             &cached_results,
             5,
         );
-        return Ok(cached_results);
+        return Ok(ExternalSearchResponse {
+            items: cached_results,
+            failed_sources: Vec::new(),
+        });
     }
 
     sidecar.start()?;
-    let (tx, rx) = mpsc::channel();
+    let mut batch = run_external_search_batch(
+        &app,
+        db.inner(),
+        sidecar.inner(),
+        cache.inner(),
+        search_runtime.inner(),
+        &query,
+        &request_id,
+        generation,
+        1,
+    );
 
-    const SOURCES: [&str; 3] = ["youtube", "soundcloud", "bandcamp"];
-    for source in SOURCES {
-        let source_name = source.to_string();
-        let query_value = query.clone();
-        let manager = Arc::clone(sidecar.inner());
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let method = format!("{}.search", source_name);
-            let payload = manager
-                .call(&method, json!({ "query": query_value, "page": 0 }))
-                .and_then(|result| {
-                    let items = result.get("items").cloned().ok_or_else(|| {
-                        format!(
-                            "{} returned a search response without items",
-                            provider_label(&source_name)
-                        )
-                    })?;
-                    serde_json::from_value::<Vec<ExternalSearchResult>>(items).map_err(|error| {
-                        format!(
-                            "{} returned an invalid search response: {error}",
-                            provider_label(&source_name)
-                        )
-                    })
-                });
-
-            let _ = tx.send((source_name, payload));
-        });
-    }
-    drop(tx);
-
-    let mut all_results = Vec::new();
-    let mut completed_sources = HashSet::new();
-    let mut failed_sources = Vec::new();
-    for (source, payload) in rx {
-        completed_sources.insert(source.clone());
-        match payload {
-            Ok(items) => {
-                let items = enrich_external_results(&db, items);
-                let _ = app.emit(
-                    "external-search-partial",
-                    ExternalSearchPartialEvent {
-                        query: query.clone(),
-                        source,
-                        results: items.clone(),
-                    },
-                );
-                let warm_candidates = rank_external_results(&query, items.clone());
-                spawn_preresolve_for_results(
-                    Arc::clone(sidecar.inner()),
-                    Arc::clone(&*cache),
-                    Arc::clone(search_runtime.inner()),
+    // A provider child can be terminated by the OS, security software, or an
+    // upstream dependency crash. One bounded restart makes a transient child
+    // failure invisible to the user while still returning promptly when the
+    // providers are genuinely unavailable. Never restart for an obsolete
+    // search because that could interrupt the newer generation.
+    if batch.should_restart_sidecar() {
+        log::warn!(
+            target: "mewsik::search",
+            "search returned no results with {} provider failure(s); restarting the sidecar once",
+            batch.failures.len()
+        );
+        match search_runtime.restart_sidecar_if_current(generation, sidecar.inner()) {
+            Ok(true) if search_runtime.is_current(generation) => {
+                batch = run_external_search_batch(
+                    &app,
+                    db.inner(),
+                    sidecar.inner(),
+                    cache.inner(),
+                    search_runtime.inner(),
+                    &query,
+                    &request_id,
                     generation,
-                    &warm_candidates,
                     2,
                 );
-                all_results.extend(items);
             }
-            Err(err) => {
-                log::warn!("Failed to search {}: {}", source, err);
-                failed_sources.push(source);
+            Ok(_) => {
+                log::info!(
+                    target: "mewsik::search",
+                    "skipping sidecar retry because a newer search generation started"
+                );
+            }
+            Err(error) => {
+                log::error!(
+                    target: "mewsik::search",
+                    "failed to restart the provider sidecar: {}",
+                    error
+                );
             }
         }
     }
 
-    for source in SOURCES {
-        if !completed_sources.contains(source) {
-            log::warn!("Search worker for {} exited without a response", source);
-            failed_sources.push(source.to_string());
-        }
-    }
-
-    let ranked = rank_external_results(&query, all_results);
+    let failed_sources = batch.failed_sources();
+    let ranked = rank_external_results(&query, batch.results);
     if ranked.is_empty() && !failed_sources.is_empty() {
         return Err(provider_failure_message(&failed_sources));
     }
     if failed_sources.is_empty() {
         search_runtime.cache_results(&query, &ranked);
     }
-    let _ = app.emit(
-        "external-search-complete",
-        ExternalSearchCompleteEvent {
-            query: query.clone(),
-            results: ranked.clone(),
-        },
-    );
+    if search_runtime.is_current(generation) {
+        let _ = app.emit(
+            "external-search-complete",
+            ExternalSearchCompleteEvent {
+                request_id,
+                query: query.clone(),
+                results: ranked.clone(),
+            },
+        );
+    }
     spawn_preresolve_for_results(
         Arc::clone(sidecar.inner()),
         Arc::clone(&*cache),
@@ -844,7 +1016,10 @@ pub fn search_all_sources(
         5,
     );
 
-    Ok(ranked)
+    Ok(ExternalSearchResponse {
+        items: ranked,
+        failed_sources,
+    })
 }
 
 #[tauri::command]
@@ -919,8 +1094,10 @@ pub fn sidecar_status(sidecar: State<'_, Arc<SidecarManager>>) -> Result<bool, S
 mod tests {
     use super::{
         provider_failure_message, rank_external_results, validated_search_query,
-        validated_search_source, ExternalSearchResult,
+        validated_search_request_id, validated_search_source, ExternalSearchBatch,
+        ExternalSearchResult, ExternalSearchRuntime,
     };
+    use crate::sources::sidecar_manager::SidecarManager;
 
     fn result(
         source: &str,
@@ -1008,6 +1185,10 @@ mod tests {
             validated_search_query("宇多田ヒカル").as_deref(),
             Ok("宇多田ヒカル")
         );
+        assert_eq!(
+            validated_search_query("Ella Langley Choosin' Texas").as_deref(),
+            Ok("Ella Langley Choosin' Texas")
+        );
         assert!(validated_search_query("x").is_err());
         assert!(validated_search_query("hello\nworld").is_err());
         assert!(validated_search_query(&"x".repeat(201)).is_err());
@@ -1021,9 +1202,76 @@ mod tests {
     }
 
     #[test]
+    fn search_request_ids_are_small_opaque_tokens() {
+        assert_eq!(validated_search_request_id("42").as_deref(), Ok("42"));
+        assert_eq!(
+            validated_search_request_id("search_retry-2").as_deref(),
+            Ok("search_retry-2")
+        );
+        assert!(validated_search_request_id("").is_err());
+        assert!(validated_search_request_id("same query").is_err());
+        assert!(validated_search_request_id(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
     fn provider_failure_is_actionable_without_leaking_internal_errors() {
         let message = provider_failure_message(&["youtube".to_string(), "soundcloud".to_string()]);
         assert!(message.contains("SoundCloud and YouTube"));
         assert!(message.contains("Try again"));
+    }
+
+    #[test]
+    fn empty_failed_batch_gets_one_sidecar_recovery_attempt() {
+        let batch = ExternalSearchBatch {
+            results: Vec::new(),
+            failures: vec![(
+                "youtube".to_string(),
+                "Sidecar exited before responding".to_string(),
+            )],
+        };
+        assert!(batch.should_restart_sidecar());
+
+        let empty_success = ExternalSearchBatch {
+            results: Vec::new(),
+            failures: Vec::new(),
+        };
+        assert!(!empty_success.should_restart_sidecar());
+
+        let partial_success = ExternalSearchBatch {
+            results: vec![result("soundcloud", "Choosin' Texas", "Ella Langley", None)],
+            failures: vec![("youtube".to_string(), "upstream timeout".to_string())],
+        };
+        assert!(!partial_success.should_restart_sidecar());
+
+        let healthy_process_with_provider_errors = ExternalSearchBatch {
+            results: Vec::new(),
+            failures: vec![
+                (
+                    "youtube".to_string(),
+                    "Sidecar error: upstream rejected the request".to_string(),
+                ),
+                (
+                    "soundcloud".to_string(),
+                    "Sidecar request 'soundcloud.search' in generation 1 timed out after 30s"
+                        .to_string(),
+                ),
+            ],
+        };
+        assert!(!healthy_process_with_provider_errors.should_restart_sidecar());
+    }
+
+    #[test]
+    fn stale_search_generation_cannot_restart_the_sidecar() {
+        let runtime = ExternalSearchRuntime::default();
+        let stale_generation = runtime.next_generation();
+        let current_generation = runtime.next_generation();
+        let sidecar = SidecarManager::new();
+
+        assert_ne!(stale_generation, current_generation);
+        assert_eq!(
+            runtime.restart_sidecar_if_current(stale_generation, &sidecar),
+            Ok(false)
+        );
+        assert!(!sidecar.is_running());
     }
 }

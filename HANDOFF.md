@@ -109,6 +109,9 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - Selecting a discovery card writes `/search?q=...` and runs the normal YouTube, SoundCloud, and Bandcamp search exactly once. The page keeps its loader visible while providers work, preserves partial results, exposes provider failures with Retry, and only says **No results** after a conclusive completed search.
 - Discovery clicks are recorded with item, shelf, and snapshot IDs for future ranking evaluation. A click remains a click; it is not mislabeled as a save, completed listen, or recommendation success.
 - External search validates queries and provider names, rejects malformed sidecar responses, and no longer converts total provider failure into a fake successful empty result. Incomplete failures are not cached.
+- Packaged Windows search no longer passes Node the verbatim `\\?\` canonical entry-script path that made Node exit with `EISDIR` before any provider could answer. The script remains canonicalized and security-checked first, then receives a normal Windows child-process argument.
+- Search-sidecar requests are isolated by process generation, restart once only for real transport failures, and retain successful provider results when another provider is down. Opaque request tokens prevent delayed events from an older search or retry from overwriting the current results.
+- Release builds now keep a bounded native log with sidecar spawn, restart, exit, and retirement evidence, so future packaged-only failures can be diagnosed from the real installed process instead of guessed from a browser mock.
 - Discover now has three honest states: useful onboarding with no library, qualified-listen profile progress, and a personal rotation once enough listening exists. Thirty seconds of actual audible time drives affinity, history, rediscovery, and play statistics; paused time and short skips do not tune the profile.
 - Playback history now separates track length from audible listening time and records why a play ended. Natural end, stop, next/previous, source replacement, errors, and shutdown are finalized distinctly and idempotently; only a natural end is a completion.
 - Playback errors carry their originating session ID, so a late failure from an old asynchronous fetch cannot stop or falsely finalize the newer song that replaced it.
@@ -135,8 +138,9 @@ Completed on the combined branch and packaged native release:
 
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
-- `pnpm test:e2e`: 44/44 pass on a clean Vite server
-- `cargo test --lib`: 98 pass, 0 fail, 2 intentionally ignored live-provider tests
+- `pnpm test:e2e`: 47/47 pass on a clean Vite server
+- `cargo test --lib`: 105 pass, 0 fail, 3 intentionally ignored live-provider tests
+- Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
 - Discovery live integration: Apple, ListenBrainz, and Bandcamp Daily refreshed successfully, produced real shelves, and persisted a compatible snapshot
 - Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, material-density floor and differentiated material signatures, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
 - Shared journey: cached-reader idempotence, Mk1 advancement, Signal/Mk2 remount continuity, A -> B -> A reset, pause decay, 60/144 Hz null-cadence invariance, and zero synthetic startup-impact coverage
@@ -146,10 +150,10 @@ Completed on the combined branch and packaged native release:
 - Legacy engine migration and supported engine roster: covered by Playwright
 - Named rail navigation, retired `V`, response repair/persistence, Flow-neutral response profiles, synchronized player/engine auto-hide, app-surface-only wake behavior, locked manual Hide, interaction holds, and close/reopen state reset: covered by Playwright
 - Stations: dedicated Discover/Favorites/Directory navigation, directory persistence, ranking-specific metrics, saved-state behavior, and compact local health covered by Playwright.
-- Search discovery: v2 shelf contracts, source status, one-reason cards, click-event payloads, forced refresh, fallback shelves, query URL handoff, in-progress loading, real-result rendering, and conclusive no-result handling covered by Playwright.
+- Search discovery: v2 shelf contracts, source status, one-reason cards, click-event payloads, forced refresh, fallback shelves, exact apostrophe-query URL handoff, in-progress loading, real-result rendering, partial-provider degradation, retry recovery, stale-event rejection, and conclusive no-result handling covered by Playwright.
 - Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
 - Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
-- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 14,899,712-byte `.text` code section as the workspace executable and differs by only the expected three-byte Tauri bundle discriminator (`UNK` workspace artifact vs `NSS` installed payload).
+- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 15,137,792-byte `.text` code section and SHA-256 `F4FCA72497DA4C98D9408113628F14DEBA4EE92FBA413BC31CCDEF60303EB92C` as the workspace executable; the raw files differ by the expected Tauri bundle discriminator.
 - The real user database migrated to version 7 successfully after a pre-upgrade backup; `PRAGMA quick_check` returned `ok`, and the installed process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
@@ -170,10 +174,10 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (20,988,928 bytes): SHA-256 `43907547A1CA0CE28E7DD789786B929026CC7C9C2B2F97C38C7C301205166D3B`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,685,219 bytes): SHA-256 `1A56DB4CDEFEE74FFB90CB2D485250429B19C6789EDEC5FD592D02D2EE513A8E`
-- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,142,848 bytes): SHA-256 `E4A54F73E0ECE36AC9EDC19CEA34784F3DE417BA45E87448F8D98823E538004C`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (20,988,928 bytes): SHA-256 `77F347C8CC80AA4FB1B890D37286BB403E6EC5991867987A27341039FEBAA5B6`
+- `src-tauri/target/release/mewsik.exe` (21,298,688 bytes): SHA-256 `1515327E7CB906497171B887339E72A1AEC464C47DE4FE25661ABF835273786F`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,745,227 bytes): SHA-256 `8D227D42110229EE8F1A22412A770399D8398D0CF2FF522FA73F88B41EA9B64E`
+- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,241,152 bytes): SHA-256 `1330046F01A943E0C0D18FDDF2D783424A7EAE138653E742CBFAE5E622550280`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,298,688 bytes): SHA-256 `4891D04EEE01F05D8699FCE413AD8A9BDA6FA31050706D0D4EB2CE0B32BB44EF`
 
 The executable and both installers are currently unsigned. Code signing remains release-distribution work, not a visualizer merge blocker.
 
