@@ -6,11 +6,13 @@
 	import { toast } from 'svelte-sonner';
 	import {
 		CheckCircle2,
+		Download,
 		FolderOpen,
 		HardDrive,
 		Laptop,
 		Moon,
 		RefreshCw,
+		RotateCcw,
 		Search,
 		Sun,
 		X
@@ -33,6 +35,8 @@
 	let scanning = $state(false);
 	let providerRunning = $state(false);
 	let providerLoading = $state(false);
+	let downloadLocation = $state<api.DownloadLocationInfo | null>(null);
+	let downloadLocationLoading = $state(false);
 	let settingsError = $state('');
 	let lastScan = $state<ScanSummary | null>(null);
 
@@ -43,12 +47,14 @@
 	async function loadSettings() {
 		loading = true;
 		try {
-			const [paths, running] = await Promise.all([
+			const [paths, running, location] = await Promise.all([
 				api.getLibraryPaths(),
-				api.sidecarStatus().catch(() => false)
+				api.sidecarStatus().catch(() => false),
+				api.getDownloadLocation()
 			]);
 			libraryPaths = paths;
 			providerRunning = running;
+			downloadLocation = location;
 			await library.loadAll();
 			settingsError = '';
 		} catch (error) {
@@ -122,6 +128,56 @@
 			}
 		} finally {
 			scanning = false;
+		}
+	}
+
+	function formatBytes(bytes: number): string {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+		return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+	}
+
+	async function chooseDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			const directory = await api.pickFolder(downloadLocation?.directory);
+			if (!directory) return;
+			await api.setDownloadLocation(directory);
+			downloadLocation = await api.getDownloadLocation();
+			toast.success('New downloads will use this folder');
+		} catch (error) {
+			toast.error(`Could not change download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
+		}
+	}
+
+	async function resetDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			await api.resetDownloadLocation();
+			downloadLocation = await api.getDownloadLocation();
+			toast.success('Download folder reset to the default location');
+		} catch (error) {
+			toast.error(`Could not reset download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
+		}
+	}
+
+	async function showDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			await api.revealDownloadLocation();
+			downloadLocation = await api.getDownloadLocation();
+		} catch (error) {
+			toast.error(`Could not open download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
 		}
 	}
 
@@ -229,6 +285,59 @@
 					</span>
 				{/if}
 			</div>
+		</CardContent>
+	</Card>
+
+	<Card>
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>Download location</CardTitle>
+					<CardDescription class="mt-1">New music saves somewhere recognizable and remains yours to manage.</CardDescription>
+				</div>
+				<div class="flex flex-wrap gap-2">
+					<Button variant="outline" size="sm" onclick={showDownloadFolder} disabled={loading || downloadLocationLoading || !downloadLocation}>
+						<FolderOpen class="size-4" /> Show folder
+					</Button>
+					<Button size="sm" onclick={chooseDownloadFolder} disabled={loading || downloadLocationLoading}>
+						<Download class="size-4" /> Change folder
+					</Button>
+				</div>
+			</div>
+		</CardHeader>
+		<CardContent class="flex flex-col gap-3">
+			{#if loading || !downloadLocation}
+				<div class="h-16 animate-pulse rounded-lg bg-muted"></div>
+			{:else}
+				<div class="flex items-center gap-3 rounded-lg border border-border/70 px-3 py-3">
+					<div class="flex size-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+						<Download class="size-4" />
+					</div>
+					<div class="min-w-0 flex-1">
+						<p class="truncate font-mono text-xs" title={downloadLocation.directory}>{downloadLocation.directory}</p>
+						<p class="mt-1 text-[11px] text-muted-foreground">
+							{#if downloadLocation.is_custom}
+								{downloadLocation.exists ? 'Custom folder' : 'Custom folder unavailable · Reconnect it or choose another'}
+							{:else}
+								Default folder{downloadLocation.exists ? '' : ' · Created with your next download'}
+							{/if}
+						</p>
+					</div>
+					{#if downloadLocation.is_custom}
+						<Button variant="ghost" size="sm" onclick={resetDownloadFolder} disabled={downloadLocationLoading}>
+							<RotateCcw class="size-3.5" /> Use default
+						</Button>
+					{/if}
+				</div>
+
+				<p class="px-1 text-[11px] text-muted-foreground">Changing this affects future downloads only. Existing files are never moved or deleted automatically.</p>
+
+				{#if downloadLocation.legacy_file_count > 0}
+					<div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+						{downloadLocation.legacy_file_count} existing {downloadLocation.legacy_file_count === 1 ? 'download remains' : 'downloads remain'} in the old app folder ({formatBytes(downloadLocation.legacy_bytes)}). They stay playable there; nothing was moved.
+					</div>
+				{/if}
+			{/if}
 		</CardContent>
 	</Card>
 

@@ -72,7 +72,8 @@ const defaultSettings = {
 	library_paths: [],
 	audio_device: null,
 	normalization_enabled: false,
-	last_volume: 1
+	last_volume: 1,
+	download_directory: null
 };
 
 // Library
@@ -187,6 +188,7 @@ export const getSettings = () =>
 		audio_device: string | null;
 		normalization_enabled: boolean;
 		last_volume: number;
+		download_directory: string | null;
 	}>('get_settings', undefined, defaultSettings);
 
 export const updateLibraryPaths = (paths: string[]) =>
@@ -499,9 +501,43 @@ export const getPlayStats = () =>
 export const getRecentlyPlayed = () => safeInvoke<LibraryTrack[]>('get_recently_played', undefined, []);
 
 // Downloads
+export interface DownloadLocationInfo {
+	directory: string;
+	default_directory: string;
+	is_custom: boolean;
+	exists: boolean;
+	legacy_file_count: number;
+	legacy_bytes: number;
+}
+
+export interface DownloadStart {
+	id: string;
+	directory: string | null;
+	already_active: boolean;
+}
+
+const browserDownloadLocation: DownloadLocationInfo = {
+	directory: 'Music/Mewsik',
+	default_directory: 'Music/Mewsik',
+	is_custom: false,
+	exists: false,
+	legacy_file_count: 0,
+	legacy_bytes: 0
+};
+
 export const getDownloads = () => safeInvoke<Download[]>('get_downloads', undefined, []);
+export const refreshDownloadFiles = () =>
+	safeInvoke<Download[]>('refresh_download_files');
+export const getDownloadLocation = () =>
+	safeInvoke<DownloadLocationInfo>('get_download_location', undefined, browserDownloadLocation);
+export const setDownloadLocation = (directory: string) =>
+	safeInvoke<void>('set_download_location', { directory });
+export const resetDownloadLocation = () =>
+	safeInvoke<void>('reset_download_location');
+export const revealDownloadLocation = () =>
+	safeInvoke<void>('reveal_download_location');
 export const downloadRecording = (recordingId: string) =>
-	safeInvoke<string>('download_recording', { recordingId });
+	safeInvoke<DownloadStart>('download_recording', { recordingId });
 export const cancelDownload = (downloadId: string) =>
 	safeInvoke('cancel_download', { downloadId });
 export const deleteDownload = (downloadId: string) =>

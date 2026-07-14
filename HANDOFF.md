@@ -126,6 +126,17 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - Newly added library paths must be existing directories; an already-saved disconnected drive can remain visible and removable rather than bricking settings startup.
 - Library path identity is case-insensitive on Windows and case-sensitive on Unix targets, preserving valid case-distinct folders without allowing a differently cased nonexistent path to bypass validation.
 
+### Downloads and user-owned storage
+
+- New downloads no longer default to the private `%APPDATA%` tree. The platform Music folder under `Mewsik` is preferred, Downloads is the public fallback, and private app data is used only when neither known folder exists.
+- Settings shows the exact destination and provides native **Show folder**, **Change folder**, and **Use default** actions. Changing it affects future jobs only; each active job owns the destination captured when it was queued.
+- Existing downloads remain at their absolute paths and are never silently moved or deleted. The Settings card reports legacy AppData files and their size so an explicit migration can be added later without risking current media.
+- Missing or disconnected files now retain both their download and managed-source records in a recoverable `missing` state. Reconnecting the drive restores them, while playback performs a recording-scoped check and falls back to a valid remote source instead of selecting a stale local path.
+- Downloads-page polling is DB-only. **Check files** performs the explicit full filesystem reconciliation on a blocking worker, and a failed **Show in folder** action triggers the same repair check.
+- Download-directory validation creates and verifies a writable destination before inserting a job. Same-title jobs reserve filenames atomically, so concurrent downloads cannot overwrite one another.
+- Config persistence uses a same-directory temporary file, flush, and atomic replacement; older config files deserialize with the new field at its safe default.
+- The full queue/continuity and visual expansion direction is captured in `docs/product-direction-2026-07-14.md`; backend-owned Up Next is the next milestone.
+
 ### Audio-level contract
 
 Native RMS and peak are now calculated from the unwindowed PCM waveform. The old implementation calculated both from FFT magnitudes that had already been divided by the FFT size, making a controlled 0.8-amplitude sine report RMS `0.00765` instead of `0.56569`. That kept Signal's silence gate closed and muted RMS-driven section changes in Mk1 and Mk2.
@@ -138,8 +149,8 @@ Completed on the combined branch and packaged native release:
 
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
-- `pnpm test:e2e`: 47/47 pass on a clean Vite server
-- `cargo test --lib`: 105 pass, 0 fail, 3 intentionally ignored live-provider tests
+- `pnpm test:e2e -- --workers=4`: 48/48 pass on a clean Vite server
+- `cargo test`: 115 pass, 0 fail, 3 intentionally ignored live-provider tests
 - Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
 - Discovery live integration: Apple, ListenBrainz, and Bandcamp Daily refreshed successfully, produced real shelves, and persisted a compatible snapshot
 - Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, material-density floor and differentiated material signatures, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
@@ -152,8 +163,9 @@ Completed on the combined branch and packaged native release:
 - Stations: dedicated Discover/Favorites/Directory navigation, directory persistence, ranking-specific metrics, saved-state behavior, and compact local health covered by Playwright.
 - Search discovery: v2 shelf contracts, source status, one-reason cards, click-event payloads, forced refresh, fallback shelves, exact apostrophe-query URL handoff, in-progress loading, real-result rendering, partial-provider degradation, retry recovery, stale-event rejection, and conclusive no-result handling covered by Playwright.
 - Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
+- Download storage: old-config compatibility, platform default resolution, atomic config replacement, non-destructive disconnect/reconnect recovery, playback-boundary remote fallback, same-name reservation concurrency, per-job destination capture, directory masquerading as an audio file, newest-retry source ownership, cheap polling, manual health scans, and unavailable custom-folder messaging covered by Rust and Playwright.
 - Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
-- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 15,137,792-byte `.text` code section and SHA-256 `F4FCA72497DA4C98D9408113628F14DEBA4EE92FBA413BC31CCDEF60303EB92C` as the workspace executable; the raw files differ by the expected Tauri bundle discriminator.
+- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 15,151,104-byte `.text` code section and SHA-256 `2741110A5A69F35A9B5329BDB48BDFFD44E30C8FF40E9B18BE00BEB397C7C951` as the workspace executable; the raw files differ by the expected Tauri bundle discriminator.
 - The real user database migrated to version 7 successfully after a pre-upgrade backup; `PRAGMA quick_check` returned `ok`, and the installed process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
@@ -174,10 +186,10 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (21,298,688 bytes): SHA-256 `1515327E7CB906497171B887339E72A1AEC464C47DE4FE25661ABF835273786F`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,745,227 bytes): SHA-256 `8D227D42110229EE8F1A22412A770399D8398D0CF2FF522FA73F88B41EA9B64E`
-- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,241,152 bytes): SHA-256 `1330046F01A943E0C0D18FDDF2D783424A7EAE138653E742CBFAE5E622550280`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,298,688 bytes): SHA-256 `4891D04EEE01F05D8699FCE413AD8A9BDA6FA31050706D0D4EB2CE0B32BB44EF`
+- `src-tauri/target/release/mewsik.exe` (21,343,232 bytes): SHA-256 `99E212B49C985331D736999774148EF0144BD939F083A62D9D5C7D549EC1EB0F`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,766,912 bytes): SHA-256 `D40A528128251529290685423F1448527410D27919A1443A0597611DEFAB0BB7`
+- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,249,344 bytes): SHA-256 `21896ABBC918D25EB4306E4C5DD7B7FC18132C636E960564D90FC8519F50A7B6`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,343,232 bytes): SHA-256 `294FE03B7AD59BB8B3E3FE468FCA8BC9214A98E0D525FB743CC4E3DC21053B0F`
 
 The executable and both installers are currently unsigned. Code signing remains release-distribution work, not a visualizer merge blocker.
 
@@ -208,10 +220,16 @@ The executable and both installers are currently unsigned. Code signing remains 
 - `src-tauri/src/discovery/store.rs`
 - `src-tauri/src/commands/discovery.rs`
 - `src-tauri/src/db/migrations.rs`
+- `src-tauri/src/config.rs`
+- `src-tauri/src/commands/downloads.rs`
+- `src-tauri/src/download/mod.rs`
 - `src/routes/+layout.svelte`
+- `src/routes/downloads/+page.svelte`
+- `src/routes/settings/+page.svelte`
 - `src/routes/search/+page.svelte`
 - `src/routes/stations/+page.svelte`
 - `src/routes/visualizer-test/+page.svelte`
 - `e2e/visualizer.spec.ts`
 - `e2e/journey-runtime.spec.ts`
 - `e2e/mk2-conductor.spec.ts`
+- `docs/product-direction-2026-07-14.md`

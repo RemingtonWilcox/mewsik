@@ -36,6 +36,17 @@ pub fn run() {
     // Init database
     let db_path = AppConfig::db_path();
     let db = db::init_db(&db_path).expect("failed to initialize database");
+    let startup_download_db = db.clone();
+    let _ = std::thread::Builder::new()
+        .name("download-file-reconcile".to_string())
+        .spawn(move || {
+            if let Err(error) = download::reconcile_download_files(&startup_download_db) {
+                log::warn!("download reconciliation failed: {error}");
+            }
+            if let Err(error) = download::sync_completed_download_sources(&startup_download_db) {
+                log::warn!("download source synchronization failed: {error}");
+            }
+        });
 
     // Init audio engine
     let engine = Arc::new(AudioEngine::new(db.clone()));
@@ -147,6 +158,11 @@ pub fn run() {
             commands::discovery::record_discovery_event,
             // Downloads
             commands::downloads::get_downloads,
+            commands::downloads::refresh_download_files,
+            commands::downloads::get_download_location,
+            commands::downloads::set_download_location,
+            commands::downloads::reset_download_location,
+            commands::downloads::reveal_download_location,
             commands::downloads::download_recording,
             commands::downloads::cancel_download,
             commands::downloads::delete_download,

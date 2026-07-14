@@ -95,6 +95,71 @@ async function installDiscoveryProfileRuntime(page: Page) {
 	});
 }
 
+async function installDownloadLocationRuntime(page: Page) {
+	await page.addInitScript(() => {
+		type DownloadInvocation = { command: string; args: Record<string, unknown> };
+		const runtimeWindow = window as Window & {
+			__DOWNLOAD_INVOCATIONS__?: DownloadInvocation[];
+			__TAURI_INTERNALS__?: {
+				invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown>;
+				transformCallback: () => number;
+				unregisterCallback: () => void;
+			};
+		};
+		runtimeWindow.__DOWNLOAD_INVOCATIONS__ = [];
+		const playbackState = {
+			is_playing: false,
+			is_buffering: false,
+			can_seek: false,
+			current_recording_id: null,
+			current_title: null,
+			current_artist: null,
+			current_album_art: null,
+			current_source_url: null,
+			current_station_id: null,
+			position_ms: 0,
+			duration_ms: 0,
+			volume: 1,
+			is_shuffle: false,
+			repeat_mode: 'off',
+			source: null
+		};
+
+		runtimeWindow.__TAURI_INTERNALS__ = {
+			invoke: async (command, args = {}) => {
+				runtimeWindow.__DOWNLOAD_INVOCATIONS__?.push({ command, args });
+				switch (command) {
+					case 'get_downloads':
+					case 'refresh_download_files':
+					case 'get_playlists':
+					case 'get_library_paths':
+					case 'get_library_tracks':
+					case 'get_all_artists':
+					case 'get_all_albums':
+						return [];
+					case 'get_download_location':
+						return {
+							directory: 'E:\\Portable Music\\Mewsik',
+							default_directory: 'C:\\Users\\listener\\Music\\Mewsik',
+							is_custom: true,
+							exists: false,
+							legacy_file_count: 0,
+							legacy_bytes: 0
+						};
+					case 'get_playback_state':
+						return playbackState;
+					case 'sidecar_status':
+						return false;
+					default:
+						return null;
+				}
+			},
+			transformCallback: () => 1,
+			unregisterCallback: () => {}
+		};
+	});
+}
+
 test.describe('Discover and Settings fallback experience', () => {
 	test('empty Discover still offers useful ways in and searchable outside picks', async ({ page }) => {
 		await page.goto('/discover');
@@ -174,6 +239,14 @@ test.describe('Discover and Settings fallback experience', () => {
 		await expect(libraryCard.getByRole('button', { name: 'Add folder' })).toBeVisible();
 		await expect(libraryCard.getByText('No local music folders yet')).toBeVisible();
 
+		const downloadCard = page.locator('[data-slot="card"]').filter({ hasText: 'Download location' });
+		await expect(downloadCard).toBeVisible();
+		await expect(downloadCard.getByText('Music/Mewsik', { exact: true })).toBeVisible();
+		await expect(downloadCard.getByText('Default folder', { exact: false })).toBeVisible();
+		await expect(downloadCard.getByText(/Existing files are never moved or deleted automatically/)).toBeVisible();
+		await expect(downloadCard.getByRole('button', { name: 'Show folder' })).toBeVisible();
+		await expect(downloadCard.getByRole('button', { name: 'Change folder' })).toBeVisible();
+
 		const theme = page.getByRole('group', { name: 'Theme' });
 		for (const preference of ['Light', 'Dark', 'System']) {
 			await expect(theme.getByRole('button', { name: preference, exact: true })).toBeVisible();
@@ -191,5 +264,46 @@ test.describe('Discover and Settings fallback experience', () => {
 		await expect(troubleshooting.getByRole('button', { name: 'Restart providers' })).toBeVisible();
 		await troubleshooting.locator('summary').click();
 		await expect(troubleshooting.getByRole('button', { name: 'Restart providers' })).toBeHidden();
+	});
+
+	test('Downloads keeps mount polling cheap and runs file health only on request', async ({ page }) => {
+		await installDownloadLocationRuntime(page);
+		await page.goto('/downloads');
+
+		await expect(page.getByRole('heading', { name: 'Downloads', exact: true })).toBeVisible();
+		await expect(page.getByText('E:\\Portable Music\\Mewsik', { exact: true })).toBeVisible();
+		const refreshCount = () =>
+			page.evaluate(() => {
+				const calls = (window as Window & {
+					__DOWNLOAD_INVOCATIONS__?: Array<{ command: string }>;
+				}).__DOWNLOAD_INVOCATIONS__ ?? [];
+				return calls.filter(({ command }) => command === 'refresh_download_files').length;
+			});
+		await expect.poll(refreshCount).toBe(0);
+
+		// Leave enough time for both the Downloads-page poll and the global sidebar
+		// poll to run. Those reads must never retrigger the expensive health check.
+		await page.waitForTimeout(3_250);
+		const commandCounts = await page.evaluate(() => {
+			const calls = (window as Window & {
+				__DOWNLOAD_INVOCATIONS__?: Array<{ command: string }>;
+			}).__DOWNLOAD_INVOCATIONS__ ?? [];
+			return {
+				refreshes: calls.filter(({ command }) => command === 'refresh_download_files').length,
+				reads: calls.filter(({ command }) => command === 'get_downloads').length
+			};
+		});
+		expect(commandCounts.refreshes).toBe(0);
+		expect(commandCounts.reads).toBeGreaterThanOrEqual(2);
+
+		await page.getByRole('button', { name: 'Check files' }).click();
+		await expect.poll(refreshCount).toBe(1);
+		await page.waitForTimeout(1_750);
+		await expect.poll(refreshCount).toBe(1);
+
+		await page.getByRole('link', { name: 'Settings' }).first().click();
+		await expect(
+			page.getByText('Custom folder unavailable · Reconnect it or choose another', { exact: true })
+		).toBeVisible();
 	});
 });

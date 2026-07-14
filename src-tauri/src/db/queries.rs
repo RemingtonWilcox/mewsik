@@ -504,6 +504,23 @@ pub fn find_managed_download_source_for_recording(
     }
 }
 
+pub fn set_track_source_file_availability(
+    db: &DbPool,
+    file_path: &str,
+    is_available: bool,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE track_sources
+         SET is_available = ?1,
+             last_verified = ?2,
+             updated_at = ?2
+         WHERE file_path = ?3",
+        params![is_available as i32, now(), file_path],
+    )?;
+    Ok(())
+}
+
 pub fn update_track_source_stream(
     db: &DbPool,
     track_source_id: &str,
@@ -666,6 +683,36 @@ pub fn get_latest_completed_download_for_recording(
         Some(r) => Ok(Some(r?)),
         None => Ok(None),
     }
+}
+
+pub fn get_download_files_for_recording(
+    db: &DbPool,
+    recording_id: &str,
+) -> Result<Vec<Download>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, recording_id, source, source_url, status, progress, file_path, error_message, created_at, updated_at
+         FROM downloads
+         WHERE recording_id = ?1
+           AND status IN ('completed', 'missing')
+           AND file_path IS NOT NULL
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map(params![recording_id], |row| {
+        Ok(Download {
+            id: row.get(0)?,
+            recording_id: row.get(1)?,
+            source: row.get(2)?,
+            source_url: row.get(3)?,
+            status: row.get(4)?,
+            progress: row.get(5)?,
+            file_path: row.get(6)?,
+            error_message: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn find_source_by_path(
@@ -1331,6 +1378,24 @@ pub fn fail_download(
              error_message = ?1,
              updated_at = ?2
          WHERE id = ?3",
+        params![error_message, now(), download_id],
+    )?;
+    Ok(())
+}
+
+pub fn mark_download_missing(
+    db: &DbPool,
+    download_id: &str,
+    error_message: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE downloads
+         SET status = 'missing',
+             error_message = ?1,
+             updated_at = ?2
+         WHERE id = ?3
+           AND status = 'completed'",
         params![error_message, now(), download_id],
     )?;
     Ok(())

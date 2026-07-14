@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import {
 		Download,
 		RefreshCw,
@@ -18,20 +19,54 @@
 	import { toast } from 'svelte-sonner';
 
 	let downloads = $state<DownloadItem[]>([]);
+	let downloadLocation = $state<api.DownloadLocationInfo | null>(null);
 	let loading = $state(true);
+	// This is deliberately not reactive. A reactive in-flight guard read from a
+	// $effect can retrigger that effect on every request and create a fetch loop.
+	let polling = false;
+	let refreshingFiles = $state(false);
 	let actioning = $state<Record<string, boolean>>({});
 
-	$effect(() => {
+	onMount(() => {
+		// Page entry and recurring polling are DB-only. Filesystem/network health
+		// checks are explicit so an offline UNC path cannot stall route loading.
 		void loadDownloads();
+		void loadDownloadLocation();
 		const interval = setInterval(() => void loadDownloads(), 1500);
 		return () => clearInterval(interval);
 	});
 
 	async function loadDownloads() {
+		if (polling) return;
+		polling = true;
 		try {
 			downloads = await api.getDownloads();
 		} finally {
+			polling = false;
 			loading = false;
+		}
+	}
+
+	async function refreshDownloadFiles(announce = true) {
+		if (refreshingFiles) return;
+		refreshingFiles = true;
+		try {
+			downloads = await api.refreshDownloadFiles();
+			await loadDownloadLocation();
+			if (announce) toast.success('Downloaded files checked');
+		} catch (error) {
+			if (announce) toast.error(`Could not check downloaded files: ${error}`);
+		} finally {
+			refreshingFiles = false;
+			loading = false;
+		}
+	}
+
+	async function loadDownloadLocation() {
+		try {
+			downloadLocation = await api.getDownloadLocation();
+		} catch {
+			downloadLocation = null;
 		}
 	}
 
@@ -50,7 +85,7 @@
 			await api.revealDownloadPath(downloadId);
 		} catch (e) {
 			toast.error(`Failed to reveal download: ${e}`);
-			await loadDownloads();
+			await refreshDownloadFiles(false);
 		} finally {
 			const { [downloadId]: _removed, ...rest } = actioning;
 			actioning = rest;
@@ -61,8 +96,12 @@
 		if (!item.recording_id || actioning[item.id]) return;
 		actioning = { ...actioning, [item.id]: true };
 		try {
-			await api.downloadRecording(item.recording_id);
-			toast.success('Download queued again');
+			const started = await api.downloadRecording(item.recording_id);
+			if (started.already_active || !started.directory) {
+				toast.message('Download is already queued');
+			} else {
+				toast.success(`Download queued again · Saving to ${started.directory}`);
+			}
 			await loadDownloads();
 		} catch (e) {
 			toast.error(`Failed to retry download: ${e}`);
@@ -109,11 +148,25 @@
 			<h1 class="text-2xl font-bold">Downloads</h1>
 			<p class="text-sm text-muted-foreground">Saved tracks and active download jobs.</p>
 		</div>
-		<Button variant="outline" size="sm" onclick={loadDownloads}>
-			<RefreshCw class="mr-1 size-4" />
-			Refresh
+		<Button
+			variant="outline"
+			size="sm"
+			onclick={() => void refreshDownloadFiles()}
+			disabled={refreshingFiles}
+		>
+			<RefreshCw class={`mr-1 size-4 ${refreshingFiles ? 'animate-spin' : ''}`} />
+			{refreshingFiles ? 'Checking…' : 'Check files'}
 		</Button>
 	</div>
+
+	{#if downloadLocation}
+		<div class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-xs">
+			<FolderOpen class="size-3.5 shrink-0 text-primary" />
+			<span class="text-muted-foreground">New downloads save to</span>
+			<span class="min-w-0 flex-1 truncate font-mono" title={downloadLocation.directory}>{downloadLocation.directory}</span>
+			<a href="/settings" class="font-medium text-primary hover:underline">Change</a>
+		</div>
+	{/if}
 
 	{#if loading}
 		<Card class="border-dashed">
@@ -137,10 +190,10 @@
 	{:else}
 		<div class="flex flex-col gap-2">
 			{#each downloads as item}
-				{@const fileName = item.file_path?.split('/').pop() ?? 'Unknown'}
+				{@const fileName = item.file_path?.split(/[\\/]/).pop() ?? 'Preparing file'}
 				{@const isActive = item.status === 'pending' || item.status === 'downloading' || item.status === 'processing'}
 				{@const isDone = item.status === 'completed'}
-				{@const isFailed = item.status === 'failed' || item.status === 'cancelled'}
+				{@const isFailed = item.status === 'failed' || item.status === 'cancelled' || item.status === 'missing'}
 				<div class="flex items-center gap-3 rounded-lg border border-border bg-card p-3">
 					<!-- Status icon -->
 					<div class="shrink-0">
@@ -190,6 +243,8 @@
 								variant="ghost"
 								size="icon"
 								class="size-8"
+								aria-label="Cancel download"
+								title="Cancel download"
 								disabled={Boolean(actioning[item.id])}
 								onclick={() => cancelDownload(item)}
 							>
@@ -201,6 +256,8 @@
 								variant="ghost"
 								size="icon"
 								class="size-8"
+								aria-label="Retry download"
+								title="Retry download"
 								disabled={Boolean(actioning[item.id])}
 								onclick={() => retryDownload(item)}
 							>
@@ -212,6 +269,8 @@
 								variant="ghost"
 								size="icon"
 								class="size-8 text-destructive hover:text-destructive"
+								aria-label="Remove download"
+								title="Remove download"
 								disabled={Boolean(actioning[item.id])}
 								onclick={() => deleteDownloadItem(item)}
 							>

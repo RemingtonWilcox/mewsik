@@ -121,7 +121,7 @@ export interface Download {
 	recording_id: string | null;
 	source: string;
 	source_url: string;
-	status: 'pending' | 'downloading' | 'processing' | 'completed' | 'failed' | 'cancelled';
+	status: 'pending' | 'downloading' | 'processing' | 'completed' | 'missing' | 'failed' | 'cancelled';
 	progress: number;
 	file_path: string | null;
 	error_message: string | null;

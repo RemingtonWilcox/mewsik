@@ -540,8 +540,12 @@
 				result.duration_ms ?? undefined,
 				result.cover_art_url ?? undefined
 			);
-			await api.downloadRecording(recordingId);
-			toast.success(`Download queued: ${result.title}`);
+			const started = await api.downloadRecording(recordingId);
+			if (started.already_active || !started.directory) {
+				toast.message(`Download already queued: ${result.title}`);
+			} else {
+				toast.success(`Download queued: ${result.title} · Saving to ${started.directory}`);
+			}
 		} catch (e) {
 			downloadedIds = new Set([...downloadedIds].filter(id => id !== key));
 			toast.error(`Failed to download: ${e}`);
