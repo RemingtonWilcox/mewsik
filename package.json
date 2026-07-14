@@ -26,7 +26,8 @@
     "release:config": "node scripts/prepare-release-config.mjs",
     "release:verify-keypair": "node scripts/verify-release-keypair.mjs",
     "test:e2e": "playwright test",
-    "test:e2e:headed": "playwright test --headed"
+    "test:e2e:headed": "playwright test --headed",
+    "test:discovery-snapshot": "node --test scripts/discovery-snapshot/generator.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",

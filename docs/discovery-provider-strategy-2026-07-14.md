@@ -6,15 +6,20 @@ Checked against the providers' official documentation on 2026-07-14.
 
 An ordinary mewsik user must never create or paste a third-party developer key. Provider secrets also must not be bundled in the Windows executable, macOS app, repository, or frontend assets; desktop clients are public clients and embedded secrets can be extracted.
 
-For a public release, one small mewsik discovery service should:
+For the public beta, the shared discovery service is a scheduled, static publisher rather than an always-running API server. GitHub Actions is the credential boundary: after the repository secrets are configured, it refreshes the public aggregate data and deploys a versioned JSON snapshot to GitHub Pages. The desktop app never receives those credentials.
 
-1. hold provider credentials server-side;
-2. refresh each source on its own cadence;
-3. cache, normalize, attribute, and serve credential-free snapshots;
-4. degrade to recent honest snapshots when a provider is slow or unavailable; and
-5. keep playback/search provider logic separate from trend-ranking inputs.
+The implemented split is:
 
-The compute and bandwidth for this scheduler should be small at friend/beta scale. Provider approval, quota, and content-license terms are the real constraints.
+1. publish only credentialed YouTube and Last.fm chart batches at `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json`;
+2. keep Apple Marketing Tools, ListenBrainz, and Bandcamp Daily as direct public inputs;
+3. keep library history, taste signals, interactions, and final ranking private and local;
+4. refresh each source on its own cadence and label delivery as `live`, `cached`, `stale`, or `unavailable`;
+5. retain a failed provider's prior batch for no more than three of that provider's cadences; and
+6. keep playback/search provider logic separate from trend-ranking inputs.
+
+The client pins the HTTPS endpoint and schema version, accepts only the two expected source IDs, caps payload and item sizes, checks timestamps and cadences, and allowlists provider link and artwork hosts. A malformed, future-dated, oversized, unknown, or over-age snapshot is rejected instead of trusted. Local developer keys remain an opt-in fallback for development; ordinary listeners never configure them.
+
+The hourly publisher has no continuously running server or database bill at friend/beta scale. Provider approval, quota, and content-license terms remain the real constraints.
 
 ## Provider decisions
 
@@ -22,13 +27,13 @@ The compute and bandwidth for this scheduler should be small at friend/beta scal
 
 - Use documented `videos.list` requests with `chart=mostPopular`, a region, and the Music video category. This is a one-unit general read rather than an expensive `search.list` request.
 - The current default allocation includes 10,000 units per day for general endpoints and a separate 100 `search.list` calls per day. Higher quota requires a compliance audit; Google does not publish a pay-as-you-go quota price.
-- One IP-restricted server key can refresh cached regional snapshots for all mewsik clients. Do not put the key in the desktop app, and do not ask users to create Google projects.
+- One GitHub Actions secret refreshes the shared U.S. Music-category snapshot for all mewsik clients. Restrict this key to the YouTube Data API v3, but do not IP-restrict it because GitHub-hosted runner egress addresses are not stable. Do not put the key in the desktop app, and do not ask users to create Google projects.
 
 Official references: [videos.list](https://developers.google.com/youtube/v3/docs/videos/list), [quota overview](https://developers.google.com/youtube/v3/getting-started), [quota audits](https://developers.google.com/youtube/v3/guides/quota_and_compliance_audits), and [developer policies](https://developers.google.com/youtube/terms/developer-policies).
 
 ### Last.fm: useful secondary consensus signal, pending approval
 
-- Last.fm charts and tags can add global and genre context. A single server-held application key is the right technical model.
+- Last.fm charts and tags can add global and genre context. A single GitHub Actions-held application key is the implemented technical model.
 - The standard API terms cover noncommercial use. Commercial use requires contacting Last.fm; pricing and a fixed rate ceiling are not published.
 - Attribution/linkback and HTTP-aware caching are required, stored Last.fm data is capped, and API artwork/audio is outside the standard license.
 
@@ -65,9 +70,9 @@ Official references: [charts](https://developer.apple.com/documentation/applemus
 
 ## Delivery order
 
-1. Keep Apple Marketing Tools, ListenBrainz, and Bandcamp Daily as the no-setup beta stack with explicit source and freshness labels.
-2. Add the mewsik discovery service and move snapshots behind a versioned `/discovery` response; clients keep a local last-known-good frame.
-3. Add scheduled YouTube Music-category `mostPopular` snapshots by selected regions.
-4. Contact Last.fm for public/commercial terms and add it only after approval.
+1. Merge and deploy the implemented GitHub Pages publisher, then verify the credential-free unavailable-state snapshot.
+2. Add the repository-held YouTube key, verify the hourly U.S. Music-category `mostPopular` batch, and watch quota/error telemetry in Actions.
+3. Contact Last.fm about the intended public/commercial use before adding its repository secret.
+4. Add more YouTube regions only after the U.S. cadence and quota are measured.
 5. Apply to Beatport for licensed desktop use.
-6. Keep Spotify out of ranking unless its access and cross-service policy materially change.
+6. Keep Spotify out of ranking unless its access and cross-service policy materially changes.

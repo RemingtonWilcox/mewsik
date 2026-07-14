@@ -46,6 +46,16 @@ One CPU-only `VisualizerJourneyRuntime` owns the director, adaptive spectrum, Si
 
 Canonical source identity includes source type, recording, URL, and station, plus a monotonic source epoch so A -> B -> A cannot reuse stale temporal state. Source changes clear the CPU journey and renderer feedback in the same frame. Closing the entire overlay intentionally stops the native analyzer subscription; continuous live-audio journey tracking resumes when the overlay is opened again.
 
+### Prism
+
+Prism's performance and determinism foundation is now in place:
+
+- one reusable request-animation-frame scheduler advances at a fixed 60 Hz instead of creating timing state inside each frame;
+- its internal canvas is capped at 1920 x 1080 pixels even on larger or high-DPI displays;
+- scene choices use the shared journey seed and source epoch, so switching engines or returning A -> B -> A follows the current musical journey instead of starting a new random loop;
+- onset decisions are deterministic and latched per onset rather than rerolled with `Math.random()` during rendering; and
+- canvas diagnostics expose the fixed frame-rate and internal-pixel budgets, while focused runtime tests cover backing-size, scheduler, and deterministic-event behavior.
+
 ### Mk2
 
 Mk2 keeps its volumetric Mandelbulb identity but now:
@@ -96,7 +106,10 @@ The current analyzer exposes mono spectral features rather than raw stereo sampl
 
 The product surfaces were rebuilt around explicit jobs instead of overlapping dashboards.
 
-- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial. Official Last.fm and YouTube signals activate only when developer/runtime keys are configured; listeners are not expected to provide them, and the UI reports missing signals as unavailable rather than inventing data.
+- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial with a credential-free shared snapshot for YouTube and Last.fm. GitHub Actions owns the optional provider keys and publishes only normalized public chart batches to GitHub Pages; ordinary listeners never create or paste keys.
+- The hosted endpoint is pinned to `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json`. The client accepts schema v1 only, allowlists the two hosted source IDs and provider URL hosts, caps the response at 2 MiB and 200 items per source, validates timestamps/cadences, and rejects unknown, malformed, future-dated, or over-age content.
+- The publisher runs hourly while preserving each provider's cadence: YouTube refreshes hourly and Last.fm every four hours. A recent prior batch is `cached`; a failed refresh can be `stale` for at most three cadences; absent credentials or expired fallback data is `unavailable`. The desktop preserves these delivery labels instead of relabeling hosted data as live.
+- Apple, ListenBrainz, and Bandcamp remain direct public inputs. Personal library history, interactions, taste profile, and final ranking remain local and are never uploaded to the public snapshot.
 - Cold Search and Discover loads now show an accessible staged status panel with real elapsed time and an indeterminate progress bar. Apple territories refresh concurrently and remain deterministically ordered, reducing their worst-case cold delay from four serial request windows to one.
 - Every source has bounded requests, a declared refresh cadence, typed track/release/editorial records, stable provider IDs, and separately stored listeners, plays, views, and likes. A stale Bandcamp feed is rejected instead of presented as current.
 - Source cadences are enforced independently: a one-hour YouTube refresh does not re-fetch daily ListenBrainz releases or four-hour Apple charts. Missing Apple territories can be filled from their own recent saved frame without relabeling the partial response as complete.
@@ -156,6 +169,8 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - `.github/workflows/draft-windows-release.yml` is manual-only, tied to the exact default-branch ref and protected `release` environment, requires a strictly increasing stable version plus typed confirmation, proves the Tauri updater keypair, runs all gates, requires Azure Artifact Signing, and creates a draft rather than publishing automatically.
 - Release configuration is generated into an ignored credential-free merge file. The workflow has no unsigned fallback and no real private key, password, certificate, or Azure secret is stored in this repository.
 - Version `0.1.0` cannot update itself; installing the first signed `0.2.0` candidate is a one-time manual bootstrap. macOS still uses the existing native sign/notarize script and does not yet participate in the updater feed.
+- The current local/installed `0.2.0` is unsigned private-test output. The protected `release` environment and a cryptographically verified, locally recoverable updater keypair are configured; one separate disaster-recovery backup, Azure signing account/profile credentials, and a usable `latest.json` are still absent, so this is not a distributable bootstrap release yet.
+- A reachable Apple Silicon Mac has the native notarization tools but currently lacks pnpm, a Developer ID Application identity, and the `mewsik-notary` Keychain profile. The MacBook that may hold the existing signing identity was unreachable during the audit. No current Mac artifact is ready to distribute.
 
 ### Audio-level contract
 
@@ -169,8 +184,9 @@ Completed on the combined branch and packaged native release:
 
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
-- `pnpm test:e2e -- --workers=4`: 65/65 pass on a clean Vite server, including 11 updater state/race/recovery scenarios
-- `cargo test --all-targets`: 139 pass, 0 fail, 3 intentionally ignored live-provider tests
+- `pnpm test:e2e -- --workers=4`: 69/69 pass on a clean Vite server, including 11 updater state/race/recovery scenarios and Prism's scheduler/pixel/seed foundation
+- `pnpm test:discovery-snapshot`: 10/10 pass, including provider-failure retention, credential exclusion, strict sanitization, and atomic publication
+- `cargo test --all-targets`: 149 pass, 0 fail, 3 intentionally ignored live-provider tests
 - Disposable release-contract test: a real generated Tauri keypair passed sign/verify and credential-exclusion checks; wrong refs, prerelease versions, non-increasing versions, and mismatched keys were rejected. The disposable key and generated config were removed afterward.
 - Local-build startup smoke: the updater plugin remains unregistered when no signed release configuration exists; the fresh debug app stayed responsive and closed through the normal window path.
 - Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
@@ -187,7 +203,7 @@ Completed on the combined branch and packaged native release:
 - Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
 - Download storage: old-config compatibility, platform default resolution, atomic config replacement, non-destructive disconnect/reconnect recovery, playback-boundary remote fallback, same-name reservation concurrency, per-job destination capture, directory masquerading as an audio file, newest-retry source ownership, cheap polling, manual health scans, and unavailable custom-folder messaging covered by Rust and Playwright.
 - Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
-- Native Windows `0.2.0` rebuilt and installed three times through the current-user NSIS path while the final startup guard was tightened. Before each install, all 12 real user-data files were hashed; afterward the same 12 files and 97,293,289 bytes matched byte-for-byte with zero changed hashes.
+- Native Windows `0.2.0` was rebuilt and installed again through the current-user NSIS path after the hosted-discovery and Prism changes. Before and after the install, all 12 real user-data files and 97,915,881 bytes matched byte-for-byte with zero changed hashes.
 - `PRAGMA quick_check` returned `ok`, no download was active during the upgrade gate, and the installed `0.2.0` process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
@@ -208,9 +224,9 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (21,786,112 bytes): SHA-256 `E415D7A35AED2D882A6C49AA1BB1C8A186ABE3791997953D79D3145A5F71C011`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,018,638 bytes): SHA-256 `2883622EFB10914216DC0C3E43E23C507DEBAC3E4CB1043E34AB141E8948350B`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,786,112 bytes): SHA-256 `C886685A53A89CA3C4988B218D72D9E80DC37CC842E7ECC61F524E1EFE63925E`
+- `src-tauri/target/release/mewsik.exe` (22,112,256 bytes): SHA-256 `F93C8C25043EE217742765A84025026A091D70576CD25F38C4510608941DBDDE`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,060,667 bytes): SHA-256 `91E2112ECAC798CABB210D88C500FB63A6295DD06C7AC722BCE56182A145F2E2`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (22,112,256 bytes): SHA-256 `5DDBC9A0F87080085AC9F7446DA9636F3BD213FBFA3D7A5F2053B14C43F1CAF3`
 
 These local artifacts are intentionally unsigned and are for this machine/private testing only. The protected workflow must produce and verify a new Authenticode-signed candidate before anything is distributed as the public `0.2.0` bootstrap release.
 
@@ -221,6 +237,7 @@ These local artifacts are intentionally unsigned and are for this machine/privat
 - `src/lib/components/visualizer/visualizer-mk2.svelte`
 - `src/lib/components/visualizer/visualizer-signal.svelte`
 - `src/lib/visualizer/mk2/conductor.ts`
+- `src/lib/visualizer/prism/runtime.ts`
 - `src/lib/visualizer/catalog.ts`
 - `src/lib/visualizer/journey.ts`
 - `src/lib/visualizer/identity.ts`

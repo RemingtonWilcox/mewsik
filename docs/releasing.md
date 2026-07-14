@@ -1,8 +1,15 @@
 # Public beta release checklist
 
-mewsik produces self-contained Windows and macOS installers. Version 0.2.0 adds the credential-free code foundation for a signed Windows updater and a guarded GitHub draft-release workflow. No signing key, certificate, or password is stored in the repository. The workflow cannot create even a draft unless every required release credential is configured, and a human must still review and publish that draft.
+mewsik is structured to produce self-contained Windows and macOS installers. Version 0.2.0 adds the credential-free code foundation for a signed Windows updater and a guarded GitHub draft-release workflow. No signing key, certificate, or password is stored in the repository. The workflow cannot create even a draft unless every required release credential is configured, and a human must still review and publish that draft.
 
 Normal local builds deliberately have no updater endpoint or public key. They report `updaterConfigured: false` to the UI and continue to build and run without release credentials. Only the guarded release workflow generates the ignored Tauri merge config and compiles in the `stable` update channel.
+
+## Current readiness on 2026-07-14
+
+- The installed/local Windows 0.2.0 build is unsigned private-test output. It is current enough for local testing, but it is not the signed public bootstrap installer.
+- The updater UI, native shutdown gate, and draft workflow exist. The protected `release` environment is restricted to `main`, requires owner approval, and contains a cryptographically verified Tauri updater keypair. The encrypted recovery material is stored outside the repository under the current Windows account, but still needs one separate disaster-recovery copy because its local password envelope is DPAPI-bound to this account. Azure Artifact Signing account/profile credentials are still absent, so the public `latest.json` feed is not live.
+- GitHub Pages is enabled for the separate credential-free discovery snapshot. Its workflow and client contract are implemented; YouTube and Last.fm remain `unavailable` until the workflow is on the default branch and the repository provider secrets are configured.
+- No distributable Mac build is current. The reachable Apple Silicon Mac lacks pnpm, a Developer ID Application identity, and the `mewsik-notary` Keychain profile; the MacBook that may hold the signing identity was unreachable during the audit.
 
 ## Supported release targets
 
@@ -21,6 +28,19 @@ A universal macOS artifact is not supported yet. Ship separate `aarch64` and `x6
 No tester types a `C:\Users\...` path. Tauri's installer and mewsik resolve the signed-in Windows user's standard folders at runtime. NSIS installs per user under that user's local application-data folder. New downloads normally go to that user's `Music\Mewsik` folder, then `Downloads\Mewsik` if Windows exposes no Music folder, and only fall back to the private app-data `downloads` folder if neither standard user folder is available. A user-selected location is stored per user. The account name is never hardcoded.
 
 The Windows deliverable is the NSIS `setup.exe`; that installer is the setup experience, so no separate wizard is required. Signing identifies the publisher and protects the file from modification, but no signing method can promise that every antivirus or reputation system immediately trusts a brand-new product. Never tell testers to disable security software. Distribute only the GitHub Release artifact and publish its SHA-256 hash.
+
+## Shared discovery publication
+
+After it is merged to the default branch, `.github/workflows/deploy-discovery-snapshot.yml` runs hourly and publishes `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json` through GitHub Pages. It contains normalized public aggregate batches only; it must never contain user history, library contents, interactions, or provider credentials.
+
+Configure these repository Actions secrets only after the corresponding provider account and terms are approved:
+
+| Name | Purpose |
+| --- | --- |
+| `MEWSIK_YOUTUBE_API_KEY` | Shared YouTube Data API v3 Music-category chart refresh. Restrict it to the YouTube Data API v3, not runner IP addresses. |
+| `MEWSIK_LASTFM_API_KEY` | Shared Last.fm top-tracks refresh. Do not enable it for a public/commercial release until the intended use is covered by Last.fm's terms or written approval. |
+
+The workflow publishes an honest `unavailable` source when its key is absent, reuses a still-fresh prior batch as `cached`, and retains a failed batch as `stale` for at most three provider cadences. Ordinary app users configure nothing. Local environment keys are developer fallback only and must never be bundled into an installer.
 
 ## Version and toolchain gate
 
@@ -114,6 +134,8 @@ pnpm release:macos
 The script also supports `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID`, or `APPLE_API_KEY` + `APPLE_API_KEY_PATH` with optional `APPLE_API_ISSUER`. Keep certificates, API keys, and passwords in Keychain or CI secrets—never in the repository or chat.
 
 The script signs embedded Node and FFmpeg with hardened-runtime entitlements, signs the app and DMG, waits for an explicit notarization acceptance, staples the ticket, and fails unless codesign, DMG, stapler, and Gatekeeper checks pass.
+
+Signing and notarization must run on macOS, but the commands may be launched over SSH after that Mac is powered on, unlocked, reachable, and has the certificate and Keychain profile installed. Windows can coordinate the job; it cannot perform the native codesign/notary work itself.
 
 The GitHub updater workflow currently ships Windows x64 only. The macOS updater remains disabled because every nested executable must be explicitly signed before the updater archive is created. The current script does not yet produce the signed `.app.tar.gz` updater bundle or merge both architectures into `latest.json`. Do not add macOS to a generic Tauri matrix until that order is implemented and verified.
 

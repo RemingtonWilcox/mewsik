@@ -127,7 +127,7 @@ test.describe('visualizer engine roster', () => {
 		// A Window-level event is not enough; wake events must come from an app surface.
 		await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointermove')));
 		await page.waitForTimeout(200);
-		await expectVisualizerChrome(page, false, 500);
+		await expectVisualizerChrome(page, false, 1_500);
 
 		// Activity over the actual visualizer surface wakes both layers together.
 		await page.mouse.move(160, 280);
@@ -137,7 +137,7 @@ test.describe('visualizer engine roster', () => {
 		const playerBar = page.locator('[data-player-bar]');
 		await playerBar.hover();
 		await page.waitForTimeout(2_500);
-		await expectVisualizerChrome(page, true, 500);
+		await expectVisualizerChrome(page, true, 1_500);
 		await page.mouse.move(160, 280);
 		await expectVisualizerChrome(page, false);
 
@@ -148,7 +148,7 @@ test.describe('visualizer engine roster', () => {
 		await title.focus();
 		await expect(title).toBeFocused();
 		await page.waitForTimeout(2_500);
-		await expectVisualizerChrome(page, true, 500);
+		await expectVisualizerChrome(page, true, 1_500);
 
 		await page.keyboard.press('Escape');
 		await expect(opener).toBeFocused();

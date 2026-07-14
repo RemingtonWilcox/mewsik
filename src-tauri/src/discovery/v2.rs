@@ -13,13 +13,15 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 const SNAPSHOT_KEY: &str = "search-discovery-v2";
-const ALGORITHM_VERSION: &str = "discovery-v2.2";
+const ALGORITHM_VERSION: &str = "discovery-v2.3";
 const SECTION_SIZE: usize = 8;
 const FAILURE_RETRY_SECS: i64 = 60;
+const HOSTED_RETRY_SECS: i64 = 15 * 60;
 const MANUAL_REFRESH_COOLDOWN_SECS: i64 = 60;
 const PROFILE_TRACK_GOAL: i64 = 5;
 
@@ -80,6 +82,7 @@ pub struct DiscoveryFeedRuntime {
     client: Client,
     config: SourceConfig,
     refresh_lock: AsyncMutex<()>,
+    hosted_not_before: AtomicI64,
 }
 
 impl DiscoveryFeedRuntime {
@@ -93,6 +96,7 @@ impl DiscoveryFeedRuntime {
             client,
             config,
             refresh_lock: AsyncMutex::new(()),
+            hosted_not_before: AtomicI64::new(0),
         }
     }
 
@@ -131,11 +135,28 @@ impl DiscoveryFeedRuntime {
         let requested_sources = specs
             .iter()
             .filter(|spec| {
-                spec.enabled && (force || source_is_due(&self.db, spec, now.timestamp()))
+                source_should_refresh(
+                    &self.db,
+                    spec,
+                    now.timestamp(),
+                    force,
+                    self.hosted_not_before.load(AtomicOrdering::Relaxed),
+                )
             })
             .map(|spec| spec.id.to_string())
             .collect::<HashSet<_>>();
         let report = sources::fetch_all(&self.client, &self.config, now, &requested_sources).await;
+        if specs
+            .iter()
+            .any(|spec| spec.uses_hosted_snapshot && requested_sources.contains(spec.id))
+        {
+            let next_attempt = report
+                .hosted_next_refresh_at
+                .filter(|refresh_at| *refresh_at > now.timestamp())
+                .unwrap_or(now.timestamp() + HOSTED_RETRY_SECS);
+            self.hosted_not_before
+                .store(next_attempt, AtomicOrdering::Relaxed);
+        }
         let failed_statuses =
             build_source_statuses(&self.config, &[], &[], &report, now.timestamp());
         match self.refresh_from_report(report, now) {
@@ -253,8 +274,8 @@ impl DiscoveryFeedRuntime {
 
         let taste = load_taste_profile(&self.db)?;
         let (mut feed, fingerprint) = build_feed(&self.db, &batches, statuses, &taste, now)?;
-        let expires_at =
-            next_source_refresh(&self.db, &source_specs(&self.config), now.timestamp());
+        let specs = source_specs(&self.config);
+        let expires_at = next_source_refresh(&self.db, &specs, &report, now.timestamp());
         feed.next_refresh_at = Some(expires_at);
         let snapshot = FeedSnapshot {
             key: SNAPSHOT_KEY.to_string(),
@@ -281,9 +302,21 @@ struct SourceSpec {
     scopes: Vec<String>,
     optional: bool,
     enabled: bool,
+    uses_hosted_snapshot: bool,
 }
 
 fn source_specs(config: &SourceConfig) -> Vec<SourceSpec> {
+    let hosted_enabled = config.hosted_snapshot_url.is_some();
+    let has_lastfm_key = config
+        .lastfm_api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let has_youtube_key = config
+        .youtube_api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty());
+    let uses_hosted_lastfm = hosted_enabled && !has_lastfm_key;
+    let uses_hosted_youtube = hosted_enabled && !has_youtube_key;
     vec![
         SourceSpec {
             id: APPLE_SOURCE,
@@ -297,6 +330,7 @@ fn source_specs(config: &SourceConfig) -> Vec<SourceSpec> {
                 .collect(),
             optional: false,
             enabled: true,
+            uses_hosted_snapshot: false,
         },
         SourceSpec {
             id: LISTENBRAINZ_SOURCE,
@@ -306,6 +340,7 @@ fn source_specs(config: &SourceConfig) -> Vec<SourceSpec> {
             scopes: vec!["global".to_string()],
             optional: false,
             enabled: true,
+            uses_hosted_snapshot: false,
         },
         SourceSpec {
             id: BANDCAMP_SOURCE,
@@ -315,6 +350,7 @@ fn source_specs(config: &SourceConfig) -> Vec<SourceSpec> {
             scopes: vec!["daily".to_string()],
             optional: false,
             enabled: true,
+            uses_hosted_snapshot: false,
         },
         SourceSpec {
             id: LASTFM_SOURCE,
@@ -323,22 +359,24 @@ fn source_specs(config: &SourceConfig) -> Vec<SourceSpec> {
             cadence_secs: 4 * 60 * 60,
             scopes: vec!["global".to_string()],
             optional: true,
-            enabled: config
-                .lastfm_api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty()),
+            enabled: hosted_enabled || has_lastfm_key,
+            uses_hosted_snapshot: uses_hosted_lastfm,
         },
         SourceSpec {
             id: YOUTUBE_SOURCE,
             family: "youtube",
             label: "YouTube music heat",
             cadence_secs: 60 * 60,
-            scopes: vec![config.youtube_market.to_uppercase()],
+            // The shared snapshot has one documented US chart. A custom market
+            // applies only to the direct developer-key adapter.
+            scopes: vec![if uses_hosted_youtube {
+                "US".to_string()
+            } else {
+                config.youtube_market.to_uppercase()
+            }],
             optional: true,
-            enabled: config
-                .youtube_api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty()),
+            enabled: hosted_enabled || has_youtube_key,
+            uses_hosted_snapshot: uses_hosted_youtube,
         },
     ]
 }
@@ -353,10 +391,28 @@ fn source_is_due(db: &DbPool, spec: &SourceSpec, now: i64) -> bool {
         })
 }
 
-fn next_source_refresh(db: &DbPool, specs: &[SourceSpec], now: i64) -> i64 {
-    specs
+fn source_should_refresh(
+    db: &DbPool,
+    spec: &SourceSpec,
+    now: i64,
+    force: bool,
+    hosted_not_before: i64,
+) -> bool {
+    spec.enabled
+        && (force
+            || ((!spec.uses_hosted_snapshot || now >= hosted_not_before)
+                && source_is_due(db, spec, now)))
+}
+
+fn next_source_refresh(
+    db: &DbPool,
+    specs: &[SourceSpec],
+    report: &SourceFetchReport,
+    now: i64,
+) -> i64 {
+    let mut candidates = specs
         .iter()
-        .filter(|spec| spec.enabled)
+        .filter(|spec| spec.enabled && !spec.uses_hosted_snapshot)
         .flat_map(|spec| {
             spec.scopes.iter().map(move |scope| {
                 store::load_source_observation_frames(db, spec.family, scope)
@@ -366,6 +422,22 @@ fn next_source_refresh(db: &DbPool, specs: &[SourceSpec], now: i64) -> i64 {
                     .unwrap_or(now + FAILURE_RETRY_SECS)
             })
         })
+        .collect::<Vec<_>>();
+
+    if specs
+        .iter()
+        .any(|spec| spec.enabled && spec.uses_hosted_snapshot)
+    {
+        candidates.push(
+            report
+                .hosted_next_refresh_at
+                .filter(|refresh_at| *refresh_at > now)
+                .unwrap_or(now + HOSTED_RETRY_SECS),
+        );
+    }
+
+    candidates
+        .into_iter()
         .min()
         .unwrap_or(now + FAILURE_RETRY_SECS)
         .max(now + FAILURE_RETRY_SECS)
@@ -454,20 +526,27 @@ fn build_source_statuses(
                     .filter(|cached_batch| cached_batch.source == spec.id)
                     .map(|cached_batch| cached_batch.items.len())
                     .sum::<usize>();
+                let delivered = report.delivery_statuses.get(spec.id);
+                let default_detail = if cached_items > 0 {
+                    format!(
+                        "{} delivered items; {} recent saved items filled missing scopes",
+                        batch.items.len(),
+                        cached_items
+                    )
+                } else {
+                    format!("{} usable items", batch.items.len())
+                };
                 DiscoverySourceStatus {
                     id: spec.id.to_string(),
                     label: batch.label.clone(),
-                    state: "live".to_string(),
+                    state: delivered
+                        .map(|status| status.state.as_str())
+                        .unwrap_or("live")
+                        .to_string(),
                     updated_at: Some(batch.fetched_at),
-                    detail: Some(if cached_items > 0 {
-                        format!(
-                            "{} live items; {} recent saved items filled missing scopes",
-                            batch.items.len(),
-                            cached_items
-                        )
-                    } else {
-                        format!("{} usable items", batch.items.len())
-                    }),
+                    detail: delivered
+                        .and_then(|status| status.detail.clone())
+                        .or(Some(default_detail)),
                 }
             } else if let Some(batch) = cached.iter().find(|batch| batch.source == spec.id) {
                 let oldest_observation = batch
@@ -486,6 +565,12 @@ fn build_source_statuses(
                         .get(spec.id)
                         .map(|message| format!("Live refresh failed; using saved data: {message}"))
                         .or_else(|| {
+                            report
+                                .delivery_statuses
+                                .get(spec.id)
+                                .and_then(|status| status.detail.clone())
+                        })
+                        .or_else(|| {
                             Some(if within_cadence {
                                 "Using a saved observation still inside its source cadence"
                                     .to_string()
@@ -499,6 +584,12 @@ fn build_source_statuses(
                 let detail = failures
                     .get(spec.id)
                     .map(|message| (*message).to_string())
+                    .or_else(|| {
+                        report
+                            .delivery_statuses
+                            .get(spec.id)
+                            .and_then(|status| status.detail.clone())
+                    })
                     .or_else(|| {
                         (skipped.contains(spec.id) || spec.optional).then(|| {
                             "Not enabled in this build; no listener setup is required".to_string()
@@ -2183,6 +2274,113 @@ mod tests {
             observation.chart_size == Some(5)
                 && observation.rank_position.is_some_and(|rank| rank <= 5)
         }));
+    }
+
+    #[test]
+    fn hosted_sources_are_enabled_without_desktop_provider_keys() {
+        let config = SourceConfig {
+            hosted_snapshot_url: Some(sources::HOSTED_DISCOVERY_SNAPSHOT_URL.to_string()),
+            youtube_market: "GB".to_string(),
+            ..SourceConfig::default()
+        };
+        let hosted_specs = source_specs(&config)
+            .into_iter()
+            .filter(|spec| spec.uses_hosted_snapshot)
+            .collect::<Vec<_>>();
+        let hosted = hosted_specs
+            .iter()
+            .map(|spec| spec.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(hosted, HashSet::from([LASTFM_SOURCE, YOUTUBE_SOURCE]));
+        let youtube = hosted_specs
+            .iter()
+            .find(|spec| spec.id == YOUTUBE_SOURCE)
+            .expect("hosted YouTube spec");
+        assert_eq!(youtube.scopes, vec!["US"]);
+    }
+
+    #[test]
+    fn retained_hosted_batch_is_not_mislabeled_live() {
+        let now = 1_800_000_000;
+        let config = SourceConfig {
+            hosted_snapshot_url: Some(sources::HOSTED_DISCOVERY_SNAPSHOT_URL.to_string()),
+            ..SourceConfig::default()
+        };
+        let mut item = apple_item("video-1", "Channel", "Song", "US", 1, now);
+        item.source = YOUTUBE_SOURCE.to_string();
+        item.source_family = "youtube".to_string();
+        item.external_ids =
+            BTreeMap::from([("youtube_video_id".to_string(), "video-1".to_string())]);
+        let batch = SourceBatch {
+            source: YOUTUBE_SOURCE.to_string(),
+            label: "YouTube popular music videos (US)".to_string(),
+            fetched_at: now - 300,
+            cadence_secs: 3_600,
+            items: vec![item],
+        };
+        let mut report = SourceFetchReport::default();
+        report.delivery_statuses.insert(
+            YOUTUBE_SOURCE.to_string(),
+            sources::SourceDeliveryStatus {
+                state: sources::SourceDeliveryState::Cached,
+                last_attempt_at: Some(now),
+                detail: Some("Recent shared snapshot".to_string()),
+            },
+        );
+        let statuses = build_source_statuses(&config, &[batch], &[], &report, now);
+        let youtube = statuses
+            .iter()
+            .find(|status| status.id == YOUTUBE_SOURCE)
+            .expect("YouTube status");
+        assert_eq!(youtube.state, "cached");
+        assert_eq!(youtube.detail.as_deref(), Some("Recent shared snapshot"));
+    }
+
+    #[test]
+    fn unchanged_hosted_snapshot_uses_publisher_backoff() {
+        let db = init_memory_db().expect("database");
+        let now = 1_800_000_000;
+        let config = SourceConfig {
+            hosted_snapshot_url: Some(sources::HOSTED_DISCOVERY_SNAPSHOT_URL.to_string()),
+            ..SourceConfig::default()
+        };
+        let hosted_specs = source_specs(&config)
+            .into_iter()
+            .filter(|spec| spec.uses_hosted_snapshot)
+            .collect::<Vec<_>>();
+        let report = SourceFetchReport {
+            hosted_next_refresh_at: Some(now + 1_800),
+            ..SourceFetchReport::default()
+        };
+        assert_eq!(
+            next_source_refresh(&db, &hosted_specs, &report, now),
+            now + 1_800
+        );
+    }
+
+    #[test]
+    fn hosted_not_before_gate_survives_other_sources_refreshing_sooner() {
+        let db = init_memory_db().expect("database");
+        let now = 1_800_000_000;
+        let config = SourceConfig {
+            hosted_snapshot_url: Some(sources::HOSTED_DISCOVERY_SNAPSHOT_URL.to_string()),
+            ..SourceConfig::default()
+        };
+        let youtube = source_specs(&config)
+            .into_iter()
+            .find(|spec| spec.id == YOUTUBE_SOURCE)
+            .expect("hosted YouTube spec");
+
+        assert!(source_is_due(&db, &youtube, now));
+        assert!(!source_should_refresh(&db, &youtube, now, false, now + 900));
+        assert!(source_should_refresh(
+            &db,
+            &youtube,
+            now + 900,
+            false,
+            now + 900
+        ));
+        assert!(source_should_refresh(&db, &youtube, now, true, now + 900));
     }
 
     #[tokio::test]

@@ -84,7 +84,7 @@ Queue planning must therefore move into the backend instead of introducing a sec
 - Personal Discover is primarily deterministic and library/listening-history driven: rotation, rediscovery, affinities, unfinished exploration, and useful bridges beyond the library.
 - Internet trend data may seed exploration or autoplay candidates, but should not masquerade as a deeply personalized black-box feed.
 - Every recommendation needs an inspectable reason and honest source freshness.
-- Installed apps must not contain shared provider secrets or require ordinary listeners to create developer accounts. Public discovery should move behind one credentialed, cadence-aware mewsik snapshot service; see [Discovery provider strategy](discovery-provider-strategy-2026-07-14.md).
+- Installed apps do not contain shared provider secrets or require ordinary listeners to create developer accounts. The implemented beta split keeps Apple, ListenBrainz, and Bandcamp as direct public inputs while a scheduled GitHub Actions publisher serves credentialed YouTube and Last.fm batches from a versioned GitHub Pages snapshot. Personal history and final ranking stay local; see [Discovery provider strategy](discovery-provider-strategy-2026-07-14.md).
 
 ## Track D: visualizer evolution
 
@@ -116,7 +116,7 @@ Each concept requires a one-page identity, performance budget, conductor model, 
 
 ### Performance prerequisites
 
-- Give Prism the shared 60 Hz scheduler, deterministic musical seed, and an absolute internal-pixel ceiling before adding more scenes.
+- Prism's prerequisite is complete: it has a reusable fixed 60 Hz scheduler, shared journey seed/source epoch, deterministic onset decisions, and a 1920 x 1080 internal-pixel ceiling.
 - Give Soma an absolute pixel ceiling and measured quality tiers before increasing its raymarch topology.
 - Extract Soma's shader/uniform packing before adding archetype rails so compilation and packing can be tested directly.
 - Implement triangle, cross, and mandala influence as one bounded domain/archetype warp through the existing body, not four separately raymarched bodies.
@@ -145,7 +145,9 @@ The first delivery step is implemented on `codex/visualizer-rebuild`:
 - Normal Downloads polling is database-only. The explicit **Check files** action runs the potentially slow filesystem scan on a blocking worker, avoiding a route-load freeze on offline network paths.
 - Same-title jobs reserve output names atomically, eliminating the prior check-then-overwrite race.
 
-The next implementation milestone is the backend-owned playback context and deterministic Up Next contract described above.
+The backend-owned playback context and deterministic continuation milestone is also implemented, along with the shared discovery delivery foundation and Prism's performance/determinism prerequisite. The hosted snapshot still needs its repository provider credentials before YouTube or Last.fm can report live data.
+
+The next implementation work is true prepared-next/prebuffered handoff, Soma's absolute pixel ceiling and measured quality tiers, and then the bounded visual-foundation prototypes described above.
 
 ## Guardrails
 
