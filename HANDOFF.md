@@ -135,7 +135,26 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - Downloads-page polling is DB-only. **Check files** performs the explicit full filesystem reconciliation on a blocking worker, and a failed **Show in folder** action triggers the same repair check.
 - Download-directory validation creates and verifies a writable destination before inserting a job. Same-title jobs reserve filenames atomically, so concurrent downloads cannot overwrite one another.
 - Config persistence uses a same-directory temporary file, flush, and atomic replacement; older config files deserialize with the new field at its safe default.
-- The full queue/continuity and visual expansion direction is captured in `docs/product-direction-2026-07-14.md`; backend-owned Up Next is the next milestone.
+- The full queue/continuity and visual expansion direction is captured in `docs/product-direction-2026-07-14.md`. The first backend-owned continuity milestone is now implemented; true source prebuffering/gapless handoff remains separate work.
+
+### Deterministic playback continuation
+
+- Playback sessions now own queue/context continuation explicitly. The audio worker acknowledges the exact request only after a local or remote source really starts, preventing an old async start from extending a replacement queue.
+- Stop, error, radio takeover, queue replacement, and raw error-stop paths invalidate the corresponding owner. A stale failure or recommendation worker cannot mutate the newer playback session.
+- Continuation waits for actual start readiness without the old two-second false timeout, but exits when the queue moves away from its anchor, output disappears, or the bounded failsafe expires.
+- The first playable recommendation is appended as soon as it is known; the remaining tail can arrive later without reordering existing user choices.
+- External provider context is capped, deduplicated, and falls back deterministically when the provider tail is unusable.
+- Recommendation ranking uses an independent read-only SQLite WAL connection for on-disk libraries so it cannot hold the main application database mutex during playback handoff.
+- This is deterministic metadata/source continuation, not true decoded-audio prebuffering or sample-accurate gapless playback.
+
+### Windows updates and release safety
+
+- Version `0.2.0` introduces the updater UI and native shutdown gate. Normal source/local builds deliberately do not register the updater plugin and report updates unavailable; only the protected release build supplies a public key, endpoint, and `MEWSIK_UPDATE_CHANNEL=stable`.
+- Update install is user-confirmed. The package is downloaded and signature-verified first, then native code atomically blocks new music downloads, refuses to proceed while one is active, and shuts down the sidecar, playback, and tracked FFmpeg children before handing control to NSIS.
+- A music download that starts while the application package is downloading postpones installation without throwing away the verified package. Repeated clicks and install/relaunch recovery paths are guarded and covered by browser tests.
+- `.github/workflows/draft-windows-release.yml` is manual-only, tied to the exact default-branch ref and protected `release` environment, requires a strictly increasing stable version plus typed confirmation, proves the Tauri updater keypair, runs all gates, requires Azure Artifact Signing, and creates a draft rather than publishing automatically.
+- Release configuration is generated into an ignored credential-free merge file. The workflow has no unsigned fallback and no real private key, password, certificate, or Azure secret is stored in this repository.
+- Version `0.1.0` cannot update itself; installing the first signed `0.2.0` candidate is a one-time manual bootstrap. macOS still uses the existing native sign/notarize script and does not yet participate in the updater feed.
 
 ### Audio-level contract
 
@@ -149,8 +168,10 @@ Completed on the combined branch and packaged native release:
 
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
-- `pnpm test:e2e -- --workers=4`: 48/48 pass on a clean Vite server
-- `cargo test`: 115 pass, 0 fail, 3 intentionally ignored live-provider tests
+- `pnpm test:e2e -- --workers=4`: 65/65 pass on a clean Vite server, including 11 updater state/race/recovery scenarios
+- `cargo test --all-targets`: 139 pass, 0 fail, 3 intentionally ignored live-provider tests
+- Disposable release-contract test: a real generated Tauri keypair passed sign/verify and credential-exclusion checks; wrong refs, prerelease versions, non-increasing versions, and mismatched keys were rejected. The disposable key and generated config were removed afterward.
+- Local-build startup smoke: the updater plugin remains unregistered when no signed release configuration exists; the fresh debug app stayed responsive and closed through the normal window path.
 - Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
 - Discovery live integration: Apple, ListenBrainz, and Bandcamp Daily refreshed successfully, produced real shelves, and persisted a compatible snapshot
 - Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, material-density floor and differentiated material signatures, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
@@ -165,8 +186,8 @@ Completed on the combined branch and packaged native release:
 - Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
 - Download storage: old-config compatibility, platform default resolution, atomic config replacement, non-destructive disconnect/reconnect recovery, playback-boundary remote fallback, same-name reservation concurrency, per-job destination capture, directory masquerading as an audio file, newest-retry source ownership, cheap polling, manual health scans, and unavailable custom-folder messaging covered by Rust and Playwright.
 - Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
-- Native Windows release rebuilt and installed through the current-user NSIS path. The launched installed payload has the same 15,151,104-byte `.text` code section and SHA-256 `2741110A5A69F35A9B5329BDB48BDFFD44E30C8FF40E9B18BE00BEB397C7C951` as the workspace executable; the raw files differ by the expected Tauri bundle discriminator.
-- The real user database migrated to version 7 successfully after a pre-upgrade backup; `PRAGMA quick_check` returned `ok`, and the installed process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
+- Native Windows `0.2.0` rebuilt and installed three times through the current-user NSIS path while the final startup guard was tightened. Before each install, all 12 real user-data files were hashed; afterward the same 12 files and 97,293,289 bytes matched byte-for-byte with zero changed hashes.
+- `PRAGMA quick_check` returned `ok`, no download was active during the upgrade gate, and the installed `0.2.0` process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
 - Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
 - Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
 - Mk2's 60 FPS accumulator was checked at 60, 75, 90, 120, and 144 Hz without the old high-refresh over-rendering bug
@@ -186,12 +207,11 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (21,343,232 bytes): SHA-256 `99E212B49C985331D736999774148EF0144BD939F083A62D9D5C7D549EC1EB0F`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.1.0_x64-setup.exe` (50,766,912 bytes): SHA-256 `D40A528128251529290685423F1448527410D27919A1443A0597611DEFAB0BB7`
-- `src-tauri/target/release/bundle/msi/mewsik_0.1.0_x64_en-US.msi` (72,249,344 bytes): SHA-256 `21896ABBC918D25EB4306E4C5DD7B7FC18132C636E960564D90FC8519F50A7B6`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,343,232 bytes): SHA-256 `294FE03B7AD59BB8B3E3FE468FCA8BC9214A98E0D525FB743CC4E3DC21053B0F`
+- `src-tauri/target/release/mewsik.exe` (21,786,112 bytes): SHA-256 `E415D7A35AED2D882A6C49AA1BB1C8A186ABE3791997953D79D3145A5F71C011`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,018,638 bytes): SHA-256 `2883622EFB10914216DC0C3E43E23C507DEBAC3E4CB1043E34AB141E8948350B`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (21,786,112 bytes): SHA-256 `C886685A53A89CA3C4988B218D72D9E80DC37CC842E7ECC61F524E1EFE63925E`
 
-The executable and both installers are currently unsigned. Code signing remains release-distribution work, not a visualizer merge blocker.
+These local artifacts are intentionally unsigned and are for this machine/private testing only. The protected workflow must produce and verify a new Authenticode-signed candidate before anything is distributed as the public `0.2.0` bootstrap release.
 
 ## Key files
 

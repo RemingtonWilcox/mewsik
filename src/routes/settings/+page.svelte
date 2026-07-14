@@ -3,6 +3,7 @@
 	import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '$lib/components/ui/card';
 	import * as api from '$lib/api/tauri';
 	import { useLibrary } from '$lib/state/library.svelte';
+	import { useAppUpdater } from '$lib/state/app-updater.svelte';
 	import { toast } from 'svelte-sonner';
 	import {
 		CheckCircle2,
@@ -10,11 +11,15 @@
 		FolderOpen,
 		HardDrive,
 		Laptop,
+		LoaderCircle,
 		Moon,
 		RefreshCw,
 		RotateCcw,
+		Rocket,
 		Search,
+		ShieldCheck,
 		Sun,
+		TriangleAlert,
 		X
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
@@ -29,6 +34,7 @@
 	};
 
 	const library = useLibrary();
+	const updater = useAppUpdater();
 
 	let libraryPaths = $state<string[]>([]);
 	let loading = $state(true);
@@ -42,6 +48,7 @@
 
 	onMount(() => {
 		void loadSettings();
+		updater.startLaunchCheck();
 	});
 
 	async function loadSettings() {
@@ -136,6 +143,26 @@
 		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
 		if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 		return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+	}
+
+	function formatReleaseDate(value: string | null): string | null {
+		if (!value) return null;
+		const date = new Date(value);
+		if (Number.isNaN(date.getTime())) return null;
+		return date.toLocaleDateString(undefined, {
+			year: 'numeric',
+			month: 'short',
+			day: 'numeric'
+		});
+	}
+
+	function updateCheckLabel(): string {
+		if (updater.status === 'checking') return 'Checking…';
+		if (updater.unavailableReason === 'development') return 'Release builds only';
+		if (updater.unavailableReason === 'configuration') return 'Unavailable in this build';
+		if (updater.unavailableReason === 'feed') return 'Check again';
+		if (updater.status === 'current' || updater.status === 'error') return 'Check again';
+		return 'Check for updates';
 	}
 
 	async function chooseDownloadFolder() {
@@ -338,6 +365,148 @@
 					</div>
 				{/if}
 			{/if}
+		</CardContent>
+	</Card>
+
+	<Card id="app-updates" data-testid="app-updates">
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>App updates</CardTitle>
+					<CardDescription class="mt-1">
+						Installed version {updater.currentVersion}. You decide when an available update is installed.
+					</CardDescription>
+				</div>
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => updater.checkNow()}
+					disabled={!updater.canCheck}
+				>
+					<RefreshCw class={`size-3.5 ${updater.status === 'checking' ? 'animate-spin' : ''}`} />
+					{updateCheckLabel()}
+				</Button>
+			</div>
+		</CardHeader>
+		<CardContent class="flex flex-col gap-3">
+			{#if updater.status === 'checking'}
+				<div class="flex items-center gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status" aria-live="polite">
+					<LoaderCircle class="size-4 shrink-0 animate-spin text-primary" />
+					<div>
+						<p class="text-sm font-medium">Checking for a newer version…</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">Your current app keeps running while this finishes.</p>
+					</div>
+				</div>
+			{:else if updater.status === 'current'}
+				<div class="flex items-center gap-3 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-3" role="status" aria-live="polite">
+					<CheckCircle2 class="size-4 shrink-0 text-emerald-500" />
+					<div>
+						<p class="text-sm font-medium">You’re up to date</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">Version {updater.currentVersion} is the newest release available.</p>
+					</div>
+				</div>
+			{:else if updater.status === 'unavailable'}
+				<div class="flex items-start gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status">
+					<ShieldCheck class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+					<div>
+						<p class="text-sm font-medium">
+							{updater.unavailableReason === 'configuration'
+								? 'Automatic updates are not configured in this build'
+								: updater.unavailableReason === 'feed'
+									? 'No update feed has been published yet'
+									: 'Update checks are available in installed releases'}
+						</p>
+						<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+							{updater.unavailableReason === 'configuration'
+								? 'This copy keeps working normally. Install a newer release manually when one is provided.'
+								: updater.unavailableReason === 'feed'
+									? 'This bootstrap copy keeps working normally. You can check again after the first signed update is published.'
+									: 'Browser previews and local development stay offline. Release builds check quietly once when mewsik starts.'}
+						</p>
+					</div>
+				</div>
+			{:else if updater.status === 'error'}
+				<div class="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-3 text-destructive" role="alert">
+					<TriangleAlert class="mt-0.5 size-4 shrink-0" />
+					<p class="text-sm">{updater.errorMessage}</p>
+				</div>
+			{:else if updater.status === 'idle'}
+				<div class="flex items-start gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status">
+					<ShieldCheck class="mt-0.5 size-4 shrink-0 text-primary" />
+					<div>
+						<p class="text-sm font-medium">Updates stay under your control</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">mewsik checks once when it starts, then waits for your approval.</p>
+					</div>
+				</div>
+			{/if}
+
+			{#if updater.availableUpdate && ['available', 'downloading', 'ready', 'relaunching'].includes(updater.status)}
+				<div class="rounded-xl border border-primary/25 bg-primary/5 p-4" aria-live="polite">
+					<div class="flex flex-wrap items-start justify-between gap-3">
+						<div class="min-w-0 flex-1">
+							<div class="flex items-center gap-2">
+								<Rocket class="size-4 text-primary" />
+								<p class="text-sm font-semibold">Version {updater.availableUpdate.version} is available</p>
+							</div>
+							{#if formatReleaseDate(updater.availableUpdate.date)}
+								<p class="mt-1 text-xs text-muted-foreground">Released {formatReleaseDate(updater.availableUpdate.date)}</p>
+							{/if}
+						</div>
+
+						{#if updater.status === 'available'}
+							<Button size="sm" onclick={() => updater.installAndRestart()}>
+								<Download class="size-3.5" /> Install and restart
+							</Button>
+						{:else if updater.status === 'ready'}
+							<Button size="sm" onclick={() => updater.restartApp()}>
+								<Rocket class="size-3.5" /> Restart now
+							</Button>
+						{:else}
+							<Button size="sm" disabled>
+								<LoaderCircle class="size-3.5 animate-spin" />
+								{updater.status === 'downloading' ? 'Installing…' : 'Restarting…'}
+							</Button>
+						{/if}
+					</div>
+
+					{#if updater.availableUpdate.body}
+						<p class="mt-3 whitespace-pre-line text-xs leading-relaxed text-muted-foreground">{updater.availableUpdate.body}</p>
+					{/if}
+
+					{#if updater.status === 'downloading'}
+						<div class="mt-4" role="status">
+							<div class="mb-1.5 flex items-center justify-between gap-3 text-xs">
+								<span>Downloading and verifying update…</span>
+								{#if updater.progressPercent !== null}
+									<span class="tabular-nums text-muted-foreground">{updater.progressPercent}%</span>
+								{/if}
+							</div>
+							<progress
+								class="h-1.5 w-full overflow-hidden rounded-full accent-primary"
+								max="100"
+								value={updater.progressPercent ?? undefined}
+								aria-label="Update download progress"
+							></progress>
+							{#if updater.totalBytes !== null}
+								<p class="mt-1 text-[11px] tabular-nums text-muted-foreground">
+									{formatBytes(updater.downloadedBytes)} of {formatBytes(updater.totalBytes)}
+								</p>
+							{/if}
+						</div>
+					{/if}
+
+					{#if updater.errorMessage}
+						<div class="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive" role="alert">
+							<TriangleAlert class="mt-0.5 size-3.5 shrink-0" />
+							<p class="text-xs">{updater.errorMessage}</p>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<p class="px-1 text-[11px] leading-relaxed text-muted-foreground">
+				Release updates are verified before installation. Your library database, settings, playlists, and downloaded music stay outside the app installation and are not replaced.
+			</p>
 		</CardContent>
 	</Card>
 

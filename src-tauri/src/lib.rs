@@ -13,18 +13,30 @@ mod metadata;
 mod sources;
 mod stations;
 
+#[cfg(not(test))]
 use audio::AudioEngine;
+#[cfg(not(test))]
 use commands::external_search::ExternalSearchRuntime;
+#[cfg(not(test))]
 use commands::settings::ConfigState;
+#[cfg(not(test))]
 use config::AppConfig;
+#[cfg(not(test))]
 use discovery::sources::SourceConfig;
+#[cfg(not(test))]
 use discovery::v2::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
+#[cfg(not(test))]
 use download::DownloadManager;
+#[cfg(not(test))]
 use parking_lot::Mutex;
-use sources::{SidecarManager, StreamCache};
+#[cfg(not(test))]
+use sources::{stream_cache::StreamCache, SidecarManager};
+#[cfg(not(test))]
 use std::sync::Arc;
+#[cfg(not(test))]
 use tauri::Manager;
 
+#[cfg(not(test))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = AppConfig::load();
@@ -69,15 +81,29 @@ pub fn run() {
     ));
     let startup_db = db.clone();
 
-    let app = tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
+        .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
                 .max_file_size(512_000)
                 .build(),
-        )
+        );
+
+    // A local/source build intentionally has no updater key or endpoint. The
+    // updater plugin treats a missing config as an initialization error, so it
+    // must only be registered in the guarded release build that supplies both
+    // the generated config and this compile-time channel marker.
+    if option_env!("MEWSIK_UPDATE_CHANNEL")
+        .map(str::trim)
+        .is_some_and(|channel| !channel.is_empty())
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    let app = builder
         .setup(move |app| {
             external_tools::configure_runtime_resource_dir(app.path().resource_dir()?)?;
             stations::health::spawn_favorite_station_health_check(startup_db.clone());
@@ -140,6 +166,8 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::update_library_paths,
             commands::settings::get_library_paths,
+            commands::release::get_release_runtime_info,
+            commands::release::prepare_update_install,
             // Smart playlists
             commands::smart_playlists::create_smart_playlist,
             commands::smart_playlists::evaluate_smart_playlist,
@@ -191,7 +219,8 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
-            app_handle.state::<Arc<AudioEngine>>().shutdown();
+            app_handle.state::<Arc<SidecarManager>>().shutdown();
+            app_handle.state::<Arc<AudioEngine>>().shutdown_for_exit();
         }
     });
 }

@@ -1,18 +1,26 @@
 # Public beta release checklist
 
-mewsik can produce self-contained Windows and macOS installers. It is suitable for controlled friend testing once the exact artifact has passed the checks below. It is not yet a polished public distribution channel: Windows signing and in-app updates are not wired up, and each macOS architecture must currently be built separately.
+mewsik produces self-contained Windows and macOS installers. Version 0.2.0 adds the credential-free code foundation for a signed Windows updater and a guarded GitHub draft-release workflow. No signing key, certificate, or password is stored in the repository. The workflow cannot create even a draft unless every required release credential is configured, and a human must still review and publish that draft.
+
+Normal local builds deliberately have no updater endpoint or public key. They report `updaterConfigured: false` to the UI and continue to build and run without release credentials. Only the guarded release workflow generates the ignored Tauri merge config and compiles in the `stable` update channel.
 
 ## Supported release targets
 
 | Target | Build host | Artifact | Current minimum |
 | --- | --- | --- | --- |
-| Windows x64 | Windows x64 | NSIS `setup.exe` (preferred for beta) and MSI | Windows 10/11 |
+| Windows x64 | Windows x64 | Authenticode-signed NSIS `setup.exe` | Windows 10/11 |
 | macOS Apple Silicon | Apple Silicon Mac | signed and notarized DMG | macOS 13.5 |
 | macOS Intel | Intel Mac | signed and notarized DMG | macOS 13.5 |
 
-`scripts/prepare-runtime-resources.mjs` bundles the host Node and FFmpeg executables and deliberately rejects a platform or architecture mismatch. A Windows machine therefore cannot produce the Mac release. Running `scripts/macos-release.sh` over SSH on a Mac is fine because the build and signing still happen on macOS. Native macOS GitHub Actions runners are another option after release secrets are configured.
+`scripts/prepare-runtime-resources.mjs` bundles the host Node and FFmpeg executables and rejects a platform or architecture mismatch. A Windows machine therefore cannot produce the Mac release. Running `scripts/macos-release.sh` over SSH on a Mac is fine because the build and signing still happen on macOS. Native macOS CI runners are another option after that release lane is completed.
 
-A single universal macOS artifact is not supported yet. Ship separate `aarch64` and `x64` DMGs until Node, FFmpeg, and the app executable are all packaged as universal binaries.
+A universal macOS artifact is not supported yet. Ship separate `aarch64` and `x64` DMGs until Node, FFmpeg, and the app executable are all packaged as universal binaries.
+
+## What happens on somebody else's computer
+
+No tester types a `C:\Users\...` path. Tauri's installer and mewsik resolve the signed-in Windows user's standard folders at runtime. NSIS installs per user under that user's local application-data folder. New downloads normally go to that user's `Music\Mewsik` folder, then `Downloads\Mewsik` if Windows exposes no Music folder, and only fall back to the private app-data `downloads` folder if neither standard user folder is available. A user-selected location is stored per user. The account name is never hardcoded.
+
+The Windows deliverable is the NSIS `setup.exe`; that installer is the setup experience, so no separate wizard is required. Signing identifies the publisher and protects the file from modification, but no signing method can promise that every antivirus or reputation system immediately trusts a brand-new product. Never tell testers to disable security software. Distribute only the GitHub Release artifact and publish its SHA-256 hash.
 
 ## Version and toolchain gate
 
@@ -22,38 +30,75 @@ Release builds use:
 - pnpm 10.11.0 from `package.json#packageManager`
 - Rust 1.95.0 from `rust-toolchain.toml`
 
-The app version must match in `package.json`, `sidecar/package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`. Change all four and then run:
+The app version must match in `package.json`, `sidecar/package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml`. Change all four and run:
 
 ```sh
 pnpm version:check
 pnpm install --frozen-lockfile
 ```
 
-Never reuse a version for different public bits. Tag the exact reviewed commit as `vX.Y.Z` only after every release artifact has been built from it.
+Never reuse a version for different public bits. The stable Windows workflow accepts plain `X.Y.Z` versions only and rejects anything that is not newer than the highest existing stable `vX.Y.Z` tag. A public `v0.1.0` already exists; the updater-capable bootstrap release is `v0.2.0`. Never replace assets under an existing tag.
 
 ## Windows release
 
-Build on Windows x64:
+The NSIS installer installs for the current user without elevation. Downgrades are blocked, and the MSI upgrade code remains pinned so a future product-name edit cannot accidentally create a second installation identity. The current Tauri WebView2 mode downloads Microsoft's bootstrapper when WebView2 is missing, so those uncommon machines need internet during setup.
 
-```powershell
-pnpm install --frozen-lockfile
-pnpm check
-pnpm test:e2e
-Push-Location src-tauri
-cargo test
-Pop-Location
-pnpm tauri build
-```
+Tauri's uninstall checkbox clears interface/WebView preferences and cache derived from the bundle identifier; its text explicitly says the SQLite library and downloaded music are preserved. Core JSON config also remains in private data, while browser-backed preferences such as visualizer choices can be cleared. Do not add an installer hook that silently deletes or moves user-owned data.
 
-The NSIS installer installs for the current user under `%LOCALAPPDATA%` without elevation. Downgrades are blocked, and the MSI upgrade code is pinned so a future product-name edit cannot accidentally create a second installation identity. The current Tauri WebView2 mode downloads Microsoft's bootstrapper when WebView2 is missing, so those uncommon machines need an internet connection during setup. Tauri's uninstall checkbox only clears interface/WebView preferences and cache derived from the bundle identifier, so its text explicitly says that the SQLite library and downloaded music are preserved. The core JSON config also remains in the private data folder, while browser-backed preferences such as visualizer choices can be cleared by that checkbox. Do not add an installer hook that silently deletes or moves user-owned library data or downloads.
+Public Windows drafts use Azure Artifact Signing through Tauri's `bundle.windows.signCommand`. Tauri signs the application executable and installer while bundling, before updater signatures and `latest.json` are produced. The guarded workflow has no unsigned fallback. A deliberately unsigned private build must be built locally, labeled unmistakably, and never published through the stable updater feed.
 
-Before broad distribution, configure Authenticode signing and timestamping for the app and installer. Signing identifies the publisher and protects the file from modification; it does not guarantee that Microsoft SmartScreen will immediately have reputation for a new build. The present repository does not contain a Windows signing certificate or signing configuration.
+## Windows updater behavior
 
-For a controlled unsigned beta, state clearly that Windows will show an unknown-publisher warning, distribute the installer only from the project's GitHub release, publish its SHA-256 hash, and never ask testers to disable antivirus.
+Version 0.1.0 had no updater, so it cannot update itself. Testers must manually install 0.2.0 once. Preserving the bundle identifier, current-user scope, and data paths makes that an in-place upgrade. From the first updater-enabled release onward, the app can:
+
+1. Check GitHub's HTTPS `latest.json` only when the release build reports updates are configured.
+2. Show the new version and release notes instead of silently installing it.
+3. Download after the user confirms.
+4. Verify Tauri's mandatory updater signature.
+5. Recheck that no music download is pending, downloading, or processing. If one started while the app package downloaded, keep the verified package and wait instead of downloading it again.
+6. Atomically block new music-download workers, check once more in native code, and only then stop playback, FFmpeg transcoders, and the search sidecar.
+7. Run the NSIS updater in passive mode. A successful Windows install exits through the installer; if installer setup fails after native services were quiesced, mewsik immediately attempts a clean recovery relaunch.
+
+This is pull-based, not a remote push into somebody's computer. Publishing a newer signed release makes it discoverable; the installed app checks and the user decides when to install. User data and downloads remain outside the application bundle and survive an in-place update.
+
+The workflow at `.github/workflows/draft-windows-release.yml` is manual-only, requires the full Git ref to be the default branch (a similarly named tag cannot pass), rejects an existing or non-increasing stable version, requires an exact typed confirmation, signs a random challenge and verifies it with the configured public key, runs the version/type/Rust/browser gates, creates signed updater artifacts, and creates a GitHub **draft**. Publishing is a separate human action. Configure a GitHub Environment named `release` with required reviewers before placing credentials in it.
+
+### Exact GitHub release contract
+
+Configure these GitHub Actions **variables** in the protected `release` environment:
+
+| Name | Value |
+| --- | --- |
+| `MEWSIK_UPDATER_PUBLIC_KEY` | The single canonical base64 line stored by Tauri in the generated `.key.pub` file. It is public and is not a path. Do not encode it again. |
+| `AZURE_ARTIFACT_SIGNING_ENDPOINT` | Bare HTTPS endpoint such as `https://wus2.codesigning.azure.net`. |
+| `AZURE_ARTIFACT_SIGNING_ACCOUNT` | Azure Artifact Signing account name. |
+| `AZURE_ARTIFACT_SIGNING_PROFILE` | Certificate-profile name inside that account. |
+
+Configure these GitHub Actions **secrets** in the same environment:
+
+| Name | Value |
+| --- | --- |
+| `TAURI_SIGNING_PRIVATE_KEY` | The single canonical base64 line in the password-encrypted Tauri `.key` file. Do not encode it again. |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for that updater private key. |
+| `AZURE_CLIENT_ID` | Client ID authorized to sign with the Artifact Signing profile. |
+| `AZURE_CLIENT_SECRET` | Client secret for that identity. |
+| `AZURE_TENANT_ID` | Azure tenant ID for that identity. |
+
+`GITHUB_TOKEN` is supplied by GitHub with job-scoped `contents: write`; do not create a personal access token. The generated `src-tauri/tauri.release.generated.conf.json` contains only the updater public key, public HTTPS endpoint, passive install mode, and public Artifact Signing identifiers. It is gitignored and never contains the updater private key or Azure client secret.
+
+Generate the updater keypair once on a trusted machine with Tauri's `signer generate` command, use a strong password, keep at least one encrypted offline backup, and place each generated one-line value in the matching GitHub entry. Do not paste the private key into issues, logs, release notes, commits, or chat. Losing it means installed clients cannot trust a replacement key; recovery requires a manually installed bridge release, so backup is a release blocker.
+
+Before dispatching, bump all four manifests to the same never-published version. From the default branch, run **Draft signed Windows release**, enter the version without `v`, and type `CREATE DRAFT vX.Y.Z`. Review the draft's Authenticode publisher, `.sig`, `latest.json`, clean install, upgrade preservation, and SHA-256 hashes before publishing. Do not mark an updater release as a GitHub prerelease: the configured `/releases/latest/` endpoint ignores prereleases. To repair a bad public release, publish a higher version instead of mutating the old one.
+
+### Required updater canary
+
+Do not send 0.2.0 broadly until its exact signed candidate has been installed on a disposable Windows profile and the Settings page reports the stable update channel without treating an older/no-update feed as a network failure. Verify the installer publisher, install scope, preserved library/downloads, and release endpoint from that installed binary.
+
+Because 0.1.0 had no updater, the first complete installed-app update canary necessarily uses 0.2.0 as the old build and a higher signed build as the update. Keep the reviewed 0.2.0 candidate installed on the canary profile. Before announcing the next release broadly, publish its reviewed draft, immediately use 0.2.0 to check, download, verify, install, and relaunch it, then recheck data and playback. If that canary fails, stop rollout and publish a higher fixed version; never replace the failing tag's assets.
 
 ## macOS release
 
-The release script refuses to build unless a Developer ID signing identity and exactly one notarization credential method are available. The recommended local setup stores notarization credentials in the macOS Keychain:
+The existing native Mac script refuses to build unless a Developer ID signing identity and exactly one notarization credential method are available. Recommended local setup stores notarization credentials in Keychain:
 
 ```sh
 xcrun notarytool store-credentials "mewsik-notary" \
@@ -66,37 +111,35 @@ export APPLE_SIGNING_IDENTITY="Developer ID Application: YOUR NAME (TEAMID)"
 pnpm release:macos
 ```
 
-The script also supports either `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID`, or `APPLE_API_KEY` + `APPLE_API_KEY_PATH` with optional `APPLE_API_ISSUER`. Keep certificates, API keys, and passwords in Keychain or CI secrets—never in the repository or a chat transcript.
+The script also supports `APPLE_ID` + `APPLE_PASSWORD` + `APPLE_TEAM_ID`, or `APPLE_API_KEY` + `APPLE_API_KEY_PATH` with optional `APPLE_API_ISSUER`. Keep certificates, API keys, and passwords in Keychain or CI secrets—never in the repository or chat.
 
-The script signs the embedded Node and FFmpeg executables with hardened-runtime entitlements, signs the app and DMG, waits for an explicit `Accepted` notarization result, staples the ticket, and fails unless codesign, DMG, stapler, and Gatekeeper assessments pass.
+The script signs embedded Node and FFmpeg with hardened-runtime entitlements, signs the app and DMG, waits for an explicit notarization acceptance, staples the ticket, and fails unless codesign, DMG, stapler, and Gatekeeper checks pass.
+
+The GitHub updater workflow currently ships Windows x64 only. The macOS updater remains disabled because every nested executable must be explicitly signed before the updater archive is created. The current script does not yet produce the signed `.app.tar.gz` updater bundle or merge both architectures into `latest.json`. Do not add macOS to a generic Tauri matrix until that order is implemented and verified.
+
+A future Mac updater lane must sign every nested executable, sign the app, notarize and staple the distributed build, create the updater archive from that final app, sign the archive with the protected Tauri updater key, and add valid `darwin-aarch64` and `darwin-x86_64` entries to one `latest.json`.
 
 ## Upgrade and data-safety test
 
-Do this on a disposable Windows user profile and a disposable macOS user profile before publishing an update:
+Do this on disposable Windows and macOS user profiles before publishing an update:
 
-1. Install the previous public version and create a library, favorites, playlists, settings changes, and at least one completed download.
-2. Record the displayed download location and copy the private data folder somewhere outside the test profile.
-3. Install the new version over the old version without manually uninstalling it.
-4. Confirm the library, playlists, settings, station favorites, playback history, and downloaded file still exist and play.
-5. Confirm a pending schema change created a valid file in the private `backups` directory and that no more than three pre-migration backups are retained.
-6. Launch search, external playback, radio playback, download, queue, and every visualizer engine from the installed build—not only the dev server.
-7. Uninstall and verify that the explicit installer wording matches what remains on disk. Reinstall and confirm the preserved user data is still readable.
+1. Install the previous public version and create a library, favorites, playlists, settings changes, and a completed download.
+2. Record the download location and copy private data somewhere outside the profile.
+3. Install the new version over the old one without manually uninstalling it.
+4. Confirm library, playlists, settings, station favorites, playback history, and the download still exist and play.
+5. Confirm a pending schema change created a valid private `backups` file and no more than three pre-migration backups remain.
+6. Test search, external playback, radio, downloads, queue, and every visualizer engine from the installed build—not only dev mode.
+7. Uninstall and verify the wording matches what remains. Reinstall and confirm preserved data is readable.
 
 Do not publish if an upgrade changes the Tauri identifier, Windows installer scope, data-directory convention, database path, or download-path semantics without a separately reviewed migration plan.
 
-## Artifact and release gate
+## Final artifact gate
 
-- Working tree and tag point to the intended commit.
+- Working tree and tag point to the intended reviewed commit.
 - `pnpm version:check`, `pnpm check`, Rust tests, and Playwright tests pass.
 - Runtime manifest hashes and bundled third-party license files are present.
-- Windows artifacts are signed for a public release, or explicitly labeled unsigned for controlled testing.
-- Every macOS DMG is signed, notarized, stapled, and tested on a clean machine of the matching architecture.
+- Windows Authenticode publisher, updater `.sig`, and `latest.json` are valid.
+- Every macOS DMG is signed, notarized, stapled, and tested on clean matching hardware.
 - SHA-256 hashes are published with the release.
-- Release notes list supported OS/architecture, known limitations, storage behavior, and whether updates are manual.
+- Release notes list supported OS/architecture, known limitations, and storage behavior.
 - Provider terms and redistribution/licensing obligations for Node, FFmpeg, YouTube, SoundCloud, Bandcamp, and radio-directory integrations have been reviewed for the intended release model.
-
-## Updates are still manual
-
-There is no updater plugin or release feed in this repository today. A tester must download and run the newer installer. The intended next distribution milestone is a signed, pull-based updater backed by HTTPS/GitHub Releases with a visible confirmation prompt, passive install, relaunch, signed update metadata, rollback-aware migrations, and preservation of private data and user-owned downloads.
-
-Updater artifact signatures are separate from Windows Authenticode and Apple Developer ID signatures. Do not enable the updater until its private signing key has an offline backup and the corresponding public key, HTTPS endpoint, release workflow, and recovery procedure have been reviewed together.

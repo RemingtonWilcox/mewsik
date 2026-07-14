@@ -1070,7 +1070,15 @@ pub fn play_external(
     )?;
     let entry =
         crate::commands::playback::build_queue_entry(&db, &sidecar, &recording_id, Some(&cache))?;
-    engine.start_queue(vec![entry], 0);
+    let session_id = engine.start_queue(vec![entry], 0);
+    crate::commands::playback::spawn_deterministic_continuation(
+        db.inner(),
+        sidecar.inner(),
+        engine.inner(),
+        cache.inner(),
+        session_id,
+        recording_id.clone(),
+    );
     Ok(recording_id)
 }
 
@@ -1142,16 +1150,33 @@ pub fn play_external_context(
     }
 
     let session_id = engine.start_queue(vec![entry], 0);
+    if tail.is_empty() {
+        crate::commands::playback::spawn_deterministic_continuation(
+            db.inner(),
+            sidecar.inner(),
+            engine.inner(),
+            cache.inner(),
+            session_id,
+            recording_id.clone(),
+        );
+        return Ok(recording_id);
+    }
+
     let worker_db = db.inner().clone();
     let worker_sidecar = sidecar.inner().clone();
     let worker_engine = engine.inner().clone();
     let worker_cache = cache.inner().clone();
     let worker_session_id = session_id.clone();
+    let worker_anchor_recording_id = recording_id.clone();
 
     if let Err(error) = std::thread::Builder::new()
         .name("external-up-next".to_string())
         .spawn(move || {
+            let mut appended = 0usize;
             for candidate in tail {
+                if !worker_engine.queue_session_is_current(&worker_session_id) {
+                    return;
+                }
                 let candidate_title = candidate.title.clone();
                 let queued = ensure_external_recording_inner(
                     &worker_db,
@@ -1174,8 +1199,12 @@ pub fn play_external_context(
 
                 match queued {
                     Ok(entry) if entry.file_path.is_some() || entry.source_url.is_some() => {
+                        if !worker_engine.queue_session_is_current(&worker_session_id) {
+                            return;
+                        }
                         worker_engine
                             .append_context_if_session(worker_session_id.clone(), vec![entry]);
+                        appended += 1;
                     }
                     Ok(_) => {
                         log::debug!("Skipping unplayable Up Next result: {candidate_title}");
@@ -1185,12 +1214,31 @@ pub fn play_external_context(
                     }
                 }
             }
+
+            if appended == 0 && worker_engine.queue_session_is_current(&worker_session_id) {
+                crate::commands::playback::spawn_deterministic_continuation(
+                    &worker_db,
+                    &worker_sidecar,
+                    &worker_engine,
+                    &worker_cache,
+                    worker_session_id,
+                    worker_anchor_recording_id,
+                );
+            }
         })
     {
         // The selected track is already queued and playable. A worker-launch
         // failure should degrade continuation, not make the UI claim playback
         // failed after audio has started.
         log::warn!("Failed to start external Up Next worker: {error}");
+        crate::commands::playback::spawn_deterministic_continuation(
+            db.inner(),
+            sidecar.inner(),
+            engine.inner(),
+            cache.inner(),
+            session_id,
+            recording_id.clone(),
+        );
     }
 
     Ok(recording_id)
@@ -1267,6 +1315,16 @@ mod tests {
                 ("youtube", "youtube-One")
             ]
         );
+    }
+
+    #[test]
+    fn one_unique_external_result_has_no_visible_context_tail() {
+        let selected = result("youtube", "Only Song", "Artist", None);
+        let mut duplicate = result("youtube", "Duplicate Label", "Artist", None);
+        duplicate.source_id = selected.source_id.clone();
+
+        assert!(external_context_tail(&[selected.clone()], 0, 10).is_empty());
+        assert!(external_context_tail(&[selected, duplicate], 0, 10).is_empty());
     }
 
     #[test]

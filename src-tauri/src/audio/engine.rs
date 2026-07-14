@@ -74,6 +74,20 @@ pub enum AudioCommand {
     Shutdown,
 }
 
+fn command_invalidates_queue_owner(command: &AudioCommand) -> bool {
+    matches!(
+        command,
+        AudioCommand::PlayFile(..)
+            | AudioCommand::PlayEntry(..)
+            | AudioCommand::PlayUrl(..)
+            | AudioCommand::Stop
+            | AudioCommand::StopForError(..)
+            | AudioCommand::SetQueue(..)
+            | AudioCommand::ClearQueue
+            | AudioCommand::Shutdown
+    )
+}
+
 #[derive(Debug, Clone)]
 pub enum AudioEvent {
     StateChanged(PlaybackState),
@@ -168,8 +182,31 @@ impl ActivePlay {
 
 #[cfg(test)]
 mod play_request_tests {
-    use super::{ActivePlay, AudioEngine, PlayEndReason, PlayRequestGate};
+    use super::{
+        command_invalidates_queue_owner, ActivePlay, AudioCommand, AudioEngine, Mutex,
+        PlayEndReason, PlayRequestGate, PlaybackState, QueueSessionOwner, QueueSnapshot,
+    };
+    use crate::db::models::QueueItem;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    fn command_only_engine() -> (Arc<AudioEngine>, crossbeam_channel::Receiver<AudioCommand>) {
+        let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
+        let (_event_tx, event_rx) = crossbeam_channel::unbounded();
+        (
+            Arc::new(AudioEngine {
+                cmd_tx,
+                event_rx,
+                state: Arc::new(Mutex::new(PlaybackState::default())),
+                queue_snapshot: Arc::new(Mutex::new(QueueSnapshot::default())),
+                queue_owner_session: Arc::new(QueueSessionOwner::default()),
+                app_handle: Arc::new(Mutex::new(None)),
+                play_request_gate: PlayRequestGate::default(),
+                worker: Mutex::new(None),
+            }),
+            cmd_rx,
+        )
+    }
 
     #[test]
     fn newer_request_invalidates_older_finish() {
@@ -239,6 +276,119 @@ mod play_request_tests {
         ));
         assert!(AudioEngine::error_session_is_current(&playback_session, 42));
     }
+
+    #[test]
+    fn replacement_queue_invalidates_stale_context_owner() {
+        let owner = QueueSessionOwner::default();
+        owner.claim("first-session");
+        assert!(owner.is_current("first-session"));
+
+        owner.claim("replacement-session");
+        assert!(!owner.is_current("first-session"));
+        assert!(owner.is_current("replacement-session"));
+
+        owner.invalidate();
+        assert!(!owner.is_current("replacement-session"));
+    }
+
+    #[test]
+    fn failed_start_invalidates_only_its_own_queue_owner() {
+        let owner = QueueSessionOwner::default();
+        owner.claim("failed-session");
+        owner.invalidate_if_current("stale-session");
+        assert!(owner.is_current("failed-session"));
+
+        owner.invalidate_if_current("failed-session");
+        assert!(!owner.is_current("failed-session"));
+    }
+
+    #[test]
+    fn stop_and_radio_takeover_invalidate_context_ownership() {
+        assert!(command_invalidates_queue_owner(&AudioCommand::Stop));
+        assert!(command_invalidates_queue_owner(&AudioCommand::PlayUrl(
+            "station".to_string(),
+            "https://example.invalid/live".to_string(),
+            "Station".to_string(),
+        )));
+        assert!(!command_invalidates_queue_owner(&AudioCommand::Pause));
+    }
+
+    #[test]
+    fn concurrent_start_queue_owner_matches_last_enqueued_command() {
+        const THREADS: usize = 8;
+        const STARTS_PER_THREAD: usize = 64;
+
+        let (engine, command_rx) = command_only_engine();
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let mut workers = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let worker_engine = Arc::clone(&engine);
+            let worker_barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                worker_barrier.wait();
+                for _ in 0..STARTS_PER_THREAD {
+                    worker_engine.start_queue(Vec::new(), 0);
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let commands = command_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(commands.len(), THREADS * STARTS_PER_THREAD);
+        let last_session = commands
+            .iter()
+            .rev()
+            .find_map(|command| match command {
+                AudioCommand::StartQueue { session_id, .. } => Some(session_id),
+                _ => None,
+            })
+            .expect("a start command was enqueued");
+        assert!(engine.queue_session_is_current(last_session));
+
+        engine.send(AudioCommand::ClearQueue);
+        assert!(!engine.queue_session_is_current(last_session));
+    }
+
+    #[test]
+    fn continuation_readiness_waits_until_the_selected_track_has_started() {
+        let (engine, _command_rx) = command_only_engine();
+        let session = engine.start_queue(Vec::new(), 0);
+        assert!(!engine.queue_session_is_ready_for_continuation(&session, "anchor"));
+
+        engine.queue_owner_session.mark_ready(&session, "anchor");
+        assert!(engine.queue_session_is_ready_for_continuation(&session, "anchor"));
+
+        let replacement = engine.start_queue(Vec::new(), 0);
+        assert!(!engine.queue_session_is_ready_for_continuation(&session, "anchor"));
+        assert_ne!(session, replacement);
+    }
+
+    #[test]
+    fn continuation_wait_stops_when_the_queue_moves_off_its_anchor() {
+        let (engine, _command_rx) = command_only_engine();
+        let session = engine.start_queue(Vec::new(), 0);
+        assert!(engine.queue_session_can_still_start_continuation(&session, "anchor"));
+
+        *engine.queue_snapshot.lock() = QueueSnapshot {
+            session_id: session.clone(),
+            revision: 2,
+            now_playing: Some(QueueItem {
+                entry_id: "next-entry".to_string(),
+                index: 0,
+                recording_id: "different-recording".to_string(),
+                title: "Different".to_string(),
+                artist_name: "Artist".to_string(),
+                duration_ms: None,
+                cover_art_url: None,
+                is_current: true,
+            }),
+            upcoming: Vec::new(),
+        };
+
+        assert!(!engine.queue_session_can_still_start_continuation(&session, "anchor"));
+    }
 }
 
 #[derive(Default)]
@@ -269,11 +419,65 @@ impl PlayRequestGate {
     }
 }
 
+#[derive(Default)]
+struct QueueSessionState {
+    session_id: String,
+    ready_recording_id: Option<String>,
+}
+
+#[derive(Default)]
+struct QueueSessionOwner {
+    state: Mutex<QueueSessionState>,
+}
+
+impl QueueSessionOwner {
+    fn claim(&self, session_id: &str) {
+        let mut state = self.state.lock();
+        state.session_id = session_id.to_string();
+        state.ready_recording_id = None;
+    }
+
+    fn invalidate(&self) {
+        let mut state = self.state.lock();
+        state.session_id = new_queue_session_id();
+        state.ready_recording_id = None;
+    }
+
+    fn invalidate_if_current(&self, session_id: &str) {
+        let mut state = self.state.lock();
+        if state.session_id == session_id {
+            state.session_id = new_queue_session_id();
+            state.ready_recording_id = None;
+        }
+    }
+
+    fn mark_ready(&self, session_id: &str, recording_id: &str) {
+        let mut state = self.state.lock();
+        if state.session_id == session_id {
+            state.ready_recording_id = Some(recording_id.to_string());
+        }
+    }
+
+    fn is_current(&self, session_id: &str) -> bool {
+        self.state.lock().session_id == session_id
+    }
+
+    fn is_ready(&self, session_id: &str, recording_id: &str) -> bool {
+        let state = self.state.lock();
+        state.session_id == session_id && state.ready_recording_id.as_deref() == Some(recording_id)
+    }
+}
+
 pub struct AudioEngine {
     cmd_tx: Sender<AudioCommand>,
     event_rx: Receiver<AudioEvent>,
     state: Arc<Mutex<PlaybackState>>,
     queue_snapshot: Arc<Mutex<QueueSnapshot>>,
+    /// Synchronous ownership token for background context builders. Unlike the
+    /// worker snapshot, this changes before `start_queue` returns, eliminating
+    /// the startup race where a fast helper could mistake the prior session for
+    /// the active one.
+    queue_owner_session: Arc<QueueSessionOwner>,
     app_handle: Arc<Mutex<Option<AppHandle>>>,
     play_request_gate: PlayRequestGate,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -285,9 +489,11 @@ impl AudioEngine {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let state = Arc::new(Mutex::new(PlaybackState::default()));
         let queue_snapshot = Arc::new(Mutex::new(QueueSnapshot::default()));
+        let queue_owner_session = Arc::new(QueueSessionOwner::default());
         let app_handle: Arc<Mutex<Option<AppHandle>>> = Arc::new(Mutex::new(None));
         let state_clone = Arc::clone(&state);
         let queue_snapshot_clone = Arc::clone(&queue_snapshot);
+        let queue_owner_session_clone = Arc::clone(&queue_owner_session);
         let app_handle_clone = Arc::clone(&app_handle);
         let loop_cmd_tx = cmd_tx.clone();
 
@@ -300,6 +506,7 @@ impl AudioEngine {
                     event_tx,
                     state_clone,
                     queue_snapshot_clone,
+                    queue_owner_session_clone,
                     db,
                     app_handle_clone,
                 );
@@ -311,6 +518,7 @@ impl AudioEngine {
             event_rx,
             state,
             queue_snapshot,
+            queue_owner_session,
             app_handle,
             play_request_gate: PlayRequestGate::default(),
             worker: Mutex::new(Some(worker)),
@@ -320,6 +528,21 @@ impl AudioEngine {
     /// Called after Tauri's setup() so the engine can emit `audio:features` events.
     pub fn set_app_handle(&self, handle: AppHandle) {
         *self.app_handle.lock() = Some(handle);
+    }
+
+    fn update_queue_owner_for(&self, cmd: &AudioCommand) {
+        match cmd {
+            AudioCommand::StartQueue { session_id, .. } => {
+                self.queue_owner_session.claim(session_id);
+            }
+            command if command_invalidates_queue_owner(command) => {
+                // These commands replace or leave queue ownership without a
+                // caller-visible session. Any in-flight context builder must
+                // stop before doing more provider/source work.
+                self.queue_owner_session.invalidate();
+            }
+            _ => {}
+        }
     }
 
     pub fn send(&self, cmd: AudioCommand) {
@@ -336,12 +559,18 @@ impl AudioEngine {
                 | AudioCommand::PlayQueueEntry { .. }
                 | AudioCommand::SetQueue(..)
                 | AudioCommand::StartQueue { .. }
+                | AudioCommand::ClearQueue
                 | AudioCommand::Shutdown
         ) {
             self.play_request_gate.invalidate_and(|| {
+                // Ownership and channel order must change under the same lock.
+                // Otherwise two rapid StartQueue calls can leave the owner on
+                // one session while the audio worker receives the other last.
+                self.update_queue_owner_for(&cmd);
                 let _ = self.cmd_tx.send(cmd);
             });
         } else {
+            debug_assert!(!command_invalidates_queue_owner(&cmd));
             let _ = self.cmd_tx.send(cmd);
         }
     }
@@ -356,7 +585,14 @@ impl AudioEngine {
     /// gate lock makes ordering with a simultaneous Stop/new play unambiguous.
     pub fn finish_play_request(&self, request: u64, cmd: AudioCommand) -> bool {
         self.play_request_gate
-            .finish_if_current(request, || self.cmd_tx.send(cmd).is_ok())
+            .finish_if_current(request, || {
+                // Async radio resolution bypasses `send`, so revoke any
+                // one-song continuation before the station command enters the
+                // engine queue. Stale workers then stop before more provider
+                // work and their guarded appends are rejected.
+                self.update_queue_owner_for(&cmd);
+                self.cmd_tx.send(cmd).is_ok()
+            })
             .unwrap_or(false)
     }
 
@@ -394,6 +630,38 @@ impl AudioEngine {
         });
     }
 
+    pub fn queue_session_is_current(&self, session_id: &str) -> bool {
+        self.queue_owner_session.is_current(session_id)
+    }
+
+    pub fn queue_session_is_ready_for_continuation(
+        &self,
+        session_id: &str,
+        recording_id: &str,
+    ) -> bool {
+        self.queue_owner_session.is_ready(session_id, recording_id)
+    }
+
+    pub fn queue_session_can_still_start_continuation(
+        &self,
+        session_id: &str,
+        recording_id: &str,
+    ) -> bool {
+        if !self.queue_owner_session.is_current(session_id) {
+            return false;
+        }
+        let snapshot = self.queue_snapshot.lock();
+        // The owner changes synchronously before the audio worker publishes its
+        // first snapshot, so an older snapshot means "not observed yet."
+        if snapshot.session_id != session_id {
+            return true;
+        }
+        snapshot
+            .now_playing
+            .as_ref()
+            .is_some_and(|item| item.recording_id == recording_id)
+    }
+
     pub fn select_queue_entry(&self, session_id: String, entry_id: String) {
         self.send(AudioCommand::PlayQueueEntry {
             session_id,
@@ -412,11 +680,21 @@ impl AudioEngine {
     /// makes the database write deterministic instead of racing process exit.
     pub fn shutdown(&self) {
         self.play_request_gate.invalidate_and(|| {
-            let _ = self.cmd_tx.send(AudioCommand::Shutdown);
+            let command = AudioCommand::Shutdown;
+            self.update_queue_owner_for(&command);
+            let _ = self.cmd_tx.send(command);
         });
         if let Some(worker) = self.worker.lock().take() {
             let _ = worker.join();
         }
+    }
+
+    /// Terminal application shutdown also stops transcoder children that are
+    /// not owned by Tauri managed state. The updater uses this path because
+    /// the Windows installer exits the process without a normal RunEvent::Exit.
+    pub fn shutdown_for_exit(&self) {
+        http_stream::quiesce_and_stop_ffmpeg();
+        self.shutdown();
     }
 
     fn should_prefer_full_fetch(entry: &QueueEntry) -> bool {
@@ -954,6 +1232,7 @@ impl AudioEngine {
         event_tx: Sender<AudioEvent>,
         state: Arc<Mutex<PlaybackState>>,
         queue_snapshot: Arc<Mutex<QueueSnapshot>>,
+        queue_owner_session: Arc<QueueSessionOwner>,
         db: DbPool,
         app_handle: Arc<Mutex<Option<AppHandle>>>,
     ) {
@@ -962,6 +1241,7 @@ impl AudioEngine {
             Err(e) => {
                 log::error!("Failed to open audio output: {}", e);
                 let _ = event_tx.send(AudioEvent::Error(format!("No audio output: {}", e)));
+                queue_owner_session.invalidate();
                 return;
             }
         };
@@ -1145,6 +1425,7 @@ impl AudioEngine {
                             let state_clone = s.clone();
                             drop(s);
                             let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                            queue_owner_session.mark_ready(queue.session_id(), &entry.recording_id);
                         }
                         Err(err) => {
                             let _ = cmd_tx.send(AudioCommand::StopForError(session_id));
@@ -1179,6 +1460,7 @@ impl AudioEngine {
                         &mut awaiting_source,
                         desired_playing,
                     );
+                    queue_owner_session.mark_ready(queue.session_id(), &entry.recording_id);
                 }
                 Ok(AudioCommand::PlayUrl(station_id, url, name)) => {
                     let session_id = Self::reset_playback_session(
@@ -1348,6 +1630,7 @@ impl AudioEngine {
                             if !Self::error_session_is_current(&playback_session, session_id) {
                                 continue;
                             }
+                            queue_owner_session.invalidate_if_current(queue.session_id());
                             PlayEndReason::PlaybackError
                         }
                         _ => PlayEndReason::Stopped,
@@ -1767,6 +2050,7 @@ impl AudioEngine {
                     queue.set_tracks_with_session(session_id, tracks, start_index);
                     Self::sync_queue_state(&queue, &queue_snapshot);
                     if let Some(entry) = queue.current().cloned() {
+                        let local_source = entry.file_path.is_some();
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
                             &tap_tx,
@@ -1784,7 +2068,10 @@ impl AudioEngine {
                             &mut desired_playing,
                             PlayEndReason::QueueChanged,
                         ) {
+                            queue_owner_session.invalidate_if_current(queue.session_id());
                             let _ = event_tx.send(AudioEvent::Error(err));
+                        } else if local_source {
+                            queue_owner_session.mark_ready(queue.session_id(), &entry.recording_id);
                         }
                     } else {
                         Self::reset_playback_session(

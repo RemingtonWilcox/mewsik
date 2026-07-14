@@ -61,6 +61,7 @@ pub struct PlayQueue {
     current: Option<QueueOccurrence>,
     upcoming: Vec<QueueOccurrence>,
     history: Vec<QueueOccurrence>,
+    accept_context_appends: bool,
     shuffle: bool,
     repeat: RepeatMode,
 }
@@ -75,6 +76,7 @@ impl PlayQueue {
             current: None,
             upcoming: Vec::new(),
             history: Vec::new(),
+            accept_context_appends: true,
             shuffle: false,
             repeat: RepeatMode::Off,
         }
@@ -100,6 +102,7 @@ impl PlayQueue {
         self.current = None;
         self.upcoming.clear();
         self.history.clear();
+        self.accept_context_appends = true;
 
         if self.canonical.is_empty() {
             self.bump_revision();
@@ -140,7 +143,7 @@ impl PlayQueue {
         session_id: &str,
         entries: Vec<QueueEntry>,
     ) -> bool {
-        if session_id != self.session_id || entries.is_empty() {
+        if session_id != self.session_id || !self.accept_context_appends || entries.is_empty() {
             return false;
         }
 
@@ -364,6 +367,7 @@ impl PlayQueue {
         self.current = None;
         self.upcoming.clear();
         self.history.clear();
+        self.accept_context_appends = false;
         self.bump_revision();
     }
 
@@ -371,6 +375,9 @@ impl PlayQueue {
         self.canonical = self.current.iter().cloned().collect();
         self.upcoming.clear();
         self.history.clear();
+        // "Clear Up Next" is an ownership boundary, not a temporary empty
+        // frame that a late background continuation may refill.
+        self.accept_context_appends = false;
         self.bump_revision();
     }
 
@@ -630,5 +637,17 @@ mod tests {
             queue.next().map(|track| track.recording_id.as_str()),
             Some("two")
         );
+    }
+
+    #[test]
+    fn clear_upcoming_rejects_late_context_from_the_same_session() {
+        let mut queue = PlayQueue::new();
+        queue.set_tracks(vec![entry("one"), entry("two")], 0);
+        let session = queue.session_id().to_string();
+
+        queue.clear_upcoming();
+
+        assert!(!queue.append_context_if_session(&session, vec![entry("late")]));
+        assert!(upcoming_ids(&queue).is_empty());
     }
 }

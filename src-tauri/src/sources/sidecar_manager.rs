@@ -33,6 +33,7 @@ struct Inner {
     child: Option<Child>,
     stdin: Option<BufWriter<ChildStdin>>,
     generation: u64,
+    shutting_down: bool,
 }
 
 #[derive(Serialize)]
@@ -66,6 +67,7 @@ impl SidecarManager {
                 child: None,
                 stdin: None,
                 generation: 0,
+                shutting_down: false,
             })),
             pending: Arc::new(Mutex::new(HashMap::new())),
             request_id: AtomicU64::new(1),
@@ -74,6 +76,9 @@ impl SidecarManager {
 
     pub fn start(&self) -> Result<(), String> {
         let mut inner = self.inner.lock();
+        if inner.shutting_down {
+            return Err("Search providers are shutting down for app exit".to_string());
+        }
         reap_if_dead(&mut inner, &self.pending);
         if inner.child.is_some() {
             return Ok(());
@@ -312,29 +317,16 @@ impl SidecarManager {
 
     pub fn stop(&self) {
         let mut inner = self.inner.lock();
-        let generation = inner.generation;
-        inner.stdin.take();
-        if let Some(mut child) = inner.child.take() {
-            let child_id = child.id();
-            let _ = child.kill();
-            match child.wait() {
-                Ok(status) => log::info!(
-                    target: "mewsik::sidecar",
-                    "stopped sidecar generation {} pid {}: {}",
-                    generation,
-                    child_id,
-                    status
-                ),
-                Err(error) => log::warn!(
-                    target: "mewsik::sidecar",
-                    "failed waiting for sidecar generation {} pid {} to stop: {}",
-                    generation,
-                    child_id,
-                    error
-                ),
-            }
-        }
-        clear_pending_generation(&self.pending, generation);
+        stop_inner(&mut inner, &self.pending);
+    }
+
+    /// Permanently prevents this process from starting another Node child,
+    /// then kills and waits for the current generation. Used immediately before
+    /// updater-driven process exit, where normal managed-state Drop is bypassed.
+    pub fn shutdown(&self) {
+        let mut inner = self.inner.lock();
+        inner.shutting_down = true;
+        stop_inner(&mut inner, &self.pending);
     }
 
     pub fn restart(&self) -> Result<(), String> {
@@ -348,6 +340,32 @@ impl SidecarManager {
         reap_if_dead(&mut inner, &self.pending);
         inner.child.is_some()
     }
+}
+
+fn stop_inner(inner: &mut Inner, pending: &PendingMap) {
+    let generation = inner.generation;
+    inner.stdin.take();
+    if let Some(mut child) = inner.child.take() {
+        let child_id = child.id();
+        let _ = child.kill();
+        match child.wait() {
+            Ok(status) => log::info!(
+                target: "mewsik::sidecar",
+                "stopped sidecar generation {} pid {}: {}",
+                generation,
+                child_id,
+                status
+            ),
+            Err(error) => log::warn!(
+                target: "mewsik::sidecar",
+                "failed waiting for sidecar generation {} pid {} to stop: {}",
+                generation,
+                child_id,
+                error
+            ),
+        }
+    }
+    clear_pending_generation(pending, generation);
 }
 
 /// Detect a child that exited on its own (crash, OOM) and clean up so callers
@@ -546,6 +564,15 @@ mod tests {
         assert_eq!(next_generation(0), 1);
         assert_eq!(next_generation(9), 10);
         assert_eq!(next_generation(u64::MAX), 1);
+    }
+
+    #[test]
+    fn terminal_shutdown_prevents_a_late_sidecar_restart() {
+        let manager = super::SidecarManager::new();
+        manager.shutdown();
+        let error = manager.start().expect_err("shutdown must be permanent");
+        assert!(error.contains("shutting down"));
+        assert!(!manager.is_running());
     }
 
     #[cfg(windows)]

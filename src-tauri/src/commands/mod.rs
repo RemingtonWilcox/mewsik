@@ -5,6 +5,7 @@ pub mod external_search;
 pub mod library;
 pub mod playback;
 pub mod playlists;
+pub mod release;
 pub mod search;
 pub mod settings;
 pub mod smart_playlists;

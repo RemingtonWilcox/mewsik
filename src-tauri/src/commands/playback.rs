@@ -2,6 +2,7 @@ use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::queue::{QueueEntry, RepeatMode};
 use crate::db::models::{PlaybackState, QueueSnapshot};
 use crate::db::{queries, DbPool};
+use crate::discovery::recommendations::RecommendationEngine;
 use crate::download;
 use crate::sources::sidecar_manager::SidecarManager;
 use crate::sources::stream_cache::StreamCache;
@@ -343,6 +344,121 @@ pub(crate) fn build_queue_entry(
     })
 }
 
+const SINGLE_TRACK_CONTINUATION_LIMIT: usize = 8;
+const SINGLE_TRACK_CANDIDATE_SCAN_LIMIT: usize = 24;
+const SINGLE_TRACK_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+const SINGLE_TRACK_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Expands a one-song context without delaying its start. Candidate selection
+/// is deterministic and database-only. Building a queue entry may refresh an
+/// expired provider URL, but this worker never fetches or decodes audio for a
+/// future track; actual media work remains demand-driven in the audio engine.
+pub(crate) fn spawn_deterministic_continuation(
+    db: &DbPool,
+    sidecar: &Arc<SidecarManager>,
+    engine: &Arc<AudioEngine>,
+    cache: &StreamCache,
+    session_id: String,
+    anchor_recording_id: String,
+) {
+    let worker_db = db.clone();
+    let worker_sidecar = Arc::clone(sidecar);
+    let worker_engine = Arc::clone(engine);
+    let worker_cache = cache.clone();
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("single-track-continuation".to_string())
+        .spawn(move || {
+            // The app uses one mutex-protected SQLite connection. Let the audio
+            // worker finish its start/history transaction before running the
+            // larger recommendation query, or a fast helper can make pressing
+            // Play feel slower on a large library.
+            let readiness_deadline = std::time::Instant::now() + SINGLE_TRACK_READY_TIMEOUT;
+            loop {
+                if !worker_engine.queue_session_can_still_start_continuation(
+                    &session_id,
+                    &anchor_recording_id,
+                ) || std::time::Instant::now() >= readiness_deadline
+                {
+                    return;
+                }
+                if worker_engine
+                    .queue_session_is_ready_for_continuation(&session_id, &anchor_recording_id)
+                {
+                    break;
+                }
+                std::thread::sleep(SINGLE_TRACK_READY_POLL_INTERVAL);
+            }
+
+            let candidate_ids = match RecommendationEngine::new(worker_db.clone())
+                .continuation_recording_ids(
+                    &anchor_recording_id,
+                    SINGLE_TRACK_CANDIDATE_SCAN_LIMIT,
+                )
+            {
+                Ok(ids) => ids,
+                Err(error) => {
+                    log::debug!(
+                        "Could not build continuation for {anchor_recording_id}: {error}"
+                    );
+                    return;
+                }
+            };
+
+            let mut prepared = Vec::with_capacity(SINGLE_TRACK_CONTINUATION_LIMIT - 1);
+            let mut published = 0usize;
+            for candidate_id in candidate_ids {
+                if published + prepared.len() >= SINGLE_TRACK_CONTINUATION_LIMIT
+                    || !worker_engine.queue_session_is_current(&session_id)
+                {
+                    break;
+                }
+
+                match build_queue_entry(
+                    &worker_db,
+                    &worker_sidecar,
+                    &candidate_id,
+                    Some(&worker_cache),
+                ) {
+                    Ok(entry) if entry.file_path.is_some() || entry.source_url.is_some() => {
+                        if published == 0 {
+                            // Make the first playable successor visible as soon
+                            // as it is ready. A slow provider refresh for a later
+                            // suggestion must never leave the active song with
+                            // an empty Up Next queue.
+                            worker_engine
+                                .append_context_if_session(session_id.clone(), vec![entry]);
+                            published = 1;
+                        } else {
+                            prepared.push(entry);
+                        }
+                    }
+                    Ok(_) => {
+                        log::debug!(
+                            "Skipping continuation candidate without a playable source: {candidate_id}"
+                        );
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "Skipping continuation candidate {candidate_id}: {error}"
+                        );
+                    }
+                }
+            }
+
+            if !prepared.is_empty() && worker_engine.queue_session_is_current(&session_id) {
+                // Append the remaining batch behind anything the listener may
+                // have manually queued while provider URLs were resolving.
+                // Queue V2 shuffles only this new batch when shuffle is active.
+                worker_engine.append_context_if_session(session_id, prepared);
+            }
+        })
+    {
+        // Playback already started. Continuation is intentionally best-effort.
+        log::warn!("Failed to start single-track continuation worker: {error}");
+    }
+}
+
 #[tauri::command]
 pub fn play_recording(
     db: State<'_, DbPool>,
@@ -356,7 +472,15 @@ pub fn play_recording(
         return Err("No playable source for this recording".to_string());
     }
 
-    engine.start_queue(vec![entry], 0);
+    let session_id = engine.start_queue(vec![entry], 0);
+    spawn_deterministic_continuation(
+        db.inner(),
+        sidecar.inner(),
+        engine.inner(),
+        cache.inner(),
+        session_id,
+        recording_id,
+    );
     Ok(())
 }
 
@@ -448,7 +572,18 @@ pub fn play_tracks_from(
         queue_entries.push(build_queue_entry(&db, &sidecar, id, Some(&cache))?);
     }
 
-    engine.start_queue(queue_entries, start_index);
+    let single_anchor = (recording_ids.len() == 1).then(|| recording_ids[start_index].clone());
+    let session_id = engine.start_queue(queue_entries, start_index);
+    if let Some(anchor_recording_id) = single_anchor {
+        spawn_deterministic_continuation(
+            db.inner(),
+            sidecar.inner(),
+            engine.inner(),
+            cache.inner(),
+            session_id,
+            anchor_recording_id,
+        );
+    }
     Ok(())
 }
 

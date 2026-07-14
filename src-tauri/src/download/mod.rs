@@ -15,21 +15,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Default)]
+struct DownloadManagerState {
+    cancellations: HashMap<String, Arc<AtomicBool>>,
+    update_installing: bool,
+}
+
+#[derive(Default)]
 pub struct DownloadManager {
-    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    state: Mutex<DownloadManagerState>,
 }
 
 impl DownloadManager {
-    pub fn register(&self, download_id: &str) -> Arc<AtomicBool> {
+    pub fn register(&self, download_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut state = self.state.lock();
+        if state.update_installing {
+            return Err(
+                "An app update is starting. Restart mewsik before beginning another music download."
+                    .to_string(),
+            );
+        }
         let token = Arc::new(AtomicBool::new(false));
-        self.cancellations
-            .lock()
+        state
+            .cancellations
             .insert(download_id.to_string(), token.clone());
-        token
+        Ok(token)
     }
 
     pub fn cancel(&self, download_id: &str) -> bool {
-        if let Some(token) = self.cancellations.lock().get(download_id).cloned() {
+        if let Some(token) = self.state.lock().cancellations.get(download_id).cloned() {
             token.store(true, Ordering::Relaxed);
             true
         } else {
@@ -38,7 +51,35 @@ impl DownloadManager {
     }
 
     pub fn unregister(&self, download_id: &str) {
-        self.cancellations.lock().remove(download_id);
+        self.state.lock().cancellations.remove(download_id);
+    }
+
+    /// Atomically prevents new worker reservations and reports any work that
+    /// was already alive. The database check also catches stale active rows
+    /// left by an older interrupted build.
+    pub fn prepare_update_install(&self, db: &DbPool) -> Result<usize, String> {
+        let mut state = self.state.lock();
+        if state.update_installing {
+            return Err("App update installation is already prepared".to_string());
+        }
+        if !state.cancellations.is_empty() {
+            return Ok(state.cancellations.len());
+        }
+
+        state.update_installing = true;
+        drop(state);
+        let active_rows = queries::count_active_downloads(db).map_err(|error| error.to_string());
+        match active_rows {
+            Ok(0) => Ok(0),
+            Ok(count) => {
+                self.state.lock().update_installing = false;
+                Ok(count)
+            }
+            Err(error) => {
+                self.state.lock().update_installing = false;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -720,23 +761,34 @@ pub fn queue_download_for_entry(
         created_at: now.clone(),
         updated_at: now,
     };
-    queries::insert_download(db, &download).map_err(|e| e.to_string())?;
+    // Reserve a live-worker slot before the database row exists. The updater's
+    // prepare command holds the same manager mutex, so it cannot observe zero
+    // work and quiesce while a new download is between its check and insert.
+    let cancel_token = manager.register(&download.id)?;
+    if let Err(error) = queries::insert_download(db, &download) {
+        manager.unregister(&download.id);
+        return Err(error.to_string());
+    }
 
-    let db = db.clone();
+    let worker_db = db.clone();
     let manager = manager.clone();
     let recording_id = recording_id.map(str::to_string);
     let download_id = download.id.clone();
-    let cancel_token = manager.register(&download_id);
     let worker_manager = manager.clone();
     let worker_download_id = download_id.clone();
     std::thread::Builder::new()
         .name(format!("download-{}", download.id))
         .spawn(move || {
-            if let Err(err) =
-                queries::update_download_progress(&db, &worker_download_id, 1.0, "downloading")
-                    .map_err(|e| e.to_string())
+            if let Err(err) = queries::update_download_progress(
+                &worker_db,
+                &worker_download_id,
+                1.0,
+                "downloading",
+            )
+            .map_err(|e| e.to_string())
             {
-                let _ = queries::fail_download(&db, &worker_download_id, &err);
+                let _ = queries::fail_download(&worker_db, &worker_download_id, &err);
+                worker_manager.unregister(&worker_download_id);
                 return;
             }
 
@@ -746,17 +798,23 @@ pub fn queue_download_for_entry(
                 match reserve_unique_output_path(&downloads_dir, &base_name, &extension) {
                     Ok(destination) => destination,
                     Err(error) => {
-                        let _ = queries::fail_download(&db, &worker_download_id, &error);
+                        let _ = queries::fail_download(&worker_db, &worker_download_id, &error);
                         worker_manager.unregister(&worker_download_id);
                         return;
                     }
                 };
 
             let result = if let Some(path) = entry.file_path.as_deref() {
-                copy_local_file(&db, &worker_download_id, path, &destination, &cancel_token)
+                copy_local_file(
+                    &worker_db,
+                    &worker_download_id,
+                    path,
+                    &destination,
+                    &cancel_token,
+                )
             } else if should_transcode_remote_to_mp3(&entry) {
                 transcode_remote_file_to_mp3(
-                    &db,
+                    &worker_db,
                     &worker_download_id,
                     &entry,
                     entry.source_url.as_deref().unwrap_or_default(),
@@ -765,7 +823,7 @@ pub fn queue_download_for_entry(
                 )
             } else if let Some(url) = entry.source_url.as_deref() {
                 fetch_remote_file(
-                    &db,
+                    &worker_db,
                     &worker_download_id,
                     url,
                     &entry.source_headers,
@@ -782,22 +840,25 @@ pub fn queue_download_for_entry(
                 let _ = std::fs::remove_file(&destination);
                 match err {
                     DownloadError::Cancelled => {
-                        let _ = queries::cancel_download(&db, &worker_download_id);
+                        let _ = queries::cancel_download(&worker_db, &worker_download_id);
                     }
                     DownloadError::Failed(message) => {
-                        let _ = queries::fail_download(&db, &worker_download_id, &message);
+                        let _ = queries::fail_download(&worker_db, &worker_download_id, &message);
                     }
                 }
             } else if let Some(recording_id) = recording_id.as_deref() {
-                let _ = upsert_download_source(&db, recording_id, &entry.source, &destination);
-                let _ = crate::db::queries::set_in_library(&db, recording_id, true);
+                let _ =
+                    upsert_download_source(&worker_db, recording_id, &entry.source, &destination);
+                let _ = crate::db::queries::set_in_library(&worker_db, recording_id, true);
             }
 
             worker_manager.unregister(&worker_download_id);
         })
         .map_err(|e| {
             manager.unregister(&download_id);
-            format!("Failed to spawn download worker: {}", e)
+            let message = format!("Failed to spawn download worker: {}", e);
+            let _ = queries::fail_download(db, &download_id, &message);
+            message
         })?;
 
     Ok(download.id)
@@ -824,6 +885,47 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn update_quiesce_and_download_reservation_share_one_gate() {
+        let db = init_memory_db().expect("db");
+        let manager = DownloadManager::default();
+        let live = manager.register("live-worker").expect("reserve worker");
+        assert!(!live.load(Ordering::Relaxed));
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 1);
+
+        manager.unregister("live-worker");
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 0);
+        assert!(manager.register("too-late").is_err());
+        assert!(manager.prepare_update_install(&db).is_err());
+    }
+
+    #[test]
+    fn stale_active_database_row_blocks_update_quiesce() {
+        let db = init_memory_db().expect("db");
+        let now = queries::now();
+        queries::insert_download(
+            &db,
+            &Download {
+                id: "stale-active".to_string(),
+                recording_id: None,
+                source: "youtube".to_string(),
+                source_url: "https://example.invalid/audio".to_string(),
+                status: "downloading".to_string(),
+                progress: 42.0,
+                file_path: None,
+                error_message: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("insert stale active row");
+
+        let manager = DownloadManager::default();
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 1);
+        assert!(manager.register("still-allowed").is_ok());
+    }
 
     #[test]
     fn completed_download_is_promoted_to_local_track_source() {

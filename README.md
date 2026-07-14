@@ -30,7 +30,7 @@
 
 ## Install (early beta)
 
-This repository builds native Windows and macOS applications, but the public release process is still being hardened. Check each GitHub release for its exact supported platforms and signing status. Automatic updates are not implemented yet, so a newer beta must be installed over the existing version manually.
+This repository builds native Windows and macOS applications, but the public release process is still being hardened. Check each GitHub release for its exact supported platforms and signing status. Version 0.1 cannot update itself, so moving to the first signed 0.2 release is a one-time manual install. Signed stable Windows releases built by the protected release workflow can then check for newer signed releases and offer an opt-in update in Settings. Local, source-built, unsigned, and current macOS builds keep the updater disabled and are updated manually.
 
 ### Windows 10/11 (x64)
 

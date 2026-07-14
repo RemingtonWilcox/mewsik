@@ -1438,6 +1438,16 @@ pub fn get_downloads(db: &DbPool) -> Result<Vec<Download>, rusqlite::Error> {
     rows.collect()
 }
 
+pub fn count_active_downloads(db: &DbPool) -> Result<usize, rusqlite::Error> {
+    let conn = db.lock();
+    conn.query_row(
+        "SELECT COUNT(*) FROM downloads WHERE status IN ('pending', 'downloading', 'processing')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
+}
+
 pub fn get_download_by_id(
     db: &DbPool,
     download_id: &str,

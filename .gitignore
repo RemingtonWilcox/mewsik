@@ -24,6 +24,7 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.test
+src-tauri/tauri.release.generated.conf.json
 
 # Vite
 vite.config.js.timestamp-*

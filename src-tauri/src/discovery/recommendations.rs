@@ -1,7 +1,8 @@
 use crate::db::models::LibraryTrack;
 use crate::db::DbPool;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OpenFlags, Row};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 const QUALIFIED_LISTEN_MIN_MS: i64 = 30_000;
 const PROFILE_TRACK_GOAL: i64 = 5;
@@ -292,6 +293,234 @@ impl RecommendationEngine {
             .map_err(|e| e.to_string())?;
 
         Ok(diversify_candidates(candidates, limit, 1))
+    }
+
+    /// Deterministic radio-style continuation for a playback context that only
+    /// contains one recording. This deliberately ranks already-known catalog
+    /// relationships; it does not call a provider, download audio, or decode a
+    /// second track while the current one is playing.
+    pub fn continuation_recording_ids(
+        &self,
+        anchor_recording_id: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        // The primary DbPool intentionally wraps one connection for ordered
+        // writes. Ranking can be a larger read, so use a separate WAL reader in
+        // packaged/on-disk databases; otherwise a continuation query could
+        // hold that mutex while the listener tries to start another song.
+        let database_path = {
+            let conn = self.db.lock();
+            conn.path()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+        };
+        let independent_reader = database_path
+            .map(|path| {
+                let connection = Connection::open_with_flags(
+                    path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                        | OpenFlags::SQLITE_OPEN_URI,
+                )
+                .map_err(|error| error.to_string())?;
+                connection
+                    .busy_timeout(Duration::from_secs(2))
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(connection)
+            })
+            .transpose()?;
+        let shared_reader;
+        let conn = if let Some(connection) = independent_reader.as_ref() {
+            connection
+        } else {
+            // In-memory databases used by unit tests have no reopenable path.
+            shared_reader = self.db.lock();
+            &shared_reader
+        };
+        let mut stmt = conn
+            .prepare(
+                r#"
+                WITH anchor AS (
+                    SELECT NULLIF(LOWER(TRIM(genre)), '') AS genre_key
+                    FROM recordings
+                    WHERE id = ?1
+                ),
+                candidates AS (
+                    SELECT
+                        r.id,
+                        r.title,
+                        r.is_in_library,
+                        EXISTS(
+                            SELECT 1
+                            FROM album_tracks candidate_album
+                            JOIN album_tracks anchor_album
+                              ON anchor_album.album_id = candidate_album.album_id
+                            WHERE candidate_album.recording_id = r.id
+                              AND anchor_album.recording_id = ?1
+                        ) AS same_album,
+                        COALESCE(
+                            (
+                                SELECT MIN(
+                                    CASE
+                                        WHEN (
+                                            COALESCE(candidate_album.disc_number, 1) * 100000
+                                            + COALESCE(candidate_album.track_number, 0)
+                                        ) > (
+                                            COALESCE(anchor_album.disc_number, 1) * 100000
+                                            + COALESCE(anchor_album.track_number, 0)
+                                        ) THEN 0
+                                        ELSE 1
+                                    END
+                                )
+                                FROM album_tracks candidate_album
+                                JOIN album_tracks anchor_album
+                                  ON anchor_album.album_id = candidate_album.album_id
+                                WHERE candidate_album.recording_id = r.id
+                                  AND anchor_album.recording_id = ?1
+                            ),
+                            2
+                        ) AS album_wrap,
+                        COALESCE(
+                            (
+                                SELECT MIN(
+                                    COALESCE(candidate_album.disc_number, 1) * 100000
+                                    + COALESCE(candidate_album.track_number, 0)
+                                )
+                                FROM album_tracks candidate_album
+                                JOIN album_tracks anchor_album
+                                  ON anchor_album.album_id = candidate_album.album_id
+                                WHERE candidate_album.recording_id = r.id
+                                  AND anchor_album.recording_id = ?1
+                            ),
+                            2147483647
+                        ) AS album_position,
+                        COALESCE(
+                            (
+                                SELECT MAX(similarity.score)
+                                FROM recording_similarities similarity
+                                WHERE (
+                                    similarity.recording_id_a = ?1
+                                    AND similarity.recording_id_b = r.id
+                                ) OR (
+                                    similarity.recording_id_b = ?1
+                                    AND similarity.recording_id_a = r.id
+                                )
+                            ),
+                            0.0
+                        ) AS similarity_score,
+                        EXISTS(
+                            SELECT 1
+                            FROM recording_artists candidate_artist
+                            JOIN recording_artists anchor_artist
+                              ON anchor_artist.artist_id = candidate_artist.artist_id
+                            WHERE candidate_artist.recording_id = r.id
+                              AND anchor_artist.recording_id = ?1
+                              AND candidate_artist.role = 'primary'
+                              AND anchor_artist.role = 'primary'
+                        ) AS same_artist,
+                        CASE
+                            WHEN (SELECT genre_key FROM anchor) IS NOT NULL
+                             AND LOWER(TRIM(r.genre)) = (SELECT genre_key FROM anchor)
+                            THEN 1
+                            ELSE 0
+                        END AS same_genre,
+                        (
+                            SELECT MAX(history.started_at)
+                            FROM play_history history
+                            WHERE history.recording_id = r.id
+                        ) AS last_played
+                    FROM recordings r
+                    WHERE r.id <> ?1
+                      AND (
+                            EXISTS(
+                                SELECT 1
+                                FROM track_sources source
+                                WHERE source.recording_id = r.id
+                                  AND source.is_available = 1
+                                  AND (
+                                      NULLIF(TRIM(source.file_path), '') IS NOT NULL
+                                      OR NULLIF(TRIM(source.source_url), '') IS NOT NULL
+                                      OR NULLIF(TRIM(source.source_id), '') IS NOT NULL
+                                  )
+                            )
+                            OR EXISTS(
+                                SELECT 1
+                                FROM downloads download
+                                WHERE download.recording_id = r.id
+                                  AND download.status = 'completed'
+                                  AND NULLIF(TRIM(download.file_path), '') IS NOT NULL
+                            )
+                      )
+                      AND (
+                            r.is_in_library = 1
+                            OR EXISTS(
+                                SELECT 1
+                                FROM album_tracks candidate_album
+                                JOIN album_tracks anchor_album
+                                  ON anchor_album.album_id = candidate_album.album_id
+                                WHERE candidate_album.recording_id = r.id
+                                  AND anchor_album.recording_id = ?1
+                            )
+                            OR EXISTS(
+                                SELECT 1
+                                FROM recording_artists candidate_artist
+                                JOIN recording_artists anchor_artist
+                                  ON anchor_artist.artist_id = candidate_artist.artist_id
+                                WHERE candidate_artist.recording_id = r.id
+                                  AND anchor_artist.recording_id = ?1
+                                  AND candidate_artist.role = 'primary'
+                                  AND anchor_artist.role = 'primary'
+                            )
+                            OR EXISTS(
+                                SELECT 1
+                                FROM recording_similarities similarity
+                                WHERE (
+                                    similarity.recording_id_a = ?1
+                                    AND similarity.recording_id_b = r.id
+                                ) OR (
+                                    similarity.recording_id_b = ?1
+                                    AND similarity.recording_id_a = r.id
+                                )
+                            )
+                      )
+                )
+                SELECT id
+                FROM candidates
+                ORDER BY
+                    CASE
+                        WHEN same_album = 1 THEN 0
+                        WHEN similarity_score > 0 THEN 1
+                        WHEN same_artist = 1 THEN 2
+                        WHEN same_genre = 1 THEN 3
+                        ELSE 4
+                    END,
+                    album_wrap,
+                    album_position,
+                    similarity_score DESC,
+                    CASE WHEN same_artist = 1 THEN 0 ELSE 1 END,
+                    CASE WHEN same_genre = 1 THEN 0 ELSE 1 END,
+                    CASE WHEN is_in_library = 1 THEN 0 ELSE 1 END,
+                    CASE WHEN last_played IS NULL THEN 0 ELSE 1 END,
+                    last_played ASC,
+                    LOWER(title) ASC,
+                    id ASC
+                LIMIT ?2
+                "#,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let rows = stmt
+            .query_map(params![anchor_recording_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| error.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())
     }
 
     fn fallback_library_mix(
@@ -647,6 +876,33 @@ mod tests {
             .unwrap();
     }
 
+    fn make_playable(db: &DbPool, recording_id: &str) {
+        db.lock()
+            .execute(
+                "INSERT INTO track_sources (id, recording_id, source, file_path, quality_score, is_available, created_at, updated_at) VALUES (?1, ?2, 'local', ?3, 100, 1, datetime('now'), datetime('now'))",
+                params![
+                    format!("source-{recording_id}"),
+                    recording_id,
+                    format!("/music/{recording_id}.mp3")
+                ],
+            )
+            .unwrap();
+    }
+
+    fn put_on_album(db: &DbPool, recording_id: &str, album_id: &str, track_number: i64) {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT OR IGNORE INTO albums (id, title, created_at, updated_at) VALUES (?1, ?2, datetime('now'), datetime('now'))",
+            params![album_id, format!("Album {album_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO album_tracks (album_id, recording_id, disc_number, track_number) VALUES (?1, ?2, 1, ?3)",
+            params![album_id, recording_id, track_number],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn qualified_history_mix_is_stable_until_history_changes() {
         let db = init_memory_db().unwrap();
@@ -744,5 +1000,92 @@ mod tests {
         assert_eq!(mix.len(), 4);
         assert_eq!(stats.unique_tracks, 0);
         assert!(!stats.profile_ready);
+    }
+
+    #[test]
+    fn single_track_continuation_is_related_playable_and_deterministic() {
+        let db = init_memory_db().unwrap();
+        for (id, artist) in [
+            ("anchor", "artist-a"),
+            ("album-before", "artist-a"),
+            ("album-after", "artist-a"),
+            ("similar", "artist-b"),
+            ("same-artist", "artist-a"),
+            ("same-genre", "artist-c"),
+            ("library-fallback", "artist-d"),
+            ("unplayable-album", "artist-a"),
+        ] {
+            seed_library_track(&db, id, artist);
+        }
+
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE recordings SET genre = 'Ambient' WHERE id IN ('anchor', 'same-genre')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO recording_similarities (recording_id_a, recording_id_b, score, source) VALUES ('anchor', 'similar', 0.91, 'test')",
+                [],
+            )
+            .unwrap();
+        }
+
+        put_on_album(&db, "album-before", "album-a", 1);
+        put_on_album(&db, "anchor", "album-a", 2);
+        put_on_album(&db, "album-after", "album-a", 3);
+        put_on_album(&db, "unplayable-album", "album-a", 4);
+        for id in [
+            "album-before",
+            "album-after",
+            "similar",
+            "same-artist",
+            "same-genre",
+            "library-fallback",
+        ] {
+            make_playable(&db, id);
+        }
+
+        let engine = RecommendationEngine::new(db);
+        let first = engine.continuation_recording_ids("anchor", 10).unwrap();
+        let second = engine.continuation_recording_ids("anchor", 10).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            vec![
+                "album-after",
+                "album-before",
+                "similar",
+                "same-artist",
+                "same-genre",
+                "library-fallback",
+            ]
+        );
+        assert!(!first.iter().any(|id| id == "anchor"));
+        assert!(!first.iter().any(|id| id == "unplayable-album"));
+    }
+
+    #[test]
+    fn external_anchor_only_falls_back_to_known_relationships() {
+        let db = init_memory_db().unwrap();
+        seed_library_track(&db, "external-anchor", "artist-a");
+        seed_library_track(&db, "same-artist", "artist-a");
+        seed_library_track(&db, "unrelated-external", "artist-b");
+        db.lock()
+            .execute(
+                "UPDATE recordings SET is_in_library = 0 WHERE id IN ('external-anchor', 'same-artist', 'unrelated-external')",
+                [],
+            )
+            .unwrap();
+        make_playable(&db, "same-artist");
+        make_playable(&db, "unrelated-external");
+
+        let ids = RecommendationEngine::new(db)
+            .continuation_recording_ids("external-anchor", 10)
+            .unwrap();
+
+        assert_eq!(ids, vec!["same-artist"]);
     }
 }
