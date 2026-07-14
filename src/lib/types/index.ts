@@ -86,7 +86,7 @@ export interface Station {
 	favicon_path: string | null;
 	country: string | null;
 	language: string | null;
-	tags: string[] | null;
+	tags: string | null;
 	codec: string | null;
 	bitrate: number | null;
 	radio_browser_id: string | null;
@@ -102,6 +102,7 @@ export interface StationHealthResult {
 	url: string;
 	status: 'ok' | 'stale' | 'dead';
 	last_checked_at: string | null;
+	repaired: boolean;
 }
 
 export interface PlayHistory {

@@ -153,7 +153,7 @@ export const MK2_CONDUCTOR_LIMITS = {
 	spectralLean: [-1, 1],
 	spectralTravelRate: [-0.18, 0.18],
 	paletteWarmth: [-1, 1],
-	materialDensity: [0, 1],
+	materialDensity: [0.3, 1],
 	materialIridescence: [0, 1],
 	materialErosion: [0, 1]
 } as const;
@@ -845,30 +845,35 @@ export class Mk2Conductor {
 				clamp01(finite(frame.clock?.beatPulse)) * kick * 0.32
 		);
 		const axialStretchTarget = clamp01(
-			0.06 +
-				this.sproutForm * 0.58 +
-				this.windingForm * 0.22 +
-				body * 0.34 +
+			0.04 +
+				this.sproutForm * 0.78 +
+				this.windingForm * 0.3 +
+				body * 0.28 +
 				positiveBody * 0.12 -
-				this.dormancyForm * 0.16
+				this.dormancyForm * 0.24
 		);
 		const lobeSplitTarget = clamp01(
-			0.03 + this.bloomForm * 0.66 + mids * 0.25 + positiveMids * 0.14 - this.seedForm * 0.08
+			0.02 +
+				this.bloomForm * 0.82 +
+				mids * 0.24 +
+				positiveMids * 0.14 -
+				this.seedForm * 0.12 -
+				this.windingForm * 0.05
 		);
 		const foldDepthTarget = clamp01(
-			0.05 +
-				this.windingForm * 0.58 +
-				mids * 0.28 +
-				spectralMotion * 0.16 +
+			0.04 +
+				this.windingForm * 0.72 +
+				mids * 0.24 +
+				spectralMotion * 0.12 +
 				positiveMids * 0.1 -
-				this.bloomForm * 0.08
+				this.bloomForm * 0.14
 		);
 		const cavityOpenTarget = clamp01(
-			0.02 +
-				this.sheddingForm * 0.72 +
-				this.dormancyForm * 0.16 +
-				signalRelease * 0.12 -
-				this.seedForm * 0.08
+			0.01 +
+				this.sheddingForm * 0.86 +
+				this.dormancyForm * 0.08 +
+				signalRelease * 0.08 -
+				this.seedForm * 0.1
 		);
 		const surfaceRidgesTarget = clamp01(
 			0.04 +
@@ -878,12 +883,13 @@ export class Mk2Conductor {
 				this.windingForm * 0.08
 		);
 		const filamentReachTarget = clamp01(
-			0.03 +
-				air * 0.48 +
-				treble * 0.18 +
-				positiveAir * 0.22 +
-				centroid * 0.12 +
-				this.bloomForm * 0.16
+			0.02 +
+				air * 0.42 +
+				treble * 0.14 +
+				positiveAir * 0.18 +
+				centroid * 0.08 +
+				this.bloomForm * 0.32 +
+				this.sheddingForm * 0.08
 		);
 		this.rootMass = approachAsymmetric(this.rootMass, rootMassTarget, 0.34, 0.95, dt);
 		this.rootPulse = approachAsymmetric(this.rootPulse, rootPulseTarget, 0.018, 0.22, dt);
@@ -1124,7 +1130,9 @@ export class Mk2Conductor {
 			profile.backgroundFlow +
 				(signalMotion - 0.5) * 0.002 +
 				spectralMotion * 0.003 +
-				this.suspense * 0.003,
+				// Anticipation only adds forward speed. The integrated phase therefore
+				// foreshadows the next form without snapping backward on release.
+				this.suspense * 0.009,
 			...MK2_CONDUCTOR_LIMITS.backgroundFlow
 		);
 		this.topologyBias = approachAsymmetric(this.topologyBias, topologyTarget, 1.35, 2, dt);
@@ -1159,14 +1167,18 @@ export class Mk2Conductor {
 				this.sheddingForm * 0.12,
 			...MK2_CONDUCTOR_LIMITS.paletteWarmth
 		);
-		const materialDensityTarget = clamp01(
-			0.18 +
-				this.seedForm * 0.5 +
-				this.windingForm * 0.54 +
-				this.dormancyForm * 0.38 +
-				this.rootMass * 0.18 -
-				this.sheddingForm * 0.32 -
-				this.bloomForm * 0.06
+		// Density is pigment/body substance, never opacity. Even a shedding shell
+		// keeps enough mass to read as tissue rather than a pale compositing layer.
+		const materialDensityTarget = clamp(
+			0.32 +
+				this.seedForm * 0.42 +
+				this.sproutForm * 0.12 +
+				this.windingForm * 0.46 +
+				this.bloomForm * 0.04 +
+				this.dormancyForm * 0.34 +
+				this.rootMass * 0.16 -
+				this.sheddingForm * 0.16,
+			...MK2_CONDUCTOR_LIMITS.materialDensity
 		);
 		const materialIridescenceTarget = clamp01(
 			0.06 +

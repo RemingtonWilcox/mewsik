@@ -1,7 +1,15 @@
 use crate::db::models::LibraryTrack;
 use crate::db::DbPool;
+use crate::discovery::feed::{SearchDiscoveryFeed, SharedDiscoveryFeedRuntime};
 use crate::discovery::recommendations::{PlayStats, RecommendationEngine};
 use tauri::State;
+
+#[tauri::command]
+pub async fn get_search_discovery_feed(
+    runtime: State<'_, SharedDiscoveryFeedRuntime>,
+) -> Result<SearchDiscoveryFeed, String> {
+    Ok(runtime.get_feed().await)
+}
 
 #[tauri::command]
 pub fn get_daily_mix(db: State<'_, DbPool>) -> Result<Vec<LibraryTrack>, String> {

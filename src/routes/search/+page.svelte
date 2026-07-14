@@ -4,10 +4,17 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import SourceIcon from '$lib/components/source-icon.svelte';
+	import SearchDiscoveryFeedView from '$lib/components/search/search-discovery-feed.svelte';
 	import * as api from '$lib/api/tauri';
-	import type { ExternalSearchResult } from '$lib/api/tauri';
+	import type {
+		ExternalSearchResult,
+		SearchDiscoveryFeed,
+		SearchDiscoveryItem
+	} from '$lib/api/tauri';
 	import { usePlayer, formatTime } from '$lib/state/player.svelte';
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { toast } from 'svelte-sonner';
 	import { Search, Play, Pause, Heart, Download, LoaderCircle, X, CheckCircle2 } from '@lucide/svelte';
 
@@ -30,7 +37,6 @@
 	let externalResults = $state<ExternalSearchResult[]>(searchState.results as ExternalSearchResult[]);
 	let searchingExternal = $state(false);
 	let loadingMore = $state(false);
-	let externalDebounceTimer: ReturnType<typeof setTimeout>;
 	let externalSearchRequest = 0;
 	let pendingExternalActions = $state<Record<string, 'play' | 'save' | 'download'>>({});
 	let savedIds = $state<Set<string>>(new Set());
@@ -38,8 +44,10 @@
 	let sidecarReady = $state(false);
 	let sidecarStartPromise: Promise<void> | null = null;
 	let activeExternalQuery = '';
-	let queuedExternalQuery = '';
-	let lastCompletedExternalQuery = searchState.results.length > 0 ? searchState.query : '';
+	let handledUrlQuery = '';
+	let completedExternalQuery = $state(
+		searchState.results.length > 0 ? searchState.query.trim() : ''
+	);
 	let sourcePreference = $state<SearchSourcePreference>(searchState.sourcePreference as SearchSourcePreference || 'all');
 	let loadMoreSentinel = $state<HTMLDivElement | null>(null);
 	let nextPageBySource = $state<Record<ProviderSource, number>>({
@@ -52,6 +60,8 @@
 		soundcloud: true,
 		bandcamp: true
 	});
+	let discoveryFeed = $state<SearchDiscoveryFeed | null>(null);
+	let loadingDiscoveryFeed = $state(true);
 	let queueAppendGeneration = 0;
 	let activeQueueSelection:
 		| {
@@ -69,11 +79,20 @@
 		| null = null;
 
 	const MIN_QUERY_LENGTH = 2;
-	const EXTERNAL_SEARCH_DEBOUNCE_MS = 520;
-
 	onMount(() => {
 		let disposed = false;
 		const cleanups: Array<() => void> = [];
+
+		void api.getSearchDiscoveryFeed()
+			.then((feed) => {
+				if (!disposed) discoveryFeed = feed;
+			})
+			.catch(() => {
+				if (!disposed) discoveryFeed = null;
+			})
+			.finally(() => {
+				if (!disposed) loadingDiscoveryFeed = false;
+			});
 
 		void ensureSidecarReady().catch(() => {
 			sidecarReady = false;
@@ -94,6 +113,7 @@
 		void api.listenExternalSearchComplete((payload) => {
 			if (disposed || payload.query !== query.trim()) return;
 			externalResults = payload.results;
+			completedExternalQuery = payload.query;
 		}).then((unlisten) => {
 			if (disposed) {
 				unlisten();
@@ -117,6 +137,15 @@
 	$effect(() => { searchState.query = query; });
 	$effect(() => { searchState.results = externalResults; });
 	$effect(() => { searchState.sourcePreference = sourcePreference; });
+	$effect(() => {
+		const urlQuery = (page.url.searchParams.get('q') ?? '').trim().replace(/\s+/g, ' ');
+		if (urlQuery.length < MIN_QUERY_LENGTH || urlQuery === handledUrlQuery) return;
+		handledUrlQuery = urlQuery;
+		if (query.trim() === urlQuery && completedExternalQuery === urlQuery && externalResults.length > 0) {
+			return;
+		}
+		startNewSearch(urlQuery, false);
+	});
 	$effect(() => {
 		const selection = {
 			recordingId: player.state.current_recording_id,
@@ -236,11 +265,15 @@
 
 
 	async function searchExternal(searchQuery = query.trim()) {
+		searchQuery = searchQuery.trim().replace(/\s+/g, ' ');
 		if (!searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return;
+		if (activeExternalQuery === searchQuery) return;
 
 		const requestId = ++externalSearchRequest;
+		activeExternalQuery = searchQuery;
 		searchingExternal = true;
 		externalError = '';
+		completedExternalQuery = '';
 		resetPaginationState();
 		try {
 			await ensureSidecarReady();
@@ -248,14 +281,19 @@
 			if (requestId === externalSearchRequest) {
 				externalResults = results;
 				externalError = '';
+				completedExternalQuery = searchQuery;
 			}
 		} catch (e) {
 			if (requestId === externalSearchRequest) {
 				externalResults = [];
 				externalError = `Search is unavailable${e ? `: ${e}` : ''}`;
+				completedExternalQuery = '';
 			}
 		} finally {
-			if (requestId === externalSearchRequest) searchingExternal = false;
+			if (requestId === externalSearchRequest) {
+				activeExternalQuery = '';
+				searchingExternal = false;
+			}
 		}
 	}
 
@@ -322,8 +360,30 @@
 		if (event.key !== 'Enter') return;
 		const trimmedQuery = query.trim();
 		if (trimmedQuery.length < MIN_QUERY_LENGTH) return;
+		startNewSearch(trimmedQuery, true);
+	}
+
+	function syncSearchUrl(searchQuery: string) {
+		handledUrlQuery = searchQuery;
+		void goto(`/search?q=${encodeURIComponent(searchQuery)}`, {
+			replaceState: true,
+			noScroll: true,
+			keepFocus: true
+		});
+	}
+
+	function startNewSearch(searchQuery: string, updateUrl: boolean) {
+		const nextQuery = searchQuery.trim().replace(/\s+/g, ' ');
+		if (nextQuery.length < MIN_QUERY_LENGTH) return;
+		query = nextQuery;
+		sourcePreference = 'all';
+		externalResults = [];
+		externalError = '';
+		completedExternalQuery = '';
 		currentPage = 1;
-		void searchExternal(trimmedQuery);
+		resetPaginationState();
+		if (updateUrl) syncSearchUrl(nextQuery);
+		void searchExternal(nextQuery);
 	}
 
 	function clearSearch() {
@@ -331,9 +391,20 @@
 		externalResults = [];
 		externalError = '';
 		searchingExternal = false;
+		completedExternalQuery = '';
+		activeExternalQuery = '';
 		currentPage = 1;
 		resetPaginationState();
 		externalSearchRequest += 1;
+		handledUrlQuery = '';
+		void goto('/search', { replaceState: true, noScroll: true, keepFocus: true });
+	}
+
+	function searchDiscoveryItem(item: SearchDiscoveryItem) {
+		const nextQuery = item.search_query.trim();
+		if (nextQuery.length < MIN_QUERY_LENGTH) return;
+
+		startNewSearch(nextQuery, true);
 	}
 
 	async function playExternalTrack(result: ExternalSearchResult) {
@@ -684,19 +755,35 @@
 				<span class="text-xs text-muted-foreground">End of results</span>
 			{/if}
 		</div>
+	{:else if searchingExternal}
+		<div class="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
+			<LoaderCircle class="size-5 animate-spin text-primary" />
+			<p>Searching YouTube, SoundCloud, and Bandcamp for “{query}”…</p>
+		</div>
 	{:else if externalError}
-		<p class="py-8 text-center text-sm text-destructive">{externalError}</p>
+		<div class="flex flex-col items-center gap-3 py-8 text-center">
+			<p class="max-w-xl text-sm text-destructive">{externalError}</p>
+			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
+				Retry search
+			</Button>
+		</div>
 	{:else if query.trim().length > 0 && query.trim().length < MIN_QUERY_LENGTH}
 		<p class="py-8 text-center text-muted-foreground">
 			Type at least {MIN_QUERY_LENGTH} characters to search.
 		</p>
-	{:else if query.trim().length >= MIN_QUERY_LENGTH}
+	{:else if query.trim().length >= MIN_QUERY_LENGTH && completedExternalQuery === query.trim()}
 		<p class="py-8 text-center text-muted-foreground">
 			No results for "{query}".
 		</p>
-	{:else}
-		<p class="py-8 text-center text-muted-foreground">
-			Search YouTube, SoundCloud, and Bandcamp from one place.
+	{:else if query.trim().length >= MIN_QUERY_LENGTH}
+		<p class="py-8 text-center text-sm text-muted-foreground">
+			Press Enter to search every music source.
 		</p>
+	{:else}
+		<SearchDiscoveryFeedView
+			feed={discoveryFeed}
+			loading={loadingDiscoveryFeed}
+			onselect={searchDiscoveryItem}
+		/>
 	{/if}
 </div>

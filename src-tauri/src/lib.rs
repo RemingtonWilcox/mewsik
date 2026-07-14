@@ -17,6 +17,7 @@ use audio::AudioEngine;
 use commands::external_search::ExternalSearchRuntime;
 use commands::settings::ConfigState;
 use config::AppConfig;
+use discovery::feed::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
 use download::DownloadManager;
 use parking_lot::Mutex;
 use sources::{SidecarManager, StreamCache};
@@ -50,6 +51,8 @@ pub fn run() {
     let stream_cache: StreamCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let external_search_runtime = Arc::new(ExternalSearchRuntime::default());
+    let discovery_feed_runtime: SharedDiscoveryFeedRuntime =
+        Arc::new(DiscoveryFeedRuntime::default());
     let startup_db = db.clone();
 
     tauri::Builder::default()
@@ -75,6 +78,7 @@ pub fn run() {
         .manage(downloads)
         .manage(stream_cache)
         .manage(external_search_runtime)
+        .manage(discovery_feed_runtime)
         .invoke_handler(tauri::generate_handler![
             // Library
             commands::library::scan_library,
@@ -137,6 +141,7 @@ pub fn run() {
             commands::discovery::get_rediscover,
             commands::discovery::get_play_stats,
             commands::discovery::get_recently_played,
+            commands::discovery::get_search_discovery_feed,
             // Downloads
             commands::downloads::get_downloads,
             commands::downloads::download_recording,
@@ -149,6 +154,8 @@ pub fn run() {
             // Stations
             commands::stations::search_radio_stations,
             commands::stations::search_radio_stations_advanced,
+            commands::stations::browse_radio_stations,
+            commands::stations::get_radio_station_details,
             commands::stations::save_station,
             commands::stations::get_favorite_stations,
             commands::stations::verify_favorite_stations,

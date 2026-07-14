@@ -432,6 +432,155 @@ test.describe('Mk2 macro conductor', () => {
 		);
 	});
 
+	test('material density keeps a body-substance floor through the full lifecycle', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor, MK2_CONDUCTOR_LIMITS } = await import(modulePath);
+			const conductor = new Mk2Conductor('material-density-floor');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			const sequence = [
+				['intro', 4],
+				['verse', 8],
+				['build', 8],
+				['drop', 8],
+				['chorus', 5],
+				['bridge', 18],
+				['breakdown', 8],
+				['outro', 10]
+			] as const;
+
+			// Remove the bass/root contribution that normally lends the organism
+			// extra mass. This deliberately stresses the shedding material, where
+			// the old equation could collapse toward a substance-free value.
+			for (const name of Object.keys(spectrum.levels)) spectrum.levels[name] = 0;
+			for (const name of Object.keys(spectrum.deltas)) spectrum.deltas[name] = 0;
+			spectrum.bass = spectrum.mid = spectrum.treble = 0;
+			spectrum.spectralMotion = 0;
+			spectrum.novelty = 0;
+			frame.bassPunch = 0;
+
+			let minDensity = Number.POSITIVE_INFINITY;
+			let maxDensity = Number.NEGATIVE_INFINITY;
+			let minSection = '';
+			for (const [section, seconds] of sequence) {
+				frame.section = signal.section = section;
+				frame.drop.buildActive = section === 'build';
+				frame.drop.anticipation = section === 'build' ? 0.9 : 0;
+				frame.context.energyLookahead = section === 'build' ? 0.92 : frame.energy;
+				const frames = seconds * 60;
+				for (let i = 0; i < frames; i += 1) {
+					frame.context.sectionProgress = (i + 1) / frames;
+					frame.clock.phraseIndex = Math.floor(i / 120);
+					const output: any = conductor.update(frame, signal, spectrum, 1 / 60);
+					if (output.materialDensity < minDensity) {
+						minDensity = output.materialDensity;
+						minSection = section;
+					}
+					maxDensity = Math.max(maxDensity, output.materialDensity);
+				}
+			}
+
+			return {
+				declaredRange: Array.from(MK2_CONDUCTOR_LIMITS.materialDensity),
+				minDensity,
+				maxDensity,
+				minSection
+			};
+		}, FIXTURES);
+
+		expect(result.declaredRange).toEqual([0.3, 1]);
+		expect(result.minDensity).toBeGreaterThanOrEqual(0.3 - 1e-9);
+		// Prove this journey actually exercises the floor instead of passing only
+		// because every sampled state happened to remain dense.
+		expect(result.minDensity).toBeLessThan(0.305);
+		expect(['bridge', 'breakdown']).toContain(result.minSection);
+		expect(result.maxDensity - result.minDensity).toBeGreaterThan(0.35);
+	});
+
+	test('lifecycle endpoints retain meaningfully different material signatures', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const conductor = new Mk2Conductor('material-signatures');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			const materialKeys = [
+				'materialDensity',
+				'materialIridescence',
+				'materialErosion'
+			] as const;
+			const settle = (section: string, seconds: number) => {
+				frame.section = signal.section = section;
+				frame.drop.buildActive = section === 'build';
+				frame.drop.anticipation = section === 'build' ? 0.9 : 0;
+				frame.context.energyLookahead = section === 'build' ? 0.92 : frame.energy;
+				let output: any;
+				for (let i = 0; i < seconds * 60; i += 1) {
+					frame.context.sectionProgress = (i + 1) / (seconds * 60);
+					output = conductor.update(frame, signal, spectrum, 1 / 60);
+				}
+				return Object.fromEntries(materialKeys.map((name) => [name, output[name]]));
+			};
+
+			const samples = {
+				seed: Object.fromEntries(
+					materialKeys.map((name) => [name, (conductor.update(frame, signal, spectrum, 1 / 60) as any)[name]])
+				),
+				sprout: settle('verse', 9),
+				winding: settle('build', 9),
+				bloom: settle('drop', 9),
+				shedding: settle('bridge', 9),
+				dormant: settle('outro', 11)
+			};
+			const entries = Object.entries(samples);
+			let minPairwiseDistance = Number.POSITIVE_INFINITY;
+			for (let a = 0; a < entries.length; a += 1) {
+				for (let b = a + 1; b < entries.length; b += 1) {
+					const distance = Math.hypot(
+						...materialKeys.map(
+							(name) => Number(entries[a][1][name]) - Number(entries[b][1][name])
+						)
+					);
+					minPairwiseDistance = Math.min(minPairwiseDistance, distance);
+				}
+			}
+			const ranges = Object.fromEntries(
+				materialKeys.map((name) => {
+					const values = entries.map(([, sample]) => Number(sample[name]));
+					return [name, Math.max(...values) - Math.min(...values)];
+				})
+			);
+			return { samples, ranges, minPairwiseDistance };
+		}, FIXTURES);
+
+		expect(result.minPairwiseDistance).toBeGreaterThan(0.075);
+		expect(result.ranges.materialDensity).toBeGreaterThan(0.25);
+		expect(result.ranges.materialIridescence).toBeGreaterThan(0.2);
+		expect(result.ranges.materialErosion).toBeGreaterThan(0.35);
+		expect(result.samples.seed.materialDensity).toBeGreaterThan(
+			result.samples.sprout.materialDensity + 0.1
+		);
+		expect(result.samples.winding.materialDensity).toBeGreaterThan(
+			result.samples.bloom.materialDensity + 0.18
+		);
+		expect(result.samples.bloom.materialIridescence).toBeGreaterThan(
+			result.samples.winding.materialIridescence + 0.15
+		);
+		expect(result.samples.shedding.materialErosion).toBeGreaterThan(
+			result.samples.bloom.materialErosion + 0.3
+		);
+		expect(result.samples.dormant.materialDensity).toBeGreaterThan(
+			result.samples.shedding.materialDensity + 0.2
+		);
+	});
+
 	test('sub, body, mids, presence, and air control different anatomical scales', async ({ page }) => {
 		await page.goto('/');
 		const samples = await page.evaluate(async (fixtures) => {

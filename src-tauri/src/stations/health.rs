@@ -10,12 +10,14 @@ use crate::db::models::Station;
 use crate::db::{queries, DbPool};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
 const STATION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const STATION_RECHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const MAX_STATION_VERIFY_URLS: usize = 100;
 const MAX_CONCURRENT_STATION_PROBES: usize = 8;
+static FAVORITE_VERIFY_LOCK: Mutex<()> = Mutex::const_new(());
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationHealthResult {
@@ -23,6 +25,8 @@ pub struct StationHealthResult {
     pub url: String,
     pub status: String,
     pub last_checked_at: Option<String>,
+    #[serde(default)]
+    pub repaired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,13 +64,16 @@ pub(crate) async fn try_heal_station(
     station: &Station,
 ) -> Option<String> {
     let uuid = station.radio_browser_id.as_deref()?;
-    for candidate in resolve_station_urls_by_uuid(client, uuid).await {
+    for candidate in resolve_station_urls_by_uuid(uuid).await {
         let Some(playable_url) = probe_station_stream(client, &candidate).await else {
             continue;
         };
         if playable_url == station.url {
-            // Same URL we already have — nothing to heal with.
-            return None;
+            // The first attempt may have failed transiently. A fresh UUID
+            // lookup that proves the same URL works still recovers the
+            // station; it simply is not counted as a URL repair.
+            let _ = queries::update_station_health(db, &station.id, 0, &queries::now());
+            return Some(playable_url);
         }
         queries::update_station_url(db, &station.id, &playable_url).ok()?;
         let _ = queries::update_station_health(db, &station.id, 0, &queries::now());
@@ -155,6 +162,7 @@ pub(crate) async fn verify_station_urls_inner(
             url: target.url,
             status: if playable_url.is_some() { "ok" } else { "dead" }.to_string(),
             last_checked_at: Some(checked_at.clone()),
+            repaired: false,
         })
         .collect())
 }
@@ -162,6 +170,10 @@ pub(crate) async fn verify_station_urls_inner(
 pub(crate) async fn verify_favorite_stations_inner(
     db: &DbPool,
 ) -> Result<Vec<StationHealthResult>, String> {
+    // The launch/6-hour checker and a user-triggered Smart rescan can overlap.
+    // Serialize whole favorite scans so URL repairs and fail counters cannot
+    // race and overwrite one another.
+    let _scan_guard = FAVORITE_VERIFY_LOCK.lock().await;
     let stations = queries::get_favorite_stations(db).map_err(|e| e.to_string())?;
     if stations.is_empty() {
         return Ok(Vec::new());
@@ -189,6 +201,7 @@ pub(crate) async fn verify_favorite_stations_inner(
 
     let mut results = Vec::with_capacity(stations.len());
     for station in stations {
+        let original_url = station.url.clone();
         let checked_at = queries::now();
         let playable = health_by_station_id.remove(&station.id).flatten();
         let mut is_healthy = playable.is_some();
@@ -222,11 +235,13 @@ pub(crate) async fn verify_favorite_stations_inner(
         queries::update_station_health(db, &station.id, next_fail_count, &checked_at)
             .map_err(|e| e.to_string())?;
 
+        let repaired = is_healthy && url != original_url;
         results.push(StationHealthResult {
             station_id: Some(station.id),
             url,
             status: station_health_status(next_fail_count).to_string(),
             last_checked_at: Some(checked_at),
+            repaired,
         });
     }
 

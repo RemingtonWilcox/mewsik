@@ -317,13 +317,130 @@ export async function pickFolder(defaultPath?: string): Promise<string | null> {
 }
 
 // Discovery
+export interface SearchDiscoveryItem {
+	id: string;
+	title: string;
+	artist: string;
+	album: string | null;
+	artwork_url: string | null;
+	search_query: string;
+	listen_count: number | null;
+	rank: number | null;
+	momentum: number | null;
+	context: string | null;
+}
+
+export interface SearchDiscoverySection {
+	id: string;
+	title: string;
+	subtitle: string;
+	items: SearchDiscoveryItem[];
+}
+
+export interface SearchDiscoveryFeed {
+	generated_at: number;
+	source: string;
+	is_stale: boolean;
+	is_fallback: boolean;
+	sections: SearchDiscoverySection[];
+}
+
+export interface PlayStats {
+	total_plays: number;
+	total_time_ms: number;
+	unique_tracks: number;
+	profile_track_goal: number;
+	profile_ready: boolean;
+}
+
+const SEARCH_DISCOVERY_PICKS: Array<[artist: string, title: string, album: string]> = [
+	['Daft Punk', 'One More Time', 'Discovery'],
+	['Radiohead', 'Weird Fishes / Arpeggi', 'In Rainbows'],
+	['Kendrick Lamar', 'Money Trees', 'good kid, m.A.A.d city'],
+	['Björk', 'Jóga', 'Homogenic'],
+	['Aphex Twin', 'Xtal', 'Selected Ambient Works 85-92'],
+	['FKA twigs', 'cellophane', 'MAGDALENE'],
+	['Burial', 'Archangel', 'Untrue'],
+	['Fleetwood Mac', 'Dreams', 'Rumours'],
+	['Nujabes', 'Feather', 'Modal Soul'],
+	['SOPHIE', 'Is It Cold in the Water?', "OIL OF EVERY PEARL'S UN-INSIDES"],
+	['Talking Heads', 'This Must Be the Place', 'Speaking in Tongues'],
+	['A Tribe Called Quest', 'Electric Relaxation', 'Midnight Marauders'],
+	['Massive Attack', 'Teardrop', 'Mezzanine'],
+	['Caroline Polachek', 'Bunny Is a Rider', 'Desire, I Want to Turn Into You'],
+	['MF DOOM', 'Doomsday', 'Operation: Doomsday'],
+	['Beach House', 'Myth', 'Bloom'],
+	['Jamie xx', 'Loud Places', 'In Colour'],
+	['Portishead', 'Roads', 'Dummy'],
+	['Charli xcx', '360', 'BRAT'],
+	['The Avalanches', 'Since I Left You', 'Since I Left You'],
+	['Floating Points', 'Silhouettes (I, II & III)', 'Elaenia'],
+	['J Dilla', 'Time: The Donut of the Heart', 'Donuts'],
+	['Cocteau Twins', 'Heaven or Las Vegas', 'Heaven or Las Vegas'],
+	['Solange', 'Cranes in the Sky', 'A Seat at the Table']
+];
+
+function fallbackSearchDiscoveryFeed(): SearchDiscoveryFeed {
+	const items = SEARCH_DISCOVERY_PICKS.map(([artist, title, album], index) => ({
+		id: `browser-fallback-${index}`,
+		title,
+		artist,
+		album,
+		artwork_url: null,
+		search_query: `${artist} ${title}`,
+		listen_count: null,
+		rank: null,
+		momentum: null,
+		context: 'Mewsik editorial'
+	}));
+	return {
+		generated_at: Math.floor(Date.now() / 1000),
+		source: 'Mewsik editorial',
+		is_stale: false,
+		is_fallback: true,
+		sections: [
+			{
+				id: 'editorial-starts',
+				title: 'Reliable starts',
+				subtitle: 'Handpicked by Mewsik while live charts refresh',
+				items: items.slice(0, 8)
+			},
+			{
+				id: 'editorial-detours',
+				title: 'Worth the detour',
+				subtitle: 'Strong records from different corners of music',
+				items: items.slice(8, 16)
+			},
+			{
+				id: 'editorial-rabbit-holes',
+				title: 'Reliable rabbit holes',
+				subtitle: 'Broad on purpose and not personalized',
+				items: items.slice(16, 24)
+			}
+		]
+	};
+}
+
+export const getSearchDiscoveryFeed = () =>
+	safeInvoke<SearchDiscoveryFeed>(
+		'get_search_discovery_feed',
+		undefined,
+		fallbackSearchDiscoveryFeed
+	);
+
 export const getDailyMix = () => safeInvoke<LibraryTrack[]>('get_daily_mix', undefined, []);
 export const getRediscover = () => safeInvoke<LibraryTrack[]>('get_rediscover', undefined, []);
 export const getPlayStats = () =>
-	safeInvoke<{ total_plays: number; total_time_ms: number; unique_tracks: number }>(
+	safeInvoke<PlayStats>(
 		'get_play_stats',
 		undefined,
-		{ total_plays: 0, total_time_ms: 0, unique_tracks: 0 }
+		{
+			total_plays: 0,
+			total_time_ms: 0,
+			unique_tracks: 0,
+			profile_track_goal: 5,
+			profile_ready: false
+		}
 	);
 export const getRecentlyPlayed = () => safeInvoke<LibraryTrack[]>('get_recently_played', undefined, []);
 
@@ -345,17 +462,56 @@ export interface RadioBrowserStation {
 	homepage: string | null;
 	favicon: string | null;
 	country: string | null;
+	countrycode?: string | null;
 	language: string | null;
 	tags: string | null;
 	codec: string | null;
 	bitrate: number | null;
+	hls?: number | null;
+	votes?: number | null;
+	clickcount?: number | null;
+	clicktrend?: number | null;
+	lastcheckok?: number | null;
+	lastchecktime_iso8601?: string | null;
+	lastcheckoktime_iso8601?: string | null;
+	ssl_error?: number | null;
 	stationuuid: string;
 }
 
-export const searchRadioStations = (query: string, mode: 'name' | 'tag' = 'name') =>
+export type RadioStationSort = 'smart' | 'popular' | 'rising' | 'loved' | 'quality';
+
+export interface RadioStationPage {
+	items: RadioBrowserStation[];
+	next_offset: number;
+	has_more: boolean;
+}
+
+export const searchRadioStations = (
+	query: string,
+	mode: 'name' | 'tag' = 'name',
+	sort: RadioStationSort = 'smart'
+) =>
 	safeInvoke<RadioBrowserStation[]>(
-		mode === 'name' ? 'search_radio_stations' : 'search_radio_stations_advanced',
-		mode === 'name' ? { query } : { query, mode },
+		'search_radio_stations_advanced',
+		{ query, mode, sort },
+		[]
+	);
+
+export const browseRadioStations = (
+	sort: RadioStationSort = 'smart',
+	offset = 0,
+	limit = 40
+) =>
+	safeInvoke<RadioStationPage>(
+		'browse_radio_stations',
+		{ sort, offset, limit },
+		{ items: [], next_offset: offset, has_more: false }
+	);
+
+export const getRadioStationDetails = (stationUuids: string[]) =>
+	safeInvoke<RadioBrowserStation[]>(
+		'get_radio_station_details',
+		{ stationUuids },
 		[]
 	);
 

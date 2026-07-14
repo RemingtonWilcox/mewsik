@@ -453,7 +453,9 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		+ growth * 0.045
 		+ openness * 0.028
 		+ u.surfaceImpact * 0.008
-		- u.dormancyForm * 0.055;
+		+ u.bloomForm * 0.045
+		- u.seedForm * 0.035
+		- u.dormancyForm * 0.085;
 	var q = p / breath;
 
 	// Rotation is now a secondary, multi-minute drift. Phrase posture only bends
@@ -479,14 +481,27 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 
 	// Body/mids own large silhouette changes: long sprout, wound build, wide
 	// bloom, and contracted dormancy are genuinely different coordinate fields.
-	let stretchY = max(0.62,
-		0.92 + u.axialStretch * 0.48 + u.windingForm * 0.13
-		- u.bloomForm * 0.10 - u.dormancyForm * 0.18);
-	let stretchX = max(0.70, 0.92 + u.lobeSplit * 0.24 + u.bloomForm * 0.18);
-	let stretchZ = max(0.70, 0.94 + u.lobeSplit * 0.17 + u.rootMass * 0.08);
+	let stretchY = max(0.52,
+		0.82 + u.axialStretch * 0.70 + u.sproutForm * 0.14 + u.windingForm * 0.08
+		- u.bloomForm * 0.14 - u.dormancyForm * 0.28);
+	let stretchX = max(0.64,
+		0.80 + u.lobeSplit * 0.34 + u.bloomForm * 0.28 + u.dormancyForm * 0.12);
+	let stretchZ = max(0.64,
+		0.82 + u.lobeSplit * 0.27 + u.bloomForm * 0.20 + u.rootMass * 0.08
+		+ u.dormancyForm * 0.14);
 	q.x = q.x / stretchX;
 	q.y = q.y / stretchY;
 	q.z = q.z / stretchZ;
+
+	// Sprout grows as one visibly biased shoot instead of a uniformly stretched
+	// orb. Winding then pulls the cross-section inward before applying its twist;
+	// bloom releases that stored pressure laterally, while dormancy settles flat.
+	let sproutBend = u.sproutForm * (0.08 + u.axialStretch * 0.08);
+	q.x = q.x - sin(q.y * 1.18 + tSlow * 0.23) * sproutBend
+		- q.y * q.y * u.sproutForm * 0.045;
+	let windingCompression = 1.0 + u.windingForm * (0.10 + u.foldDepth * 0.18);
+	q.x = q.x * windingCompression;
+	q.z = q.z * windingCompression;
 
 	// Signed filter motion leans the organism through space instead of changing a
 	// fullscreen overlay. Root energy expands only the lower anatomy.
@@ -533,12 +548,17 @@ fn map(p: vec3<f32>) -> f32 {
 	// A single expensive Mandelbulb remains the organic heart. Intro/outro blend
 	// toward a waxy cocoon; active sections reveal the fractal continuously.
 	let cocoonRadii = vec3<f32>(
-		0.69 + u.rootMass * 0.08,
-		0.82 + u.axialStretch * 0.12 - u.dormancyForm * 0.10,
-		0.67 + u.lobeSplit * 0.07
+		0.60 + u.rootMass * 0.08 + u.bloomForm * 0.12 + u.dormancyForm * 0.10,
+		0.68 + u.axialStretch * 0.18 + u.sproutForm * 0.12 - u.dormancyForm * 0.14,
+		0.58 + u.lobeSplit * 0.12 + u.bloomForm * 0.10 + u.dormancyForm * 0.12
 	);
 	let cocoon = sdEllipsoid(q, cocoonRadii);
-	let bodyScale = 1.02 + growth * 0.035 - u.dormancyForm * 0.025;
+	// A lifecycle-owned core scale keeps the expensive fractal itself from reading
+	// as the same ball in every section. Larger coordinate scale means a smaller,
+	// denser core; bloom deliberately moves in the opposite direction.
+	let bodyScale = 1.04 + growth * 0.025 + u.seedForm * 0.12
+		+ u.windingForm * 0.08 + u.sheddingForm * 0.04 + u.dormancyForm * 0.18
+		- u.sproutForm * 0.04 - u.bloomForm * 0.12;
 	// Macro studies earn extra true fractal iterations. Both gates are uniform
 	// across the frame and require an elected close study, so an intricate normal
 	// hero shot never pays the macro cost by accident.
@@ -551,9 +571,9 @@ fn map(p: vec3<f32>) -> f32 {
 		fractalIterations
 	) * (1.01 - growth * 0.045);
 	let fractalReveal = clamp(
-		0.22 + u.sproutForm * 0.48 + u.windingForm * 0.72 + u.bloomForm * 0.82
-		+ u.sheddingForm * 0.56 - u.seedForm * 0.16 - u.dormancyForm * 0.24,
-		0.06,
+		0.24 + u.sproutForm * 0.44 + u.windingForm * 0.62 + u.bloomForm * 0.76
+		+ u.sheddingForm * 0.50 - u.seedForm * 0.08 - u.dormancyForm * 0.12,
+		0.14,
 		1.0
 	);
 	var body = mix(cocoon, fractal, fractalReveal);
@@ -575,7 +595,7 @@ fn map(p: vec3<f32>) -> f32 {
 	// inside the core. Their directions, reach, buds, and visibility crossfade
 	// from asymmetric sprout to wound cocoon to open bloom.
 	for (var i: i32 = 0; i < 4; i = i + 1) {
-		var sproutGate = 0.18;
+		var sproutGate = 0.04;
 		var windingGate = 0.50;
 		var bloomGate = 0.88;
 		var lanePolarity = -1.0;
@@ -585,11 +605,11 @@ fn map(p: vec3<f32>) -> f32 {
 			bloomGate = 1.0;
 			lanePolarity = 1.0;
 		} else if (i == 1) {
-			sproutGate = 0.72;
+			sproutGate = 0.48;
 			windingGate = 0.74;
 			bloomGate = 0.96;
 		} else if (i == 2) {
-			sproutGate = 0.42;
+			sproutGate = 0.12;
 			windingGate = 0.58;
 			bloomGate = 0.92;
 			lanePolarity = 1.0;
@@ -622,24 +642,24 @@ fn map(p: vec3<f32>) -> f32 {
 		);
 		let laneVariation = 0.90 + f32(i) * 0.055 + lanePolarity * u.spectralLean * 0.08;
 		let reach = (
-			0.58 + u.axialStretch * 0.20 + u.lobeSplit * 0.26
-			+ u.bloomForm * 0.28 + u.filamentReach * 0.12
+			0.52 + u.axialStretch * 0.28 + u.lobeSplit * 0.38
+			+ u.bloomForm * 0.42 + u.filamentReach * 0.14 - u.windingForm * 0.12
 		) * laneVariation;
-		let a = direction * (0.16 + u.windingForm * 0.06);
+		let a = direction * (0.14 + u.windingForm * 0.13);
 		var b = direction * reach;
 		b.y = b.y + sin(u.morphPhase * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
 		b.x = b.x + u.spectralLean * lanePolarity * (0.035 + u.lobeSplit * 0.055);
-		let branchRadius = 0.082 + u.rootMass * 0.035 + u.lobeSplit * 0.055
-			+ u.bloomForm * 0.055 + u.filamentReach * 0.025;
+		let branchRadius = 0.070 + u.rootMass * 0.030 + u.lobeSplit * 0.070
+			+ u.bloomForm * 0.075 + u.filamentReach * 0.025;
 		let branch = sdCapsule(q, a, b, branchRadius);
-		let budRadius = 0.115 + u.lobeSplit * 0.075 + u.bloomForm * 0.085
+		let budRadius = 0.100 + u.lobeSplit * 0.100 + u.bloomForm * 0.140
 			+ u.rootPulse * 0.018;
 		let bud = sdEllipsoid(
 			q - b,
 			vec3<f32>(budRadius * (1.12 + u.lobeSplit * 0.18), budRadius * 0.86, budRadius)
 		);
-		let appendage = min(branch, bud) + (1.0 - presence) * 0.24;
-		body = smin(body, appendage, 0.060 + presence * 0.045);
+		let appendage = min(branch, bud) + (1.0 - presence) * 0.34;
+		body = smin(body, appendage, 0.050 + presence * 0.060);
 	}
 
 	// Bridge/breakdown opens a real exterior-intersecting tunnel. Unlike the old
@@ -654,7 +674,7 @@ fn map(p: vec3<f32>) -> f32 {
 		cavityQ,
 		vec3<f32>(-1.35, 0.0, 0.0),
 		vec3<f32>(1.35, 0.0, 0.0),
-		0.075 + u.cavityOpen * 0.30
+		0.070 + u.cavityOpen * 0.38
 	);
 	let cavityGate = smoothstep(0.08, 0.74, u.cavityOpen);
 	body = smax(body, -tunnel - (1.0 - cavityGate) * 0.46, 0.052);
@@ -665,17 +685,18 @@ fn map(p: vec3<f32>) -> f32 {
 	// Two coherent shed fragments drift away during bridge/breakdown. They remain
 	// part of this one world-space SDF—no translucent texture layer is involved.
 	let shedGate = clamp(u.sheddingForm * 1.18, 0.0, 1.0);
+	let fragmentDrift = 0.72 + shedGate * 0.43;
 	let fragmentAOffset = vec3<f32>(
-		0.98 + sin(u.morphPhase * 0.61) * 0.12,
-		0.38 + cos(u.morphPhase * 0.47) * 0.13,
-		-0.24 + sin(u.morphPhase * 0.39) * 0.10
+		fragmentDrift + sin(u.morphPhase * 0.61) * 0.12,
+		0.30 + shedGate * 0.18 + cos(u.morphPhase * 0.47) * 0.13,
+		-0.20 - shedGate * 0.10 + sin(u.morphPhase * 0.39) * 0.10
 	);
 	let fragmentBOffset = vec3<f32>(
-		-0.82 + cos(u.morphPhase * 0.53) * 0.15,
-		-0.46 + sin(u.morphPhase * 0.43) * 0.12,
-		0.56 + cos(u.morphPhase * 0.31) * 0.11
+		-fragmentDrift * 0.88 + cos(u.morphPhase * 0.53) * 0.15,
+		-0.36 - shedGate * 0.16 + sin(u.morphPhase * 0.43) * 0.12,
+		0.43 + shedGate * 0.20 + cos(u.morphPhase * 0.31) * 0.11
 	);
-	let fragmentRadius = 0.12 + u.filamentReach * 0.055 + u.materialErosion * 0.035;
+	let fragmentRadius = 0.15 + u.filamentReach * 0.060 + u.materialErosion * 0.050;
 	let fragmentA = sdEllipsoid(
 		q - fragmentAOffset,
 		vec3<f32>(fragmentRadius * 1.35, fragmentRadius * 0.78, fragmentRadius)
@@ -820,20 +841,28 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	// The CPU integrates this phase from the shared song journey. Mids/tension
 	// bend the current, while bass/growth change its body; no transient rail
 	// touches background luminance.
+	// Suspense accelerates the CPU-integrated phase instead of offsetting it here,
+	// so the foreshadowing current can never rewind when anticipation releases.
 	let flowPhase = u.backgroundPhase + familyPhase + u.morphPhase * 0.21;
 	let warpP = worldP * 0.24 + currentAxis * flowPhase * 0.20;
 	let warp = vn3(warpP) - 0.5;
 	let bend = sin(along * 0.54 + flowPhase + warp * 2.0) * (0.30 + u.mid * 0.16)
 		+ sin(lift * 0.31 - flowPhase * 0.47 + familyPhase) * (0.10 + tension * 0.10);
 	let currentCoord = across * 0.30 + bend;
-	let currentWidth = 0.44 + u.rootMass * 0.08 + growth * 0.06 + u.openness * 0.07
-		+ u.bloomForm * 0.12 - tension * 0.14 - u.suspense * 0.07;
+	let currentWidth = 0.32 + u.rootMass * 0.08 + growth * 0.05 + u.openness * 0.05
+		+ u.sproutForm * 0.07 + u.bloomForm * 0.24 + u.sheddingForm * 0.10
+		+ u.dormancyForm * 0.18 - u.windingForm * 0.15 - tension * 0.10
+		- u.suspense * 0.08;
 	let normalizedDistance = currentCoord / max(currentWidth, 0.20);
 	var currentBody = exp(-normalizedDistance * normalizedDistance);
 	// The same atmospheric river divides during bloom and frays during shedding.
 	// This is one world-space field, but its arrangement now follows the lifeform.
-	let splitAmount = clamp(u.bloomForm * 0.75 + u.sheddingForm * 0.45, 0.0, 0.92);
-	let splitOffset = 0.20 + u.lobeSplit * 0.20 + u.filamentReach * 0.10;
+	let splitAmount = clamp(
+		u.bloomForm * 0.98 + u.sheddingForm * 0.68 + u.suspense * 0.30,
+		0.0,
+		0.92
+	);
+	let splitOffset = 0.24 + u.lobeSplit * 0.28 + u.filamentReach * 0.12;
 	let splitA = (currentCoord - splitOffset) / max(currentWidth * 0.72, 0.16);
 	let splitB = (currentCoord + splitOffset) / max(currentWidth * 0.72, 0.16);
 	let splitBody = (exp(-splitA * splitA) + exp(-splitB * splitB)) * 0.58;
@@ -842,7 +871,7 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	let erosionBreaks = mix(
 		1.0,
 		0.42 + 0.58 * smoothstep(-0.25, 0.55, sin(along * 2.3 + flowPhase * 0.44 + warp * 3.1)),
-		u.materialErosion
+		clamp(u.materialErosion + u.suspense * 0.10, 0.0, 1.0)
 	);
 	let current = currentBody * filament * erosionBreaks;
 	let currentCol = mix(
@@ -850,8 +879,16 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 		palette7(baseT + 0.55),
 		clamp(0.35 + tension * 0.35 + upT * 0.15, 0.0, 1.0)
 	);
+	let atmosphereTransfer = clamp(
+		(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
+			+ u.cavityOpen * 0.22,
+		0.0,
+		1.0
+	);
 	bg = bg + currentCol * current * (
-		0.026 + u.rms * 0.020 + growth * 0.020 + u.bloomForm * 0.022
+		0.023 + u.rms * 0.018 + growth * 0.018 + u.sproutForm * 0.006
+			+ u.bloomForm * 0.036 + u.sheddingForm * 0.018
+			+ atmosphereTransfer * 0.015 + u.suspense * 0.008
 	);
 
 	// Preserve a quiet pocket behind the subject. The current remains visible at
@@ -932,13 +969,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		// ── Surface hit
 		if (d < EPS) {
-			let n = calcNormal(p);
+			let geometryNormal = calcNormal(p);
 			let view = -rd;
-			let cosNL = clamp(dot(n, lightDir), 0.0, 1.0);
-			let halfDir = safeNormalize(lightDir + view, lightDir);
-			let cosNH = clamp(dot(n, halfDir), 0.0, 1.0);
-			let cosNV = clamp(dot(n, view), 0.0, 1.0);
-			let shadow = lightVisibility(p + n * 0.005, lightDir, 4.0);
+			let shadow = lightVisibility(p + geometryNormal * 0.005, lightDir, 4.0);
 
 			// Two short ambient-occlusion probes preserve crevice depth. The lifecycle
 			// primitives are funded by removing the third probe and two shadow steps,
@@ -947,7 +980,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			var aoW = 0.0;
 			for (var k: i32 = 1; k <= 2; k = k + 1) {
 				let ko = f32(k) * 0.065;
-				var aoSample = map(p + n * ko);
+				var aoSample = map(p + geometryNormal * ko);
 				if (!(abs(aoSample) < 1e10)) { aoSample = ko; }
 				let occ = ko - aoSample;
 				ao = ao + occ * pow(0.6, f32(k));
@@ -970,18 +1003,98 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				surfQ * (5.4 + u.materialErosion * 4.8 + u.detailFocus * 3.2)
 					+ familyOffset + vec3<f32>(u.morphPhase * 0.012)
 			);
+			// One hit-time octave gives broad cocoon lobes actual skin. Its spatial
+			// scale stays fixed while audio changes contrast/roughness, so pores breathe
+			// without crawling or rescaling. This never runs inside the raymarch, SDF
+			// normal, shadow, or AO loops.
+			let microScale = 19.0;
+			let microP = surfQ * microScale + familyOffset * 1.71
+				- vec3<f32>(u.morphPhase * 0.019);
+			let microNoise = vn3(microP);
+			// Keep lighting in the SDF/world frame. The material octave affects pigment
+			// and roughness only, avoiding a detached bump layer on a heavily warped body.
+			let n = geometryNormal;
+			let cosNL = clamp(dot(n, lightDir), 0.0, 1.0);
+			let halfDir = safeNormalize(lightDir + view, lightDir);
+			let cosNH = clamp(dot(n, halfDir), 0.0, 1.0);
+			let cosNV = clamp(dot(n, view), 0.0, 1.0);
 			let pore = smoothstep(0.72, 0.94, 1.0 - surfaceNoise);
 
 			let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
 				+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
 			let surfacePalette = u.paletteOffset + u.palettePhase * 0.34
 				+ u.paletteWarmth * 0.075 + lifecycleHue;
+			// The same world-space river that crosses the sky passes through Soma's
+			// skin as a material current. It only bends pigment/roughness; it never
+			// adds unlit brightness, so it cannot become a pasted-on stripe layer.
+			let skinFamilyPhase = u.paletteFamily * 1.04719755 + surfacePalette * 1.7
+				+ u.spectralTravelPhase * 0.16;
+			let skinCurrentAxis = safeNormalize(
+				vec3<f32>(cos(skinFamilyPhase), 0.22 + u._pad1 * 0.16, sin(skinFamilyPhase)),
+				vec3<f32>(0.7, 0.25, 0.6)
+			);
+			let skinFlowPhase = u.backgroundPhase + skinFamilyPhase + u.morphPhase * 0.21;
+			let skinCurrent = sin(
+				dot(p, skinCurrentAxis) * 1.45 - skinFlowPhase * 0.61
+					+ surfaceNoise * 3.1 + microNoise * 0.65
+			);
 			let palT = surfacePalette
 				+ length(surfQ) * 0.12
 				+ n.x * 0.045 + n.y * 0.055
 				+ (surfaceNoise - 0.5) * (0.12 + u.materialErosion * 0.06)
-				+ bandDetail * 0.022;
-			let baseCol = palette7(palT);
+				+ (microNoise - 0.5) * (0.035 + u.surfaceRidges * 0.055)
+				+ bandDetail * 0.022
+				+ skinCurrent * (0.005 + u.materialIridescence * 0.012);
+			let density = clamp(u.materialDensity, 0.30, 1.0);
+			let rawBaseCol = palette7(palT);
+			let rawBaseLuma = dot(rawBaseCol, vec3<f32>(0.2126, 0.7152, 0.0722));
+			let rawBaseChroma = max(rawBaseCol.r, max(rawBaseCol.g, rawBaseCol.b))
+				- min(rawBaseCol.r, min(rawBaseCol.g, rawBaseCol.b));
+			let pigmentAnchorRaw = palette7(
+				surfacePalette + 0.40
+					+ (surfaceNoise - 0.5) * 0.14
+					+ (microNoise - 0.5) * (0.08 + u.surfaceRidges * 0.05)
+					+ skinCurrent * 0.010
+			);
+			let pigmentAnchorLuma = dot(
+				pigmentAnchorRaw,
+				vec3<f32>(0.2126, 0.7152, 0.0722)
+			);
+			let pigmentAnchor = clamp(
+				mix(vec3<f32>(pigmentAnchorLuma), pigmentAnchorRaw, 1.18),
+				vec3<f32>(0.0),
+				vec3<f32>(1.0)
+			) * 0.55;
+			let washedRecovery = max(
+				smoothstep(0.40, 0.70, rawBaseLuma),
+				(1.0 - smoothstep(0.08, 0.30, rawBaseChroma))
+					* smoothstep(0.22, 0.52, rawBaseLuma)
+			);
+			let paleRecovery = clamp(
+				washedRecovery * (0.50 + density * 0.56)
+					+ u.sproutForm * washedRecovery * 0.08
+					+ u.sheddingForm * washedRecovery * 0.10,
+				0.0,
+				0.94
+			);
+			let pigmentGrain = clamp(
+				0.94 + (surfaceNoise - 0.5) * 0.24
+					+ (microNoise - 0.5) * (0.20 + u.surfaceRidges * 0.10),
+				0.72,
+				1.10
+			);
+			// Pale palette stops retain their hue, but are pulled back into a deeper
+			// lifecycle pigment before lighting. White can remain a highlight, not a body.
+			var baseCol = mix(rawBaseCol, pigmentAnchor, paleRecovery) * pigmentGrain;
+			// Cap diffuse pigment luminance before any light touches it. Specular and
+			// rim highlights can still flare, but a pale palette stop can no longer
+			// turn the entire close-study body into a white/grey shell.
+			let baseColLuma = max(
+				dot(baseCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
+				0.0001
+			);
+			let pigmentCeiling = 0.44 + density * 0.12 + u.materialIridescence * 0.025;
+			baseCol = baseCol * min(1.0, pigmentCeiling / baseColLuma);
 
 			// Continuous lifecycle material vocabulary: seed/dormancy are waxy,
 			// sprout is wet, winding is taut chitin, bloom is crystalline, and
@@ -998,23 +1111,29 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let taut = tautRaw / materialWeight;
 			let crystal = crystalRaw / materialWeight;
 			let porous = porousRaw / materialWeight;
+			let ridgeRelief = (surfaceNoise - 0.5) * (0.18 + u.surfaceRidges * 0.22)
+				+ (microNoise - 0.5) * (0.11 + u.surfaceRidges * 0.16)
+				+ skinCurrent * u.surfaceRidges * 0.015;
+			let iridescentShift = u.materialIridescence * (1.0 - cosNV)
+				* (0.10 + surfaceNoise * 0.045)
+				+ skinCurrent * u.materialIridescence * 0.009;
 
 			let roughness = clamp(
-				wax * 0.56 + wet * 0.22 + taut * 0.34 + crystal * 0.11 + porous * 0.84
+				wax * 0.56 + wet * 0.24 + taut * 0.35 + crystal * 0.22 + porous * 0.80
 					+ pore * porous * 0.08 - bandDetail * (wet + crystal) * 0.035
-					- u.treble * (wet + crystal) * 0.025,
+					- u.treble * (wet + crystal) * 0.025 - ridgeRelief * 0.12,
 				0.09,
 				0.92
 			);
 			let specStrength = wax * 0.16 + wet * 0.52 + taut * 0.34
-				+ crystal * 0.72 + porous * 0.08;
+				+ crystal * 0.56 + porous * 0.08;
 			let diffuseStrength = wax * 0.92 + wet * 0.66 + taut * 0.72
-				+ crystal * 0.42 + porous * 0.88;
+				+ crystal * 0.66 + porous * 0.90;
 			let detailShade = clamp(
-				0.88 + surfaceNoise * 0.18 - pore * porous * 0.22
+				0.96 + ridgeRelief - pore * porous * 0.22
 					+ (bandDetail - 0.5) * u.mid * 0.035,
-				0.62,
-				1.08
+				0.60,
+				1.18
 			);
 
 			// Lighting arrangement and contrast evolve with the lifecycle. All
@@ -1023,12 +1142,12 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let keyStrength = wax * 0.86 + wet * 1.00 + taut * 1.18
 				+ crystal * 0.95 + porous * 0.90;
 			let fillStrength = wax * 0.42 + wet * 0.32 + taut * 0.14
-				+ crystal * 0.18 + porous * 0.10;
+				+ crystal * 0.28 + porous * 0.20;
 			let rimStrength = wax * 0.08 + wet * 0.22 + taut * 0.48
-				+ crystal * 0.75 + porous * 0.52;
-			let keyTint = palette7(surfacePalette + 0.16) * 1.18;
+				+ crystal * 0.52 + porous * 0.42;
+			let keyTint = palette7(surfacePalette + 0.16 + iridescentShift * 0.16) * 1.10;
 			let fillTint = palette7(surfacePalette + 0.54) * 0.68;
-			let rimTint = palette7(surfacePalette + 0.79) * 1.12;
+			let rimTint = palette7(surfacePalette + 0.79 + iridescentShift * 1.12) * 1.04;
 			let ambientTint = palette7(surfacePalette + 0.66) * 0.42;
 
 			let fillDir = safeNormalize(
@@ -1045,21 +1164,28 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let direct = keyTint * cosNL * shadow * keyStrength;
 			let fill = fillTint * cosNF * fillStrength;
 			let ambient = ambientTint * (0.16 + max(n.y, 0.0) * 0.16) * (0.78 + ao * 0.22);
+			// AO still carves the fractal, but it can no longer erase all pigment and
+			// leave only a pale rim/specular shell behind.
+			let bodyAo = 0.24 + ao * 0.76;
 			let diffuse = baseCol * (direct + fill + ambient)
-				* ao * detailShade * diffuseStrength;
+				* bodyAo * detailShade * diffuseStrength * mix(0.90, 1.06, density);
 
 			let specPow = mix(144.0, 12.0, roughness);
 			let specular = pow(cosNH, specPow);
 			let fresnel = 0.04 + 0.96 * pow(1.0 - cosNV, 5.0);
 			let reflected = reflect(-view, n);
-			let envLow = palette7(surfacePalette + 0.48 + reflected.x * 0.035);
-			let envHigh = palette7(surfacePalette + 0.82 + reflected.z * 0.035);
+			let envLow = palette7(
+				surfacePalette + 0.48 + reflected.x * 0.035 + iridescentShift * 0.82
+			);
+			let envHigh = palette7(
+				surfacePalette + 0.82 + reflected.z * 0.035 + iridescentShift * 1.18
+			);
 			let environment = mix(
 				envLow,
 				envHigh,
 				smoothstep(-0.60, 0.82, reflected.y)
 			);
-			let reflectionStrength = wet * 0.28 + taut * 0.10 + crystal * 0.54 + wax * 0.04;
+			let reflectionStrength = wet * 0.28 + taut * 0.10 + crystal * 0.36 + wax * 0.04;
 			let specularCol = keyTint * specular * specStrength * shadow
 				+ environment * fresnel * reflectionStrength;
 			let rim = rimTint * cosNR * rimFresnel * rimStrength
@@ -1072,7 +1198,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let impactGain = 1.0 + rootMask * (u.rootPulse * 0.09 + u.surfaceImpact * 0.045);
 			let crevice = palette7(surfacePalette + 0.34) * pow(1.0 - ao, 2.0)
 				* (porous * 0.026 + crystal * 0.014);
-			let surfaceCol = (diffuse + specularCol + rim) * impactGain + crevice;
+			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
+			let bodyFill = deepPigment * (0.028 + density * 0.070)
+				* (0.34 + cosNV * 0.46) * (0.48 + bodyAo * 0.52);
+			let surfaceCol = (diffuse + specularCol + rim + bodyFill) * impactGain + crevice;
 			scattered = scattered + surfaceCol * transmittance;
 			transmittance = 0.0;
 			break;
@@ -1082,7 +1211,17 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// Density mildly increases in concavities near the fractal (proxied by
 		// the SDF value), so fog hugs the form like incense smoke.
 		let proxim = exp(-d * 1.4);
-		let localDensity = u.fogDensity * (1.0 + proxim * 1.8);
+		// Dense tissue pushes the medium away from its silhouette; shedding and
+		// cavities invite it back in. Body and atmosphere now trade substance
+		// instead of a universal near-surface veil washing every form equally.
+		let atmosphereTransfer = clamp(
+			(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
+				+ u.cavityOpen * 0.22,
+			0.0,
+			1.0
+		);
+		let proximityFog = mix(0.30, 1.10, atmosphereTransfer);
+		let localDensity = u.fogDensity * (0.88 + proxim * proximityFog);
 		// A phase/clearance approximation replaces a nested shadow raymarch at
 		// every fog step. Surface hits still receive a real soft shadow above;
 		// atmosphere keeps directional depth at a tiny fraction of the cost.

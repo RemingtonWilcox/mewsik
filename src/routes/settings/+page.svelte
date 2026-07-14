@@ -1,243 +1,280 @@
 <script lang="ts">
 	import { Button } from '$lib/components/ui/button';
-	import { Input } from '$lib/components/ui/input';
 	import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '$lib/components/ui/card';
-	import { Separator } from '$lib/components/ui/separator';
 	import * as api from '$lib/api/tauri';
 	import { useLibrary } from '$lib/state/library.svelte';
 	import { toast } from 'svelte-sonner';
-	import { FolderOpen, RefreshCw, Plus, X, Sun, Moon, RadioTower, Play, Square } from '@lucide/svelte';
-	import { toggleMode } from 'mode-watcher';
+	import {
+		CheckCircle2,
+		FolderOpen,
+		HardDrive,
+		Laptop,
+		Moon,
+		RefreshCw,
+		Search,
+		Sun,
+		X
+	} from '@lucide/svelte';
+	import { onMount } from 'svelte';
+	import { setMode, userPrefersMode } from 'mode-watcher';
+
+	type ThemePreference = 'light' | 'dark' | 'system';
+	type ScanSummary = {
+		folders: number;
+		newTracks: number;
+		updatedTracks: number;
+		errors: string[];
+	};
 
 	const library = useLibrary();
 
 	let libraryPaths = $state<string[]>([]);
-	let newPath = $state('');
-	let loading = $state(false);
-	let sidecarRunning = $state(false);
-	let sidecarLoading = $state(false);
+	let loading = $state(true);
+	let scanning = $state(false);
+	let providerRunning = $state(false);
+	let providerLoading = $state(false);
 	let settingsError = $state('');
+	let lastScan = $state<ScanSummary | null>(null);
 
-	$effect(() => {
-		loadSettings();
+	onMount(() => {
+		void loadSettings();
 	});
 
 	async function loadSettings() {
+		loading = true;
 		try {
 			const [paths, running] = await Promise.all([
 				api.getLibraryPaths(),
 				api.sidecarStatus().catch(() => false)
 			]);
 			libraryPaths = paths;
-			sidecarRunning = running;
+			providerRunning = running;
+			await library.loadAll();
 			settingsError = '';
 		} catch (error) {
-			settingsError = `Failed to load settings${error ? `: ${error}` : ''}`;
-			toast.error(settingsError);
-		}
-	}
-
-	async function addResolvedPath(path: string) {
-		const trimmedPath = path.trim();
-		if (!trimmedPath) return;
-		if (libraryPaths.includes(trimmedPath)) {
-			toast.message('That folder is already in your library');
-			newPath = '';
-			return;
-		}
-
-		const updated = [...libraryPaths, trimmedPath];
-		try {
-			await api.updateLibraryPaths(updated);
-			libraryPaths = updated;
-			newPath = '';
-			settingsError = '';
-			toast.success('Library path added');
-		} catch (e) {
-			toast.error(`Failed to add path: ${e}`);
-		}
-	}
-
-	async function addPath() {
-		await addResolvedPath(newPath);
-	}
-
-	async function browseForFolder() {
-		try {
-			const path = await api.pickFolder(newPath.trim() || libraryPaths.at(-1));
-			if (!path) return;
-			newPath = path;
-			await addResolvedPath(path);
-		} catch (error) {
-			toast.error(`Failed to browse for a folder: ${error}`);
-		}
-	}
-
-	async function removePath(index: number) {
-		const updated = libraryPaths.filter((_, i) => i !== index);
-		try {
-			await api.updateLibraryPaths(updated);
-			libraryPaths = updated;
-			settingsError = '';
-			toast.success('Library path removed');
-		} catch {
-			toast.error('Failed to remove path');
-		}
-	}
-
-	async function scanAll() {
-		if (libraryPaths.length === 0) {
-			toast.error('Add a music folder first');
-			return;
-		}
-		loading = true;
-		try {
-			for (const path of libraryPaths) {
-				const result = await library.scan(path);
-				toast.success(`Scanned: ${result.new_tracks} new, ${result.updated_tracks} updated`);
-			}
-		} catch (e) {
-			toast.error(`Scan failed: ${e}`);
+			settingsError = `Could not load settings${error ? `: ${error}` : ''}`;
 		} finally {
 			loading = false;
 		}
 	}
 
-	async function startSidecar() {
-		sidecarLoading = true;
+	async function browseForFolder() {
 		try {
-			await api.startSidecar();
-			sidecarRunning = true;
-			toast.success('External provider sidecar started');
-		} catch (e) {
-			toast.error(`Failed to start sidecar: ${e}`);
-		} finally {
-			sidecarLoading = false;
+			const path = await api.pickFolder(libraryPaths.at(-1));
+			if (!path) return;
+			if (libraryPaths.includes(path)) {
+				toast.message('That folder is already in your library');
+				return;
+			}
+
+			const updated = [...libraryPaths, path];
+			await api.updateLibraryPaths(updated);
+			libraryPaths = updated;
+			settingsError = '';
+			toast.success('Music folder added');
+		} catch (error) {
+			toast.error(`Could not add folder: ${error}`);
 		}
 	}
 
-	async function stopSidecar() {
-		sidecarLoading = true;
+	async function removePath(index: number) {
+		const updated = libraryPaths.filter((_, pathIndex) => pathIndex !== index);
+		try {
+			await api.updateLibraryPaths(updated);
+			libraryPaths = updated;
+			settingsError = '';
+			toast.success('Folder removed from future scans');
+		} catch (error) {
+			toast.error(`Could not remove folder: ${error}`);
+		}
+	}
+
+	async function scanAll() {
+		if (libraryPaths.length === 0 || scanning) return;
+
+		scanning = true;
+		const summary: ScanSummary = {
+			folders: 0,
+			newTracks: 0,
+			updatedTracks: 0,
+			errors: []
+		};
+
+		for (const path of libraryPaths) {
+			try {
+				const result = await api.scanLibrary(path);
+				summary.folders += 1;
+				summary.newTracks += result.new_tracks;
+				summary.updatedTracks += result.updated_tracks;
+				summary.errors.push(...result.errors.map((error) => `${path}: ${error}`));
+			} catch (error) {
+				summary.errors.push(`${path}: ${error}`);
+			}
+		}
+
+		try {
+			await library.loadAll();
+			lastScan = summary;
+			if (summary.errors.length > 0) {
+				toast.warning(`Scan finished with ${summary.errors.length} issue${summary.errors.length === 1 ? '' : 's'}`);
+			} else {
+				toast.success(`Library updated: ${summary.newTracks} new, ${summary.updatedTracks} changed`);
+			}
+		} finally {
+			scanning = false;
+		}
+	}
+
+	async function restartProviders() {
+		if (providerLoading) return;
+		providerLoading = true;
 		try {
 			await api.stopSidecar();
-			sidecarRunning = false;
-			toast.success('External provider sidecar stopped');
-		} catch (e) {
-			toast.error(`Failed to stop sidecar: ${e}`);
+			await api.startSidecar();
+			providerRunning = true;
+			toast.success('Search providers restarted');
+		} catch (error) {
+			providerRunning = false;
+			toast.error(`Could not restart search providers: ${error}`);
 		} finally {
-			sidecarLoading = false;
+			providerLoading = false;
 		}
+	}
+
+	function chooseTheme(preference: ThemePreference) {
+		setMode(preference);
 	}
 </script>
 
-<div class="flex max-w-2xl flex-col gap-6">
-	<h1 class="text-2xl font-bold">Settings</h1>
+<div class="flex max-w-3xl flex-col gap-6 pb-8">
+	<div>
+		<h1 class="text-2xl font-bold">Settings</h1>
+		<p class="mt-1 text-sm text-muted-foreground">Your library, appearance, and a small set of useful repair tools.</p>
+	</div>
 
 	{#if settingsError}
-		<p class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+		<p class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
 			{settingsError}
 		</p>
 	{/if}
 
 	<Card>
-		<CardHeader>
-			<CardTitle>Music Library</CardTitle>
-			<CardDescription>Add folders containing your local music files, then scan to import them.</CardDescription>
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>Music library</CardTitle>
+					<CardDescription class="mt-1">Choose folders once, then rescan whenever the files on disk change.</CardDescription>
+				</div>
+				<Button variant="outline" size="sm" onclick={browseForFolder} disabled={loading}>
+					<FolderOpen class="size-4" /> Add folder
+				</Button>
+			</div>
 		</CardHeader>
 		<CardContent class="flex flex-col gap-4">
-			{#if libraryPaths.length > 0}
-				{#each libraryPaths as path, i}
-					<div class="flex items-center gap-2 rounded-md border border-border p-2">
-						<FolderOpen class="size-4 shrink-0 text-muted-foreground" />
-						<span class="flex-1 truncate text-sm font-mono">{path}</span>
-						<Button variant="ghost" size="icon" class="size-7 shrink-0" onclick={() => removePath(i)}>
-							<X class="size-4" />
-						</Button>
-					</div>
-				{/each}
-			{:else}
-				<p class="text-sm text-muted-foreground">No library folders added yet.</p>
-			{/if}
-
-			<div class="flex flex-wrap gap-2">
-				<Input
-					placeholder="/Users/remington/Music"
-					class="min-w-[16rem] flex-1"
-					bind:value={newPath}
-					onkeydown={(e) => { if (e.key === 'Enter') addPath(); }}
-				/>
-				<Button variant="outline" onclick={browseForFolder}>
-					<FolderOpen class="mr-1 size-4" />
-					Browse
-				</Button>
-				<Button variant="outline" onclick={addPath} disabled={!newPath.trim()}>
-					<Plus class="mr-1 size-4" />
-					Add
-				</Button>
-			</div>
-
-			<Separator />
-
-			<Button onclick={scanAll} disabled={loading || libraryPaths.length === 0} class="w-fit">
-				{#if loading}
-					<RefreshCw class="mr-2 size-4 animate-spin" />
-					Scanning...
-				{:else}
-					<RefreshCw class="mr-2 size-4" />
-					Scan Library
-				{/if}
-			</Button>
-		</CardContent>
-	</Card>
-
-	<Card>
-		<CardHeader>
-			<CardTitle>External Providers</CardTitle>
-			<CardDescription>Manage the local sidecar used for YouTube, SoundCloud, and Bandcamp search/stream resolution.</CardDescription>
-		</CardHeader>
-		<CardContent class="flex items-center justify-between gap-4">
-			<div class="flex items-center gap-3">
-				<div class={`flex size-10 items-center justify-center rounded-full ${sidecarRunning ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'}`}>
-					<RadioTower class="size-5" />
+			<div class="grid grid-cols-3 gap-2 rounded-xl border border-border/70 bg-muted/20 p-3 text-center">
+				<div>
+					<p class="text-lg font-semibold tabular-nums">{library.tracks.length}</p>
+					<p class="text-[11px] text-muted-foreground">Tracks</p>
+				</div>
+				<div class="border-x border-border/60">
+					<p class="text-lg font-semibold tabular-nums">{library.artists.length}</p>
+					<p class="text-[11px] text-muted-foreground">Artists</p>
 				</div>
 				<div>
-					<p class="text-sm font-medium">Provider sidecar</p>
-					<p class="text-xs text-muted-foreground">
-						{sidecarRunning ? 'Running and ready for external search' : 'Stopped. External search and streaming will not work.'}
-					</p>
+					<p class="text-lg font-semibold tabular-nums">{library.albums.length}</p>
+					<p class="text-[11px] text-muted-foreground">Albums</p>
 				</div>
 			</div>
-			{#if sidecarRunning}
-				<Button variant="outline" size="sm" onclick={stopSidecar} disabled={sidecarLoading}>
-					<Square class="mr-1 size-4" />
-					Stop
-				</Button>
+
+			{#if loading}
+				<div class="h-14 animate-pulse rounded-lg bg-muted"></div>
+			{:else if libraryPaths.length > 0}
+				<div class="space-y-2">
+					{#each libraryPaths as path, index}
+						<div class="flex items-center gap-3 rounded-lg border border-border/70 px-3 py-2.5">
+							<div class="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+								<HardDrive class="size-4" />
+							</div>
+							<span class="min-w-0 flex-1 truncate font-mono text-xs" title={path}>{path}</span>
+							<Button
+								variant="ghost"
+								size="icon-sm"
+								class="shrink-0 text-muted-foreground"
+								onclick={() => removePath(index)}
+								aria-label={`Stop scanning ${path}`}
+							>
+								<X class="size-4" />
+							</Button>
+						</div>
+					{/each}
+					<p class="px-1 text-[11px] text-muted-foreground">Removing a folder stops future scans; it does not delete imported tracks or files.</p>
+				</div>
 			{:else}
-				<Button size="sm" onclick={startSidecar} disabled={sidecarLoading}>
-					<Play class="mr-1 size-4" />
-					Start
-				</Button>
+				<div class="rounded-xl border border-dashed border-border px-4 py-7 text-center">
+					<FolderOpen class="mx-auto size-7 text-muted-foreground" />
+					<p class="mt-2 text-sm font-medium">No local music folders yet</p>
+					<p class="mt-1 text-xs text-muted-foreground">You can still search and stream music without one.</p>
+				</div>
 			{/if}
+
+			<div class="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
+				<Button onclick={scanAll} disabled={scanning || libraryPaths.length === 0}>
+					<RefreshCw class={`size-4 ${scanning ? 'animate-spin' : ''}`} />
+					{scanning ? 'Scanning folders…' : 'Scan all folders'}
+				</Button>
+				{#if lastScan}
+					<span class={`inline-flex items-center gap-1.5 text-xs ${lastScan.errors.length > 0 ? 'text-amber-500' : 'text-emerald-500'}`}>
+						<CheckCircle2 class="size-3.5" />
+						{lastScan.folders}/{libraryPaths.length} scanned · {lastScan.newTracks} new · {lastScan.updatedTracks} changed
+					</span>
+				{/if}
+			</div>
 		</CardContent>
 	</Card>
 
 	<Card>
 		<CardHeader>
 			<CardTitle>Appearance</CardTitle>
-			<CardDescription>Customize the look of mewsik.</CardDescription>
+			<CardDescription>Use a fixed theme or follow Windows automatically.</CardDescription>
 		</CardHeader>
 		<CardContent>
-			<div class="flex items-center justify-between">
-				<div>
-					<p class="text-sm font-medium">Theme</p>
-					<p class="text-xs text-muted-foreground">Toggle between dark and light mode</p>
-				</div>
-				<Button variant="outline" size="sm" onclick={() => toggleMode()}>
-					<Sun class="mr-1 size-4 dark:hidden" />
-					<Moon class="mr-1 hidden size-4 dark:block" />
-					Toggle Theme
-				</Button>
+			<div class="grid grid-cols-3 gap-2" role="group" aria-label="Theme">
+				{#each [
+					{ value: 'light' as const, label: 'Light', icon: Sun },
+					{ value: 'dark' as const, label: 'Dark', icon: Moon },
+					{ value: 'system' as const, label: 'System', icon: Laptop }
+				] as option}
+					<button
+						type="button"
+						class={`flex items-center justify-center gap-2 rounded-lg border px-3 py-3 text-sm transition-colors ${userPrefersMode.current === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}
+						onclick={() => chooseTheme(option.value)}
+						aria-pressed={userPrefersMode.current === option.value}
+					>
+						<option.icon class="size-4" /> {option.label}
+					</button>
+				{/each}
 			</div>
 		</CardContent>
 	</Card>
+
+	<details class="group rounded-xl border border-border bg-card">
+		<summary class="flex cursor-pointer list-none items-center justify-between gap-4 px-6 py-4">
+			<div>
+				<p class="text-sm font-semibold">Search troubleshooting</p>
+				<p class="mt-0.5 text-xs text-muted-foreground">External providers normally start by themselves. Open this only if Search gets stuck.</p>
+			</div>
+			<Search class={`size-4 shrink-0 ${providerRunning ? 'text-emerald-500' : 'text-muted-foreground'}`} />
+		</summary>
+		<div class="border-t border-border/60 px-6 py-4">
+			<div class="flex flex-wrap items-center justify-between gap-3">
+				<p class="text-xs text-muted-foreground">
+					{providerRunning ? 'Search providers are running.' : 'Providers are idle and will start with your next search.'}
+				</p>
+				<Button variant="outline" size="sm" onclick={restartProviders} disabled={providerLoading}>
+					<RefreshCw class={`size-3.5 ${providerLoading ? 'animate-spin' : ''}`} />
+					Restart providers
+				</Button>
+			</div>
+		</div>
+	</details>
 </div>

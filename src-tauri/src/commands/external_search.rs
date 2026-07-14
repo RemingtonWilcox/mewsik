@@ -165,6 +165,60 @@ fn normalize_query(value: &str) -> String {
         .join(" ")
 }
 
+fn validated_search_query(value: &str) -> Result<String, String> {
+    if value.chars().any(char::is_control) {
+        return Err("Search query contains unsupported control characters".to_string());
+    }
+    let query = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let length = query.chars().count();
+    if length < 2 {
+        return Err("Search query must contain at least 2 characters".to_string());
+    }
+    if length > 200 {
+        return Err("Search query must be 200 characters or fewer".to_string());
+    }
+    Ok(query)
+}
+
+fn validated_search_source(value: &str) -> Result<&'static str, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "youtube" => Ok("youtube"),
+        "soundcloud" => Ok("soundcloud"),
+        "bandcamp" => Ok("bandcamp"),
+        _ => Err("Unsupported search source".to_string()),
+    }
+}
+
+fn provider_label(source: &str) -> &str {
+    match source {
+        "youtube" => "YouTube",
+        "soundcloud" => "SoundCloud",
+        "bandcamp" => "Bandcamp",
+        _ => "a music provider",
+    }
+}
+
+fn provider_failure_message(sources: &[String]) -> String {
+    let mut labels = sources
+        .iter()
+        .map(|source| provider_label(source).to_string())
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.dedup();
+    let joined = match labels.as_slice() {
+        [] => "music providers".to_string(),
+        [only] => only.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => format!(
+            "{}, and {}",
+            labels[..labels.len() - 1].join(", "),
+            labels[labels.len() - 1]
+        ),
+    };
+    let verb = if labels.len() == 1 { "is" } else { "are" };
+    format!("Search could not finish because {joined} {verb} temporarily unavailable. Try again.")
+}
+
 fn search_cache_key(query: &str) -> Option<String> {
     let normalized = normalize_query(query);
     if normalized.is_empty() {
@@ -628,6 +682,8 @@ pub fn search_external(
     source: String,
     page: Option<usize>,
 ) -> Result<ExternalSearchPage, String> {
+    let query = validated_search_query(&query)?;
+    let source = validated_search_source(&source)?;
     sidecar.start()?;
     let method = format!("{}.search", source);
     let result = sidecar.call(
@@ -636,8 +692,18 @@ pub fn search_external(
     )?;
 
     let items: Vec<ExternalSearchResult> =
-        serde_json::from_value(result.get("items").cloned().unwrap_or_default())
-            .unwrap_or_default();
+        serde_json::from_value(result.get("items").cloned().ok_or_else(|| {
+            format!(
+                "{} returned an invalid search response",
+                provider_label(source)
+            )
+        })?)
+        .map_err(|error| {
+            format!(
+                "{} returned an invalid search response: {error}",
+                provider_label(source)
+            )
+        })?;
     let has_more = result
         .get("has_more")
         .and_then(|value| value.as_bool())
@@ -659,6 +725,7 @@ pub fn search_all_sources(
     search_runtime: State<'_, Arc<ExternalSearchRuntime>>,
     query: String,
 ) -> Result<Vec<ExternalSearchResult>, String> {
+    let query = validated_search_query(&query)?;
     let generation = search_runtime.next_generation();
     if let Some(cached_results) = search_runtime.get_cached_results(&query) {
         let cached_results = enrich_external_results(&db, cached_results);
@@ -683,7 +750,8 @@ pub fn search_all_sources(
     sidecar.start()?;
     let (tx, rx) = mpsc::channel();
 
-    for source in ["youtube", "soundcloud", "bandcamp"] {
+    const SOURCES: [&str; 3] = ["youtube", "soundcloud", "bandcamp"];
+    for source in SOURCES {
         let source_name = source.to_string();
         let query_value = query.clone();
         let manager = Arc::clone(sidecar.inner());
@@ -692,11 +760,19 @@ pub fn search_all_sources(
             let method = format!("{}.search", source_name);
             let payload = manager
                 .call(&method, json!({ "query": query_value, "page": 0 }))
-                .map(|result| {
-                    serde_json::from_value::<Vec<ExternalSearchResult>>(
-                        result.get("items").cloned().unwrap_or_default(),
-                    )
-                    .unwrap_or_default()
+                .and_then(|result| {
+                    let items = result.get("items").cloned().ok_or_else(|| {
+                        format!(
+                            "{} returned a search response without items",
+                            provider_label(&source_name)
+                        )
+                    })?;
+                    serde_json::from_value::<Vec<ExternalSearchResult>>(items).map_err(|error| {
+                        format!(
+                            "{} returned an invalid search response: {error}",
+                            provider_label(&source_name)
+                        )
+                    })
                 });
 
             let _ = tx.send((source_name, payload));
@@ -705,7 +781,10 @@ pub fn search_all_sources(
     drop(tx);
 
     let mut all_results = Vec::new();
+    let mut completed_sources = HashSet::new();
+    let mut failed_sources = Vec::new();
     for (source, payload) in rx {
+        completed_sources.insert(source.clone());
         match payload {
             Ok(items) => {
                 let items = enrich_external_results(&db, items);
@@ -728,12 +807,27 @@ pub fn search_all_sources(
                 );
                 all_results.extend(items);
             }
-            Err(err) => log::warn!("Failed to search {}: {}", source, err),
+            Err(err) => {
+                log::warn!("Failed to search {}: {}", source, err);
+                failed_sources.push(source);
+            }
+        }
+    }
+
+    for source in SOURCES {
+        if !completed_sources.contains(source) {
+            log::warn!("Search worker for {} exited without a response", source);
+            failed_sources.push(source.to_string());
         }
     }
 
     let ranked = rank_external_results(&query, all_results);
-    search_runtime.cache_results(&query, &ranked);
+    if ranked.is_empty() && !failed_sources.is_empty() {
+        return Err(provider_failure_message(&failed_sources));
+    }
+    if failed_sources.is_empty() {
+        search_runtime.cache_results(&query, &ranked);
+    }
     let _ = app.emit(
         "external-search-complete",
         ExternalSearchCompleteEvent {
@@ -823,7 +917,10 @@ pub fn sidecar_status(sidecar: State<'_, Arc<SidecarManager>>) -> Result<bool, S
 
 #[cfg(test)]
 mod tests {
-    use super::{rank_external_results, ExternalSearchResult};
+    use super::{
+        provider_failure_message, rank_external_results, validated_search_query,
+        validated_search_source, ExternalSearchResult,
+    };
 
     fn result(
         source: &str,
@@ -899,5 +996,34 @@ mod tests {
             ranked.first().map(|item| item.source_id.as_str()),
             Some("youtube-high")
         );
+    }
+
+    #[test]
+    fn search_query_validation_trims_unicode_and_rejects_unsafe_input() {
+        assert_eq!(
+            validated_search_query("  Ryuichi   Sakamoto  ").as_deref(),
+            Ok("Ryuichi Sakamoto")
+        );
+        assert_eq!(
+            validated_search_query("宇多田ヒカル").as_deref(),
+            Ok("宇多田ヒカル")
+        );
+        assert!(validated_search_query("x").is_err());
+        assert!(validated_search_query("hello\nworld").is_err());
+        assert!(validated_search_query(&"x".repeat(201)).is_err());
+    }
+
+    #[test]
+    fn search_source_is_an_allowlist() {
+        assert_eq!(validated_search_source(" YouTube "), Ok("youtube"));
+        assert!(validated_search_source("youtube.resolve_stream").is_err());
+        assert!(validated_search_source("spotify").is_err());
+    }
+
+    #[test]
+    fn provider_failure_is_actionable_without_leaking_internal_errors() {
+        let message = provider_failure_message(&["youtube".to_string(), "soundcloud".to_string()]);
+        assert!(message.contains("SoundCloud and YouTube"));
+        assert!(message.contains("Try again"));
     }
 }

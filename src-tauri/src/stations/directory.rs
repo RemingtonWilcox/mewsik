@@ -8,7 +8,7 @@ use super::network::{
     parse_public_http_url, send_public_get_following_redirects, MAX_PUBLIC_REDIRECTS,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RadioBrowserStation {
     pub name: String,
     pub url: String,
@@ -19,26 +19,42 @@ pub struct RadioBrowserStation {
     pub homepage: Option<String>,
     pub favicon: Option<String>,
     pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub countrycode: Option<String>,
     pub language: Option<String>,
     pub tags: Option<String>,
     pub codec: Option<String>,
     pub bitrate: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub votes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickcount: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clicktrend: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lastcheckok: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lastchecktime_iso8601: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lastcheckoktime_iso8601: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssl_error: Option<i32>,
     pub stationuuid: String,
 }
 
 /// Public radio-browser mirrors, tried in order. The directory is a
 /// volunteer-run cluster; any single server can be down.
 const RADIO_BROWSER_SERVERS: [&str; 3] = [
+    // The official aggregate hostname follows the currently advertised mirror
+    // set. Keep named fallbacks because the service is volunteer-run and DNS or
+    // one edge can disappear independently.
+    "https://all.api.radio-browser.info",
     "https://de1.api.radio-browser.info",
-    "https://de2.api.radio-browser.info",
-    "https://fi1.api.radio-browser.info",
+    "https://nl1.api.radio-browser.info",
 ];
 
 /// GET from the radio-browser directory with mirror failover.
-pub(crate) async fn radio_browser_get(
-    _client: &reqwest::Client,
-    path_and_query: &str,
-) -> Option<reqwest::Response> {
+pub(crate) async fn radio_browser_get(path_and_query: &str) -> Option<reqwest::Response> {
     for server in RADIO_BROWSER_SERVERS {
         let url = parse_public_http_url(&format!("{}{}", server, path_and_query)).ok()?;
         match send_public_get_following_redirects(
@@ -65,12 +81,9 @@ struct RadioBrowserUuidStation {
 /// permanent UUID. Stream hosts rotate; the UUID is stable. Returns
 /// candidates in preference order: url_resolved (direct stream) first,
 /// then url (may be a playlist — the probe unwraps it).
-pub(crate) async fn resolve_station_urls_by_uuid(
-    client: &reqwest::Client,
-    uuid: &str,
-) -> Vec<String> {
+pub(crate) async fn resolve_station_urls_by_uuid(uuid: &str) -> Vec<String> {
     let url = format!("/json/stations/byuuid/{}", urlencoding::encode(uuid));
-    let Some(response) = radio_browser_get(client, &url).await else {
+    let Some(response) = radio_browser_get(&url).await else {
         return Vec::new();
     };
     let Ok(stations) = response.json::<Vec<RadioBrowserUuidStation>>().await else {

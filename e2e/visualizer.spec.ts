@@ -13,6 +13,23 @@ async function expectProductionEngine(
 		.toBe(engine);
 }
 
+async function expectVisualizerChrome(
+	page: import('@playwright/test').Page,
+	visible: boolean,
+	timeout = 4_000
+) {
+	const expected = String(visible);
+	await expect
+		.poll(
+			async () => ({
+				host: await page.locator('[data-visualizer-host]').getAttribute('data-controls-visible'),
+				player: await page.locator('[data-player-bar]').getAttribute('data-visualizer-chrome-visible')
+			}),
+			{ timeout }
+		)
+		.toEqual({ host: expected, player: expected });
+}
+
 test.describe('visualizer engine roster', () => {
 	test('lab exposes only the supported engines and keyboard routes', async ({ page }) => {
 		await page.goto('/visualizer-test');
@@ -83,7 +100,7 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'mk1');
 		await page.keyboard.press('ArrowLeft');
 		await expectProductionEngine(page, 'signal');
-		await page.getByRole('button', { name: 'Show visualizer details' }).click();
+		await page.getByRole('button', { name: /Signal: Phosphor score\. Show details/ }).click();
 		await page.getByRole('button', { name: 'Calm', exact: true }).click();
 		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
 			'data-visualizer-response',
@@ -98,35 +115,86 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.locator('[data-app-content]')).not.toHaveAttribute('inert', '');
 	});
 
-	test('rail preserves keyboard focus, restores its opener, and still auto-hides after pointer use', async ({ page }) => {
+	test('engine and playback chrome share one fast idle clock and interaction holds', async ({ page }) => {
 		await page.goto('/');
 		const opener = page.getByRole('button', { name: 'Visualizer' });
 		await opener.click();
 		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
 		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
+		await expectVisualizerChrome(page, true);
+		await expectVisualizerChrome(page, false);
 
+		// A Window-level event is not enough; wake events must come from an app surface.
+		await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointermove')));
+		await page.waitForTimeout(200);
+		await expectVisualizerChrome(page, false, 500);
+
+		// Activity over the actual visualizer surface wakes both layers together.
+		await page.mouse.move(160, 280);
+		await expectVisualizerChrome(page, true);
+
+		// A stationary pointer over either control surface keeps both available.
+		const playerBar = page.locator('[data-player-bar]');
+		await playerBar.hover();
+		await page.waitForTimeout(2_500);
+		await expectVisualizerChrome(page, true, 500);
+		await page.mouse.move(160, 280);
+		await expectVisualizerChrome(page, false);
+
+		// Genuine keyboard focus is also a hold, unlike focus left by a pointer click.
+		await page.mouse.move(180, 300);
+		await expectVisualizerChrome(page, true);
+		const title = page.getByRole('button', { name: /Prism: Rhythmic geometry\. Show details/ });
+		await title.focus();
+		await expect(title).toBeFocused();
+		await page.waitForTimeout(2_500);
+		await expectVisualizerChrome(page, true, 500);
+
+		await page.keyboard.press('Escape');
+		await expect(opener).toBeFocused();
+	});
+
+	test('manual Hide stays locked until H, I, or a stage click explicitly reveals it', async ({ page }) => {
+		await page.goto('/');
+		const opener = page.getByRole('button', { name: 'Visualizer' });
+		await opener.click();
+
+		const host = page.locator('[data-visualizer-host]');
+		await page
+			.getByRole('navigation', { name: 'Visualizer engines' })
+			.getByRole('button', { name: 'Hide visualizer controls', exact: true })
+			.click();
+		await expect(host).toHaveAttribute('data-controls-mode', 'locked-hidden');
+		await expectVisualizerChrome(page, false);
+
+		// Ordinary movement and engine keyboard routes must not defeat the lock.
+		await page.mouse.move(80, 180);
+		await page.mouse.move(360, 420);
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk2');
+		await page.waitForTimeout(350);
+		await expectVisualizerChrome(page, false, 500);
+
 		await page.keyboard.press('i');
+		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
+		await expectVisualizerChrome(page, true);
 		await expect(page.getByRole('region', { name: 'Soma visualizer details' })).toBeVisible();
 		await page.keyboard.press('i');
 
-		const title = page.getByRole('button', { name: /Evolution · Living fractal SOMA/ });
-		await title.focus();
-		await expect(title).toBeFocused();
-		await page.waitForTimeout(8_200);
-		await expect(page.getByRole('navigation', { name: 'Visualizer engines' })).toBeVisible();
+		await page.keyboard.press('h');
+		await expect(host).toHaveAttribute('data-controls-mode', 'locked-hidden');
+		await expectVisualizerChrome(page, false);
+		await page.keyboard.press('h');
+		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
+		await expectVisualizerChrome(page, true);
 
-		const close = page.getByRole('button', { name: 'Close visualizer' });
-		await close.hover();
-		await close.click();
+		await page.keyboard.press('h');
+		await page.getByRole('button', { name: 'Show visualizer controls' }).click();
+		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
+		await expectVisualizerChrome(page, true);
+
+		await page.keyboard.press('Escape');
 		await expect(opener).toBeFocused();
-
-		await opener.click();
-		await page.getByRole('button', { name: /Next visualizer/ }).click();
-		await page.mouse.move(12, 700);
-		await page.waitForTimeout(6_800);
-		await expect(page.getByRole('navigation', { name: 'Visualizer engines' })).toHaveCount(0);
 	});
 
 	test('response mode repairs invalid storage and hydrates across a reload', async ({ page }) => {

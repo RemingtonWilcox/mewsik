@@ -1,7 +1,10 @@
 use crate::db::models::LibraryTrack;
 use crate::db::DbPool;
-use rusqlite::{params, Row};
+use rusqlite::{params, Connection, Row};
 use std::collections::{HashMap, HashSet};
+
+const QUALIFIED_LISTEN_MIN_MS: i64 = 30_000;
+const PROFILE_TRACK_GOAL: i64 = 5;
 
 pub struct RecommendationEngine {
     db: DbPool,
@@ -21,15 +24,7 @@ impl RecommendationEngine {
     /// Generate a mix that blends affinity, novelty, and similarity signals.
     pub fn generate_daily_mix(&self, limit: usize) -> Result<Vec<LibraryTrack>, String> {
         let conn = self.db.lock();
-        let history_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM play_history WHERE recording_id IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if history_count < 5 {
+        if !profile_is_ready(&conn) {
             drop(conn);
             return self.fallback_library_mix(limit, &HashSet::new());
         }
@@ -44,6 +39,7 @@ impl RecommendationEngine {
                         MAX(started_at) AS last_played
                     FROM play_history
                     WHERE recording_id IS NOT NULL
+                      AND COALESCE(duration_ms, 0) >= 30000
                       AND started_at > datetime('now', '-90 days')
                     GROUP BY recording_id
                 ),
@@ -56,6 +52,7 @@ impl RecommendationEngine {
                       ON ra.recording_id = ph.recording_id
                      AND ra.role = 'primary'
                     WHERE ph.recording_id IS NOT NULL
+                      AND COALESCE(ph.duration_ms, 0) >= 30000
                       AND ph.started_at > datetime('now', '-45 days')
                     GROUP BY ra.artist_id
                 ),
@@ -66,6 +63,7 @@ impl RecommendationEngine {
                     FROM play_history ph
                     JOIN recordings r ON r.id = ph.recording_id
                     WHERE ph.recording_id IS NOT NULL
+                      AND COALESCE(ph.duration_ms, 0) >= 30000
                       AND ph.started_at > datetime('now', '-45 days')
                       AND r.genre IS NOT NULL
                       AND TRIM(r.genre) <> ''
@@ -83,6 +81,7 @@ impl RecommendationEngine {
                         JOIN play_history ph
                           ON ph.recording_id = rs.recording_id_a
                         WHERE ph.started_at > datetime('now', '-30 days')
+                          AND COALESCE(ph.duration_ms, 0) >= 30000
 
                         UNION ALL
 
@@ -93,6 +92,7 @@ impl RecommendationEngine {
                         JOIN play_history ph
                           ON ph.recording_id = rs.recording_id_b
                         WHERE ph.started_at > datetime('now', '-30 days')
+                          AND COALESCE(ph.duration_ms, 0) >= 30000
                     )
                     GROUP BY recording_id
                 )
@@ -152,8 +152,7 @@ impl RecommendationEngine {
                             THEN 2.0
                             ELSE 0.0
                         END -
-                        COALESCE(recent_track_stats.play_count, 0) * 0.75 +
-                        ((ABS(RANDOM()) % 1000) / 1000.0)
+                        COALESCE(recent_track_stats.play_count, 0) * 0.75
                     ) AS recommendation_score
                 FROM recordings r
                 LEFT JOIN recording_artists ra
@@ -173,7 +172,7 @@ impl RecommendationEngine {
                         recent_track_stats.last_played IS NULL
                      OR recent_track_stats.last_played < datetime('now', '-2 days')
                   )
-                ORDER BY recommendation_score DESC
+                ORDER BY recommendation_score DESC, r.id ASC
                 LIMIT ?1
                 "#,
             )
@@ -253,9 +252,7 @@ impl RecommendationEngine {
                     ),
                     (
                         COUNT(ph.id) * 3.5 +
-                        MIN(julianday('now') - julianday(MAX(ph.started_at)), 365) / 5.0 +
-                        SUM(CASE WHEN ph.completed = 1 THEN 1 ELSE 0 END) * 0.5 +
-                        ((ABS(RANDOM()) % 1000) / 1000.0)
+                        MIN(julianday('now') - julianday(MAX(ph.started_at)), 365) / 5.0
                     ) AS rediscover_score
                 FROM recordings r
                 JOIN play_history ph
@@ -268,6 +265,7 @@ impl RecommendationEngine {
                 LEFT JOIN album_tracks at2 ON at2.recording_id = r.id
                 LEFT JOIN albums al ON al.id = at2.album_id
                 WHERE r.is_in_library = 1
+                  AND COALESCE(ph.duration_ms, 0) >= 30000
                 GROUP BY
                     r.id,
                     r.title,
@@ -281,7 +279,7 @@ impl RecommendationEngine {
                     r.genre,
                     r.year
                 HAVING MAX(ph.started_at) < datetime('now', '-30 days')
-                ORDER BY rediscover_score DESC
+                ORDER BY rediscover_score DESC, r.id ASC
                 LIMIT ?1
                 "#,
             )
@@ -365,11 +363,12 @@ impl RecommendationEngine {
                             SELECT 1
                             FROM play_history ph
                             WHERE ph.recording_id = r.id
+                              AND COALESCE(ph.duration_ms, 0) >= 30000
                         ) THEN 1
                         ELSE 0
                     END,
                     r.created_at DESC,
-                    RANDOM()
+                    r.id ASC
                 LIMIT ?1
                 "#,
             )
@@ -413,18 +412,14 @@ impl RecommendationEngine {
             )
             .unwrap_or(0);
 
-        let unique_tracks: i64 = conn
-            .query_row(
-                "SELECT COUNT(DISTINCT recording_id) FROM play_history WHERE recording_id IS NOT NULL",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
+        let unique_tracks = qualified_recording_count(&conn);
 
         Ok(PlayStats {
             total_plays,
             total_time_ms,
             unique_tracks,
+            profile_track_goal: PROFILE_TRACK_GOAL,
+            profile_ready: unique_tracks >= PROFILE_TRACK_GOAL,
         })
     }
 
@@ -520,6 +515,21 @@ pub struct PlayStats {
     pub total_plays: i64,
     pub total_time_ms: i64,
     pub unique_tracks: i64,
+    pub profile_track_goal: i64,
+    pub profile_ready: bool,
+}
+
+fn qualified_recording_count(conn: &Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT recording_id) FROM play_history WHERE recording_id IS NOT NULL AND COALESCE(duration_ms, 0) >= ?1",
+        params![QUALIFIED_LISTEN_MIN_MS],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+fn profile_is_ready(conn: &Connection) -> bool {
+    qualified_recording_count(conn) >= PROFILE_TRACK_GOAL
 }
 
 fn diversify_candidates(
@@ -531,6 +541,7 @@ fn diversify_candidates(
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.track.id.cmp(&b.track.id))
     });
 
     let mut selected = Vec::new();
@@ -601,4 +612,137 @@ fn map_library_track_row(row: &Row<'_>) -> rusqlite::Result<LibraryTrack> {
         playlist_track_id: None,
         playlist_position: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::init_memory_db;
+
+    fn seed_library_track(db: &DbPool, id: &str, artist_id: &str) {
+        let conn = db.lock();
+        conn.execute(
+            "INSERT INTO recordings (id, title, duration_ms, is_in_library, created_at, updated_at) VALUES (?1, ?2, 180000, 1, datetime('now'), datetime('now'))",
+            params![id, format!("Track {id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO artists (id, name, created_at, updated_at) VALUES (?1, ?2, datetime('now'), datetime('now'))",
+            params![artist_id, format!("Artist {artist_id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recording_artists (recording_id, artist_id, role, position) VALUES (?1, ?2, 'primary', 0)",
+            params![id, artist_id],
+        )
+        .unwrap();
+    }
+
+    fn record_play(db: &DbPool, play_id: &str, recording_id: &str, duration_ms: i64) {
+        db.lock()
+            .execute(
+                "INSERT INTO play_history (id, recording_id, source_used, started_at, ended_at, duration_ms, completed) VALUES (?1, ?2, 'local', datetime('now'), datetime('now'), ?3, 1)",
+                params![play_id, recording_id, duration_ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn qualified_history_mix_is_stable_until_history_changes() {
+        let db = init_memory_db().unwrap();
+        for index in 0..8 {
+            seed_library_track(
+                &db,
+                &format!("recording-{index}"),
+                &format!("artist-{index}"),
+            );
+        }
+        for index in 0..5 {
+            record_play(
+                &db,
+                &format!("play-{index}"),
+                &format!("recording-{index}"),
+                45_000,
+            );
+        }
+
+        let engine = RecommendationEngine::new(db);
+        let first = engine.generate_daily_mix(3).unwrap();
+        let second = engine.generate_daily_mix(3).unwrap();
+        let first_ids = first
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect::<Vec<_>>();
+        let second_ids = second
+            .iter()
+            .map(|track| track.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(first_ids, vec!["recording-5", "recording-6", "recording-7"]);
+        let stats = engine.get_play_stats().unwrap();
+        assert_eq!(stats.unique_tracks, PROFILE_TRACK_GOAL);
+        assert!(stats.profile_ready);
+        assert_eq!(stats.profile_track_goal, PROFILE_TRACK_GOAL);
+    }
+
+    #[test]
+    fn repeated_qualified_plays_of_one_track_do_not_complete_profile() {
+        let db = init_memory_db().unwrap();
+        for index in 0..8 {
+            seed_library_track(
+                &db,
+                &format!("recording-{index}"),
+                &format!("artist-{index}"),
+            );
+        }
+        for index in 0..5 {
+            record_play(&db, &format!("repeat-{index}"), "recording-0", 45_000);
+        }
+
+        {
+            let conn = db.lock();
+            assert_eq!(qualified_recording_count(&conn), 1);
+            assert!(!profile_is_ready(&conn));
+        }
+        let engine = RecommendationEngine::new(db.clone());
+        let learning_stats = engine.get_play_stats().unwrap();
+        assert_eq!(learning_stats.unique_tracks, 1);
+        assert!(!learning_stats.profile_ready);
+
+        for index in 1..5 {
+            record_play(
+                &db,
+                &format!("distinct-{index}"),
+                &format!("recording-{index}"),
+                45_000,
+            );
+        }
+        let ready_stats = engine.get_play_stats().unwrap();
+        assert_eq!(ready_stats.unique_tracks, PROFILE_TRACK_GOAL);
+        assert!(ready_stats.profile_ready);
+    }
+
+    #[test]
+    fn short_skips_do_not_count_as_a_learned_profile() {
+        let db = init_memory_db().unwrap();
+        for index in 0..6 {
+            seed_library_track(
+                &db,
+                &format!("recording-{index}"),
+                &format!("artist-{index}"),
+            );
+        }
+        for index in 0..5 {
+            record_play(&db, &format!("skip-{index}"), "recording-0", 2_000);
+        }
+
+        let engine = RecommendationEngine::new(db);
+        let mix = engine.generate_daily_mix(4).unwrap();
+        let stats = engine.get_play_stats().unwrap();
+
+        assert_eq!(mix.len(), 4);
+        assert_eq!(stats.unique_tracks, 0);
+        assert!(!stats.profile_ready);
+    }
 }
