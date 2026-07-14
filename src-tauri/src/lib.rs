@@ -120,8 +120,10 @@ pub fn run() {
             commands::playback::add_to_queue,
             commands::playback::play_next,
             commands::playback::play_queue_index,
+            commands::playback::play_queue_entry,
             commands::playback::get_queue,
             commands::playback::remove_from_queue,
+            commands::playback::remove_queue_entry,
             commands::playback::clear_queue,
             // Playlists
             commands::playlists::get_playlists,
@@ -146,6 +148,7 @@ pub fn run() {
             commands::external_search::search_all_sources,
             commands::external_search::ensure_external_recording,
             commands::external_search::play_external,
+            commands::external_search::play_external_context,
             commands::external_search::start_sidecar,
             commands::external_search::stop_sidecar,
             commands::external_search::sidecar_status,

@@ -1,6 +1,6 @@
 use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::queue::{QueueEntry, RepeatMode};
-use crate::db::models::{PlaybackState, QueueItem};
+use crate::db::models::{PlaybackState, QueueSnapshot};
 use crate::db::{queries, DbPool};
 use crate::download;
 use crate::sources::sidecar_manager::SidecarManager;
@@ -356,7 +356,7 @@ pub fn play_recording(
         return Err("No playable source for this recording".to_string());
     }
 
-    engine.send(AudioCommand::SetQueue(vec![entry], 0));
+    engine.start_queue(vec![entry], 0);
     Ok(())
 }
 
@@ -433,12 +433,22 @@ pub fn play_tracks_from(
     recording_ids: Vec<String>,
     start_index: usize,
 ) -> Result<(), String> {
+    if recording_ids.is_empty() {
+        return Err("Playback context is empty".to_string());
+    }
+    if start_index >= recording_ids.len() {
+        return Err(format!(
+            "Playback start index {start_index} is outside a {}-track context",
+            recording_ids.len()
+        ));
+    }
+
     let mut queue_entries = Vec::new();
     for id in &recording_ids {
         queue_entries.push(build_queue_entry(&db, &sidecar, id, Some(&cache))?);
     }
 
-    engine.send(AudioCommand::SetQueue(queue_entries, start_index));
+    engine.start_queue(queue_entries, start_index);
     Ok(())
 }
 
@@ -478,18 +488,71 @@ pub fn play_next(
 
 #[tauri::command]
 pub fn play_queue_index(engine: State<'_, Arc<AudioEngine>>, index: usize) -> Result<(), String> {
+    let snapshot = engine.get_queue();
+    if index >= snapshot.upcoming.len() {
+        return Err("That Up Next item is no longer available".to_string());
+    }
     engine.send(AudioCommand::PlayQueueIndex(index));
     Ok(())
 }
 
 #[tauri::command]
-pub fn get_queue(engine: State<'_, Arc<AudioEngine>>) -> Result<Vec<QueueItem>, String> {
+pub fn play_queue_entry(
+    engine: State<'_, Arc<AudioEngine>>,
+    session_id: String,
+    entry_id: String,
+) -> Result<(), String> {
+    let snapshot = engine.get_queue();
+    if snapshot.session_id != session_id {
+        return Err("The queue changed; refresh Up Next and try again".to_string());
+    }
+    let exists = snapshot
+        .now_playing
+        .as_ref()
+        .is_some_and(|item| item.entry_id == entry_id)
+        || snapshot
+            .upcoming
+            .iter()
+            .any(|item| item.entry_id == entry_id);
+    if !exists {
+        return Err("That Up Next item is no longer available".to_string());
+    }
+    engine.select_queue_entry(session_id, entry_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_queue(engine: State<'_, Arc<AudioEngine>>) -> Result<QueueSnapshot, String> {
     Ok(engine.get_queue())
 }
 
 #[tauri::command]
 pub fn remove_from_queue(engine: State<'_, Arc<AudioEngine>>, index: usize) -> Result<(), String> {
+    if index >= engine.get_queue().upcoming.len() {
+        return Err("That Up Next item is no longer available".to_string());
+    }
     engine.send(AudioCommand::RemoveFromQueue(index));
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_queue_entry(
+    engine: State<'_, Arc<AudioEngine>>,
+    session_id: String,
+    entry_id: String,
+) -> Result<(), String> {
+    let snapshot = engine.get_queue();
+    if snapshot.session_id != session_id {
+        return Err("The queue changed; refresh Up Next and try again".to_string());
+    }
+    if !snapshot
+        .upcoming
+        .iter()
+        .any(|item| item.entry_id == entry_id)
+    {
+        return Err("That Up Next item is no longer available".to_string());
+    }
+    engine.remove_queue_entry(session_id, entry_id);
     Ok(())
 }
 

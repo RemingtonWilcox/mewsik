@@ -1,9 +1,9 @@
 use super::analyzer::{self, TappedSource};
 use super::http_stream;
-use super::queue::{PlayQueue, QueueEntry, RepeatMode};
+use super::queue::{new_queue_session_id, PlayQueue, QueueEntry, RepeatMode};
 use crate::db::{
     self,
-    models::{PlaybackState, QueueItem},
+    models::{PlaybackState, QueueItem, QueueSnapshot},
     DbPool,
 };
 use crossbeam_channel::{Receiver, Sender};
@@ -49,10 +49,27 @@ pub enum AudioCommand {
     SetRepeat(RepeatMode),
     AddToQueue(QueueEntry),
     InsertNext(QueueEntry),
+    AppendContextIfSession {
+        session_id: String,
+        entries: Vec<QueueEntry>,
+    },
     PlayQueueIndex(usize),
+    PlayQueueEntry {
+        session_id: String,
+        entry_id: String,
+    },
     RemoveFromQueue(usize),
+    RemoveQueueEntry {
+        session_id: String,
+        entry_id: String,
+    },
     ClearQueue,
     SetQueue(Vec<QueueEntry>, usize), // tracks, start_index
+    StartQueue {
+        session_id: String,
+        tracks: Vec<QueueEntry>,
+        start_index: usize,
+    },
     GetState,
     Shutdown,
 }
@@ -256,7 +273,7 @@ pub struct AudioEngine {
     cmd_tx: Sender<AudioCommand>,
     event_rx: Receiver<AudioEvent>,
     state: Arc<Mutex<PlaybackState>>,
-    queue_items: Arc<Mutex<Vec<QueueItem>>>,
+    queue_snapshot: Arc<Mutex<QueueSnapshot>>,
     app_handle: Arc<Mutex<Option<AppHandle>>>,
     play_request_gate: PlayRequestGate,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -267,10 +284,10 @@ impl AudioEngine {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let state = Arc::new(Mutex::new(PlaybackState::default()));
-        let queue_items = Arc::new(Mutex::new(Vec::new()));
+        let queue_snapshot = Arc::new(Mutex::new(QueueSnapshot::default()));
         let app_handle: Arc<Mutex<Option<AppHandle>>> = Arc::new(Mutex::new(None));
         let state_clone = Arc::clone(&state);
-        let queue_items_clone = Arc::clone(&queue_items);
+        let queue_snapshot_clone = Arc::clone(&queue_snapshot);
         let app_handle_clone = Arc::clone(&app_handle);
         let loop_cmd_tx = cmd_tx.clone();
 
@@ -282,7 +299,7 @@ impl AudioEngine {
                     loop_cmd_tx,
                     event_tx,
                     state_clone,
-                    queue_items_clone,
+                    queue_snapshot_clone,
                     db,
                     app_handle_clone,
                 );
@@ -293,7 +310,7 @@ impl AudioEngine {
             cmd_tx,
             event_rx,
             state,
-            queue_items,
+            queue_snapshot,
             app_handle,
             play_request_gate: PlayRequestGate::default(),
             worker: Mutex::new(Some(worker)),
@@ -316,7 +333,9 @@ impl AudioEngine {
                 | AudioCommand::Next
                 | AudioCommand::Prev
                 | AudioCommand::PlayQueueIndex(..)
+                | AudioCommand::PlayQueueEntry { .. }
                 | AudioCommand::SetQueue(..)
+                | AudioCommand::StartQueue { .. }
                 | AudioCommand::Shutdown
         ) {
             self.play_request_gate.invalidate_and(|| {
@@ -349,8 +368,44 @@ impl AudioEngine {
         self.state.lock().clone()
     }
 
-    pub fn get_queue(&self) -> Vec<QueueItem> {
-        self.queue_items.lock().clone()
+    pub fn get_queue(&self) -> QueueSnapshot {
+        self.queue_snapshot.lock().clone()
+    }
+
+    /// Starts a replacement queue session and returns its guard synchronously.
+    /// Commands sent through this engine sender retain FIFO order, so a later
+    /// `append_context_if_session` can safely use this ID without waiting for a
+    /// UI poll to observe the new snapshot.
+    pub fn start_queue(&self, tracks: Vec<QueueEntry>, start_index: usize) -> String {
+        let session_id = new_queue_session_id();
+        let command = AudioCommand::StartQueue {
+            session_id: session_id.clone(),
+            tracks,
+            start_index,
+        };
+        self.send(command);
+        session_id
+    }
+
+    pub fn append_context_if_session(&self, session_id: String, entries: Vec<QueueEntry>) {
+        self.send(AudioCommand::AppendContextIfSession {
+            session_id,
+            entries,
+        });
+    }
+
+    pub fn select_queue_entry(&self, session_id: String, entry_id: String) {
+        self.send(AudioCommand::PlayQueueEntry {
+            session_id,
+            entry_id,
+        });
+    }
+
+    pub fn remove_queue_entry(&self, session_id: String, entry_id: String) {
+        self.send(AudioCommand::RemoveQueueEntry {
+            session_id,
+            entry_id,
+        });
     }
 
     /// Flush the active play before application teardown. Joining the worker
@@ -898,7 +953,7 @@ impl AudioEngine {
         cmd_tx: Sender<AudioCommand>,
         event_tx: Sender<AudioEvent>,
         state: Arc<Mutex<PlaybackState>>,
-        queue_items: Arc<Mutex<Vec<QueueItem>>>,
+        queue_snapshot: Arc<Mutex<QueueSnapshot>>,
         db: DbPool,
         app_handle: Arc<Mutex<Option<AppHandle>>>,
     ) {
@@ -916,6 +971,7 @@ impl AudioEngine {
         analyzer::spawn_analyzer(tap_rx, Arc::clone(&app_handle));
         let playback_session = Arc::new(AtomicU64::new(0));
         let mut queue = PlayQueue::new();
+        Self::sync_queue_state(&queue, &queue_snapshot);
         let mut position_offset_ms: u64 = 0;
         let mut current_position_reports_relative = false;
         let mut active_play: Option<ActivePlay> = None;
@@ -1136,7 +1192,7 @@ impl AudioEngine {
                         PlayEndReason::SourceChanged,
                     );
                     queue.clear();
-                    Self::sync_queue_state(&queue, &queue_items);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
                     playback_kind = PlaybackKind::Radio;
                     awaiting_source = true;
                     desired_playing = true;
@@ -1420,7 +1476,7 @@ impl AudioEngine {
                 }
                 Ok(AudioCommand::Next) => {
                     if let Some(entry) = queue.next().cloned() {
-                        Self::sync_queue_state(&queue, &queue_items);
+                        Self::sync_queue_state(&queue, &queue_snapshot);
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
                             &tap_tx,
@@ -1497,7 +1553,7 @@ impl AudioEngine {
                         }
                     } else if let Some(entry) = queue.prev().cloned() {
                         changed_track = true;
-                        Self::sync_queue_state(&queue, &queue_items);
+                        Self::sync_queue_state(&queue, &queue_snapshot);
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
                             &tap_tx,
@@ -1547,7 +1603,7 @@ impl AudioEngine {
                 }
                 Ok(AudioCommand::SetShuffle(val)) => {
                     queue.set_shuffle(val);
-                    Self::sync_queue_state(&queue, &queue_items);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
                     let mut s = state.lock();
                     s.is_shuffle = val;
                     let state_clone = s.clone();
@@ -1569,20 +1625,103 @@ impl AudioEngine {
                 }
                 Ok(AudioCommand::AddToQueue(entry)) => {
                     queue.add(entry);
-                    Self::sync_queue_state(&queue, &queue_items);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
                 }
                 Ok(AudioCommand::InsertNext(entry)) => {
                     queue.insert_next(entry);
-                    Self::sync_queue_state(&queue, &queue_items);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
+                }
+                Ok(AudioCommand::AppendContextIfSession {
+                    session_id,
+                    entries,
+                }) => {
+                    if queue.append_context_if_session(&session_id, entries) {
+                        Self::sync_queue_state(&queue, &queue_snapshot);
+                    }
                 }
                 Ok(AudioCommand::PlayQueueIndex(idx)) => {
-                    queue.set_index(idx);
-                    Self::sync_queue_state(&queue, &queue_items);
-                    if let Some(entry) = queue.current() {
+                    if queue.set_index(idx) {
+                        Self::sync_queue_state(&queue, &queue_snapshot);
+                        let entry = queue.current().cloned();
+                        if let Some(entry) = entry {
+                            if let Err(err) = Self::play_queue_entry(
+                                &sink,
+                                &tap_tx,
+                                &entry,
+                                &cmd_tx,
+                                &event_tx,
+                                &state,
+                                &db,
+                                &playback_session,
+                                &mut position_offset_ms,
+                                &mut current_position_reports_relative,
+                                &mut active_play,
+                                &mut playback_kind,
+                                &mut awaiting_source,
+                                &mut desired_playing,
+                                PlayEndReason::QueueChanged,
+                            ) {
+                                let _ = event_tx.send(AudioEvent::Error(err));
+                            }
+                        }
+                    }
+                }
+                Ok(AudioCommand::PlayQueueEntry {
+                    session_id,
+                    entry_id,
+                }) => {
+                    if queue.select_entry(&session_id, &entry_id) {
+                        Self::sync_queue_state(&queue, &queue_snapshot);
+                        let entry = queue.current().cloned();
+                        if let Some(entry) = entry {
+                            if let Err(err) = Self::play_queue_entry(
+                                &sink,
+                                &tap_tx,
+                                &entry,
+                                &cmd_tx,
+                                &event_tx,
+                                &state,
+                                &db,
+                                &playback_session,
+                                &mut position_offset_ms,
+                                &mut current_position_reports_relative,
+                                &mut active_play,
+                                &mut playback_kind,
+                                &mut awaiting_source,
+                                &mut desired_playing,
+                                PlayEndReason::QueueChanged,
+                            ) {
+                                let _ = event_tx.send(AudioEvent::Error(err));
+                            }
+                        }
+                    }
+                }
+                Ok(AudioCommand::RemoveFromQueue(idx)) => {
+                    if queue.remove(idx) {
+                        Self::sync_queue_state(&queue, &queue_snapshot);
+                    }
+                }
+                Ok(AudioCommand::RemoveQueueEntry {
+                    session_id,
+                    entry_id,
+                }) => {
+                    if queue.remove_entry(&session_id, &entry_id) {
+                        Self::sync_queue_state(&queue, &queue_snapshot);
+                    }
+                }
+                Ok(AudioCommand::ClearQueue) => {
+                    queue.clear_upcoming();
+                    Self::sync_queue_state(&queue, &queue_snapshot);
+                }
+                Ok(AudioCommand::SetQueue(tracks, start)) => {
+                    queue.set_tracks(tracks, start);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
+                    // Start playing from start index
+                    if let Some(entry) = queue.current().cloned() {
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
                             &tap_tx,
-                            entry,
+                            &entry,
                             &cmd_tx,
                             &event_tx,
                             &state,
@@ -1598,26 +1737,40 @@ impl AudioEngine {
                         ) {
                             let _ = event_tx.send(AudioEvent::Error(err));
                         }
+                    } else {
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut active_play,
+                            awaiting_source,
+                            PlayEndReason::QueueChanged,
+                        );
+                        awaiting_source = false;
+                        desired_playing = false;
+                        playback_kind = PlaybackKind::Idle;
+                        let mut s = state.lock();
+                        *s = PlaybackState::default();
+                        s.volume = sink.volume();
+                        let state_clone = s.clone();
+                        drop(s);
+                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
                     }
                 }
-                Ok(AudioCommand::RemoveFromQueue(idx)) => {
-                    queue.remove(idx);
-                    Self::sync_queue_state(&queue, &queue_items);
-                }
-                Ok(AudioCommand::ClearQueue) => {
-                    queue.clear_upcoming();
-                    Self::sync_queue_state(&queue, &queue_items);
-                }
-                Ok(AudioCommand::SetQueue(tracks, start)) => {
-                    queue.set_tracks(tracks);
-                    queue.set_index(start);
-                    Self::sync_queue_state(&queue, &queue_items);
-                    // Start playing from start index
-                    if let Some(entry) = queue.current() {
+                Ok(AudioCommand::StartQueue {
+                    session_id,
+                    tracks,
+                    start_index,
+                }) => {
+                    queue.set_tracks_with_session(session_id, tracks, start_index);
+                    Self::sync_queue_state(&queue, &queue_snapshot);
+                    if let Some(entry) = queue.current().cloned() {
                         if let Err(err) = Self::play_queue_entry(
                             &sink,
                             &tap_tx,
-                            entry,
+                            &entry,
                             &cmd_tx,
                             &event_tx,
                             &state,
@@ -1713,9 +1866,14 @@ impl AudioEngine {
                         );
                         Self::finalize_active_play(&db, &mut active_play, end_reason);
 
-                        // Auto-advance to next track
-                        if let Some(entry) = queue.next().cloned() {
-                            Self::sync_queue_state(&queue, &queue_items);
+                        // Repeat One belongs only to a genuine natural ending.
+                        // A truncated source advances so a broken URL cannot
+                        // trap playback in an infinite retry loop.
+                        if let Some(entry) = queue
+                            .advance_after_completion(end_reason == PlayEndReason::NaturalEnd)
+                            .cloned()
+                        {
+                            Self::sync_queue_state(&queue, &queue_snapshot);
                             if let Err(err) = Self::play_queue_entry(
                                 &sink,
                                 &tap_tx,
@@ -1877,22 +2035,40 @@ impl AudioEngine {
         }
     }
 
-    fn sync_queue_state(queue: &PlayQueue, queue_items: &Arc<Mutex<Vec<QueueItem>>>) {
-        let current_index = queue.current_index();
-        *queue_items.lock() = queue
-            .tracks()
-            .iter()
+    fn sync_queue_state(queue: &PlayQueue, snapshot: &Arc<Mutex<QueueSnapshot>>) {
+        let now_playing = queue
+            .current_occurrence()
+            .map(|(entry_id, entry)| QueueItem {
+                entry_id: entry_id.to_string(),
+                index: 0,
+                recording_id: entry.recording_id.clone(),
+                title: entry.title.clone(),
+                artist_name: entry.artist.clone(),
+                duration_ms: entry.duration_ms,
+                cover_art_url: entry.cover_art.clone(),
+                is_current: true,
+            });
+        let upcoming = queue
+            .upcoming_occurrences()
             .enumerate()
-            .map(|(index, entry)| QueueItem {
+            .map(|(index, (entry_id, entry))| QueueItem {
+                entry_id: entry_id.to_string(),
                 index,
                 recording_id: entry.recording_id.clone(),
                 title: entry.title.clone(),
                 artist_name: entry.artist.clone(),
                 duration_ms: entry.duration_ms,
                 cover_art_url: entry.cover_art.clone(),
-                is_current: current_index == Some(index),
+                is_current: false,
             })
             .collect();
+
+        *snapshot.lock() = QueueSnapshot {
+            session_id: queue.session_id().to_string(),
+            revision: queue.revision(),
+            now_playing,
+            upcoming,
+        };
     }
 }
 

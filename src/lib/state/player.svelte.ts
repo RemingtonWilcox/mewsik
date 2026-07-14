@@ -282,8 +282,20 @@ export function usePlayer() {
 			scheduleRefresh();
 		},
 
+		async playQueueEntry(sessionId: string, entryId: string) {
+			clearPendingSeek();
+			clearVisualizerAudio();
+			await api.playQueueEntry(sessionId, entryId);
+			scheduleRefresh();
+		},
+
 		async removeFromQueue(index: number) {
 			await api.removeFromQueue(index);
+			scheduleRefresh([0, 50]);
+		},
+
+		async removeQueueEntry(sessionId: string, entryId: string) {
+			await api.removeQueueEntry(sessionId, entryId);
 			scheduleRefresh([0, 50]);
 		},
 

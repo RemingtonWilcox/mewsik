@@ -190,6 +190,7 @@ export interface PlaybackWaveform {
 }
 
 export interface QueueItem {
+	entry_id: string;
 	index: number;
 	recording_id: string;
 	title: string;
@@ -197,4 +198,11 @@ export interface QueueItem {
 	duration_ms: number | null;
 	cover_art_url: string | null;
 	is_current: boolean;
+}
+
+export interface QueueSnapshot {
+	session_id: string;
+	revision: number;
+	now_playing: QueueItem | null;
+	upcoming: QueueItem[];
 }

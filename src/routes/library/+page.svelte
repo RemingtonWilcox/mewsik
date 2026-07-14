@@ -71,16 +71,13 @@
 		}
 	}
 
-	function shuffleTracks(tracks: LibraryTrack[]): string[] {
-		return [...tracks]
-			.sort(() => Math.random() - 0.5)
-			.map((track) => track.id);
-	}
-
 	async function playFocusedTracks(shuffle = false) {
 		if (focusedTracks.length === 0) return;
-		const ids = shuffle ? shuffleTracks(focusedTracks) : focusedTracks.map((track) => track.id);
+		const ids = focusedTracks.map((track) => track.id);
 		await player.playAll(ids, 0);
+		if (player.state.is_shuffle !== shuffle) {
+			await player.toggleShuffle();
+		}
 	}
 </script>
 

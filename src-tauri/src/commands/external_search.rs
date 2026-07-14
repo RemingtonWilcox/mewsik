@@ -1,4 +1,4 @@
-use crate::audio::engine::{AudioCommand, AudioEngine};
+use crate::audio::engine::AudioEngine;
 use crate::db::models::*;
 use crate::db::{queries, DbPool};
 use crate::sources::sidecar_manager::SidecarManager;
@@ -622,7 +622,7 @@ fn spawn_preresolve_for_results(
     });
 }
 
-fn ensure_external_recording_inner(
+pub(crate) fn ensure_external_recording_inner(
     db: &DbPool,
     cache: Option<&StreamCache>,
     source: String,
@@ -1070,7 +1070,129 @@ pub fn play_external(
     )?;
     let entry =
         crate::commands::playback::build_queue_entry(&db, &sidecar, &recording_id, Some(&cache))?;
-    engine.send(AudioCommand::SetQueue(vec![entry], 0));
+    engine.start_queue(vec![entry], 0);
+    Ok(recording_id)
+}
+
+const EXTERNAL_CONTEXT_UP_NEXT_LIMIT: usize = 10;
+
+fn external_context_tail(
+    items: &[ExternalSearchResult],
+    start_index: usize,
+    limit: usize,
+) -> Vec<ExternalSearchResult> {
+    if items.len() <= 1 || start_index >= items.len() || limit == 0 {
+        return Vec::new();
+    }
+
+    let selected = &items[start_index];
+    let mut seen = HashSet::from([(selected.source.clone(), selected.source_id.clone())]);
+    let mut tail = Vec::with_capacity(limit.min(items.len() - 1));
+
+    // Follow the visible ranking from the clicked row and wrap once so a pick
+    // near the end of a page still has a useful continuation. Provider IDs are
+    // the stable identity here; duplicate search rows are never queued twice.
+    for offset in 1..items.len() {
+        let item = &items[(start_index + offset) % items.len()];
+        if !seen.insert((item.source.clone(), item.source_id.clone())) {
+            continue;
+        }
+        tail.push(item.clone());
+        if tail.len() >= limit {
+            break;
+        }
+    }
+
+    tail
+}
+
+/// Starts the selected external result immediately, then lets a native worker
+/// build the rest of Up Next. Queue ownership no longer belongs to the Search
+/// page, so navigating elsewhere cannot cancel continuation. The queue session
+/// guard rejects late work after the user starts a different context.
+#[tauri::command]
+pub fn play_external_context(
+    sidecar: State<'_, Arc<SidecarManager>>,
+    db: State<'_, DbPool>,
+    engine: State<'_, Arc<AudioEngine>>,
+    cache: State<'_, StreamCache>,
+    items: Vec<ExternalSearchResult>,
+    start_index: usize,
+) -> Result<String, String> {
+    let selected = items
+        .get(start_index)
+        .cloned()
+        .ok_or_else(|| "The selected search result is no longer available".to_string())?;
+    let tail = external_context_tail(&items, start_index, EXTERNAL_CONTEXT_UP_NEXT_LIMIT);
+
+    let recording_id = ensure_external_recording_inner(
+        &db,
+        Some(&cache),
+        selected.source,
+        selected.source_id,
+        selected.title,
+        selected.artist,
+        selected.duration_ms,
+        selected.cover_art_url,
+    )?;
+    let entry =
+        crate::commands::playback::build_queue_entry(&db, &sidecar, &recording_id, Some(&cache))?;
+    if entry.file_path.is_none() && entry.source_url.is_none() {
+        return Err("No playable source for this search result".to_string());
+    }
+
+    let session_id = engine.start_queue(vec![entry], 0);
+    let worker_db = db.inner().clone();
+    let worker_sidecar = sidecar.inner().clone();
+    let worker_engine = engine.inner().clone();
+    let worker_cache = cache.inner().clone();
+    let worker_session_id = session_id.clone();
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("external-up-next".to_string())
+        .spawn(move || {
+            for candidate in tail {
+                let candidate_title = candidate.title.clone();
+                let queued = ensure_external_recording_inner(
+                    &worker_db,
+                    Some(&worker_cache),
+                    candidate.source,
+                    candidate.source_id,
+                    candidate.title,
+                    candidate.artist,
+                    candidate.duration_ms,
+                    candidate.cover_art_url,
+                )
+                .and_then(|candidate_id| {
+                    crate::commands::playback::build_queue_entry(
+                        &worker_db,
+                        &worker_sidecar,
+                        &candidate_id,
+                        Some(&worker_cache),
+                    )
+                });
+
+                match queued {
+                    Ok(entry) if entry.file_path.is_some() || entry.source_url.is_some() => {
+                        worker_engine
+                            .append_context_if_session(worker_session_id.clone(), vec![entry]);
+                    }
+                    Ok(_) => {
+                        log::debug!("Skipping unplayable Up Next result: {candidate_title}");
+                    }
+                    Err(error) => {
+                        log::debug!("Skipping failed Up Next result {candidate_title}: {error}");
+                    }
+                }
+            }
+        })
+    {
+        // The selected track is already queued and playable. A worker-launch
+        // failure should degrade continuation, not make the UI claim playback
+        // failed after audio has started.
+        log::warn!("Failed to start external Up Next worker: {error}");
+    }
+
     Ok(recording_id)
 }
 
@@ -1093,9 +1215,9 @@ pub fn sidecar_status(sidecar: State<'_, Arc<SidecarManager>>) -> Result<bool, S
 #[cfg(test)]
 mod tests {
     use super::{
-        provider_failure_message, rank_external_results, validated_search_query,
-        validated_search_request_id, validated_search_source, ExternalSearchBatch,
-        ExternalSearchResult, ExternalSearchRuntime,
+        external_context_tail, provider_failure_message, rank_external_results,
+        validated_search_query, validated_search_request_id, validated_search_source,
+        ExternalSearchBatch, ExternalSearchResult, ExternalSearchRuntime,
     };
     use crate::sources::sidecar_manager::SidecarManager;
 
@@ -1119,6 +1241,32 @@ mod tests {
             is_downloaded: false,
             recording_id: None,
         }
+    }
+
+    #[test]
+    fn external_context_wraps_caps_and_deduplicates_provider_rows() {
+        let items = vec![
+            result("youtube", "One", "Artist", None),
+            result("youtube", "Two", "Artist", None),
+            result("youtube", "Three", "Artist", None),
+            result("youtube", "Two", "Duplicate Artist", None),
+            result("soundcloud", "Four", "Artist", None),
+        ];
+
+        let tail = external_context_tail(&items, 2, 3);
+        let identities: Vec<_> = tail
+            .iter()
+            .map(|item| (item.source.as_str(), item.source_id.as_str()))
+            .collect();
+
+        assert_eq!(
+            identities,
+            vec![
+                ("youtube", "youtube-Two"),
+                ("soundcloud", "soundcloud-Four"),
+                ("youtube", "youtube-One")
+            ]
+        );
     }
 
     #[test]

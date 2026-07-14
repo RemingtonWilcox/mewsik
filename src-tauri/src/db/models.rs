@@ -219,6 +219,10 @@ impl Default for PlaybackState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
+    /// Stable identity for this occurrence. Two queue rows that reference the
+    /// same recording deliberately have different entry IDs.
+    pub entry_id: String,
+    /// Legacy upcoming index. New callers should mutate by session + entry ID.
     pub index: usize,
     pub recording_id: String,
     pub title: String,
@@ -226,4 +230,15 @@ pub struct QueueItem {
     pub duration_ms: Option<i64>,
     pub cover_art_url: Option<String>,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueueSnapshot {
+    /// Changes whenever a new playback context replaces the queue.
+    pub session_id: String,
+    /// Monotonically increases for observable mutations within the session.
+    pub revision: u64,
+    pub now_playing: Option<QueueItem>,
+    /// Literal future playback order. History is never included.
+    pub upcoming: Vec<QueueItem>,
 }

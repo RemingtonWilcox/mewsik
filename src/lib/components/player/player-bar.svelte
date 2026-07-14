@@ -331,6 +331,8 @@
 			variant="ghost"
 			size="icon"
 			class="size-8"
+			title="Up Next queue"
+			aria-label="Up Next queue"
 			onclick={() => {
 				// The queue sheet portals below the visualizer overlay — leave the
 				// visualizer first so the sheet is actually visible.

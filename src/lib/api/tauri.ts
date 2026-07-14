@@ -9,7 +9,7 @@ import type {
 	SearchResult,
 	Station,
 	StationHealthResult,
-	QueueItem,
+	QueueSnapshot,
 	Download
 } from '$lib/types';
 
@@ -141,9 +141,23 @@ export const playNext = (recordingId: string) => safeInvoke('play_next', { recor
 
 export const playQueueIndex = (index: number) => safeInvoke('play_queue_index', { index });
 
-export const getQueue = () => safeInvoke<QueueItem[]>('get_queue', undefined, []);
+const defaultQueueSnapshot: QueueSnapshot = {
+	session_id: '',
+	revision: 0,
+	now_playing: null,
+	upcoming: []
+};
+
+export const getQueue = () =>
+	safeInvoke<QueueSnapshot>('get_queue', undefined, defaultQueueSnapshot);
+
+export const playQueueEntry = (sessionId: string, entryId: string) =>
+	safeInvoke('play_queue_entry', { sessionId, entryId });
 
 export const removeFromQueue = (index: number) => safeInvoke('remove_from_queue', { index });
+
+export const removeQueueEntry = (sessionId: string, entryId: string) =>
+	safeInvoke('remove_queue_entry', { sessionId, entryId });
 
 export const clearQueue = () => safeInvoke('clear_queue');
 
@@ -309,6 +323,9 @@ export const playExternal = (
 		durationMs,
 		coverArtUrl
 	});
+
+export const playExternalContext = (items: ExternalSearchResult[], startIndex: number) =>
+	safeInvoke<string>('play_external_context', { items, startIndex });
 
 export const startSidecar = () => safeInvoke<void>('start_sidecar', undefined, () => undefined);
 export const stopSidecar = () => safeInvoke<void>('stop_sidecar', undefined, () => undefined);

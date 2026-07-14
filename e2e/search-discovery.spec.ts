@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-type SearchMockScenario = 'success' | 'fail-once' | 'partial-then-fail';
+type SearchMockScenario = 'success' | 'fail-once' | 'partial-then-fail' | 'multi-result';
 
 interface SearchMockOptions {
 	discoveryPick?: 'daft-punk' | 'ella-langley';
@@ -215,8 +215,20 @@ async function installTauriSearchMock(page: Page, options: SearchMockOptions = {
 							failed_sources: ['youtube', 'bandcamp']
 						};
 					}
+					if (scenario === 'multi-result') {
+						const first = resultForQuery(searchQuery);
+						return {
+							items: [
+								first,
+								{ ...first, source_id: 'context-2', title: 'Context Song Two' },
+								{ ...first, source_id: 'context-3', title: 'Context Song Three' }
+							],
+							failed_sources: []
+						};
+					}
 					return { items: [resultForQuery(searchQuery)], failed_sources: [] };
 				}
+				if (command === 'play_external_context') return 'recording-context-2';
 				if (command === 'record_discovery_event') return null;
 				if (command === 'start_sidecar' || command.startsWith('plugin:event|')) return null;
 				return [];
@@ -310,6 +322,49 @@ test('a q URL auto-runs once and opens directly on real results', async ({ page 
 			})
 		)
 		.toBe(1);
+});
+
+test('external playback hands the complete context to one native queue command', async ({ page }) => {
+	await installTauriSearchMock(page, { scenario: 'multi-result' });
+	await page.goto('/search');
+
+	const input = page.getByPlaceholder('Search songs, artists...');
+	await expect(input).toBeVisible({ timeout: 15_000 });
+	await input.fill('Context Artist Context Song');
+	await input.press('Enter');
+	await expect(page.getByText('Context Song Two', { exact: true })).toBeVisible();
+
+	await page.getByRole('row').filter({ hasText: 'Context Song Two' }).dblclick();
+
+	await expect
+		.poll(() =>
+			page.evaluate(() => {
+				const invocations = (window as Window & {
+					__MEWSIK_TEST_INVOCATIONS__?: Array<{
+						command: string;
+						args: Record<string, unknown>;
+					}>;
+				}).__MEWSIK_TEST_INVOCATIONS__ ?? [];
+				return invocations
+					.filter(({ command }) =>
+						['play_external_context', 'ensure_external_recording', 'add_to_queue'].includes(command)
+					)
+					.map(({ command, args }) => ({ command, args }));
+			})
+		)
+		.toEqual([
+			{
+				command: 'play_external_context',
+				args: {
+					items: [
+						expect.objectContaining({ source_id: 'daft-punk-1', title: 'One More Time' }),
+						expect.objectContaining({ source_id: 'context-2', title: 'Context Song Two' }),
+						expect.objectContaining({ source_id: 'context-3', title: 'Context Song Three' })
+					],
+					startIndex: 1
+				}
+			}
+		]);
 });
 
 test("a discovery query containing an apostrophe searches exactly once and renders the result", async ({ page }) => {

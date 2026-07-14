@@ -62,7 +62,6 @@
 	});
 	let discoveryFeed = $state<SearchDiscoveryFeed | null>(null);
 	let loadingDiscoveryFeed = $state(true);
-	let queueAppendGeneration = 0;
 	let activeQueueSelection:
 		| {
 			recordingId: string | null;
@@ -131,7 +130,7 @@
 
 		return () => {
 			disposed = true;
-			invalidateQueueAppender();
+			activeQueueSelection = null;
 			for (const cleanup of cleanups) {
 				cleanup();
 			}
@@ -175,7 +174,7 @@
 			selection.artist === activeQueueSelection.previous.artist;
 
 		if (!isActiveSearchSelection && !isPreviousSelectionWhileResolving) {
-			invalidateQueueAppender();
+			activeQueueSelection = null;
 		}
 	});
 
@@ -438,7 +437,7 @@
 	}
 
 	async function playExternalTrack(result: ExternalSearchResult) {
-		const generation = invalidateQueueAppender();
+		activeQueueSelection = null;
 		activeQueueSelection = {
 			recordingId: null,
 			source: result.source,
@@ -453,53 +452,16 @@
 		};
 
 		await runExternalAction(result, 'play', async () => {
-			// Play the clicked track immediately
-			const recordingId = await api.playExternal(
-				result.source,
-				result.source_id,
-				result.title,
-				result.artist,
-				result.duration_ms ?? undefined,
-				result.cover_art_url ?? undefined
+			const currentResults = pagedResults;
+			const clickedIndex = currentResults.findIndex(
+				(candidate) => externalResultKey(candidate) === externalResultKey(result)
 			);
-			if (generation !== queueAppendGeneration) return;
+			const context = clickedIndex >= 0 ? currentResults : [result];
+			const contextIndex = clickedIndex >= 0 ? clickedIndex : 0;
+			const recordingId = await api.playExternalContext(context, contextIndex);
 			if (activeQueueSelection) activeQueueSelection.recordingId = recordingId;
 			toast.success(`Playing: ${result.title}`);
-
-			// Queue the rest of the visible page in the background
-			const currentResults = pagedResults;
-			const clickedIndex = currentResults.findIndex(r => externalResultKey(r) === externalResultKey(result));
-			const tracksAfter = currentResults.slice(clickedIndex + 1);
-			if (tracksAfter.length > 0) {
-				// Fire and forget — don't block playback
-				void queueRemainingTracks(tracksAfter, generation);
-			}
 		});
-	}
-
-	function invalidateQueueAppender(): number {
-		activeQueueSelection = null;
-		return ++queueAppendGeneration;
-	}
-
-	async function queueRemainingTracks(tracks: ExternalSearchResult[], generation: number) {
-		for (const track of tracks) {
-			if (generation !== queueAppendGeneration) return;
-			try {
-				const recordingId = await api.ensureExternalRecording(
-					track.source,
-					track.source_id,
-					track.title,
-					track.artist,
-					track.duration_ms ?? undefined,
-					track.cover_art_url ?? undefined
-				);
-				if (generation !== queueAppendGeneration) return;
-				await player.addToQueue(recordingId);
-			} catch {
-				// Skip tracks that fail to resolve — don't break the queue
-			}
-		}
 	}
 
 	async function saveExternal(result: ExternalSearchResult) {
