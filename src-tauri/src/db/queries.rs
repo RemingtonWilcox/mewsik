@@ -504,6 +504,23 @@ pub fn find_managed_download_source_for_recording(
     }
 }
 
+pub fn set_track_source_file_availability(
+    db: &DbPool,
+    file_path: &str,
+    is_available: bool,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE track_sources
+         SET is_available = ?1,
+             last_verified = ?2,
+             updated_at = ?2
+         WHERE file_path = ?3",
+        params![is_available as i32, now(), file_path],
+    )?;
+    Ok(())
+}
+
 pub fn update_track_source_stream(
     db: &DbPool,
     track_source_id: &str,
@@ -666,6 +683,36 @@ pub fn get_latest_completed_download_for_recording(
         Some(r) => Ok(Some(r?)),
         None => Ok(None),
     }
+}
+
+pub fn get_download_files_for_recording(
+    db: &DbPool,
+    recording_id: &str,
+) -> Result<Vec<Download>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, recording_id, source, source_url, status, progress, file_path, error_message, created_at, updated_at
+         FROM downloads
+         WHERE recording_id = ?1
+           AND status IN ('completed', 'missing')
+           AND file_path IS NOT NULL
+         ORDER BY created_at DESC",
+    )?;
+    let rows = stmt.query_map(params![recording_id], |row| {
+        Ok(Download {
+            id: row.get(0)?,
+            recording_id: row.get(1)?,
+            source: row.get(2)?,
+            source_url: row.get(3)?,
+            status: row.get(4)?,
+            progress: row.get(5)?,
+            file_path: row.get(6)?,
+            error_message: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    })?;
+    rows.collect()
 }
 
 pub fn find_source_by_path(
@@ -901,23 +948,59 @@ pub fn record_play(
     recording_id: Option<&str>,
     source_used: Option<&str>,
     station_id: Option<&str>,
+    duration_ms: Option<i64>,
 ) -> Result<String, rusqlite::Error> {
     let id = new_id();
     let conn = db.lock();
     conn.execute(
-        "INSERT INTO play_history (id, recording_id, source_used, station_id, started_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, recording_id, source_used, station_id, now()],
+        "INSERT INTO play_history
+         (id, recording_id, source_used, station_id, started_at, duration_ms, listened_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+        params![
+            id,
+            recording_id,
+            source_used,
+            station_id,
+            now(),
+            duration_ms.map(|value| value.max(0))
+        ],
     )?;
     Ok(id)
 }
 
-pub fn complete_play(db: &DbPool, play_id: &str, duration_ms: i64) -> Result<(), rusqlite::Error> {
+/// Finalize one play exactly once.
+///
+/// Returning `false` means another playback path already finalized the row.
+/// This makes late source/error events harmless instead of letting them rewrite
+/// the original, user-visible reason that playback ended.
+pub fn finalize_play(
+    db: &DbPool,
+    play_id: &str,
+    listened_ms: i64,
+    duration_ms: Option<i64>,
+    end_reason: &str,
+) -> Result<bool, rusqlite::Error> {
+    let naturally_completed = end_reason == "natural_end";
     let conn = db.lock();
-    conn.execute(
-        "UPDATE play_history SET ended_at = ?1, duration_ms = ?2, completed = 1 WHERE id = ?3",
-        params![now(), duration_ms, play_id],
+    let updated = conn.execute(
+        "UPDATE play_history
+         SET ended_at = ?1,
+             listened_ms = ?2,
+             duration_ms = COALESCE(?3, duration_ms),
+             end_reason = ?4,
+             completed = ?5
+         WHERE id = ?6
+           AND ended_at IS NULL",
+        params![
+            now(),
+            listened_ms.max(0),
+            duration_ms.map(|value| value.max(0)),
+            end_reason,
+            naturally_completed as i32,
+            play_id
+        ],
     )?;
-    Ok(())
+    Ok(updated == 1)
 }
 
 // ── FTS Search ──
@@ -1188,11 +1271,7 @@ pub fn get_station_by_id(
     }
 }
 
-pub fn update_station_url(
-    db: &DbPool,
-    station_id: &str,
-    url: &str,
-) -> Result<(), rusqlite::Error> {
+pub fn update_station_url(db: &DbPool, station_id: &str, url: &str) -> Result<(), rusqlite::Error> {
     let conn = db.lock();
     conn.execute(
         "UPDATE stations SET url = ?1 WHERE id = ?2",
@@ -1201,10 +1280,7 @@ pub fn update_station_url(
     Ok(())
 }
 
-pub fn increment_station_fail_count(
-    db: &DbPool,
-    station_id: &str,
-) -> Result<(), rusqlite::Error> {
+pub fn increment_station_fail_count(db: &DbPool, station_id: &str) -> Result<(), rusqlite::Error> {
     let conn = db.lock();
     conn.execute(
         "UPDATE stations SET fail_count = fail_count + 1 WHERE id = ?1",
@@ -1307,6 +1383,24 @@ pub fn fail_download(
     Ok(())
 }
 
+pub fn mark_download_missing(
+    db: &DbPool,
+    download_id: &str,
+    error_message: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE downloads
+         SET status = 'missing',
+             error_message = ?1,
+             updated_at = ?2
+         WHERE id = ?3
+           AND status = 'completed'",
+        params![error_message, now(), download_id],
+    )?;
+    Ok(())
+}
+
 pub fn cancel_download(db: &DbPool, download_id: &str) -> Result<bool, rusqlite::Error> {
     let conn = db.lock();
     let updated = conn.execute(
@@ -1342,6 +1436,16 @@ pub fn get_downloads(db: &DbPool) -> Result<Vec<Download>, rusqlite::Error> {
         })
     })?;
     rows.collect()
+}
+
+pub fn count_active_downloads(db: &DbPool) -> Result<usize, rusqlite::Error> {
+    let conn = db.lock();
+    conn.query_row(
+        "SELECT COUNT(*) FROM downloads WHERE status IN ('pending', 'downloading', 'processing')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|count| count.max(0) as usize)
 }
 
 pub fn get_download_by_id(
@@ -1462,5 +1566,95 @@ pub fn get_local_file_for_recording(
     match rows.next()? {
         Some(row) => Ok(Some(row.get(0)?)),
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod play_history_tests {
+    use super::{finalize_play, record_play};
+    use crate::db::init_memory_db;
+    use rusqlite::params;
+
+    fn seed_recording(db: &crate::db::DbPool, recording_id: &str, duration_ms: i64) {
+        db.lock()
+            .execute(
+                "INSERT INTO recordings
+                 (id, title, duration_ms, created_at, updated_at)
+                 VALUES (?1, 'Test track', ?2, datetime('now'), datetime('now'))",
+                params![recording_id, duration_ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn interrupted_play_is_finalized_once_without_becoming_a_completion() {
+        let db = init_memory_db().unwrap();
+        seed_recording(&db, "recording-1", 180_000);
+        let play_id =
+            record_play(&db, Some("recording-1"), Some("local"), None, Some(180_000)).unwrap();
+
+        let started: (i64, i64, i64) = db
+            .lock()
+            .query_row(
+                "SELECT listened_ms, duration_ms, ended_at IS NULL
+                 FROM play_history WHERE id = ?1",
+                params![&play_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(started, (0, 180_000, 1));
+
+        assert!(finalize_play(&db, &play_id, 12_345, Some(180_000), "skipped_next").unwrap());
+        assert!(!finalize_play(&db, &play_id, 99_999, Some(180_000), "playback_error",).unwrap());
+
+        let persisted = db
+            .lock()
+            .query_row(
+                "SELECT listened_ms, duration_ms, end_reason, completed,
+                        ended_at IS NOT NULL
+                 FROM play_history WHERE id = ?1",
+                params![play_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            persisted,
+            (12_345, 180_000, "skipped_next".to_string(), 0, 1)
+        );
+    }
+
+    #[test]
+    fn natural_end_is_the_only_completed_outcome() {
+        let db = init_memory_db().unwrap();
+        seed_recording(&db, "recording-2", 90_000);
+        let play_id = record_play(
+            &db,
+            Some("recording-2"),
+            Some("youtube"),
+            None,
+            Some(90_000),
+        )
+        .unwrap();
+
+        assert!(finalize_play(&db, &play_id, 84_000, Some(90_000), "natural_end").unwrap());
+
+        let completed: i64 = db
+            .lock()
+            .query_row(
+                "SELECT completed FROM play_history WHERE id = ?1",
+                params![play_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completed, 1);
     }
 }

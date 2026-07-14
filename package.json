@@ -1,13 +1,19 @@
 {
   "name": "mewsik",
   "private": true,
-  "version": "0.0.1",
+  "version": "0.2.0",
+  "packageManager": "pnpm@10.11.0",
+  "engines": {
+    "node": "24.15.0",
+    "pnpm": "10.11.0"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite dev",
+    "version:check": "node scripts/check-version-consistency.mjs",
     "prepare:runtime": "node scripts/prepare-runtime-resources.mjs",
     "sidecar:build": "pnpm --filter mewsik-sidecar build",
-    "build": "pnpm sidecar:build && vite build",
+    "build": "pnpm version:check && pnpm sidecar:build && vite build",
     "preview": "vite preview",
     "prepare": "svelte-kit sync || echo ''",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
@@ -16,8 +22,12 @@
     "tauri:dev": "pnpm sidecar:build && tauri dev",
     "tauri:build": "pnpm sidecar:build && tauri build",
     "release:macos": "bash scripts/macos-release.sh",
+    "release:preflight": "node scripts/prepare-release-config.mjs --check",
+    "release:config": "node scripts/prepare-release-config.mjs",
+    "release:verify-keypair": "node scripts/verify-release-keypair.mjs",
     "test:e2e": "playwright test",
-    "test:e2e:headed": "playwright test --headed"
+    "test:e2e:headed": "playwright test --headed",
+    "test:discovery-snapshot": "node --test scripts/discovery-snapshot/generator.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
@@ -58,6 +68,8 @@
     "@lucide/svelte": "^1.7.0",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.4.2",
+    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-updater": "2.10.1",
     "clsx": "^2.1.1",
     "mode-watcher": "^1.1.0",
     "tailwind-merge": "^3.5.0",

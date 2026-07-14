@@ -16,7 +16,8 @@ const FLUX_HIST_LEN = 256;
 export class WebAnalyzer {
 	private ctx: AudioContext;
 	private analyser: AnalyserNode;
-	private freqBytes: Uint8Array;
+	private frequencyDb: Float32Array;
+	private timeDomain: Float32Array;
 	private fluxHist: number[] = [];
 	private beatPeriodFrames = 0;
 	private beatPhase = 0;
@@ -31,7 +32,8 @@ export class WebAnalyzer {
 		this.analyser.fftSize = FFT_SIZE;
 		this.analyser.smoothingTimeConstant = 0;
 		sourceNode.connect(this.analyser);
-		this.freqBytes = new Uint8Array(this.analyser.frequencyBinCount);
+		this.frequencyDb = new Float32Array(this.analyser.frequencyBinCount);
+		this.timeDomain = new Float32Array(this.analyser.fftSize);
 		this.emitIntervalMs = 1000 / EMIT_HZ;
 	}
 
@@ -42,29 +44,32 @@ export class WebAnalyzer {
 		if (now - this.lastEmit < this.emitIntervalMs) return null;
 		this.lastEmit = now;
 
-		// TS strict-mode wants Uint8Array<ArrayBuffer> exactly; our buffer is fine.
-		this.analyser.getByteFrequencyData(this.freqBytes as Uint8Array<ArrayBuffer>);
+		this.analyser.getFloatFrequencyData(this.frequencyDb as Float32Array<ArrayBuffer>);
+		this.analyser.getFloatTimeDomainData(this.timeDomain as Float32Array<ArrayBuffer>);
 
-		// Bytes are dB-normalized (0=-100dB, 255=-30dB by default). Convert to
-		// 0..1 linear-ish so downstream math matches Rust's magnitudes/peak
-		// scaling closely enough that smoothing and thresholds carry over.
-		const mags = new Float32Array(this.freqBytes.length);
-		for (let i = 0; i < this.freqBytes.length; i++) {
-			mags[i] = this.freqBytes[i] / 255;
+		// Web Audio reports spectral magnitudes in decibels. Convert them back to
+		// linear amplitude before applying the same log transform as the native
+		// analyzer; logging the normalized byte representation would distort the
+		// spectrum twice. Silent bins are -Infinity and must stay at linear zero.
+		const mags = new Float32Array(this.frequencyDb.length);
+		for (let i = 0; i < this.frequencyDb.length; i++) {
+			const db = this.frequencyDb[i];
+			mags[i] = Number.isFinite(db) ? Math.pow(10, db / 20) : 0;
 		}
 
 		const sampleRate = this.ctx.sampleRate;
 		const nyquist = sampleRate / 2;
 
-		// RMS / peak
+		// Waveform RMS / absolute peak, matching the Rust analyzer's normalized
+		// time-domain PCM contract.
 		let sumSq = 0;
 		let peak = 0;
-		for (let i = 0; i < mags.length; i++) {
-			const m = mags[i];
-			sumSq += m * m;
-			if (m > peak) peak = m;
+		for (let i = 0; i < this.timeDomain.length; i++) {
+			const sample = this.timeDomain[i];
+			sumSq += sample * sample;
+			peak = Math.max(peak, Math.abs(sample));
 		}
-		const rms = Math.min(1, Math.sqrt(sumSq / mags.length));
+		const rms = Math.min(1, Math.sqrt(sumSq / this.timeDomain.length));
 
 		// Log-spaced bins, 20Hz → Nyquist (matches Rust analyzer)
 		const bins: number[] = new Array(BIN_COUNT);

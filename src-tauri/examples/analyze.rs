@@ -3,7 +3,9 @@
 //! Usage: cargo run --example analyze -- <audio file>
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: analyze <audio file>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: analyze <audio file>");
     let started = std::time::Instant::now();
     match mewsik_lib::analysis::analyze_file(std::path::Path::new(&path)) {
         Ok(score) => {

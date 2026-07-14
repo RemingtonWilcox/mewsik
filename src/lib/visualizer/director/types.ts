@@ -7,6 +7,26 @@
 //
 // Renderers only ever see the V2 frame.
 
+// Kept in the director contract rather than the visualizer store so the store
+// can own one persistent VisualDirector without creating a runtime import
+// cycle. `AudioFeatures` remains publicly exported by visualizer.svelte.ts as
+// an alias of this shape.
+export type AudioFeatureFrame = {
+	bins: number[];
+	rms: number;
+	peak: number;
+	centroid: number;
+	onset: boolean;
+	bass: number;
+	mid: number;
+	treble: number;
+	sample_rate: number;
+	bpm: number;
+	beat_phase: number;
+	chroma_key: number;
+	chroma_strength: number;
+};
+
 export type VisualizerSection =
 	| 'calm'
 	| 'intro'
@@ -48,6 +68,34 @@ export type DropState = {
 	postDropDecay: number;
 };
 
+export type PerformanceContextSource = 'live' | 'score';
+export type PerformanceKeyMode = 'major' | 'minor' | 'unknown';
+
+/**
+ * Slow musical context shared by every renderer. Score-backed values are
+ * deterministic for local tracks; live values remain useful fallbacks for
+ * radio and streamed-only playback.
+ */
+export type MusicalPerformanceContext = {
+	source: PerformanceContextSource;
+	/** 0..1 through the scored section; live fallback follows phrase position. */
+	sectionProgress: number;
+	/** 0..1 normalized section loudness; live fallback is director energy. */
+	sectionEnergy: number;
+	/** 0..1 through a scored track. Zero when no offline timeline exists. */
+	trackProgress: number;
+	/** Current 2 Hz score-energy sample, or live director energy as fallback. */
+	energyCurrent: number;
+	/** Local score-energy change (future minus past), nominally -1..1. */
+	energySlope: number;
+	/** Score energy eight seconds ahead, or current live energy as fallback. */
+	energyLookahead: number;
+	/** Pitch class normalized to 0..1, matching AudioFeatureFrame.chroma_key. */
+	keyPitchClass: number;
+	keyMode: PerformanceKeyMode;
+	keyConfidence: number;
+};
+
 export type VisualDirectorFrame = {
 	section: VisualizerSection;
 	sectionAge: number;
@@ -77,4 +125,5 @@ export type VisualDirectorFrame = {
 	midRaw: number;
 	trebleRaw: number;
 	centroidRaw: number;
+	context: MusicalPerformanceContext;
 };

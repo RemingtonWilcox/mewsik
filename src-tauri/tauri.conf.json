@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "mewsik",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "app.mewsik.desktop",
   "build": {
     "frontendDist": "../build",
@@ -34,6 +34,24 @@
     "resources": {
       "../sidecar/dist/index.cjs": "sidecar/dist/index.cjs",
       "resources/bin/": "bin/"
+    },
+    "macOS": {
+      "minimumSystemVersion": "13.5"
+    },
+    "windows": {
+      "allowDowngrades": false,
+      "wix": {
+        "upgradeCode": "a734a8f6-b0f3-5c67-bcd1-c9b03553f7c5"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English"
+        ],
+        "customLanguageFiles": {
+          "English": "nsis/English.nsh"
+        }
+      }
     },
     "icon": [
       "icons/32x32.png",

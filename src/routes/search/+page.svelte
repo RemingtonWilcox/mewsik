@@ -4,10 +4,17 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import SourceIcon from '$lib/components/source-icon.svelte';
+	import SearchDiscoveryFeedView from '$lib/components/search/search-discovery-feed.svelte';
 	import * as api from '$lib/api/tauri';
-	import type { ExternalSearchResult } from '$lib/api/tauri';
+	import type {
+		ExternalSearchResult,
+		SearchDiscoveryFeed,
+		SearchDiscoveryItem
+	} from '$lib/api/tauri';
 	import { usePlayer, formatTime } from '$lib/state/player.svelte';
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { page } from '$app/state';
 	import { toast } from 'svelte-sonner';
 	import { Search, Play, Pause, Heart, Download, LoaderCircle, X, CheckCircle2 } from '@lucide/svelte';
 
@@ -30,7 +37,6 @@
 	let externalResults = $state<ExternalSearchResult[]>(searchState.results as ExternalSearchResult[]);
 	let searchingExternal = $state(false);
 	let loadingMore = $state(false);
-	let externalDebounceTimer: ReturnType<typeof setTimeout>;
 	let externalSearchRequest = 0;
 	let pendingExternalActions = $state<Record<string, 'play' | 'save' | 'download'>>({});
 	let savedIds = $state<Set<string>>(new Set());
@@ -38,8 +44,10 @@
 	let sidecarReady = $state(false);
 	let sidecarStartPromise: Promise<void> | null = null;
 	let activeExternalQuery = '';
-	let queuedExternalQuery = '';
-	let lastCompletedExternalQuery = searchState.results.length > 0 ? searchState.query : '';
+	let handledUrlQuery = '';
+	let completedExternalQuery = $state(
+		searchState.results.length > 0 ? searchState.query.trim() : ''
+	);
 	let sourcePreference = $state<SearchSourcePreference>(searchState.sourcePreference as SearchSourcePreference || 'all');
 	let loadMoreSentinel = $state<HTMLDivElement | null>(null);
 	let nextPageBySource = $state<Record<ProviderSource, number>>({
@@ -52,7 +60,8 @@
 		soundcloud: true,
 		bandcamp: true
 	});
-	let queueAppendGeneration = 0;
+	let discoveryFeed = $state<SearchDiscoveryFeed | null>(null);
+	let loadingDiscoveryFeed = $state(true);
 	let activeQueueSelection:
 		| {
 			recordingId: string | null;
@@ -69,19 +78,31 @@
 		| null = null;
 
 	const MIN_QUERY_LENGTH = 2;
-	const EXTERNAL_SEARCH_DEBOUNCE_MS = 520;
-
 	onMount(() => {
 		let disposed = false;
 		const cleanups: Array<() => void> = [];
+
+		void api.getSearchDiscoveryFeed()
+			.then((feed) => {
+				if (!disposed) discoveryFeed = feed;
+			})
+			.catch(() => {
+				if (!disposed) discoveryFeed = null;
+			})
+			.finally(() => {
+				if (!disposed) loadingDiscoveryFeed = false;
+			});
 
 		void ensureSidecarReady().catch(() => {
 			sidecarReady = false;
 		});
 
 		void api.listenExternalSearchPartial((payload) => {
-			if (disposed || payload.query !== query.trim()) return;
-			externalError = '';
+			if (
+				disposed ||
+				payload.request_id !== String(externalSearchRequest) ||
+				payload.query !== query.trim()
+			) return;
 			externalResults = mergeExternalResults(externalResults, payload.results);
 		}).then((unlisten) => {
 			if (disposed) {
@@ -92,8 +113,13 @@
 		});
 
 		void api.listenExternalSearchComplete((payload) => {
-			if (disposed || payload.query !== query.trim()) return;
+			if (
+				disposed ||
+				payload.request_id !== String(externalSearchRequest) ||
+				payload.query !== query.trim()
+			) return;
 			externalResults = payload.results;
+			completedExternalQuery = payload.query;
 		}).then((unlisten) => {
 			if (disposed) {
 				unlisten();
@@ -104,7 +130,7 @@
 
 		return () => {
 			disposed = true;
-			invalidateQueueAppender();
+			activeQueueSelection = null;
 			for (const cleanup of cleanups) {
 				cleanup();
 			}
@@ -117,6 +143,15 @@
 	$effect(() => { searchState.query = query; });
 	$effect(() => { searchState.results = externalResults; });
 	$effect(() => { searchState.sourcePreference = sourcePreference; });
+	$effect(() => {
+		const urlQuery = (page.url.searchParams.get('q') ?? '').trim().replace(/\s+/g, ' ');
+		if (urlQuery.length < MIN_QUERY_LENGTH || urlQuery === handledUrlQuery) return;
+		handledUrlQuery = urlQuery;
+		if (query.trim() === urlQuery && completedExternalQuery === urlQuery && externalResults.length > 0) {
+			return;
+		}
+		startNewSearch(urlQuery, false);
+	});
 	$effect(() => {
 		const selection = {
 			recordingId: player.state.current_recording_id,
@@ -139,7 +174,7 @@
 			selection.artist === activeQueueSelection.previous.artist;
 
 		if (!isActiveSearchSelection && !isPreviousSelectionWhileResolving) {
-			invalidateQueueAppender();
+			activeQueueSelection = null;
 		}
 	});
 
@@ -234,28 +269,60 @@
 		await sidecarStartPromise;
 	}
 
+	function formatExternalSearchError(error: unknown, hasResults: boolean): string {
+		const detail = error instanceof Error ? error.message : String(error ?? '').trim();
+		if (hasResults) {
+			return `Some music sources could not finish. Showing the results that did arrive${detail ? `: ${detail}` : '.'}`;
+		}
+		return `Search is unavailable${detail ? `: ${detail}` : ''}`;
+	}
+
+	function formatProviderWarning(failedSources: string[]): string {
+		const labels = [...new Set(failedSources)]
+			.map((source) => SOURCE_LABELS[source as ProviderSource] ?? source)
+			.sort();
+		const joined = labels.length > 2
+			? `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
+			: labels.join(' and ');
+		const verb = labels.length === 1 ? 'is' : 'are';
+		return `Some music sources could not finish. Showing the results that did arrive: ${joined || 'another provider'} ${verb} temporarily unavailable.`;
+	}
 
 	async function searchExternal(searchQuery = query.trim()) {
+		searchQuery = searchQuery.trim().replace(/\s+/g, ' ');
 		if (!searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return;
+		if (activeExternalQuery === searchQuery) return;
 
 		const requestId = ++externalSearchRequest;
+		activeExternalQuery = searchQuery;
 		searchingExternal = true;
 		externalError = '';
+		completedExternalQuery = '';
 		resetPaginationState();
 		try {
 			await ensureSidecarReady();
-			const results = await api.searchAllSources(searchQuery);
+			const response = await api.searchAllSources(searchQuery, String(requestId));
 			if (requestId === externalSearchRequest) {
-				externalResults = results;
-				externalError = '';
+				externalResults = response.items;
+				externalError = response.failed_sources.length > 0 && response.items.length > 0
+					? formatProviderWarning(response.failed_sources)
+					: '';
+				completedExternalQuery = searchQuery;
 			}
 		} catch (e) {
 			if (requestId === externalSearchRequest) {
-				externalResults = [];
-				externalError = `Search is unavailable${e ? `: ${e}` : ''}`;
+				// The managed provider process may have exited after it was first
+				// started. Force the next attempt to health-check it, and never erase
+				// useful partial results that arrived before another provider failed.
+				sidecarReady = false;
+				externalError = formatExternalSearchError(e, externalResults.length > 0);
+				completedExternalQuery = externalResults.length > 0 ? searchQuery : '';
 			}
 		} finally {
-			if (requestId === externalSearchRequest) searchingExternal = false;
+			if (requestId === externalSearchRequest) {
+				activeExternalQuery = '';
+				searchingExternal = false;
+			}
 		}
 	}
 
@@ -322,8 +389,30 @@
 		if (event.key !== 'Enter') return;
 		const trimmedQuery = query.trim();
 		if (trimmedQuery.length < MIN_QUERY_LENGTH) return;
+		startNewSearch(trimmedQuery, true);
+	}
+
+	function syncSearchUrl(searchQuery: string) {
+		handledUrlQuery = searchQuery;
+		void goto(`/search?q=${encodeURIComponent(searchQuery)}`, {
+			replaceState: true,
+			noScroll: true,
+			keepFocus: true
+		});
+	}
+
+	function startNewSearch(searchQuery: string, updateUrl: boolean) {
+		const nextQuery = searchQuery.trim().replace(/\s+/g, ' ');
+		if (nextQuery.length < MIN_QUERY_LENGTH) return;
+		query = nextQuery;
+		sourcePreference = 'all';
+		externalResults = [];
+		externalError = '';
+		completedExternalQuery = '';
 		currentPage = 1;
-		void searchExternal(trimmedQuery);
+		resetPaginationState();
+		if (updateUrl) syncSearchUrl(nextQuery);
+		void searchExternal(nextQuery);
 	}
 
 	function clearSearch() {
@@ -331,13 +420,24 @@
 		externalResults = [];
 		externalError = '';
 		searchingExternal = false;
+		completedExternalQuery = '';
+		activeExternalQuery = '';
 		currentPage = 1;
 		resetPaginationState();
 		externalSearchRequest += 1;
+		handledUrlQuery = '';
+		void goto('/search', { replaceState: true, noScroll: true, keepFocus: true });
+	}
+
+	function searchDiscoveryItem(item: SearchDiscoveryItem) {
+		const nextQuery = item.search_query.trim();
+		if (nextQuery.length < MIN_QUERY_LENGTH) return;
+
+		startNewSearch(nextQuery, true);
 	}
 
 	async function playExternalTrack(result: ExternalSearchResult) {
-		const generation = invalidateQueueAppender();
+		activeQueueSelection = null;
 		activeQueueSelection = {
 			recordingId: null,
 			source: result.source,
@@ -352,53 +452,16 @@
 		};
 
 		await runExternalAction(result, 'play', async () => {
-			// Play the clicked track immediately
-			const recordingId = await api.playExternal(
-				result.source,
-				result.source_id,
-				result.title,
-				result.artist,
-				result.duration_ms ?? undefined,
-				result.cover_art_url ?? undefined
+			const currentResults = pagedResults;
+			const clickedIndex = currentResults.findIndex(
+				(candidate) => externalResultKey(candidate) === externalResultKey(result)
 			);
-			if (generation !== queueAppendGeneration) return;
+			const context = clickedIndex >= 0 ? currentResults : [result];
+			const contextIndex = clickedIndex >= 0 ? clickedIndex : 0;
+			const recordingId = await api.playExternalContext(context, contextIndex);
 			if (activeQueueSelection) activeQueueSelection.recordingId = recordingId;
 			toast.success(`Playing: ${result.title}`);
-
-			// Queue the rest of the visible page in the background
-			const currentResults = pagedResults;
-			const clickedIndex = currentResults.findIndex(r => externalResultKey(r) === externalResultKey(result));
-			const tracksAfter = currentResults.slice(clickedIndex + 1);
-			if (tracksAfter.length > 0) {
-				// Fire and forget — don't block playback
-				void queueRemainingTracks(tracksAfter, generation);
-			}
 		});
-	}
-
-	function invalidateQueueAppender(): number {
-		activeQueueSelection = null;
-		return ++queueAppendGeneration;
-	}
-
-	async function queueRemainingTracks(tracks: ExternalSearchResult[], generation: number) {
-		for (const track of tracks) {
-			if (generation !== queueAppendGeneration) return;
-			try {
-				const recordingId = await api.ensureExternalRecording(
-					track.source,
-					track.source_id,
-					track.title,
-					track.artist,
-					track.duration_ms ?? undefined,
-					track.cover_art_url ?? undefined
-				);
-				if (generation !== queueAppendGeneration) return;
-				await player.addToQueue(recordingId);
-			} catch {
-				// Skip tracks that fail to resolve — don't break the queue
-			}
-		}
 	}
 
 	async function saveExternal(result: ExternalSearchResult) {
@@ -439,8 +502,12 @@
 				result.duration_ms ?? undefined,
 				result.cover_art_url ?? undefined
 			);
-			await api.downloadRecording(recordingId);
-			toast.success(`Download queued: ${result.title}`);
+			const started = await api.downloadRecording(recordingId);
+			if (started.already_active || !started.directory) {
+				toast.message(`Download already queued: ${result.title}`);
+			} else {
+				toast.success(`Download queued: ${result.title} · Saving to ${started.directory}`);
+			}
 		} catch (e) {
 			downloadedIds = new Set([...downloadedIds].filter(id => id !== key));
 			toast.error(`Failed to download: ${e}`);
@@ -558,6 +625,15 @@
 					{/if}
 				</button>
 			{/each}
+		</div>
+	{/if}
+
+	{#if externalError && externalResults.length > 0}
+		<div class="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2" role="status">
+			<p class="text-xs text-muted-foreground">{externalError}</p>
+			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
+				Retry missing sources
+			</Button>
 		</div>
 	{/if}
 
@@ -684,19 +760,35 @@
 				<span class="text-xs text-muted-foreground">End of results</span>
 			{/if}
 		</div>
+	{:else if searchingExternal}
+		<div class="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
+			<LoaderCircle class="size-5 animate-spin text-primary" />
+			<p>Searching YouTube, SoundCloud, and Bandcamp for “{query}”…</p>
+		</div>
 	{:else if externalError}
-		<p class="py-8 text-center text-sm text-destructive">{externalError}</p>
+		<div class="flex flex-col items-center gap-3 py-8 text-center">
+			<p class="max-w-xl text-sm text-destructive">{externalError}</p>
+			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
+				Retry search
+			</Button>
+		</div>
 	{:else if query.trim().length > 0 && query.trim().length < MIN_QUERY_LENGTH}
 		<p class="py-8 text-center text-muted-foreground">
 			Type at least {MIN_QUERY_LENGTH} characters to search.
 		</p>
-	{:else if query.trim().length >= MIN_QUERY_LENGTH}
+	{:else if query.trim().length >= MIN_QUERY_LENGTH && completedExternalQuery === query.trim()}
 		<p class="py-8 text-center text-muted-foreground">
 			No results for "{query}".
 		</p>
-	{:else}
-		<p class="py-8 text-center text-muted-foreground">
-			Search YouTube, SoundCloud, and Bandcamp from one place.
+	{:else if query.trim().length >= MIN_QUERY_LENGTH}
+		<p class="py-8 text-center text-sm text-muted-foreground">
+			Press Enter to search every music source.
 		</p>
+	{:else}
+		<SearchDiscoveryFeedView
+			feed={discoveryFeed}
+			loading={loadingDiscoveryFeed}
+			onselect={searchDiscoveryItem}
+		/>
 	{/if}
 </div>

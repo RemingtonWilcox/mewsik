@@ -1,474 +1,273 @@
-# mewsik visualizer handoff
-*Last updated: 2026-05-15*
-
-## TL;DR
-
-This repo is a Tauri 2 + SvelteKit music app with a WebGPU/WGSL visualizer. The goal is still **label-grade procedural release visualizers**: real 3D space, procedural growth, musical phrasing, drops/builds/hooks/bridges, and visuals that feel authored instead of like a spectrum toy.
-
-Important repo status (updated 2026-06-09):
-- All visualizer work (director v2, unified runtime + six motifs, mk2 AAA pass) is now **merged to `main` and pushed** — `main` == `origin/main` at `a135e82`.
-- The `visualizer-runtime` and `visualizer-lab` branches no longer exist; everything below describing them as local-only is historical.
-- Recent `main` work beyond the visualizer: radio station reliability hardening (self-healing URLs via radio-browser UUID, playlist unwrapping).
-- The art-direction targets, anti-targets, and architectural axioms in this doc remain current.
-
-Current direction:
-- The visualizer now has `auto`, `mk1`, `mk2`, `mk3`, and `runtime`.
-- The product direction remains a **unified visual runtime**: motifs/passes inside one directed WebGPU system, not separate visual states cross-faded on top of each other.
-- Director v2 is now modular under `src/lib/visualizer/director/` and emits clock/drop/palette/structure intent.
-- Unified runtime lives under `src/lib/visualizer/runtime/` with motif modules for atmosphere, reaction-diffusion, attractor, mandala, physarum, and flowfield.
-
-## User target
-
-Direct target language from the session:
-- "official visualizers for top record labels"
-- "actual 3D space, cohesive motions and designs and fractals and patterns and storytelling and audio reactive"
-- "real life reactive living organism type vibe"
-- "continuously grow and expand and evolve ... molecule by molecule frame by frame"
-- identify and react to "chorus, bridge, hook, drop, buildup" in real time
-- eventually support many visual families, up to mk10-style variety, but as one cohesive procedural system
-
-Explicit anti-targets:
-- Centered orb / radial bars / Winamp spectrum.
-- Presets that look like unrelated layers stacked with blend modes.
-- A single rotating SDF object that never truly changes.
-- Motion that continues in silence like an embedded metronome.
-- Random fog/glow slapped over the real subject.
-- Bright particle spam without composition, intent, phrasing, or depth.
-
-## Session update - 2026-05-15
-
-### Current local branch state
-
-- Active branch: `visualizer-runtime`.
-- Recent runtime commits already on branch:
-  - director v2: clock, Yadati-style drop anticipation, Tonnetz palette, structure FSM
-  - unified runtime skeleton with shared director uniform, feedback bank, bloom/composite
-  - runtime motifs: atmosphere, physarum, flowfield, reaction-diffusion, attractor, mandala
-  - lab manual motif sliders / solo buttons
-- This session continued from a cutoff while fixing black screens and WebGPU validation failures.
-
-### Bugs fixed in this repair pass
-
-- mk2 black screen:
-  - Chrome reported WGSL parse error: cannot assign to swizzled lvalue at `q.xz = rot2(...)`.
-  - Fixed in `src/lib/components/visualizer/visualizer-mk2.svelte` by rotating through temp vectors and writing components individually.
-- runtime black screen:
-  - Chrome reported invalid command buffers after shader/pipeline validation failures.
-  - Fixed `attractor.ts` and `flowfield.ts` by splitting compute shaders (`var<storage, read_write>`) from render shaders (`var<storage, read>`). WebGPU forbids read/write storage bindings in vertex stages.
-- runtime black stair-step artifact:
-  - Root cause was undefined WGSL math in `mandala.ts`: `pow(cos(...), 4.0)` can NaN when cosine is negative, plus reversed `smoothstep` edges.
-  - Fixed mandala fold/wrapping with `fract`, replaced negative-base `pow`, and corrected radial falloff.
-  - Also corrected reversed `smoothstep` calls in atmosphere.
-- runtime washed-out stacking:
-  - Motif weights were previously only an on/off gate; every nonzero motif rendered full strength.
-  - Updated motif pipelines to use WebGPU constant blend factors and `setBlendConstant(weight)` so runtime/manual slider weights actually scale output.
-  - Reduced bloom threshold/intensity, lowered flowfield edge sprite size, and tightened auto weights so one or two motifs lead per section instead of all six stacking at once.
-
-### Verification after repair
-
-- `pnpm check` passes with 0 errors / 0 warnings.
-- `pnpm build` passes.
-- Playwright + Chrome WebGPU smoke loaded `mk2`, `mk3`, and `runtime` at `/visualizer-test` with no visible error overlays and no WGSL/WebGPU console errors.
-- Final smoke screenshots were written to:
-  - `tmp/mk2-smoke-postrepair.png`
-  - `tmp/mk3-smoke-postrepair.png`
-  - `tmp/runtime-smoke-postrepair.png`
-  - `tmp/runtime-after-policy-auto.png`
-
-### Remaining critique
-
-- Runtime is stable and visible, but it is still visually early. It now shows a coherent attractor/mandala subject instead of a black screen, but palette/contrast/composition still need art direction.
-- mk2 is loading and visually stronger than before, but true Lomas-style organism growth/memory is still future work.
-- mk3 is loading and distinct as a particle traversal, but it still needs richer foreground/background composition and stronger musical structural events.
-
-## Session update - 2026-05-13
-
-### Git/GitHub audit
-
-- Verified local `HEAD`, `origin/main`, and `origin/HEAD` all point at `700f410 feat(visualizer): Mark I - 4-preset audio-reactive WebGPU pipeline`.
-- This means the GitHub version has not received the mk2/mk3/director/lab work.
-- Working tree is dirty and contains the active local visualizer work:
-  - Modified: `.gitignore`
-  - Modified: `src/lib/components/visualizer/visualizer.svelte`
-  - Modified: `src/lib/state/visualizer.svelte.ts`
-  - Modified: `src/routes/+layout.svelte`
-  - Modified: `src/routes/visualizer-test/+page.svelte`
-  - Untracked: `HANDOFF.md`
-  - Untracked: `src/lib/components/visualizer/visualizer-host.svelte`
-  - Untracked: `src/lib/components/visualizer/visualizer-mk2.svelte`
-  - Untracked: `src/lib/components/visualizer/visualizer-mk3.svelte`
-  - Untracked: `src/lib/visualizer/`
-
-### App shell / lab isolation
-
-- Updated `src/routes/+layout.svelte` so `/visualizer-test` renders only the lab page and does not mount the full app shell, sidebar, playerbar, command search, or visualizer host.
-- This fixes the lab feeling like the whole mewsik player is leaking into the test surface.
-- The normal app routes still render the full shell.
-
-### Visualizer state / host
-
-- Updated `src/lib/state/visualizer.svelte.ts`:
-  - Engine type now supports `'auto' | 'mk1' | 'mk2' | 'mk3'`.
-  - `VISUALIZER_ENGINES` includes `auto`.
-  - Engine selection is persisted to `localStorage` under `mewsik.visualizer.engine`.
-- Added `src/lib/components/visualizer/visualizer-host.svelte`:
-  - Hosts mk1/mk2/mk3.
-  - Supports explicit engine locks and `auto`.
-  - In `auto`, it uses the visual director to choose the active render engine:
-    - silence -> mk1
-    - peak/high energy -> mk3
-    - rising/motion -> mk2
-    - otherwise motif-guided mk1/mk2
-
-### Shared visual director
-
-- Added `src/lib/visualizer/visual-director.ts`.
-- It converts raw audio features into higher-level art direction:
-  - `section`: calm/rising/peak/releasing
-  - `motif`: organism/tunnel/lattice/ribbon
-  - `motifIndex`
-  - `silence`
-  - `energy`
-  - `density`
-  - `motion`
-  - `paletteBase`
-  - `paletteAccent`
-  - `structure`
-  - `phrase`
-- This is the important architectural bridge. Future visual systems should consume this shared director rather than each mk inventing its own unrelated state machine.
-
-### Visualizer lab page
-
-- Updated `src/routes/visualizer-test/+page.svelte`.
-- Engine buttons now include `auto`, `mk1`, `mk2`, `mk3`.
-- Hotkeys:
-  - `a` -> auto
-  - `q/w/e` -> mk1/mk2/mk3
-  - `0` -> auto preset
-  - `1-4` -> mk1 preset force
-- The lab renders only one visualizer component at a time and passes `showHud={false}` so HUD/chrome is not duplicated.
-- Synthetic signal is on by default for lab work.
-- Fixed the synthetic signal toggle so it actually changes the feature source:
-  - synthetic on -> generated arrangement features
-  - synthetic off with no analyzer -> silent features
-  - file/URL load -> real analyzer features
-- Synthetic signal now simulates a 48-second musical arrangement with evolving BPM, phrase, build, drop, release, RMS, onset, bass/mid/treble, chroma, and 64 bins.
-
-### mk1 cleanup
-
-- Updated `src/lib/components/visualizer/visualizer.svelte`:
-  - Added optional `showHud` prop.
-  - HUD only renders when requested.
-  - Overlay element now has button semantics and an aria label to satisfy Svelte accessibility checks.
-- mk1 remains useful for A/B and fallback, but it is not the desired final aesthetic.
-
-### mk2 redesign pass
-
-File: `src/lib/components/visualizer/visualizer-mk2.svelte`
-
-Current intent:
-- A procedural 3D organism / Mandelbulb hybrid with volumetric depth.
-- It should feel like something living, growing, accumulating tension, and changing shape through a song.
-
-Work completed:
-- Added shared director consumption.
-- Added director-driven `growth` and `tension` uniforms.
-- Added safer Mandelbulb math:
-  - guarded radius in the distance estimator
-  - guarded derivative denominator
-  - `safeNormalize` in WGSL normals/lights to prevent NaN artifacts
-- Added organism-specific SDF shaping:
-  - `organismWarp`
-  - smooth unions
-  - tendril lanes
-  - cavities
-  - surface ripple
-  - section/emission behavior tied to growth/tension
-- Reduced the detached spectrum glow/particle overlay so it does not dominate the organism.
-- Pulled camera/framing back so the subject reads better.
-- Reduced some fog/shaft dominance.
-
-Current mk2 critique:
-- It has strong potential, but the glow/organism relationship still feels too detached.
-- The organism needs deeper procedural "biology": growth, memory, mutation, branching, tension release, chorus/drop behavior, and track-specific variation.
-- The remaining work is not polish only. mk2 should be redesigned around organism behavior and composition, with the Mandelbulb acting as one material/structure source rather than the whole visual idea.
-
-### mk3 redesign pass
-
-File: `src/lib/components/visualizer/visualizer-mk3.svelte`
-
-Current intent:
-- GPU compute particle traversal through authored 3D fields.
-- It should feel like moving through a living generated world, not particle spam.
-
-Work completed:
-- Added shared director consumption.
-- Recentered and restrained the camera:
-  - reduced lateral wobble
-  - reduced look drift
-  - reduced roll
-- Reduced full-screen fog/sky overlay so particles and structure read better.
-- Brightened particle rendering after a too-dim pass.
-- Added director-driven motif/topology behavior:
-  - organism
-  - tunnel
-  - lattice
-  - ribbon
-- Added director-driven flow strength, point size, spawn spread, radial pull, palette offset, and phrase shaping.
-- Kept particle count around 70k for the current test surface.
-
-Current mk3 critique:
-- It is less busted than before, but still needs real art direction.
-- It needs stronger composition, more meaningful topology differences, better foreground/background layers, and audio-triggered structural changes.
-- The traversal idea is good; the content being traversed needs to become more authored and musically legible.
-
-### Windows / universal direction
-
-- This local Windows workspace has the app running and building with the visualizer lab.
-- The goal is to turn this into a universal code path that works on Windows and macOS, then push it back to GitHub.
-- Need to preserve macOS behavior while adding/validating Windows support. Do not let the visualizer branch become a Windows-only fork.
-
-### Verification completed
-
-Commands passed after the visualizer changes:
-
-```pwsh
-pnpm check
-pnpm build
-cargo check --manifest-path src-tauri/Cargo.toml
-```
-
-Known existing Rust warnings during `cargo check`:
-- `src/keychain.rs:51` unused imports: `delete_credential`, `get_credential`, `store_credential`
-- `src/audio/analyzer.rs:158` assigned value `sr` is never read
-
-Browser smoke status:
-- Dev server was run at `http://127.0.0.1:5174/visualizer-test`.
-- Playwright/Chrome smoke tests loaded mk2/mk3/auto with WebGPU flags.
-- No page errors, WebGPU errors, WGSL errors, or console errors were seen in the smoke passes.
-- Screenshots were written under `tmp/`, including mk2/mk3/auto smoke captures.
-
-## Architecture history
-
-### Pre-session state
-
-- Tauri 2 app, Rust backend, SvelteKit frontend.
-- WebGPU/WGSL visualizer already shipped.
-- Rust audio analyzer with FFT bins, RMS, peak, centroid, onset, bass/mid/treble.
-- Tagged `visualizer-mk1` at commit `700f410`.
-
-### Mark I - post-stack pipeline
-
-File: `src/lib/components/visualizer/visualizer.svelte`
-
-Built the existing visualizer into four presets:
-- Hyperbolic kaleidoscope / Truchet variants.
-- Cathedral flythrough volumetric lattice.
-- Voronoi caustics.
-- Nebula flow.
-
-Added:
-- Scene -> feedback -> bloom -> composite pipeline.
-- Browser analyzer features: BPM, chroma, beat phase.
-- Per-song seed reset.
-- Onset-triggered variety.
-- Preset blending experiments.
-
-Verdict:
-- Useful technically, but too centered/radial/kaleidoscopic for the target.
-- Kept as mk1 fallback and A/B reference.
-
-### Mark II - SDF / organism / volume
-
-File: `src/lib/components/visualizer/visualizer-mk2.svelte`
-
-Built around:
-- Mandelbulb distance estimator.
-- Volumetric raymarch.
-- Camera waypoints.
-- Bloom, temporal blur, ACES, grain, iridescence.
-- Section state machine.
-- Later redesigned toward an organism SDF with director-driven growth/tension.
-
-Verdict:
-- Highest immediate visual potential.
-- Needs a ground-up behavior model so it grows, mutates, breathes, and reacts to musical form.
-
-### Mark III - GPU compute particle traversal
-
-File: `src/lib/components/visualizer/visualizer-mk3.svelte`
-
-Built around:
-- GPU storage-buffer particles.
-- Init/sim compute passes.
-- Curl-noise flow.
-- Species variation.
-- Silence gating.
-- Camera traversal through a tube/field.
-- Particle recycling ahead of camera.
-- Director-driven topology/motif selection.
-
-Verdict:
-- Good traversal foundation.
-- Needs more thoughtful scene grammar, layering, topology, and musical event behavior.
-
-## Next major direction
-
-### 1. Build the unified visual runtime
-
-The next architecture should stop treating `mk1`, `mk2`, and `mk3` as separate modes. Build a unified runtime where the director drives one coherent scene:
-
-- One host/runtime surface, likely `visualizer-unified.svelte` or a set of shared runtime modules.
-- One shared `VisualDirectorFrame` per animation frame.
-- Render passes as cooperating systems:
-  - atmosphere/background
-  - organism/SDF/mesh structure
-  - particles/agents/trails
-  - post stack/bloom/composite
-  - camera choreography
-- Motifs are parameterized systems, not full component swaps.
-- Transitions happen by morphing parameters and weights inside the scene, not by overlaying unrelated renders.
-- The goal is eventually mk10-style variety, but internally that should mean 10 motif families in one language, not 10 stacked visualizers.
-
-### 2. Expand the director into music intelligence
-
-The director should become the canonical place for musical interpretation:
-
-- Better section detection: intro, verse, pre-chorus/build, hook/chorus, bridge, drop, release/outro.
-- Drop anticipation, not just drop reaction.
-- Phrase memory over 4/8/16 bars.
-- Chroma self-similarity for repeated sections.
-- Onset density and RMS deltas for build/release curves.
-- Timbre/centroid/spectral flatness for texture changes.
-- Optional vocal/formant hints later.
-- Track seed and per-section seed so visuals have identity without feeling random.
-
-### 3. Redesign mk2 as the organism system
-
-Keep the successful direction but make it more intentional:
-
-- Replace detached glow with integrated internal light, veins, membranes, and cavities.
-- Add multiple organism families:
-  - coral growth
-  - tendon/strand bundles
-  - chrysalis shell
-  - lattice bone
-  - cellular membrane
-  - crystalline fracture
-- Give the organism memory:
-  - peaks leave scars/ridges
-  - builds inflate or branch
-  - drops split, bloom, or expose interior structure
-  - quiet sections contract and reveal detail
-- Use audio bands as behavior inputs:
-  - bass -> mass, pressure, camera push
-  - mids -> growth direction and articulation
-  - treble -> surface detail, sparks, filaments
-  - chroma/key -> structural symmetry/palette pressure
-- Keep SDF safety checks. Watch for NaN/black-square tile artifacts.
-
-### 4. Redesign mk3 as the traversal/particle system
-
-Make mk3 less like particles in fog and more like traveling through authored procedural space:
-
-- Add true foreground/background particle layers.
-- Make topologies visually distinct:
-  - tunnel should read as tunnel
-  - lattice should read as lattice
-  - ribbon should read as ribbon
-  - organism should interlock with mk2 structure
-- Drive spawn zones from FFT bins rather than one global density value.
-- Add visual memory/trails from past peaks.
-- Add camera events:
-  - build -> forward acceleration
-  - drop -> banking turn or snap-through
-  - bridge -> slow drift / negative space
-  - chorus/hook -> recurring motif return
-- Keep camera readable. Avoid off-center fog overlays and random brightness spam.
-
-### 5. Productize for GitHub and both platforms
-
-Before pushing:
-
-- Create a feature branch from this local working tree.
-- Stage the untracked visualizer files intentionally.
-- Commit the current visualizer lab/director/host changes.
-- Decide whether `HANDOFF.md` should be committed or kept local. If committed, make it a useful project doc, not just session notes.
-- Run:
-  - `pnpm check`
-  - `pnpm build`
-  - `cargo check --manifest-path src-tauri/Cargo.toml`
-  - Windows Tauri build
-  - macOS Tauri build on a Mac
-- Update docs for Windows development/building if needed.
-- Push branch and open a PR against GitHub `main`.
-
-## Current repo layout
-
-Important files:
-
-- `src/routes/+layout.svelte` - app shell, with `/visualizer-test` lab isolation.
-- `src/routes/visualizer-test/+page.svelte` - visualizer lab, engine buttons, audio file/URL input, synthetic signal.
-- `src/lib/state/visualizer.svelte.ts` - visualizer singleton store and persisted engine state.
-- `src/lib/visualizer/visual-director.ts` - shared music-to-visual-intent director.
-- `src/lib/components/visualizer/visualizer-host.svelte` - app host for mk1/mk2/mk3/auto.
-- `src/lib/components/visualizer/visualizer.svelte` - mk1 post-stack visualizer.
-- `src/lib/components/visualizer/visualizer-mk2.svelte` - mk2 organism/SDF/volume visualizer.
-- `src/lib/components/visualizer/visualizer-mk3.svelte` - mk3 GPU compute particle traversal visualizer.
-- `src/lib/audio/web-analyzer.ts` - browser-side analyzer for lab mode.
-- `src-tauri/src/audio/analyzer.rs` - Rust FFT analyzer.
-
-## Useful commands
-
-```pwsh
-# Check current repo relationship to GitHub
-git status --short
-git log --oneline --decorate --max-count=8 --all
-
-# Lab dev server
-pnpm dev -- --host 127.0.0.1 --port 5174
-# Open http://127.0.0.1:5174/visualizer-test
-
-# Frontend checks
-pnpm check
-pnpm build
-
-# Rust/Tauri check
-cargo check --manifest-path src-tauri/Cargo.toml
-
-# Full Windows Tauri build
-pnpm tauri:build --bundles nsis
-```
-
-Known Windows install gotcha:
-
-```pwsh
-# NSIS silent install /S has skipped overwriting mewsik.exe before.
-# If needed, kill the app and direct-copy the built exe.
-Copy-Item src-tauri/target/release/mewsik.exe C:/Users/og10ktech/AppData/Local/mewsik/mewsik.exe -Force
-```
-
-## Known issues / gotchas
-
-- `origin/main` does not include the current visualizer lab work yet.
-- `HANDOFF.md`, mk2, mk3, host, and `src/lib/visualizer/` are currently untracked unless staged later.
-- WGSL `layout: 'auto'` can prune unused bindings. Every declared binding must be reachable from the entry point.
-- WebGPU shader NaNs can show up as black/tiled artifacts. Guard normalizations, logs, divisions, and distance-estimator edge cases.
-- mk2 still has an art-direction problem: detached glow vs organism. The next pass should integrate light/material/growth, not just tweak bloom.
-- mk3 still has an art-direction problem: centered traversal is better, but the particle field needs stronger structure, layers, and music-driven scene grammar.
-- Synthetic signal now works, but it is still only a test arrangement. Real audio files remain the important validation path.
-- The current auto mode switches components. The final auto mode should drive one unified runtime.
-
-## Architectural axioms
-
-1. Single SDF equals one manifold; the eye reads one object no matter how polished it is.
-2. Cross-fading unrelated generators reads as visual slop. Morph parameters inside a shared language instead.
-3. Audio should drive many small behaviors across many systems, not one giant brightness knob.
-4. Fast audio features should trigger events; slow features should steer mood, palette, and structure.
-5. Silence must be visually quiet.
-6. Good visualizers need composition and negative space, not just more particles or more glow.
-7. The director should own musical interpretation. Renderers should consume intent.
-
-## Resume one-liner
-
-Read `HANDOFF.md`, run `git status --short` and `git log --oneline --decorate --max-count=8 --all`, then open `http://127.0.0.1:5174/visualizer-test`. Continue by turning mk1/mk2/mk3 into a unified director-driven runtime, starting with mk2 organism behavior and mk3 traversal structure, then prepare the local Windows-tested branch for GitHub.
+# mewsik project handoff
+
+_Last updated: 2026-07-14_
+
+## Product direction
+
+The visualizer now has three named, deliberate roles:
+
+- **Prism** (`mk1`) is rhythmic geometry and the production impact anchor.
+- **Soma** (`mk2`) is a living fractal focused on cinematic evolution.
+- **Signal** (`signal`) is the audio-first phosphor score built around one crisp trace, controlled persistence, transient echoes, and negative space.
+
+The former Mk3 particle plane and layered Runtime were removed. Git history is the archive for those experiments.
+
+## Active implementation
+
+- Branch: `codex/visualizer-rebuild`
+- Approved pre-shell checkpoint: `ac6886d feat: give Mk2 a musical lifecycle`
+- Approved instrument-shell checkpoint: `881991c feat: unify visualizer instrument controls`
+- Approved project-surface checkpoint: `e6730fa feat: rebuild discovery and product surfaces`
+- Engine order: `mk1 -> mk2 -> signal`
+- Saved `auto`, `runtime`, or unknown selections migrate to `mk1`.
+- Saved `mk3` selections migrate to `signal`.
+- The visualizer lab at `/visualizer-test` exposes only Mk1, Mk2, and Signal, with synthetic/real audio input and live analysis diagnostics.
+
+### Production instrument shell
+
+Production now mounts one renderer plus one shared host-owned control layer. The renderers no longer stack their own close targets, names, telemetry, and shortcut text over the artwork.
+
+- A compact top rail names Prism, Soma, and Signal and exposes previous/next arrows, details, hide, and close controls.
+- `Left` / `Right` cycle with wrapping, `I` toggles details, `H` hides/reveals controls, and `Escape` closes. The old `V` shortcut is retired.
+- Clicking empty artwork toggles the chrome instead of accidentally closing the visualizer.
+- Details show the engine's role, live section, tempo, and one engine-specific state without exposing lab diagnostics.
+- Shared **Calm**, **Flow**, and **Surge** response profiles scale each engine around its authored identity. Flow is exactly neutral; Soma glides response changes to prevent camera jumps.
+- The rail and player bar now share one 2.2-second idle clock and one 250 ms fade, so they disappear and return together instead of behaving like unrelated overlays.
+- Pointer activity wakes the chrome only from the Mewsik surface. Hover, focus, dragging, and open details hold both layers visible; leaving the app hides auto chrome.
+- Manual **Hide** is a real locked state: ordinary mouse movement and engine switching cannot undo it. `H`, `I`, or an explicit stage click reveals it again.
+- The engine rail is capped at 26 rem and 40 px tall so it reads as a compact instrument switcher rather than a second player bar.
+- Opening moves focus into the overlay, closing restores the player-bar opener, and covered app content becomes inert while the visualizer is active. The player bar remains available.
+- Command search is suppressed while the visualizer owns the screen, avoiding a focused dialog behind the GPU surface.
+- Desktop and 390 px mobile layouts were visually inspected in a real Chromium WebGPU session; the browser console reported zero errors.
+
+### Shared musical journey
+
+One CPU-only `VisualizerJourneyRuntime` owns the director, adaptive spectrum, Signal conductor, and Mk2 conductor. It advances once per analyzer or silence tick and remains alive while the visualizer overlay is active, including time spent rendering Mk1. Signal and Mk2 therefore re-enter the current arrangement instead of restarting their intro state when engines are cycled. Their GPU devices, textures, buffers, canvases, and feedback history still mount and tear down independently.
+
+Canonical source identity includes source type, recording, URL, and station, plus a monotonic source epoch so A -> B -> A cannot reuse stale temporal state. Source changes clear the CPU journey and renderer feedback in the same frame. Closing the entire overlay intentionally stops the native analyzer subscription; continuous live-audio journey tracking resumes when the overlay is opened again.
+
+### Prism
+
+Prism's performance and determinism foundation is now in place:
+
+- one reusable request-animation-frame scheduler advances at a fixed 60 Hz instead of creating timing state inside each frame;
+- its internal canvas is capped at 1920 x 1080 pixels even on larger or high-DPI displays;
+- scene choices use the shared journey seed and source epoch, so switching engines or returning A -> B -> A follows the current musical journey instead of starting a new random loop;
+- onset decisions are deterministic and latched per onset rather than rerolled with `Math.random()` during rendering; and
+- canvas diagnostics expose the fixed frame-rate and internal-pixel budgets, while focused runtime tests cover backing-size, scheduler, and deterministic-event behavior.
+
+### Mk2
+
+Mk2 keeps its volumetric Mandelbulb identity but now:
+
+- renders at a true 60 FPS cap and 72% internal scale;
+- removes the nested fog shadow raymarch that caused multiplicative shader work;
+- uses 48 primary ray steps and 6 fractal iterations for normal shots, rising to 56 steps and 7–8 iterations only during elected macro studies, plus 5 shadow probes and 2 AO probes;
+- shares Signal's musical analysis and adds a dedicated slow conductor with six continuous lifecycle forms: seed, sprout, winding, bloom, shedding, and dormancy;
+- replaces the hidden hair-thin tendrils with four thick external limbs/buds, a localized bass root, an exterior-intersecting cavity, and coherent shed fragments while retaining one Mandelbulb evaluation;
+- routes sub/kick to root mass, body/mids to elongation/lobes/folds, presence/air to ridges/filaments/erosion, and signed spectral travel to anatomical lean and deformation flow;
+- crossfades waxy, wet-organic, taut/chitinous, crystalline, porous, and dormant material identities while evolving palette warmth, reflection, roughness, and lighting arrangement with lifecycle, harmony, and spectral character;
+- treats density as body pigment/substance rather than opacity, with a tested `0.30` floor so no lifecycle can collapse into a white ghost shell;
+- activates the previously dormant density, ridge, and iridescence rails, adds one stable hit-time skin octave, and recovers pale or neutral palette stops into noise-varied lifecycle pigment before lighting;
+- keeps geometric lighting normals and confines the extra material octave to pigment and roughness, avoiding both a detached texture overlay and the four-noise finite-difference cost of a bump-normal pass;
+- preserves crevice depth while giving diffuse pigment an AO floor, and rebalances crystal/porous stages so reflection, rim, and specular energy cannot erase the organism's body color;
+- turns near-surface fog into a density/erosion/cavity exchange: dense tissue clears its silhouette while shedding transfers substance into the atmospheric current;
+- lets suspense foreshadow upcoming splits and erosion in the background while accelerating only a forward-integrated flow phase, so the current never rewinds when tension releases;
+- expands, contracts, sprouts, winds, blooms, hollows, sheds, turns, and punches with bounded motion instead of reacting independently to every beat;
+- uses impact as a restrained lower-anatomy material response instead of camera shake, scale jolts, full-frame flashes, or an emissive surface decal;
+- replaces the white-dot particle aura and flickering grain with one world-space atmospheric current, camera parallax, and a dark pocket behind the organism;
+- lets that same atmospheric current split during bloom and fray during shedding instead of remaining a static backdrop;
+- replaces the stop/start Catmull-Rom waypoint loop with one seeded continuous camera drift, then lets sustained musical detail elect rare smooth close studies with independent zoom, azimuth, elevation, framing, and macro fidelity rails;
+- removes the diagonal vein/emission mask, direct FFT-to-albedo bands, procedural SDF corrugation, chromatic aberration, and anamorphic streaks; one geometry-bound pore field and analytic colored reflections now follow the actual surface;
+- reduces the render graph from nine passes to eight and removes the particle pipeline, particle textures, upload, and pass completely;
+- keeps a stable per-track palette family while continuously moving through its colors and glides through section-aware framing rather than hard-cutting or snapping;
+- exaggerates lifecycle anatomy without adding another fractal evaluation: seed compacts, sprout bends and stretches, winding compresses/twists, bloom opens into broader lobes and buds, shedding exposes a larger cavity and fragments, and dormancy settles into a flattened shell;
+- gives the atmospheric current lifecycle-specific width, splitting, and breakup so the background and body visibly foreshadow and trade substance with one another;
+- recovers pigment more aggressively through pale palette moments and caps diffuse washout, allowing white to remain a highlight instead of becoming the whole low-opacity body;
+- performs complete pending-init and GPU-resource cleanup.
+
+### Signal
+
+Signal is a new WebGPU renderer, not a modification of old Mk3. It uses:
+
+- one dominant Lissajous/vector trace;
+- decoded spectral residuals for selective bass body, mid deformation, treble detail, and controlled onset echoes;
+- continuous tempo-integrated spectral travel, eased phrase asymmetry, and slow one-to-two-bar topology evolution;
+- section progress, energy slope, lookahead, track progress, suspense, and release to make arrangements coast through a song instead of repeating a beat loop;
+- separate short ring-out and sustained openness controls so impacts decay without flattening the larger musical arc;
+- restrained cyan/green color with brief warm transient accents;
+- two feedback textures and two render passes;
+- a 60 FPS cap, 75% internal scale, and a 1080p internal pixel ceiling;
+- no compute simulation, particle field, bloom pyramid, or blended motif stack.
+
+The current analyzer exposes mono spectral features rather than raw stereo samples, so Signal is vectorscope-inspired rather than a literal stereo phase scope.
+
+### Discovery, search, stations, and settings
+
+The product surfaces were rebuilt around explicit jobs instead of overlapping dashboards.
+
+- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial with a credential-free shared snapshot for YouTube and Last.fm. GitHub Actions owns the optional provider keys and publishes only normalized public chart batches to GitHub Pages; ordinary listeners never create or paste keys.
+- The hosted endpoint is pinned to `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json`. The client accepts schema v1 only, allowlists the two hosted source IDs and provider URL hosts, caps the response at 2 MiB and 200 items per source, validates timestamps/cadences, and rejects unknown, malformed, future-dated, or over-age content.
+- The publisher runs hourly while preserving each provider's cadence: YouTube refreshes hourly and Last.fm every four hours. A recent prior batch is `cached`; a failed refresh can be `stale` for at most three cadences; absent credentials or expired fallback data is `unavailable`. The desktop preserves these delivery labels instead of relabeling hosted data as live.
+- Apple, ListenBrainz, and Bandcamp remain direct public inputs. Personal library history, interactions, taste profile, and final ranking remain local and are never uploaded to the public snapshot.
+- Cold Search and Discover loads now show an accessible staged status panel with real elapsed time and an indeterminate progress bar. Apple territories refresh concurrently and remain deterministically ordered, reducing their worst-case cold delay from four serial request windows to one.
+- Every source has bounded requests, a declared refresh cadence, typed track/release/editorial records, stable provider IDs, and separately stored listeners, plays, views, and likes. A stale Bandcamp feed is rejected instead of presented as current.
+- Source cadences are enforced independently: a one-hour YouTube refresh does not re-fetch daily ListenBrainz releases or four-hour Apple charts. Missing Apple territories can be filled from their own recent saved frame without relabeling the partial response as complete.
+- Canonical entities, external IDs, source observations, snapshots, and interaction events live in dedicated SQLite tables. External-ID collisions fail atomically instead of silently merging unrelated music.
+- Observation history keeps the latest 48 coherent frames per source/scope, interaction events expire after 400 days, and orphaned provider entities are cleaned up so hourly refreshes cannot grow the database forever.
+- Shelves have distinct jobs: **Top now**, **Moving fast**, **New and worth a look**, **For you**, **Outside your bubble**, and **Editors found this**. Personal shelves remain absent until the five-qualified-track profile boundary is met.
+- **Moving fast** is never fabricated on the first sample. It appears only after a saved prior observation proves rank or audience growth. Apple markets count as one source family, so four regional charts cannot fake independent-source agreement.
+- Fresh releases need actual traction, editorial support, or taste affinity; a zero-play release dump cannot fill the page. Entity and lead-artist caps prevent one artist and their collaborations from consuming a shelf, while known group names are preserved.
+- Each card exposes one plain-English reason, such as chart rank, release age, measured movement, or editorial origin. Source health is visible as live, cached, or unavailable, with a persistent snapshot and one-minute forced-refresh guard.
+- Healthy source data stays cached by source cadence, while failed refreshes fall back to recent observations, then the last saved feed, then explicitly labeled static picks. Stale data is never relabeled as live.
+- Selecting a discovery card writes `/search?q=...` and runs the normal YouTube, SoundCloud, and Bandcamp search exactly once. The page keeps its loader visible while providers work, preserves partial results, exposes provider failures with Retry, and only says **No results** after a conclusive completed search.
+- Discovery clicks are recorded with item, shelf, and snapshot IDs for future ranking evaluation. A click remains a click; it is not mislabeled as a save, completed listen, or recommendation success.
+- External search validates queries and provider names, rejects malformed sidecar responses, and no longer converts total provider failure into a fake successful empty result. Incomplete failures are not cached.
+- Packaged Windows search no longer passes Node the verbatim `\\?\` canonical entry-script path that made Node exit with `EISDIR` before any provider could answer. The script remains canonicalized and security-checked first, then receives a normal Windows child-process argument.
+- Search-sidecar requests are isolated by process generation, restart once only for real transport failures, and retain successful provider results when another provider is down. Opaque request tokens prevent delayed events from an older search or retry from overwriting the current results.
+- Release builds now keep a bounded native log with sidecar spawn, restart, exit, and retirement evidence, so future packaged-only failures can be diagnosed from the real installed process instead of guessed from a browser mock.
+- Discover now has three honest states: useful onboarding with no library, qualified-listen profile progress, and a personal rotation once enough listening exists. Thirty seconds of actual audible time drives affinity, history, rediscovery, and play statistics; paused time and short skips do not tune the profile.
+- Playback history now separates track length from audible listening time and records why a play ended. Natural end, stop, next/previous, source replacement, errors, and shutdown are finalized distinctly and idempotently; only a natural end is a completion.
+- Playback errors carry their originating session ID, so a late failure from an old asynchronous fetch cannot stop or falsely finalize the newer song that replaced it.
+- Schema migrations and their version markers now commit in one transaction. A crash between `ALTER TABLE` and the marker rolls the schema back cleanly instead of leaving the next launch stuck on a duplicate column.
+- Discover provides a stable local rotation, recent listening, long-unplayed saves, and a permanent **Beyond your library** search-inspiration shelf. Refresh remains deterministic until the listening history actually changes.
+- The learning boundary is canonical end to end: five distinct tracks listened to for at least 30 seconds. Repeating one track five times no longer activates a profile that the UI still calls unfinished.
+- Stations has dedicated **Discover / Favorites / Directory** views. Discover is curated, Favorites is saved radio, and Directory is the global catalog; clearing directory search no longer throws the user back into another view.
+- Curated and favorite cards show only local connection health. Directory cards show one metric matching the active ranking (starts, change, votes, or bitrate) rather than a wall of ambiguous telemetry.
+- Directory probes are capped to 12 visible streams, bulk detail lookup is capped to 100 IDs, saved results use a passive **Saved** label, and **Check stations** stays actionable while reporting its latest result separately.
+- Directory pagination carries a raw Radio Browser cursor across filtered HLS rows, so an unplayable stream can neither hide **Load more** nor cause overlaps between pages.
+- Settings is now a real library and appearance surface: track/artist/album summary, native folder picker, removable saved folders, resilient scan-all behavior, Light/Dark/System controls, and a collapsed provider-repair section for exceptional search failures.
+- Newly added library paths must be existing directories; an already-saved disconnected drive can remain visible and removable rather than bricking settings startup.
+- Library path identity is case-insensitive on Windows and case-sensitive on Unix targets, preserving valid case-distinct folders without allowing a differently cased nonexistent path to bypass validation.
+
+### Downloads and user-owned storage
+
+- New downloads no longer default to the private `%APPDATA%` tree. The platform Music folder under `Mewsik` is preferred, Downloads is the public fallback, and private app data is used only when neither known folder exists.
+- Settings shows the exact destination and provides native **Show folder**, **Change folder**, and **Use default** actions. Changing it affects future jobs only; each active job owns the destination captured when it was queued.
+- Existing downloads remain at their absolute paths and are never silently moved or deleted. The Settings card reports legacy AppData files and their size so an explicit migration can be added later without risking current media.
+- Missing or disconnected files now retain both their download and managed-source records in a recoverable `missing` state. Reconnecting the drive restores them, while playback performs a recording-scoped check and falls back to a valid remote source instead of selecting a stale local path.
+- Downloads-page polling is DB-only. **Check files** performs the explicit full filesystem reconciliation on a blocking worker, and a failed **Show in folder** action triggers the same repair check.
+- Download-directory validation creates and verifies a writable destination before inserting a job. Same-title jobs reserve filenames atomically, so concurrent downloads cannot overwrite one another.
+- Config persistence uses a same-directory temporary file, flush, and atomic replacement; older config files deserialize with the new field at its safe default.
+- The full queue/continuity and visual expansion direction is captured in `docs/product-direction-2026-07-14.md`. The first backend-owned continuity milestone is now implemented; true source prebuffering/gapless handoff remains separate work.
+
+### Deterministic playback continuation
+
+- Playback sessions now own queue/context continuation explicitly. The audio worker acknowledges the exact request only after a local or remote source really starts, preventing an old async start from extending a replacement queue.
+- Stop, error, radio takeover, queue replacement, and raw error-stop paths invalidate the corresponding owner. A stale failure or recommendation worker cannot mutate the newer playback session.
+- Continuation waits for actual start readiness without the old two-second false timeout, but exits when the queue moves away from its anchor, output disappears, or the bounded failsafe expires.
+- The first playable recommendation is appended as soon as it is known; the remaining tail can arrive later without reordering existing user choices.
+- External provider context is capped, deduplicated, and falls back deterministically when the provider tail is unusable.
+- Recommendation ranking uses an independent read-only SQLite WAL connection for on-disk libraries so it cannot hold the main application database mutex during playback handoff.
+- This is deterministic metadata/source continuation, not true decoded-audio prebuffering or sample-accurate gapless playback.
+
+### Windows updates and release safety
+
+- Version `0.2.0` introduces the updater UI and native shutdown gate. Normal source/local builds deliberately do not register the updater plugin and report updates unavailable; only the protected release build supplies a public key, endpoint, and `MEWSIK_UPDATE_CHANNEL=stable`.
+- Update install is user-confirmed. The package is downloaded and signature-verified first, then native code atomically blocks new music downloads, refuses to proceed while one is active, and shuts down the sidecar, playback, and tracked FFmpeg children before handing control to NSIS.
+- A music download that starts while the application package is downloading postpones installation without throwing away the verified package. Repeated clicks and install/relaunch recovery paths are guarded and covered by browser tests.
+- `.github/workflows/draft-windows-release.yml` is manual-only, tied to the exact default-branch ref and protected `release` environment, requires a strictly increasing stable version plus typed confirmation, proves the Tauri updater keypair, runs all gates, requires Azure Artifact Signing, and creates a draft rather than publishing automatically.
+- Release configuration is generated into an ignored credential-free merge file. The workflow has no unsigned fallback and no real private key, password, certificate, or Azure secret is stored in this repository.
+- Version `0.1.0` cannot update itself; installing the first signed `0.2.0` candidate is a one-time manual bootstrap. macOS still uses the existing native sign/notarize script and does not yet participate in the updater feed.
+- The current local/installed `0.2.0` is unsigned private-test output. The protected `release` environment and a cryptographically verified, locally recoverable updater keypair are configured; one separate disaster-recovery backup, Azure signing account/profile credentials, and a usable `latest.json` are still absent, so this is not a distributable bootstrap release yet.
+- A reachable Apple Silicon Mac has the native notarization tools but currently lacks pnpm, a Developer ID Application identity, and the `mewsik-notary` Keychain profile. The MacBook that may hold the existing signing identity was unreachable during the audit. No current Mac artifact is ready to distribute.
+
+### Audio-level contract
+
+Native RMS and peak are now calculated from the unwindowed PCM waveform. The old implementation calculated both from FFT magnitudes that had already been divided by the FFT size, making a controlled 0.8-amplitude sine report RMS `0.00765` instead of `0.56569`. That kept Signal's silence gate closed and muted RMS-driven section changes in Mk1 and Mk2.
+
+The browser lab now uses `AnalyserNode.getFloatTimeDomainData()` and the same normalized 0..1 waveform formula. Spectral bins, onset, centroid, and chroma remain separate frequency-domain features.
+
+## Verification status
+
+Completed on the combined branch and packaged native release:
+
+- `pnpm check`: 0 errors, 0 warnings
+- `pnpm build`: pass
+- `pnpm test:e2e -- --workers=4`: 69/69 pass on a clean Vite server, including 11 updater state/race/recovery scenarios and Prism's scheduler/pixel/seed foundation
+- `pnpm test:discovery-snapshot`: 10/10 pass, including provider-failure retention, credential exclusion, strict sanitization, and atomic publication
+- `cargo test --all-targets`: 149 pass, 0 fail, 3 intentionally ignored live-provider tests
+- Disposable release-contract test: a real generated Tauri keypair passed sign/verify and credential-exclusion checks; wrong refs, prerelease versions, non-increasing versions, and mismatched keys were rejected. The disposable key and generated config were removed afterward.
+- Local-build startup smoke: the updater plugin remains unregistered when no signed release configuration exists; the fresh debug app stayed responsive and closed through the normal window path.
+- Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
+- Discovery live integration: Apple, ListenBrainz, and Bandcamp Daily refreshed successfully, produced real shelves, and persisted a compatible snapshot
+- Mk2 conductor: finite/range, refresh-rate invariance, all six lifecycle identities, material-density floor and differentiated material signatures, boundary crossfades, band-specific anatomy, signed spectral travel, palette-wrap continuity, impact release, and deterministic reset coverage
+- Shared journey: cached-reader idempotence, Mk1 advancement, Signal/Mk2 remount continuity, A -> B -> A reset, pause decay, 60/144 Hz null-cadence invariance, and zero synthetic startup-impact coverage
+- Signal conductor: weak-air selectivity, broadband-detail preservation, phrase-wrap continuity, tempo-relative landing ring-out, drop-to-chorus de-duplication, and live-to-score handoff coverage
+- Signal: all three WGSL modules and pipelines validated on a real Chrome WebGPU adapter; exact 208-byte uniforms, 256-byte spectrum buffer, both RGBA16F feedback directions, and both production passes completed with zero GPU errors
+- Mk2: all five WGSL modules and pipelines validated in Chromium WebGPU; exact 288-byte lifecycle/shot uniforms, bind groups, targets, and eight-pass render order completed with zero GPU errors; a surfaced NaN tile was fixed and the fresh pipeline was revalidated
+- Legacy engine migration and supported engine roster: covered by Playwright
+- Named rail navigation, retired `V`, response repair/persistence, Flow-neutral response profiles, synchronized player/engine auto-hide, app-surface-only wake behavior, locked manual Hide, interaction holds, and close/reopen state reset: covered by Playwright
+- Stations: dedicated Discover/Favorites/Directory navigation, directory persistence, ranking-specific metrics, saved-state behavior, and compact local health covered by Playwright.
+- Search discovery: v2 shelf contracts, source status, one-reason cards, click-event payloads, forced refresh, fallback shelves, exact apostrophe-query URL handoff, in-progress loading, real-result rendering, partial-provider degradation, retry recovery, stale-event rejection, and conclusive no-result handling covered by Playwright.
+- Discover and Settings: empty-library onboarding, outside-library handoff, library summary, folder-picker entry, all three theme modes, and collapsed search troubleshooting covered by Playwright.
+- Download storage: old-config compatibility, platform default resolution, atomic config replacement, non-destructive disconnect/reconnect recovery, playback-boundary remote fallback, same-name reservation concurrency, per-job destination capture, directory masquerading as an audio file, newest-retry source ownership, cheap polling, manual health scans, and unavailable custom-folder messaging covered by Rust and Playwright.
+- Desktop and 390 x 844 mobile layouts for Stations and Search, compact visualizer chrome, synchronized idle hiding, and Soma's live WebGPU shader were visually checked in headed Chromium with zero console errors or warnings.
+- Native Windows `0.2.0` was rebuilt and installed again through the current-user NSIS path after the hosted-discovery and Prism changes. Before and after the install, all 12 real user-data files and 97,915,881 bytes matched byte-for-byte with zero changed hashes.
+- `PRAGMA quick_check` returned `ok`, no download was active during the upgrade gate, and the installed `0.2.0` process remained responsive from `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe`.
+- Corrected live RMS: Mk2 entered `PEAK`; Signal produced a bright, dynamic scope trace instead of a black frame
+- Native pause/resume freshness: Signal faded to silence after paused frames expired, then resumed its live trace when radio playback restarted
+- Mk2's 60 FPS accumulator was checked at 60, 75, 90, 120, and 144 Hz without the old high-refresh over-rendering bug
+
+### Native performance
+
+The table below is the last 10-second measurement checkpoint, taken before the latest Mk2 particle-pass removal and journey-conductor pass. Measurements include `mewsik.exe` plus all descendant WebView2 processes on the same Ryzen 9 5950X / RTX 3090 system. GPU is the busiest physical engine, matching Task Manager semantics. The latest Mk2 should be remeasured while real audio is playing before publishing a new comparison number.
+
+| Mode | CPU | GPU avg / peak | Working set | Private | Dedicated VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Visualizer off | 1.884% | 0.194% / 0.261% | 489.8 MiB | 246.5 MiB | 34.1 MiB |
+| Mk1 | 3.141% | 7.061% / 8.003% | 625.7 MiB | 446.9 MiB | 104.7 MiB |
+| Mk2 | 2.571% | 12.425% / 13.045% | 609.5 MiB | 389.0 MiB | 79.5 MiB |
+| Signal | 2.476% | 3.966% / 5.899% | 603.5 MiB | 402.7 MiB | 73.3 MiB |
+
+Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt Mk2 averages 12.425%, an approximately 83% reduction while remaining fully audio-reactive.
+
+### Release artifacts
+
+- `src-tauri/target/release/mewsik.exe` (22,112,256 bytes): SHA-256 `F93C8C25043EE217742765A84025026A091D70576CD25F38C4510608941DBDDE`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,060,667 bytes): SHA-256 `91E2112ECAC798CABB210D88C500FB63A6295DD06C7AC722BCE56182A145F2E2`
+- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (22,112,256 bytes): SHA-256 `5DDBC9A0F87080085AC9F7446DA9636F3BD213FBFA3D7A5F2053B14C43F1CAF3`
+
+These local artifacts are intentionally unsigned and are for this machine/private testing only. The protected workflow must produce and verify a new Authenticode-signed candidate before anything is distributed as the public `0.2.0` bootstrap release.
+
+## Key files
+
+- `src/lib/components/visualizer/visualizer-host.svelte`
+- `src/lib/components/visualizer/visualizer.svelte`
+- `src/lib/components/visualizer/visualizer-mk2.svelte`
+- `src/lib/components/visualizer/visualizer-signal.svelte`
+- `src/lib/visualizer/mk2/conductor.ts`
+- `src/lib/visualizer/prism/runtime.ts`
+- `src/lib/visualizer/catalog.ts`
+- `src/lib/visualizer/journey.ts`
+- `src/lib/visualizer/identity.ts`
+- `src/lib/visualizer/signal/conductor.ts`
+- `src/lib/visualizer/signal/spectrum.ts`
+- `src/lib/visualizer/signal/shaders.ts`
+- `src/lib/state/visualizer.svelte.ts`
+- `src/lib/state/visualizer-chrome.svelte.ts`
+- `src/lib/radio/curated.ts`
+- `src/lib/radio/signals.ts`
+- `src/lib/components/stations/station-metrics.svelte`
+- `src/lib/components/search/search-discovery-feed.svelte`
+- `src-tauri/src/commands/stations.rs`
+- `src-tauri/src/stations/directory.rs`
+- `src-tauri/src/stations/health.rs`
+- `src-tauri/src/discovery/v2.rs`
+- `src-tauri/src/discovery/sources.rs`
+- `src-tauri/src/discovery/store.rs`
+- `src-tauri/src/commands/discovery.rs`
+- `src-tauri/src/db/migrations.rs`
+- `src-tauri/src/config.rs`
+- `src-tauri/src/commands/downloads.rs`
+- `src-tauri/src/download/mod.rs`
+- `src/routes/+layout.svelte`
+- `src/routes/downloads/+page.svelte`
+- `src/routes/settings/+page.svelte`
+- `src/routes/search/+page.svelte`
+- `src/routes/stations/+page.svelte`
+- `src/routes/visualizer-test/+page.svelte`
+- `e2e/visualizer.spec.ts`
+- `e2e/journey-runtime.spec.ts`
+- `e2e/mk2-conductor.spec.ts`
+- `docs/product-direction-2026-07-14.md`

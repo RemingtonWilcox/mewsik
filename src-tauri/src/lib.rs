@@ -13,16 +13,30 @@ mod metadata;
 mod sources;
 mod stations;
 
+#[cfg(not(test))]
 use audio::AudioEngine;
+#[cfg(not(test))]
 use commands::external_search::ExternalSearchRuntime;
+#[cfg(not(test))]
 use commands::settings::ConfigState;
+#[cfg(not(test))]
 use config::AppConfig;
+#[cfg(not(test))]
+use discovery::sources::SourceConfig;
+#[cfg(not(test))]
+use discovery::v2::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
+#[cfg(not(test))]
 use download::DownloadManager;
+#[cfg(not(test))]
 use parking_lot::Mutex;
-use sources::{SidecarManager, StreamCache};
+#[cfg(not(test))]
+use sources::{stream_cache::StreamCache, SidecarManager};
+#[cfg(not(test))]
 use std::sync::Arc;
+#[cfg(not(test))]
 use tauri::Manager;
 
+#[cfg(not(test))]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = AppConfig::load();
@@ -34,6 +48,17 @@ pub fn run() {
     // Init database
     let db_path = AppConfig::db_path();
     let db = db::init_db(&db_path).expect("failed to initialize database");
+    let startup_download_db = db.clone();
+    let _ = std::thread::Builder::new()
+        .name("download-file-reconcile".to_string())
+        .spawn(move || {
+            if let Err(error) = download::reconcile_download_files(&startup_download_db) {
+                log::warn!("download reconciliation failed: {error}");
+            }
+            if let Err(error) = download::sync_completed_download_sources(&startup_download_db) {
+                log::warn!("download source synchronization failed: {error}");
+            }
+        });
 
     // Init audio engine
     let engine = Arc::new(AudioEngine::new(db.clone()));
@@ -50,20 +75,37 @@ pub fn run() {
     let stream_cache: StreamCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let external_search_runtime = Arc::new(ExternalSearchRuntime::default());
+    let discovery_feed_runtime: SharedDiscoveryFeedRuntime = Arc::new(DiscoveryFeedRuntime::new(
+        db.clone(),
+        SourceConfig::from_env(),
+    ));
     let startup_db = db.clone();
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_drag::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .max_file_size(512_000)
+                .build(),
+        );
+
+    // A local/source build intentionally has no updater key or endpoint. The
+    // updater plugin treats a missing config as an initialization error, so it
+    // must only be registered in the guarded release build that supplies both
+    // the generated config and this compile-time channel marker.
+    if option_env!("MEWSIK_UPDATE_CHANNEL")
+        .map(str::trim)
+        .is_some_and(|channel| !channel.is_empty())
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    let app = builder
         .setup(move |app| {
             external_tools::configure_runtime_resource_dir(app.path().resource_dir()?)?;
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
             stations::health::spawn_favorite_station_health_check(startup_db.clone());
             engine_for_setup.set_app_handle(app.handle().clone());
             Ok(())
@@ -75,6 +117,7 @@ pub fn run() {
         .manage(downloads)
         .manage(stream_cache)
         .manage(external_search_runtime)
+        .manage(discovery_feed_runtime)
         .invoke_handler(tauri::generate_handler![
             // Library
             commands::library::scan_library,
@@ -103,8 +146,10 @@ pub fn run() {
             commands::playback::add_to_queue,
             commands::playback::play_next,
             commands::playback::play_queue_index,
+            commands::playback::play_queue_entry,
             commands::playback::get_queue,
             commands::playback::remove_from_queue,
+            commands::playback::remove_queue_entry,
             commands::playback::clear_queue,
             // Playlists
             commands::playlists::get_playlists,
@@ -121,6 +166,8 @@ pub fn run() {
             commands::settings::get_settings,
             commands::settings::update_library_paths,
             commands::settings::get_library_paths,
+            commands::release::get_release_runtime_info,
+            commands::release::prepare_update_install,
             // Smart playlists
             commands::smart_playlists::create_smart_playlist,
             commands::smart_playlists::evaluate_smart_playlist,
@@ -129,6 +176,7 @@ pub fn run() {
             commands::external_search::search_all_sources,
             commands::external_search::ensure_external_recording,
             commands::external_search::play_external,
+            commands::external_search::play_external_context,
             commands::external_search::start_sidecar,
             commands::external_search::stop_sidecar,
             commands::external_search::sidecar_status,
@@ -137,8 +185,15 @@ pub fn run() {
             commands::discovery::get_rediscover,
             commands::discovery::get_play_stats,
             commands::discovery::get_recently_played,
+            commands::discovery::get_search_discovery_feed,
+            commands::discovery::record_discovery_event,
             // Downloads
             commands::downloads::get_downloads,
+            commands::downloads::refresh_download_files,
+            commands::downloads::get_download_location,
+            commands::downloads::set_download_location,
+            commands::downloads::reset_download_location,
+            commands::downloads::reveal_download_location,
             commands::downloads::download_recording,
             commands::downloads::cancel_download,
             commands::downloads::delete_download,
@@ -149,6 +204,8 @@ pub fn run() {
             // Stations
             commands::stations::search_radio_stations,
             commands::stations::search_radio_stations_advanced,
+            commands::stations::browse_radio_stations,
+            commands::stations::get_radio_station_details,
             commands::stations::save_station,
             commands::stations::get_favorite_stations,
             commands::stations::verify_favorite_stations,
@@ -157,6 +214,13 @@ pub fn run() {
             commands::stations::play_station,
             commands::stations::play_station_search_result,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        if matches!(event, tauri::RunEvent::Exit) {
+            app_handle.state::<Arc<SidecarManager>>().shutdown();
+            app_handle.state::<Arc<AudioEngine>>().shutdown_for_exit();
+        }
+    });
 }

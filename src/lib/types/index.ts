@@ -86,7 +86,7 @@ export interface Station {
 	favicon_path: string | null;
 	country: string | null;
 	language: string | null;
-	tags: string[] | null;
+	tags: string | null;
 	codec: string | null;
 	bitrate: number | null;
 	radio_browser_id: string | null;
@@ -102,6 +102,7 @@ export interface StationHealthResult {
 	url: string;
 	status: 'ok' | 'stale' | 'dead';
 	last_checked_at: string | null;
+	repaired: boolean;
 }
 
 export interface PlayHistory {
@@ -120,7 +121,7 @@ export interface Download {
 	recording_id: string | null;
 	source: string;
 	source_url: string;
-	status: 'pending' | 'downloading' | 'processing' | 'completed' | 'failed' | 'cancelled';
+	status: 'pending' | 'downloading' | 'processing' | 'completed' | 'missing' | 'failed' | 'cancelled';
 	progress: number;
 	file_path: string | null;
 	error_message: string | null;
@@ -189,6 +190,7 @@ export interface PlaybackWaveform {
 }
 
 export interface QueueItem {
+	entry_id: string;
 	index: number;
 	recording_id: string;
 	title: string;
@@ -196,4 +198,11 @@ export interface QueueItem {
 	duration_ms: number | null;
 	cover_art_url: string | null;
 	is_current: boolean;
+}
+
+export interface QueueSnapshot {
+	session_id: string;
+	revision: number;
+	now_playing: QueueItem | null;
+	upcoming: QueueItem[];
 }

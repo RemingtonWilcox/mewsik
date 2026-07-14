@@ -9,7 +9,7 @@ import type {
 	SearchResult,
 	Station,
 	StationHealthResult,
-	QueueItem,
+	QueueSnapshot,
 	Download
 } from '$lib/types';
 
@@ -72,7 +72,8 @@ const defaultSettings = {
 	library_paths: [],
 	audio_device: null,
 	normalization_enabled: false,
-	last_volume: 1
+	last_volume: 1,
+	download_directory: null
 };
 
 // Library
@@ -140,9 +141,23 @@ export const playNext = (recordingId: string) => safeInvoke('play_next', { recor
 
 export const playQueueIndex = (index: number) => safeInvoke('play_queue_index', { index });
 
-export const getQueue = () => safeInvoke<QueueItem[]>('get_queue', undefined, []);
+const defaultQueueSnapshot: QueueSnapshot = {
+	session_id: '',
+	revision: 0,
+	now_playing: null,
+	upcoming: []
+};
+
+export const getQueue = () =>
+	safeInvoke<QueueSnapshot>('get_queue', undefined, defaultQueueSnapshot);
+
+export const playQueueEntry = (sessionId: string, entryId: string) =>
+	safeInvoke('play_queue_entry', { sessionId, entryId });
 
 export const removeFromQueue = (index: number) => safeInvoke('remove_from_queue', { index });
+
+export const removeQueueEntry = (sessionId: string, entryId: string) =>
+	safeInvoke('remove_queue_entry', { sessionId, entryId });
 
 export const clearQueue = () => safeInvoke('clear_queue');
 
@@ -187,6 +202,7 @@ export const getSettings = () =>
 		audio_device: string | null;
 		normalization_enabled: boolean;
 		last_volume: number;
+		download_directory: string | null;
 	}>('get_settings', undefined, defaultSettings);
 
 export const updateLibraryPaths = (paths: string[]) =>
@@ -222,13 +238,20 @@ export interface ExternalSearchPage {
 	has_more: boolean;
 }
 
+export interface ExternalSearchResponse {
+	items: ExternalSearchResult[];
+	failed_sources: string[];
+}
+
 export interface ExternalSearchPartialEvent {
+	request_id: string;
 	query: string;
 	source: string;
 	results: ExternalSearchResult[];
 }
 
 export interface ExternalSearchCompleteEvent {
+	request_id: string;
 	query: string;
 	results: ExternalSearchResult[];
 }
@@ -252,8 +275,12 @@ export const searchExternal = (query: string, source: string, page = 0) =>
 		{ items: [], has_more: false }
 	);
 
-export const searchAllSources = (query: string) =>
-	safeInvoke<ExternalSearchResult[]>('search_all_sources', { query }, []);
+export const searchAllSources = (query: string, requestId: string) =>
+	safeInvoke<ExternalSearchResponse>(
+		'search_all_sources',
+		{ query, requestId },
+		{ items: [], failed_sources: [] }
+	);
 
 export const listenExternalSearchPartial = (
 	handler: (payload: ExternalSearchPartialEvent) => void
@@ -297,6 +324,9 @@ export const playExternal = (
 		coverArtUrl
 	});
 
+export const playExternalContext = (items: ExternalSearchResult[], startIndex: number) =>
+	safeInvoke<string>('play_external_context', { items, startIndex });
+
 export const startSidecar = () => safeInvoke<void>('start_sidecar', undefined, () => undefined);
 export const stopSidecar = () => safeInvoke<void>('stop_sidecar', undefined, () => undefined);
 export const sidecarStatus = () => safeInvoke<boolean>('sidecar_status', undefined, false);
@@ -317,20 +347,214 @@ export async function pickFolder(defaultPath?: string): Promise<string | null> {
 }
 
 // Discovery
+export interface SearchDiscoveryItem {
+	id: string;
+	item_kind: 'track' | 'release' | 'editorial';
+	title: string;
+	artist: string;
+	album: string | null;
+	artwork_url: string | null;
+	search_query: string;
+	listen_count: number | null;
+	rank: number | null;
+	momentum: number | null;
+	context: string | null;
+	reason: string | null;
+	source_labels: string[];
+	release_date: string | null;
+	audience_delta: number | null;
+	audience_label: string | null;
+}
+
+export interface SearchDiscoverySection {
+	id: string;
+	kind: 'top_now' | 'moving_fast' | 'new_and_rising' | 'for_you' | 'outside_your_bubble' | 'editors_found' | 'fallback';
+	personalized: boolean;
+	title: string;
+	subtitle: string;
+	items: SearchDiscoveryItem[];
+}
+
+export interface SearchDiscoveryFeed {
+	snapshot_id: string;
+	generated_at: number;
+	source: string;
+	is_stale: boolean;
+	is_fallback: boolean;
+	has_history: boolean;
+	next_refresh_at: number | null;
+	source_statuses: DiscoverySourceStatus[];
+	sections: SearchDiscoverySection[];
+}
+
+export interface DiscoverySourceStatus {
+	id: string;
+	label: string;
+	state: 'live' | 'cached' | 'unavailable' | 'stale';
+	updated_at: number | null;
+	detail: string | null;
+}
+
+export interface PlayStats {
+	total_plays: number;
+	total_time_ms: number;
+	unique_tracks: number;
+	profile_track_goal: number;
+	profile_ready: boolean;
+}
+
+const SEARCH_DISCOVERY_PICKS: Array<[artist: string, title: string, album: string]> = [
+	['Daft Punk', 'One More Time', 'Discovery'],
+	['Radiohead', 'Weird Fishes / Arpeggi', 'In Rainbows'],
+	['Kendrick Lamar', 'Money Trees', 'good kid, m.A.A.d city'],
+	['Björk', 'Jóga', 'Homogenic'],
+	['Aphex Twin', 'Xtal', 'Selected Ambient Works 85-92'],
+	['FKA twigs', 'cellophane', 'MAGDALENE'],
+	['Burial', 'Archangel', 'Untrue'],
+	['Fleetwood Mac', 'Dreams', 'Rumours'],
+	['Nujabes', 'Feather', 'Modal Soul'],
+	['SOPHIE', 'Is It Cold in the Water?', "OIL OF EVERY PEARL'S UN-INSIDES"],
+	['Talking Heads', 'This Must Be the Place', 'Speaking in Tongues'],
+	['A Tribe Called Quest', 'Electric Relaxation', 'Midnight Marauders'],
+	['Massive Attack', 'Teardrop', 'Mezzanine'],
+	['Caroline Polachek', 'Bunny Is a Rider', 'Desire, I Want to Turn Into You'],
+	['MF DOOM', 'Doomsday', 'Operation: Doomsday'],
+	['Beach House', 'Myth', 'Bloom'],
+	['Jamie xx', 'Loud Places', 'In Colour'],
+	['Portishead', 'Roads', 'Dummy'],
+	['Charli xcx', '360', 'BRAT'],
+	['The Avalanches', 'Since I Left You', 'Since I Left You'],
+	['Floating Points', 'Silhouettes (I, II & III)', 'Elaenia'],
+	['J Dilla', 'Time: The Donut of the Heart', 'Donuts'],
+	['Cocteau Twins', 'Heaven or Las Vegas', 'Heaven or Las Vegas'],
+	['Solange', 'Cranes in the Sky', 'A Seat at the Table']
+];
+
+function fallbackSearchDiscoveryFeed(): SearchDiscoveryFeed {
+	const items = SEARCH_DISCOVERY_PICKS.map(([artist, title, album], index) => ({
+		id: `browser-fallback-${index}`,
+		item_kind: 'track' as const,
+		title,
+		artist,
+		album,
+		artwork_url: null,
+		search_query: `${artist} ${title}`,
+		listen_count: null,
+		rank: null,
+		momentum: null,
+		context: 'Mewsik editorial',
+		reason: 'Mewsik editorial fallback',
+		source_labels: ['Mewsik'],
+		release_date: null,
+		audience_delta: null,
+		audience_label: null
+	}));
+	return {
+		snapshot_id: `browser-${Math.floor(Date.now() / 1000)}`,
+		generated_at: Math.floor(Date.now() / 1000),
+		source: 'Mewsik editorial',
+		is_stale: false,
+		is_fallback: true,
+		has_history: false,
+		next_refresh_at: null,
+		source_statuses: [],
+		sections: [
+			{
+				id: 'fallback-starts',
+				kind: 'fallback',
+				personalized: false,
+				title: 'Reliable starts',
+				subtitle: 'Handpicked by Mewsik while live charts refresh',
+				items: items.slice(0, 8)
+			},
+			{
+				id: 'fallback-detours',
+				kind: 'fallback',
+				personalized: false,
+				title: 'Worth the detour',
+				subtitle: 'Strong records from different corners of music',
+				items: items.slice(8, 16)
+			},
+			{
+				id: 'fallback-rabbit-holes',
+				kind: 'fallback',
+				personalized: false,
+				title: 'Reliable rabbit holes',
+				subtitle: 'Broad on purpose and not personalized',
+				items: items.slice(16, 24)
+			}
+		]
+	};
+}
+
+export const getSearchDiscoveryFeed = (force = false) =>
+	safeInvoke<SearchDiscoveryFeed>(
+		'get_search_discovery_feed',
+		{ force },
+		fallbackSearchDiscoveryFeed
+	);
+
+export const recordDiscoveryEvent = (
+	itemId: string,
+	eventType: 'click' | 'impression' | 'hide' | 'save',
+	sectionId?: string,
+	snapshotId?: string
+) => safeInvoke<void>('record_discovery_event', { itemId, eventType, sectionId, snapshotId }, () => undefined);
+
 export const getDailyMix = () => safeInvoke<LibraryTrack[]>('get_daily_mix', undefined, []);
 export const getRediscover = () => safeInvoke<LibraryTrack[]>('get_rediscover', undefined, []);
 export const getPlayStats = () =>
-	safeInvoke<{ total_plays: number; total_time_ms: number; unique_tracks: number }>(
+	safeInvoke<PlayStats>(
 		'get_play_stats',
 		undefined,
-		{ total_plays: 0, total_time_ms: 0, unique_tracks: 0 }
+		{
+			total_plays: 0,
+			total_time_ms: 0,
+			unique_tracks: 0,
+			profile_track_goal: 5,
+			profile_ready: false
+		}
 	);
 export const getRecentlyPlayed = () => safeInvoke<LibraryTrack[]>('get_recently_played', undefined, []);
 
 // Downloads
+export interface DownloadLocationInfo {
+	directory: string;
+	default_directory: string;
+	is_custom: boolean;
+	exists: boolean;
+	legacy_file_count: number;
+	legacy_bytes: number;
+}
+
+export interface DownloadStart {
+	id: string;
+	directory: string | null;
+	already_active: boolean;
+}
+
+const browserDownloadLocation: DownloadLocationInfo = {
+	directory: 'Music/Mewsik',
+	default_directory: 'Music/Mewsik',
+	is_custom: false,
+	exists: false,
+	legacy_file_count: 0,
+	legacy_bytes: 0
+};
+
 export const getDownloads = () => safeInvoke<Download[]>('get_downloads', undefined, []);
+export const refreshDownloadFiles = () =>
+	safeInvoke<Download[]>('refresh_download_files');
+export const getDownloadLocation = () =>
+	safeInvoke<DownloadLocationInfo>('get_download_location', undefined, browserDownloadLocation);
+export const setDownloadLocation = (directory: string) =>
+	safeInvoke<void>('set_download_location', { directory });
+export const resetDownloadLocation = () =>
+	safeInvoke<void>('reset_download_location');
+export const revealDownloadLocation = () =>
+	safeInvoke<void>('reveal_download_location');
 export const downloadRecording = (recordingId: string) =>
-	safeInvoke<string>('download_recording', { recordingId });
+	safeInvoke<DownloadStart>('download_recording', { recordingId });
 export const cancelDownload = (downloadId: string) =>
 	safeInvoke('cancel_download', { downloadId });
 export const deleteDownload = (downloadId: string) =>
@@ -345,17 +569,56 @@ export interface RadioBrowserStation {
 	homepage: string | null;
 	favicon: string | null;
 	country: string | null;
+	countrycode?: string | null;
 	language: string | null;
 	tags: string | null;
 	codec: string | null;
 	bitrate: number | null;
+	hls?: number | null;
+	votes?: number | null;
+	clickcount?: number | null;
+	clicktrend?: number | null;
+	lastcheckok?: number | null;
+	lastchecktime_iso8601?: string | null;
+	lastcheckoktime_iso8601?: string | null;
+	ssl_error?: number | null;
 	stationuuid: string;
 }
 
-export const searchRadioStations = (query: string, mode: 'name' | 'tag' = 'name') =>
+export type RadioStationSort = 'smart' | 'popular' | 'rising' | 'loved' | 'quality';
+
+export interface RadioStationPage {
+	items: RadioBrowserStation[];
+	next_offset: number;
+	has_more: boolean;
+}
+
+export const searchRadioStations = (
+	query: string,
+	mode: 'name' | 'tag' = 'name',
+	sort: RadioStationSort = 'smart'
+) =>
 	safeInvoke<RadioBrowserStation[]>(
-		mode === 'name' ? 'search_radio_stations' : 'search_radio_stations_advanced',
-		mode === 'name' ? { query } : { query, mode },
+		'search_radio_stations_advanced',
+		{ query, mode, sort },
+		[]
+	);
+
+export const browseRadioStations = (
+	sort: RadioStationSort = 'smart',
+	offset = 0,
+	limit = 40
+) =>
+	safeInvoke<RadioStationPage>(
+		'browse_radio_stations',
+		{ sort, offset, limit },
+		{ items: [], next_offset: offset, has_more: false }
+	);
+
+export const getRadioStationDetails = (stationUuids: string[]) =>
+	safeInvoke<RadioBrowserStation[]>(
+		'get_radio_station_details',
+		{ stationUuids },
 		[]
 	);
 

@@ -1,0 +1,75 @@
+name: Deploy discovery snapshot
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/deploy-discovery-snapshot.yml
+      - scripts/discovery-snapshot/**
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mewsik-discovery-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build credential-free snapshot
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the default branch without persisted credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Install the repository's pinned Node.js runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+
+      - name: Verify the dependency-free generator
+        run: node --test scripts/discovery-snapshot/generator.test.mjs
+
+      - name: Read GitHub Pages configuration
+        id: pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Generate the public snapshot
+        run: node scripts/discovery-snapshot/generate.mjs --output _site
+        env:
+          MEWSIK_DISCOVERY_PREVIOUS_URL: ${{ steps.pages.outputs.base_url }}/discovery/v1/snapshot.json
+          MEWSIK_YOUTUBE_API_KEY: ${{ secrets.MEWSIK_YOUTUBE_API_KEY }}
+          MEWSIK_LASTFM_API_KEY: ${{ secrets.MEWSIK_LASTFM_API_KEY }}
+
+      - name: Upload the GitHub Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    name: Publish snapshot
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

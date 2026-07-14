@@ -6,4 +6,3 @@ pub mod stream_cache;
 pub mod youtube;
 
 pub use sidecar_manager::SidecarManager;
-pub use stream_cache::StreamCache;

@@ -55,6 +55,12 @@
 		const minutes = Math.floor((ms % 3600000) / 60000);
 		return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 	}
+
+	function playQuickPick(index: number) {
+		const ids = quickPicks.map((track) => track.id);
+		if (index < 0 || index >= ids.length) return;
+		void player.playAll(ids, index);
+	}
 </script>
 
 <div class="flex flex-col gap-6">
@@ -222,7 +228,7 @@
 						{#each quickPicks as track, index}
 							<button
 								class="flex items-center gap-3 rounded-xl border border-border px-3 py-3 text-left transition-colors hover:bg-muted/60"
-								onclick={() => player.play(track.id)}
+								onclick={() => playQuickPick(index)}
 							>
 								<div class="flex size-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
 									<Play class="size-4 pl-0.5" />

@@ -1,6 +1,6 @@
 [package]
 name = "mewsik"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal music streaming & discovery app"
 authors = ["Remington Wilcox"]
 license = "MIT"
@@ -19,11 +19,13 @@ tauri = { version = "2.10.3", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-drag = "2.1.0"
 tauri-plugin-log = "2"
+tauri-plugin-process = "=2.3.1"
+tauri-plugin-updater = "=2.10.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled", "vtab"] }
 symphonia = { version = "0.5", features = ["all"] }
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 cpal = "0.15"
@@ -45,6 +47,11 @@ fuzzy-matcher = "0.3"
 async-trait = "0.1"
 urlencoding = "2"
 realfft = "3"
+quick-xml = "0.41"
+dunce = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+
+[dev-dependencies]
+minisign-verify = "=0.2.5"

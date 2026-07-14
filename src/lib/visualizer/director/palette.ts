@@ -4,10 +4,8 @@
 // because tonnetz neighbors are perfect-fifth / major-third / minor-third
 // related (Harte et al. 2006).
 //
-// Given the current sidecar only exposes chroma_key (dominant pitch class)
-// and chroma_strength, we approximate the tonnetz by interpreting the
-// dominant pitch class as a unit chroma vector and snapping it onto the
-// canonical (sin/cos) projections.
+// The analyzer exposes chroma_key normalized to 0..1 (C=0, B=11/12) plus
+// chroma_strength. Convert to pitch-class units only at the Tonnetz boundary.
 
 import { wrap01, lerp, alphaForTau, AsymmetricEnvelope } from './util.js';
 import type { PaletteHSV } from './types.js';
@@ -41,7 +39,7 @@ export class PaletteEngine {
 		energy: number;
 	}): { palette: PaletteHSV; tonnetz: [number, number, number, number, number, number] } {
 		const { chromaKey, chromaStrength, valence, arousal, energy } = opts;
-		const t = pitchClassToTonnetz(chromaKey % 12);
+		const t = pitchClassToTonnetz(wrap01(chromaKey) * 12);
 		const w = Math.max(0.05, chromaStrength);
 		for (let i = 0; i < 6; i++) {
 			this.tonnetz[i] = lerp(this.tonnetz[i], t[i], this.aTonnetz * w);

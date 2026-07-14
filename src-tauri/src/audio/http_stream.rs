@@ -7,13 +7,80 @@ use rodio::{Decoder, Source};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 const GOOGLEVIDEO_RANGE_CHUNK_BYTES: u64 = 1024 * 1024;
+
+#[derive(Default)]
+struct FfmpegTracker {
+    quiescing: bool,
+    next_id: u64,
+    children: HashMap<u64, Arc<Mutex<Child>>>,
+}
+
+static FFMPEG_TRACKER: OnceLock<Mutex<FfmpegTracker>> = OnceLock::new();
+
+fn ffmpeg_tracker() -> &'static Mutex<FfmpegTracker> {
+    FFMPEG_TRACKER.get_or_init(|| Mutex::new(FfmpegTracker::default()))
+}
+
+struct TrackedFfmpeg {
+    id: u64,
+}
+
+impl Drop for TrackedFfmpeg {
+    fn drop(&mut self) {
+        ffmpeg_tracker().lock().children.remove(&self.id);
+    }
+}
+
+fn spawn_tracked_ffmpeg(
+    command: &mut Command,
+) -> Result<(Arc<Mutex<Child>>, TrackedFfmpeg), String> {
+    // Hold the same lock used by quiesce across spawn + registration. That
+    // makes it impossible for updater shutdown to miss a just-created child.
+    let mut tracker = ffmpeg_tracker().lock();
+    if tracker.quiescing {
+        return Err("Audio transcoding is shutting down for app exit".to_string());
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start ffmpeg: {error}"))?;
+    tracker.next_id = tracker.next_id.saturating_add(1);
+    let id = tracker.next_id;
+    let child = Arc::new(Mutex::new(child));
+    tracker.children.insert(id, Arc::clone(&child));
+    Ok((child, TrackedFfmpeg { id }))
+}
+
+fn stop_ffmpeg_child(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock();
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+}
+
+/// Permanently prevents new transcoders in this process, then kills and waits
+/// for every active ffmpeg child. This is intentionally terminal-only: updater
+/// installation can bypass Tauri's normal managed-state teardown on Windows.
+pub fn quiesce_and_stop_ffmpeg() {
+    let children = {
+        let mut tracker = ffmpeg_tracker().lock();
+        tracker.quiescing = true;
+        tracker.children.values().cloned().collect::<Vec<_>>()
+    };
+    for child in children {
+        stop_ffmpeg_child(&child);
+    }
+}
 
 struct BufferedFileState {
     available_bytes: u64,
@@ -425,6 +492,9 @@ fn spawn_ffmpeg_transcode_worker(
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<(), String> {
+    if ffmpeg_tracker().lock().quiescing {
+        return Err("Audio transcoding is shutting down for app exit".to_string());
+    }
     let ffmpeg = find_binary("ffmpeg").ok_or_else(|| {
         "ffmpeg is required for progressive YouTube playback but was not found".to_string()
     })?;
@@ -475,10 +545,10 @@ fn spawn_ffmpeg_transcode_worker(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let mut child = match command.spawn() {
-                Ok(child) => child,
+            let (child, _tracked_child) = match spawn_tracked_ffmpeg(&mut command) {
+                Ok(tracked) => tracked,
                 Err(err) => {
-                    let message = format!("Failed to start ffmpeg: {}", err);
+                    let message = err.to_string();
                     shared.fail(message.clone());
                     let _ = event_tx.send(AudioEvent::Error(format!(
                         "{} failed before playback: {}",
@@ -488,16 +558,15 @@ fn spawn_ffmpeg_transcode_worker(
                 }
             };
 
-            let Some(mut stdout) = child.stdout.take() else {
-                let _ = child.kill();
-                let _ = child.wait();
+            let Some(mut stdout) = child.lock().stdout.take() else {
+                stop_ffmpeg_child(&child);
                 let message = "Failed to capture ffmpeg audio output".to_string();
                 shared.fail(message.clone());
                 let _ = event_tx.send(AudioEvent::Error(format!("{} failed: {}", label, message)));
                 return;
             };
 
-            let stderr_reader = child.stderr.take().map(|mut stderr| {
+            let stderr_reader = child.lock().stderr.take().map(|mut stderr| {
                 std::thread::spawn(move || {
                     let mut output = String::new();
                     let _ = stderr.read_to_string(&mut output);
@@ -508,8 +577,7 @@ fn spawn_ffmpeg_transcode_worker(
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 if playback_session.load(Ordering::SeqCst) != session_id {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_ffmpeg_child(&child);
                     shared.cancel();
                     return;
                 }
@@ -518,8 +586,7 @@ fn spawn_ffmpeg_transcode_worker(
                     Ok(0) => break,
                     Ok(bytes_read) => {
                         if let Err(err) = writer.write_all(&chunk[..bytes_read]) {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            stop_ffmpeg_child(&child);
                             let message = format!("Failed to write ffmpeg stream buffer: {}", err);
                             shared.fail(message.clone());
                             let _ = event_tx
@@ -529,8 +596,7 @@ fn spawn_ffmpeg_transcode_worker(
                         shared.append_bytes(bytes_read as u64);
                     }
                     Err(err) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        stop_ffmpeg_child(&child);
                         let message = format!("Failed to read ffmpeg audio output: {}", err);
                         shared.fail(message.clone());
                         let _ = event_tx
@@ -540,7 +606,7 @@ fn spawn_ffmpeg_transcode_worker(
                 }
             }
 
-            let status = child.wait();
+            let status = child.lock().wait();
             let stderr_output = stderr_reader
                 .and_then(|handle| handle.join().ok())
                 .unwrap_or_default();

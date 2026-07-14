@@ -1,6 +1,8 @@
 import type { PlaybackState, RepeatMode } from '$lib/types';
 import * as api from '$lib/api/tauri';
 import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
+import { useVisualizer } from '$lib/state/visualizer.svelte';
+import { visualizerPerformanceIdentity } from '$lib/visualizer/identity';
 
 const defaultState: PlaybackState = {
 	is_playing: false,
@@ -43,6 +45,19 @@ function clearPendingSeek() {
 let scoreRecordingId: string | null = null;
 let analysisListenerStarted = false;
 
+function clearVisualizerAudio() {
+	useVisualizer().clearLatest();
+}
+
+function playbackSourceChanged(previous: PlaybackState, next: PlaybackState): boolean {
+	return (
+		previous.source !== next.source ||
+		previous.current_recording_id !== next.current_recording_id ||
+		previous.current_source_url !== next.current_source_url ||
+		previous.current_station_id !== next.current_station_id
+	);
+}
+
 function syncVisualScore(next: PlaybackState) {
 	setScorePlayback(next.position_ms, next.is_playing);
 
@@ -64,7 +79,10 @@ function syncVisualScore(next: PlaybackState) {
 
 	void api.requestTrackAnalysis(id).then(async (status) => {
 		if (status === 'cached' && id === scoreRecordingId) {
-			setActiveScore(await api.getTrackAnalysis(id));
+			const score = await api.getTrackAnalysis(id);
+			// The user may have switched tracks while the cached score was loading.
+			// Recheck after the await so A can never overwrite B's active journey.
+			if (id === scoreRecordingId) setActiveScore(score);
 		}
 		// 'started' resolves via the analysis:complete listener;
 		// 'unavailable' stays on the live fallback.
@@ -72,6 +90,15 @@ function syncVisualScore(next: PlaybackState) {
 }
 
 function mergePlaybackState(nextState: PlaybackState) {
+	// Clear immediately when playback is no longer producing trustworthy audio.
+	// The store's 250 ms freshness timeout remains a backstop for missed polls or
+	// native analyzer stalls, while source identity protects fast track switches.
+	const sourceChanged = playbackSourceChanged(state, nextState);
+	if (sourceChanged) {
+		useVisualizer().resetPerformance(visualizerPerformanceIdentity(nextState));
+	} else if (!nextState.is_playing || nextState.is_buffering) {
+		clearVisualizerAudio();
+	}
 	if (pendingSeek) {
 		const sameTarget =
 			pendingSeek.recordingId === nextState.current_recording_id &&
@@ -135,24 +162,28 @@ export function usePlayer() {
 
 		async play(recordingId: string) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playRecording(recordingId);
 			scheduleRefresh();
 		},
 
 		async playAll(ids: string[], startIndex: number) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playTracksFrom(ids, startIndex);
 			scheduleRefresh();
 		},
 
 		async pause() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.pause();
 			scheduleRefresh([0, 50]);
 		},
 
 		async stop() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.stopPlayback();
 			scheduleRefresh([0, 50]);
 		},
@@ -166,8 +197,10 @@ export function usePlayer() {
 		async togglePlay() {
 			clearPendingSeek();
 			if (state.is_buffering) {
+				clearVisualizerAudio();
 				await api.stopPlayback();
 			} else if (state.is_playing) {
+				clearVisualizerAudio();
 				await api.pause();
 			} else {
 				if (!state.current_recording_id && !state.current_source_url && !state.current_title) {
@@ -203,12 +236,14 @@ export function usePlayer() {
 
 		async next() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.nextTrack();
 			scheduleRefresh();
 		},
 
 		async prev() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.prevTrack();
 			scheduleRefresh();
 		},
@@ -242,12 +277,25 @@ export function usePlayer() {
 
 		async playQueueIndex(index: number) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playQueueIndex(index);
+			scheduleRefresh();
+		},
+
+		async playQueueEntry(sessionId: string, entryId: string) {
+			clearPendingSeek();
+			clearVisualizerAudio();
+			await api.playQueueEntry(sessionId, entryId);
 			scheduleRefresh();
 		},
 
 		async removeFromQueue(index: number) {
 			await api.removeFromQueue(index);
+			scheduleRefresh([0, 50]);
+		},
+
+		async removeQueueEntry(sessionId: string, entryId: string) {
+			await api.removeQueueEntry(sessionId, entryId);
 			scheduleRefresh([0, 50]);
 		},
 

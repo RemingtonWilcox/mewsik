@@ -83,15 +83,18 @@ export class RingBuffer {
 	slope(start: number, len: number): number {
 		const n = Math.min(len, this.filled - start);
 		if (n < 2) return 0;
+		// `at(0)` is newest, but slope should follow chronological time so a
+		// signal rising toward the present reports a positive value. Walk the
+		// requested window oldest -> newest before fitting the line.
 		const meanX = (n - 1) / 2;
 		let meanY = 0;
-		for (let k = 0; k < n; k++) meanY += this.at(start + k);
+		for (let k = 0; k < n; k++) meanY += this.at(start + (n - 1 - k));
 		meanY /= n;
 		let num = 0;
 		let den = 0;
 		for (let k = 0; k < n; k++) {
 			const dx = k - meanX;
-			const dy = this.at(start + k) - meanY;
+			const dy = this.at(start + (n - 1 - k)) - meanY;
 			num += dx * dy;
 			den += dx * dx;
 		}

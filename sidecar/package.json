@@ -1,7 +1,7 @@
 {
   "name": "mewsik-sidecar",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "build": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\" && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.cjs",

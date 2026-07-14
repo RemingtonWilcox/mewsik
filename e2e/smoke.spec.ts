@@ -35,7 +35,7 @@ test.describe('app smoke', () => {
 		await expect(page.getByRole('heading', { name: 'Stations' })).toBeVisible();
 
 		await page.locator('a[href="/discover"]').first().click();
-		await expect(page.getByRole('heading', { name: 'Discover' })).toBeVisible();
+		await expect(page.getByRole('heading', { name: 'Discover', exact: true })).toBeVisible();
 
 		await page.locator('a[href="/downloads"]').first().click();
 		await expect(page.locator('h1').filter({ hasText: 'Downloads' })).toBeVisible();

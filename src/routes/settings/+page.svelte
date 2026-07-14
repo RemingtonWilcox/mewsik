@@ -1,243 +1,558 @@
 <script lang="ts">
 	import { Button } from '$lib/components/ui/button';
-	import { Input } from '$lib/components/ui/input';
 	import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '$lib/components/ui/card';
-	import { Separator } from '$lib/components/ui/separator';
 	import * as api from '$lib/api/tauri';
 	import { useLibrary } from '$lib/state/library.svelte';
+	import { useAppUpdater } from '$lib/state/app-updater.svelte';
 	import { toast } from 'svelte-sonner';
-	import { FolderOpen, RefreshCw, Plus, X, Sun, Moon, RadioTower, Play, Square } from '@lucide/svelte';
-	import { toggleMode } from 'mode-watcher';
+	import {
+		CheckCircle2,
+		Download,
+		FolderOpen,
+		HardDrive,
+		Laptop,
+		LoaderCircle,
+		Moon,
+		RefreshCw,
+		RotateCcw,
+		Rocket,
+		Search,
+		ShieldCheck,
+		Sun,
+		TriangleAlert,
+		X
+	} from '@lucide/svelte';
+	import { onMount } from 'svelte';
+	import { setMode, userPrefersMode } from 'mode-watcher';
+
+	type ThemePreference = 'light' | 'dark' | 'system';
+	type ScanSummary = {
+		folders: number;
+		newTracks: number;
+		updatedTracks: number;
+		errors: string[];
+	};
 
 	const library = useLibrary();
+	const updater = useAppUpdater();
 
 	let libraryPaths = $state<string[]>([]);
-	let newPath = $state('');
-	let loading = $state(false);
-	let sidecarRunning = $state(false);
-	let sidecarLoading = $state(false);
+	let loading = $state(true);
+	let scanning = $state(false);
+	let providerRunning = $state(false);
+	let providerLoading = $state(false);
+	let downloadLocation = $state<api.DownloadLocationInfo | null>(null);
+	let downloadLocationLoading = $state(false);
 	let settingsError = $state('');
+	let lastScan = $state<ScanSummary | null>(null);
 
-	$effect(() => {
-		loadSettings();
+	onMount(() => {
+		void loadSettings();
+		updater.startLaunchCheck();
 	});
 
 	async function loadSettings() {
-		try {
-			const [paths, running] = await Promise.all([
-				api.getLibraryPaths(),
-				api.sidecarStatus().catch(() => false)
-			]);
-			libraryPaths = paths;
-			sidecarRunning = running;
-			settingsError = '';
-		} catch (error) {
-			settingsError = `Failed to load settings${error ? `: ${error}` : ''}`;
-			toast.error(settingsError);
-		}
-	}
-
-	async function addResolvedPath(path: string) {
-		const trimmedPath = path.trim();
-		if (!trimmedPath) return;
-		if (libraryPaths.includes(trimmedPath)) {
-			toast.message('That folder is already in your library');
-			newPath = '';
-			return;
-		}
-
-		const updated = [...libraryPaths, trimmedPath];
-		try {
-			await api.updateLibraryPaths(updated);
-			libraryPaths = updated;
-			newPath = '';
-			settingsError = '';
-			toast.success('Library path added');
-		} catch (e) {
-			toast.error(`Failed to add path: ${e}`);
-		}
-	}
-
-	async function addPath() {
-		await addResolvedPath(newPath);
-	}
-
-	async function browseForFolder() {
-		try {
-			const path = await api.pickFolder(newPath.trim() || libraryPaths.at(-1));
-			if (!path) return;
-			newPath = path;
-			await addResolvedPath(path);
-		} catch (error) {
-			toast.error(`Failed to browse for a folder: ${error}`);
-		}
-	}
-
-	async function removePath(index: number) {
-		const updated = libraryPaths.filter((_, i) => i !== index);
-		try {
-			await api.updateLibraryPaths(updated);
-			libraryPaths = updated;
-			settingsError = '';
-			toast.success('Library path removed');
-		} catch {
-			toast.error('Failed to remove path');
-		}
-	}
-
-	async function scanAll() {
-		if (libraryPaths.length === 0) {
-			toast.error('Add a music folder first');
-			return;
-		}
 		loading = true;
 		try {
-			for (const path of libraryPaths) {
-				const result = await library.scan(path);
-				toast.success(`Scanned: ${result.new_tracks} new, ${result.updated_tracks} updated`);
-			}
-		} catch (e) {
-			toast.error(`Scan failed: ${e}`);
+			const [paths, running, location] = await Promise.all([
+				api.getLibraryPaths(),
+				api.sidecarStatus().catch(() => false),
+				api.getDownloadLocation()
+			]);
+			libraryPaths = paths;
+			providerRunning = running;
+			downloadLocation = location;
+			await library.loadAll();
+			settingsError = '';
+		} catch (error) {
+			settingsError = `Could not load settings${error ? `: ${error}` : ''}`;
 		} finally {
 			loading = false;
 		}
 	}
 
-	async function startSidecar() {
-		sidecarLoading = true;
+	async function browseForFolder() {
 		try {
-			await api.startSidecar();
-			sidecarRunning = true;
-			toast.success('External provider sidecar started');
-		} catch (e) {
-			toast.error(`Failed to start sidecar: ${e}`);
-		} finally {
-			sidecarLoading = false;
+			const path = await api.pickFolder(libraryPaths.at(-1));
+			if (!path) return;
+			if (libraryPaths.includes(path)) {
+				toast.message('That folder is already in your library');
+				return;
+			}
+
+			const updated = [...libraryPaths, path];
+			await api.updateLibraryPaths(updated);
+			libraryPaths = updated;
+			settingsError = '';
+			toast.success('Music folder added');
+		} catch (error) {
+			toast.error(`Could not add folder: ${error}`);
 		}
 	}
 
-	async function stopSidecar() {
-		sidecarLoading = true;
+	async function removePath(index: number) {
+		const updated = libraryPaths.filter((_, pathIndex) => pathIndex !== index);
+		try {
+			await api.updateLibraryPaths(updated);
+			libraryPaths = updated;
+			settingsError = '';
+			toast.success('Folder removed from future scans');
+		} catch (error) {
+			toast.error(`Could not remove folder: ${error}`);
+		}
+	}
+
+	async function scanAll() {
+		if (libraryPaths.length === 0 || scanning) return;
+
+		scanning = true;
+		const summary: ScanSummary = {
+			folders: 0,
+			newTracks: 0,
+			updatedTracks: 0,
+			errors: []
+		};
+
+		for (const path of libraryPaths) {
+			try {
+				const result = await api.scanLibrary(path);
+				summary.folders += 1;
+				summary.newTracks += result.new_tracks;
+				summary.updatedTracks += result.updated_tracks;
+				summary.errors.push(...result.errors.map((error) => `${path}: ${error}`));
+			} catch (error) {
+				summary.errors.push(`${path}: ${error}`);
+			}
+		}
+
+		try {
+			await library.loadAll();
+			lastScan = summary;
+			if (summary.errors.length > 0) {
+				toast.warning(`Scan finished with ${summary.errors.length} issue${summary.errors.length === 1 ? '' : 's'}`);
+			} else {
+				toast.success(`Library updated: ${summary.newTracks} new, ${summary.updatedTracks} changed`);
+			}
+		} finally {
+			scanning = false;
+		}
+	}
+
+	function formatBytes(bytes: number): string {
+		if (bytes < 1024) return `${bytes} B`;
+		if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+		if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+		return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+	}
+
+	function formatReleaseDate(value: string | null): string | null {
+		if (!value) return null;
+		const date = new Date(value);
+		if (Number.isNaN(date.getTime())) return null;
+		return date.toLocaleDateString(undefined, {
+			year: 'numeric',
+			month: 'short',
+			day: 'numeric'
+		});
+	}
+
+	function updateCheckLabel(): string {
+		if (updater.status === 'checking') return 'Checking…';
+		if (updater.unavailableReason === 'development') return 'Release builds only';
+		if (updater.unavailableReason === 'configuration') return 'Unavailable in this build';
+		if (updater.unavailableReason === 'feed') return 'Check again';
+		if (updater.status === 'current' || updater.status === 'error') return 'Check again';
+		return 'Check for updates';
+	}
+
+	async function chooseDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			const directory = await api.pickFolder(downloadLocation?.directory);
+			if (!directory) return;
+			await api.setDownloadLocation(directory);
+			downloadLocation = await api.getDownloadLocation();
+			toast.success('New downloads will use this folder');
+		} catch (error) {
+			toast.error(`Could not change download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
+		}
+	}
+
+	async function resetDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			await api.resetDownloadLocation();
+			downloadLocation = await api.getDownloadLocation();
+			toast.success('Download folder reset to the default location');
+		} catch (error) {
+			toast.error(`Could not reset download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
+		}
+	}
+
+	async function showDownloadFolder() {
+		if (downloadLocationLoading) return;
+		downloadLocationLoading = true;
+		try {
+			await api.revealDownloadLocation();
+			downloadLocation = await api.getDownloadLocation();
+		} catch (error) {
+			toast.error(`Could not open download folder: ${error}`);
+		} finally {
+			downloadLocationLoading = false;
+		}
+	}
+
+	async function restartProviders() {
+		if (providerLoading) return;
+		providerLoading = true;
 		try {
 			await api.stopSidecar();
-			sidecarRunning = false;
-			toast.success('External provider sidecar stopped');
-		} catch (e) {
-			toast.error(`Failed to stop sidecar: ${e}`);
+			await api.startSidecar();
+			providerRunning = true;
+			toast.success('Search providers restarted');
+		} catch (error) {
+			providerRunning = false;
+			toast.error(`Could not restart search providers: ${error}`);
 		} finally {
-			sidecarLoading = false;
+			providerLoading = false;
 		}
+	}
+
+	function chooseTheme(preference: ThemePreference) {
+		setMode(preference);
 	}
 </script>
 
-<div class="flex max-w-2xl flex-col gap-6">
-	<h1 class="text-2xl font-bold">Settings</h1>
+<div class="flex max-w-3xl flex-col gap-6 pb-8">
+	<div>
+		<h1 class="text-2xl font-bold">Settings</h1>
+		<p class="mt-1 text-sm text-muted-foreground">Your library, appearance, and a small set of useful repair tools.</p>
+	</div>
 
 	{#if settingsError}
-		<p class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+		<p class="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
 			{settingsError}
 		</p>
 	{/if}
 
 	<Card>
-		<CardHeader>
-			<CardTitle>Music Library</CardTitle>
-			<CardDescription>Add folders containing your local music files, then scan to import them.</CardDescription>
-		</CardHeader>
-		<CardContent class="flex flex-col gap-4">
-			{#if libraryPaths.length > 0}
-				{#each libraryPaths as path, i}
-					<div class="flex items-center gap-2 rounded-md border border-border p-2">
-						<FolderOpen class="size-4 shrink-0 text-muted-foreground" />
-						<span class="flex-1 truncate text-sm font-mono">{path}</span>
-						<Button variant="ghost" size="icon" class="size-7 shrink-0" onclick={() => removePath(i)}>
-							<X class="size-4" />
-						</Button>
-					</div>
-				{/each}
-			{:else}
-				<p class="text-sm text-muted-foreground">No library folders added yet.</p>
-			{/if}
-
-			<div class="flex flex-wrap gap-2">
-				<Input
-					placeholder="/Users/remington/Music"
-					class="min-w-[16rem] flex-1"
-					bind:value={newPath}
-					onkeydown={(e) => { if (e.key === 'Enter') addPath(); }}
-				/>
-				<Button variant="outline" onclick={browseForFolder}>
-					<FolderOpen class="mr-1 size-4" />
-					Browse
-				</Button>
-				<Button variant="outline" onclick={addPath} disabled={!newPath.trim()}>
-					<Plus class="mr-1 size-4" />
-					Add
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>Music library</CardTitle>
+					<CardDescription class="mt-1">Choose folders once, then rescan whenever the files on disk change.</CardDescription>
+				</div>
+				<Button variant="outline" size="sm" onclick={browseForFolder} disabled={loading}>
+					<FolderOpen class="size-4" /> Add folder
 				</Button>
 			</div>
+		</CardHeader>
+		<CardContent class="flex flex-col gap-4">
+			<div class="grid grid-cols-3 gap-2 rounded-xl border border-border/70 bg-muted/20 p-3 text-center">
+				<div>
+					<p class="text-lg font-semibold tabular-nums">{library.tracks.length}</p>
+					<p class="text-[11px] text-muted-foreground">Tracks</p>
+				</div>
+				<div class="border-x border-border/60">
+					<p class="text-lg font-semibold tabular-nums">{library.artists.length}</p>
+					<p class="text-[11px] text-muted-foreground">Artists</p>
+				</div>
+				<div>
+					<p class="text-lg font-semibold tabular-nums">{library.albums.length}</p>
+					<p class="text-[11px] text-muted-foreground">Albums</p>
+				</div>
+			</div>
 
-			<Separator />
+			{#if loading}
+				<div class="h-14 animate-pulse rounded-lg bg-muted"></div>
+			{:else if libraryPaths.length > 0}
+				<div class="space-y-2">
+					{#each libraryPaths as path, index}
+						<div class="flex items-center gap-3 rounded-lg border border-border/70 px-3 py-2.5">
+							<div class="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+								<HardDrive class="size-4" />
+							</div>
+							<span class="min-w-0 flex-1 truncate font-mono text-xs" title={path}>{path}</span>
+							<Button
+								variant="ghost"
+								size="icon-sm"
+								class="shrink-0 text-muted-foreground"
+								onclick={() => removePath(index)}
+								aria-label={`Stop scanning ${path}`}
+							>
+								<X class="size-4" />
+							</Button>
+						</div>
+					{/each}
+					<p class="px-1 text-[11px] text-muted-foreground">Removing a folder stops future scans; it does not delete imported tracks or files.</p>
+				</div>
+			{:else}
+				<div class="rounded-xl border border-dashed border-border px-4 py-7 text-center">
+					<FolderOpen class="mx-auto size-7 text-muted-foreground" />
+					<p class="mt-2 text-sm font-medium">No local music folders yet</p>
+					<p class="mt-1 text-xs text-muted-foreground">You can still search and stream music without one.</p>
+				</div>
+			{/if}
 
-			<Button onclick={scanAll} disabled={loading || libraryPaths.length === 0} class="w-fit">
-				{#if loading}
-					<RefreshCw class="mr-2 size-4 animate-spin" />
-					Scanning...
-				{:else}
-					<RefreshCw class="mr-2 size-4" />
-					Scan Library
+			<div class="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
+				<Button onclick={scanAll} disabled={scanning || libraryPaths.length === 0}>
+					<RefreshCw class={`size-4 ${scanning ? 'animate-spin' : ''}`} />
+					{scanning ? 'Scanning folders…' : 'Scan all folders'}
+				</Button>
+				{#if lastScan}
+					<span class={`inline-flex items-center gap-1.5 text-xs ${lastScan.errors.length > 0 ? 'text-amber-500' : 'text-emerald-500'}`}>
+						<CheckCircle2 class="size-3.5" />
+						{lastScan.folders}/{libraryPaths.length} scanned · {lastScan.newTracks} new · {lastScan.updatedTracks} changed
+					</span>
 				{/if}
-			</Button>
+			</div>
 		</CardContent>
 	</Card>
 
 	<Card>
-		<CardHeader>
-			<CardTitle>External Providers</CardTitle>
-			<CardDescription>Manage the local sidecar used for YouTube, SoundCloud, and Bandcamp search/stream resolution.</CardDescription>
-		</CardHeader>
-		<CardContent class="flex items-center justify-between gap-4">
-			<div class="flex items-center gap-3">
-				<div class={`flex size-10 items-center justify-center rounded-full ${sidecarRunning ? 'bg-emerald-500/15 text-emerald-600' : 'bg-muted text-muted-foreground'}`}>
-					<RadioTower class="size-5" />
-				</div>
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
 				<div>
-					<p class="text-sm font-medium">Provider sidecar</p>
-					<p class="text-xs text-muted-foreground">
-						{sidecarRunning ? 'Running and ready for external search' : 'Stopped. External search and streaming will not work.'}
-					</p>
+					<CardTitle>Download location</CardTitle>
+					<CardDescription class="mt-1">New music saves somewhere recognizable and remains yours to manage.</CardDescription>
+				</div>
+				<div class="flex flex-wrap gap-2">
+					<Button variant="outline" size="sm" onclick={showDownloadFolder} disabled={loading || downloadLocationLoading || !downloadLocation}>
+						<FolderOpen class="size-4" /> Show folder
+					</Button>
+					<Button size="sm" onclick={chooseDownloadFolder} disabled={loading || downloadLocationLoading}>
+						<Download class="size-4" /> Change folder
+					</Button>
 				</div>
 			</div>
-			{#if sidecarRunning}
-				<Button variant="outline" size="sm" onclick={stopSidecar} disabled={sidecarLoading}>
-					<Square class="mr-1 size-4" />
-					Stop
-				</Button>
+		</CardHeader>
+		<CardContent class="flex flex-col gap-3">
+			{#if loading || !downloadLocation}
+				<div class="h-16 animate-pulse rounded-lg bg-muted"></div>
 			{:else}
-				<Button size="sm" onclick={startSidecar} disabled={sidecarLoading}>
-					<Play class="mr-1 size-4" />
-					Start
-				</Button>
+				<div class="flex items-center gap-3 rounded-lg border border-border/70 px-3 py-3">
+					<div class="flex size-9 shrink-0 items-center justify-center rounded-md bg-primary/10 text-primary">
+						<Download class="size-4" />
+					</div>
+					<div class="min-w-0 flex-1">
+						<p class="truncate font-mono text-xs" title={downloadLocation.directory}>{downloadLocation.directory}</p>
+						<p class="mt-1 text-[11px] text-muted-foreground">
+							{#if downloadLocation.is_custom}
+								{downloadLocation.exists ? 'Custom folder' : 'Custom folder unavailable · Reconnect it or choose another'}
+							{:else}
+								Default folder{downloadLocation.exists ? '' : ' · Created with your next download'}
+							{/if}
+						</p>
+					</div>
+					{#if downloadLocation.is_custom}
+						<Button variant="ghost" size="sm" onclick={resetDownloadFolder} disabled={downloadLocationLoading}>
+							<RotateCcw class="size-3.5" /> Use default
+						</Button>
+					{/if}
+				</div>
+
+				<p class="px-1 text-[11px] text-muted-foreground">Changing this affects future downloads only. Existing files are never moved or deleted automatically.</p>
+
+				{#if downloadLocation.legacy_file_count > 0}
+					<div class="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+						{downloadLocation.legacy_file_count} existing {downloadLocation.legacy_file_count === 1 ? 'download remains' : 'downloads remain'} in the old app folder ({formatBytes(downloadLocation.legacy_bytes)}). They stay playable there; nothing was moved.
+					</div>
+				{/if}
 			{/if}
+		</CardContent>
+	</Card>
+
+	<Card id="app-updates" data-testid="app-updates">
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>App updates</CardTitle>
+					<CardDescription class="mt-1">
+						Installed version {updater.currentVersion}. You decide when an available update is installed.
+					</CardDescription>
+				</div>
+				<Button
+					variant="outline"
+					size="sm"
+					onclick={() => updater.checkNow()}
+					disabled={!updater.canCheck}
+				>
+					<RefreshCw class={`size-3.5 ${updater.status === 'checking' ? 'animate-spin' : ''}`} />
+					{updateCheckLabel()}
+				</Button>
+			</div>
+		</CardHeader>
+		<CardContent class="flex flex-col gap-3">
+			{#if updater.status === 'checking'}
+				<div class="flex items-center gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status" aria-live="polite">
+					<LoaderCircle class="size-4 shrink-0 animate-spin text-primary" />
+					<div>
+						<p class="text-sm font-medium">Checking for a newer version…</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">Your current app keeps running while this finishes.</p>
+					</div>
+				</div>
+			{:else if updater.status === 'current'}
+				<div class="flex items-center gap-3 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-3" role="status" aria-live="polite">
+					<CheckCircle2 class="size-4 shrink-0 text-emerald-500" />
+					<div>
+						<p class="text-sm font-medium">You’re up to date</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">Version {updater.currentVersion} is the newest release available.</p>
+					</div>
+				</div>
+			{:else if updater.status === 'unavailable'}
+				<div class="flex items-start gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status">
+					<ShieldCheck class="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+					<div>
+						<p class="text-sm font-medium">
+							{updater.unavailableReason === 'configuration'
+								? 'Automatic updates are not configured in this build'
+								: updater.unavailableReason === 'feed'
+									? 'No update feed has been published yet'
+									: 'Update checks are available in installed releases'}
+						</p>
+						<p class="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+							{updater.unavailableReason === 'configuration'
+								? 'This copy keeps working normally. Install a newer release manually when one is provided.'
+								: updater.unavailableReason === 'feed'
+									? 'This bootstrap copy keeps working normally. You can check again after the first signed update is published.'
+									: 'Browser previews and local development stay offline. Release builds check quietly once when mewsik starts.'}
+						</p>
+					</div>
+				</div>
+			{:else if updater.status === 'error'}
+				<div class="flex items-start gap-3 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-3 text-destructive" role="alert">
+					<TriangleAlert class="mt-0.5 size-4 shrink-0" />
+					<p class="text-sm">{updater.errorMessage}</p>
+				</div>
+			{:else if updater.status === 'idle'}
+				<div class="flex items-start gap-3 rounded-lg border border-border/70 bg-muted/20 px-3 py-3" role="status">
+					<ShieldCheck class="mt-0.5 size-4 shrink-0 text-primary" />
+					<div>
+						<p class="text-sm font-medium">Updates stay under your control</p>
+						<p class="mt-0.5 text-xs text-muted-foreground">mewsik checks once when it starts, then waits for your approval.</p>
+					</div>
+				</div>
+			{/if}
+
+			{#if updater.availableUpdate && ['available', 'downloading', 'ready', 'relaunching'].includes(updater.status)}
+				<div class="rounded-xl border border-primary/25 bg-primary/5 p-4" aria-live="polite">
+					<div class="flex flex-wrap items-start justify-between gap-3">
+						<div class="min-w-0 flex-1">
+							<div class="flex items-center gap-2">
+								<Rocket class="size-4 text-primary" />
+								<p class="text-sm font-semibold">Version {updater.availableUpdate.version} is available</p>
+							</div>
+							{#if formatReleaseDate(updater.availableUpdate.date)}
+								<p class="mt-1 text-xs text-muted-foreground">Released {formatReleaseDate(updater.availableUpdate.date)}</p>
+							{/if}
+						</div>
+
+						{#if updater.status === 'available'}
+							<Button size="sm" onclick={() => updater.installAndRestart()}>
+								<Download class="size-3.5" /> Install and restart
+							</Button>
+						{:else if updater.status === 'ready'}
+							<Button size="sm" onclick={() => updater.restartApp()}>
+								<Rocket class="size-3.5" /> Restart now
+							</Button>
+						{:else}
+							<Button size="sm" disabled>
+								<LoaderCircle class="size-3.5 animate-spin" />
+								{updater.status === 'downloading' ? 'Installing…' : 'Restarting…'}
+							</Button>
+						{/if}
+					</div>
+
+					{#if updater.availableUpdate.body}
+						<p class="mt-3 whitespace-pre-line text-xs leading-relaxed text-muted-foreground">{updater.availableUpdate.body}</p>
+					{/if}
+
+					{#if updater.status === 'downloading'}
+						<div class="mt-4" role="status">
+							<div class="mb-1.5 flex items-center justify-between gap-3 text-xs">
+								<span>Downloading and verifying update…</span>
+								{#if updater.progressPercent !== null}
+									<span class="tabular-nums text-muted-foreground">{updater.progressPercent}%</span>
+								{/if}
+							</div>
+							<progress
+								class="h-1.5 w-full overflow-hidden rounded-full accent-primary"
+								max="100"
+								value={updater.progressPercent ?? undefined}
+								aria-label="Update download progress"
+							></progress>
+							{#if updater.totalBytes !== null}
+								<p class="mt-1 text-[11px] tabular-nums text-muted-foreground">
+									{formatBytes(updater.downloadedBytes)} of {formatBytes(updater.totalBytes)}
+								</p>
+							{/if}
+						</div>
+					{/if}
+
+					{#if updater.errorMessage}
+						<div class="mt-3 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-destructive" role="alert">
+							<TriangleAlert class="mt-0.5 size-3.5 shrink-0" />
+							<p class="text-xs">{updater.errorMessage}</p>
+						</div>
+					{/if}
+				</div>
+			{/if}
+
+			<p class="px-1 text-[11px] leading-relaxed text-muted-foreground">
+				Release updates are verified before installation. Your library database, settings, playlists, and downloaded music stay outside the app installation and are not replaced.
+			</p>
 		</CardContent>
 	</Card>
 
 	<Card>
 		<CardHeader>
 			<CardTitle>Appearance</CardTitle>
-			<CardDescription>Customize the look of mewsik.</CardDescription>
+			<CardDescription>Use a fixed theme or follow Windows automatically.</CardDescription>
 		</CardHeader>
 		<CardContent>
-			<div class="flex items-center justify-between">
-				<div>
-					<p class="text-sm font-medium">Theme</p>
-					<p class="text-xs text-muted-foreground">Toggle between dark and light mode</p>
-				</div>
-				<Button variant="outline" size="sm" onclick={() => toggleMode()}>
-					<Sun class="mr-1 size-4 dark:hidden" />
-					<Moon class="mr-1 hidden size-4 dark:block" />
-					Toggle Theme
-				</Button>
+			<div class="grid grid-cols-3 gap-2" role="group" aria-label="Theme">
+				{#each [
+					{ value: 'light' as const, label: 'Light', icon: Sun },
+					{ value: 'dark' as const, label: 'Dark', icon: Moon },
+					{ value: 'system' as const, label: 'System', icon: Laptop }
+				] as option}
+					<button
+						type="button"
+						class={`flex items-center justify-center gap-2 rounded-lg border px-3 py-3 text-sm transition-colors ${userPrefersMode.current === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}
+						onclick={() => chooseTheme(option.value)}
+						aria-pressed={userPrefersMode.current === option.value}
+					>
+						<option.icon class="size-4" /> {option.label}
+					</button>
+				{/each}
 			</div>
 		</CardContent>
 	</Card>
+
+	<details class="group rounded-xl border border-border bg-card">
+		<summary class="flex cursor-pointer list-none items-center justify-between gap-4 px-6 py-4">
+			<div>
+				<p class="text-sm font-semibold">Search troubleshooting</p>
+				<p class="mt-0.5 text-xs text-muted-foreground">External providers normally start by themselves. Open this only if Search gets stuck.</p>
+			</div>
+			<Search class={`size-4 shrink-0 ${providerRunning ? 'text-emerald-500' : 'text-muted-foreground'}`} />
+		</summary>
+		<div class="border-t border-border/60 px-6 py-4">
+			<div class="flex flex-wrap items-center justify-between gap-3">
+				<p class="text-xs text-muted-foreground">
+					{providerRunning ? 'Search providers are running.' : 'Providers are idle and will start with your next search.'}
+				</p>
+				<Button variant="outline" size="sm" onclick={restartProviders} disabled={providerLoading}>
+					<RefreshCw class={`size-3.5 ${providerLoading ? 'animate-spin' : ''}`} />
+					Restart providers
+				</Button>
+			</div>
+		</div>
+	</details>
 </div>

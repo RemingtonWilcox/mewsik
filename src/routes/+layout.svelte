@@ -4,15 +4,25 @@
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
 	import PlayerBar from '$lib/components/player/player-bar.svelte';
 	import CommandSearch from '$lib/components/search/command-search.svelte';
+	import UpdateNotice from '$lib/components/update/update-notice.svelte';
 	import VisualizerHost from '$lib/components/visualizer/visualizer-host.svelte';
+	import { useAppUpdater } from '$lib/state/app-updater.svelte';
+	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import { page } from '$app/state';
 	import {
 		SidebarProvider,
 		SidebarInset
 	} from '$lib/components/ui/sidebar';
 	import { ModeWatcher } from 'mode-watcher';
+	import { onMount } from 'svelte';
 
 	let { children } = $props();
+	const visualizer = useVisualizer();
+	const updater = useAppUpdater();
+
+	onMount(() => {
+		updater.startLaunchCheck();
+	});
 
 	const isVisualizerLab = $derived(page.url.pathname.startsWith('/visualizer-test'));
 
@@ -64,6 +74,7 @@
 	onkeydown={(e) => {
 		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
 			e.preventDefault();
+			if (visualizer.active) return;
 			const event = new CustomEvent('toggle-command', { bubbles: true });
 			window.dispatchEvent(event);
 			return;
@@ -87,7 +98,13 @@
 	{@render children()}
 {:else}
 	<div class="flex h-screen flex-col">
-		<div class="flex flex-1 overflow-hidden">
+		<div
+			data-app-content
+			class="flex flex-1 overflow-hidden"
+			inert={visualizer.active}
+			aria-hidden={visualizer.active ? 'true' : undefined}
+		>
+			<UpdateNotice />
 			<SidebarProvider>
 				<AppSidebar />
 				<SidebarInset>

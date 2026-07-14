@@ -1,5 +1,4 @@
 use crate::audio::queue::QueueEntry;
-use crate::config::AppConfig;
 use crate::db::{
     models::{Download, TrackSource},
     queries, DbPool,
@@ -8,7 +7,7 @@ use crate::external_tools::{find_binary, format_ffmpeg_headers};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,21 +15,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[derive(Default)]
+struct DownloadManagerState {
+    cancellations: HashMap<String, Arc<AtomicBool>>,
+    update_installing: bool,
+}
+
+#[derive(Default)]
 pub struct DownloadManager {
-    cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    state: Mutex<DownloadManagerState>,
 }
 
 impl DownloadManager {
-    pub fn register(&self, download_id: &str) -> Arc<AtomicBool> {
+    pub fn register(&self, download_id: &str) -> Result<Arc<AtomicBool>, String> {
+        let mut state = self.state.lock();
+        if state.update_installing {
+            return Err(
+                "An app update is starting. Restart mewsik before beginning another music download."
+                    .to_string(),
+            );
+        }
         let token = Arc::new(AtomicBool::new(false));
-        self.cancellations
-            .lock()
+        state
+            .cancellations
             .insert(download_id.to_string(), token.clone());
-        token
+        Ok(token)
     }
 
     pub fn cancel(&self, download_id: &str) -> bool {
-        if let Some(token) = self.cancellations.lock().get(download_id).cloned() {
+        if let Some(token) = self.state.lock().cancellations.get(download_id).cloned() {
             token.store(true, Ordering::Relaxed);
             true
         } else {
@@ -39,7 +51,35 @@ impl DownloadManager {
     }
 
     pub fn unregister(&self, download_id: &str) {
-        self.cancellations.lock().remove(download_id);
+        self.state.lock().cancellations.remove(download_id);
+    }
+
+    /// Atomically prevents new worker reservations and reports any work that
+    /// was already alive. The database check also catches stale active rows
+    /// left by an older interrupted build.
+    pub fn prepare_update_install(&self, db: &DbPool) -> Result<usize, String> {
+        let mut state = self.state.lock();
+        if state.update_installing {
+            return Err("App update installation is already prepared".to_string());
+        }
+        if !state.cancellations.is_empty() {
+            return Ok(state.cancellations.len());
+        }
+
+        state.update_installing = true;
+        drop(state);
+        let active_rows = queries::count_active_downloads(db).map_err(|error| error.to_string());
+        match active_rows {
+            Ok(0) => Ok(0),
+            Ok(count) => {
+                self.state.lock().update_installing = false;
+                Ok(count)
+            }
+            Err(error) => {
+                self.state.lock().update_installing = false;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -154,7 +194,7 @@ fn upsert_download_source(
     original_source: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    if !destination.exists() {
+    if !destination.is_file() {
         return Err(format!(
             "Downloaded file is missing: {}",
             destination.to_string_lossy()
@@ -227,7 +267,36 @@ fn upsert_download_source(
     Ok(())
 }
 
-fn unique_output_path(dir: &Path, base_name: &str, extension: &str) -> PathBuf {
+pub fn prepare_download_directory(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("Could not create download folder {}: {e}", dir.display()))?;
+    if !dir.is_dir() {
+        return Err(format!(
+            "Download location is not a folder: {}",
+            dir.display()
+        ));
+    }
+
+    let probe = dir.join(format!(".mewsik-write-test-{}", ulid::Ulid::new()));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+        .map_err(|e| format!("Download folder is not writable ({}): {e}", dir.display()))?;
+    std::fs::remove_file(&probe).map_err(|e| {
+        format!(
+            "Could not finish checking download folder {}: {e}",
+            dir.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn reserve_unique_output_path(
+    dir: &Path,
+    base_name: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
     let mut attempt = 0usize;
     loop {
         let suffix = if attempt == 0 {
@@ -237,10 +306,22 @@ fn unique_output_path(dir: &Path, base_name: &str, extension: &str) -> PathBuf {
         };
         let filename = format!("{base_name}{suffix}.{extension}");
         let candidate = dir.join(filename);
-        if !candidate.exists() {
-            return candidate;
+        match OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not reserve download file {}: {error}",
+                    candidate.display()
+                ));
+            }
         }
-        attempt += 1;
     }
 }
 
@@ -501,21 +582,57 @@ pub fn sync_completed_download_source_for_recording(
     db: &DbPool,
     recording_id: &str,
 ) -> Result<(), String> {
-    let Some(download) = queries::get_latest_completed_download_for_recording(db, recording_id)
-        .map_err(|e| e.to_string())?
-    else {
-        return Ok(());
-    };
+    let downloads =
+        queries::get_download_files_for_recording(db, recording_id).map_err(|e| e.to_string())?;
+    let mut newest_available = None;
 
-    let Some(path) = download.file_path.as_deref() else {
-        return Ok(());
-    };
+    // Playback calls this immediately before choosing a source. Reconcile only
+    // this recording so a drive unplugged after startup cannot leave a stale
+    // local file preferred over an available remote stream, while a reconnected
+    // drive becomes usable again without a global scan.
+    for download in downloads {
+        let Some(file_path) = download.file_path.as_deref() else {
+            continue;
+        };
+        let path = Path::new(file_path);
+        if path.is_file() {
+            if download.status == "missing" {
+                queries::complete_download(db, &download.id, file_path)
+                    .map_err(|e| e.to_string())?;
+            }
+            if newest_available.is_none() {
+                newest_available = Some((download.source, path.to_path_buf()));
+            }
+            continue;
+        }
 
-    upsert_download_source(db, recording_id, &download.source, Path::new(path))
+        if let Some(source) =
+            queries::find_source_by_file_path(db, file_path).map_err(|e| e.to_string())?
+        {
+            if source_is_managed_download(&source) {
+                queries::set_track_source_file_availability(db, file_path, false)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        if download.status == "completed" {
+            queries::mark_download_missing(
+                db,
+                &download.id,
+                &format!("File is unavailable at {file_path}"),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+
+    if let Some((source, path)) = newest_available {
+        upsert_download_source(db, recording_id, &source, &path)?;
+    }
+    Ok(())
 }
 
 pub fn sync_completed_download_sources(db: &DbPool) -> Result<(), String> {
     let downloads = queries::get_downloads(db).map_err(|e| e.to_string())?;
+    let mut synchronized_recordings = std::collections::HashSet::new();
     for download in downloads {
         if download.status != "completed" {
             continue;
@@ -523,21 +640,27 @@ pub fn sync_completed_download_sources(db: &DbPool) -> Result<(), String> {
         let Some(recording_id) = download.recording_id.as_deref() else {
             continue;
         };
+        // get_downloads is newest-first. A recording can have older completed
+        // retries at different locations; the newest available file owns the
+        // single managed local source instead of being overwritten by history.
+        if synchronized_recordings.contains(recording_id) {
+            continue;
+        }
         let Some(file_path) = download.file_path.as_deref() else {
             continue;
         };
-        if Path::new(file_path).exists() {
-            let _ =
-                upsert_download_source(db, recording_id, &download.source, Path::new(file_path));
+        if Path::new(file_path).is_file() {
+            upsert_download_source(db, recording_id, &download.source, Path::new(file_path))?;
+            synchronized_recordings.insert(recording_id.to_string());
         }
     }
     Ok(())
 }
 
-pub fn prune_missing_downloads(db: &DbPool) -> Result<(), String> {
+pub fn reconcile_download_files(db: &DbPool) -> Result<(), String> {
     let downloads = queries::get_downloads(db).map_err(|e| e.to_string())?;
     for download in downloads {
-        if download.status != "completed" {
+        if !matches!(download.status.as_str(), "completed" | "missing") {
             continue;
         }
 
@@ -545,12 +668,38 @@ pub fn prune_missing_downloads(db: &DbPool) -> Result<(), String> {
             continue;
         };
 
-        if Path::new(file_path).exists() {
+        if Path::new(file_path).is_file() {
+            if download.status == "missing" {
+                queries::complete_download(db, &download.id, file_path)
+                    .map_err(|e| e.to_string())?;
+                if let Some(recording_id) = download.recording_id.as_deref() {
+                    let _ = upsert_download_source(
+                        db,
+                        recording_id,
+                        &download.source,
+                        Path::new(file_path),
+                    );
+                }
+            }
             continue;
         }
 
-        let _ = remove_managed_download_source_for_path(db, file_path);
-        queries::delete_download(db, &download.id).map_err(|e| e.to_string())?;
+        if download.status == "completed" {
+            if let Some(source) =
+                queries::find_source_by_file_path(db, file_path).map_err(|e| e.to_string())?
+            {
+                if source_is_managed_download(&source) {
+                    queries::set_track_source_file_availability(db, file_path, false)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            queries::mark_download_missing(
+                db,
+                &download.id,
+                &format!("File is unavailable at {file_path}"),
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
 
     Ok(())
@@ -587,7 +736,12 @@ pub fn queue_download_for_entry(
     manager: &Arc<DownloadManager>,
     recording_id: Option<&str>,
     entry: QueueEntry,
+    downloads_dir: PathBuf,
 ) -> Result<String, String> {
+    // Resolve and validate before inserting a job. An unavailable custom drive
+    // should not leave behind a permanently failed phantom download.
+    prepare_download_directory(&downloads_dir)?;
+
     let now = queries::now();
     let source_url = entry
         .file_path
@@ -607,41 +761,60 @@ pub fn queue_download_for_entry(
         created_at: now.clone(),
         updated_at: now,
     };
-    queries::insert_download(db, &download).map_err(|e| e.to_string())?;
+    // Reserve a live-worker slot before the database row exists. The updater's
+    // prepare command holds the same manager mutex, so it cannot observe zero
+    // work and quiesce while a new download is between its check and insert.
+    let cancel_token = manager.register(&download.id)?;
+    if let Err(error) = queries::insert_download(db, &download) {
+        manager.unregister(&download.id);
+        return Err(error.to_string());
+    }
 
-    let db = db.clone();
+    let worker_db = db.clone();
     let manager = manager.clone();
     let recording_id = recording_id.map(str::to_string);
     let download_id = download.id.clone();
-    let cancel_token = manager.register(&download_id);
     let worker_manager = manager.clone();
     let worker_download_id = download_id.clone();
     std::thread::Builder::new()
         .name(format!("download-{}", download.id))
         .spawn(move || {
-            if let Err(err) =
-                queries::update_download_progress(&db, &worker_download_id, 1.0, "downloading")
-                    .map_err(|e| e.to_string())
+            if let Err(err) = queries::update_download_progress(
+                &worker_db,
+                &worker_download_id,
+                1.0,
+                "downloading",
+            )
+            .map_err(|e| e.to_string())
             {
-                let _ = queries::fail_download(&db, &worker_download_id, &err);
-                return;
-            }
-
-            let downloads_dir = AppConfig::data_dir().join("downloads");
-            if let Err(err) = std::fs::create_dir_all(&downloads_dir).map_err(|e| e.to_string()) {
-                let _ = queries::fail_download(&db, &worker_download_id, &err);
+                let _ = queries::fail_download(&worker_db, &worker_download_id, &err);
+                worker_manager.unregister(&worker_download_id);
                 return;
             }
 
             let base_name = sanitize_filename(&format!("{} - {}", entry.artist, entry.title));
             let extension = infer_extension(&entry);
-            let destination = unique_output_path(&downloads_dir, &base_name, &extension);
+            let destination =
+                match reserve_unique_output_path(&downloads_dir, &base_name, &extension) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        let _ = queries::fail_download(&worker_db, &worker_download_id, &error);
+                        worker_manager.unregister(&worker_download_id);
+                        return;
+                    }
+                };
 
             let result = if let Some(path) = entry.file_path.as_deref() {
-                copy_local_file(&db, &worker_download_id, path, &destination, &cancel_token)
+                copy_local_file(
+                    &worker_db,
+                    &worker_download_id,
+                    path,
+                    &destination,
+                    &cancel_token,
+                )
             } else if should_transcode_remote_to_mp3(&entry) {
                 transcode_remote_file_to_mp3(
-                    &db,
+                    &worker_db,
                     &worker_download_id,
                     &entry,
                     entry.source_url.as_deref().unwrap_or_default(),
@@ -650,7 +823,7 @@ pub fn queue_download_for_entry(
                 )
             } else if let Some(url) = entry.source_url.as_deref() {
                 fetch_remote_file(
-                    &db,
+                    &worker_db,
                     &worker_download_id,
                     url,
                     &entry.source_headers,
@@ -667,22 +840,25 @@ pub fn queue_download_for_entry(
                 let _ = std::fs::remove_file(&destination);
                 match err {
                     DownloadError::Cancelled => {
-                        let _ = queries::cancel_download(&db, &worker_download_id);
+                        let _ = queries::cancel_download(&worker_db, &worker_download_id);
                     }
                     DownloadError::Failed(message) => {
-                        let _ = queries::fail_download(&db, &worker_download_id, &message);
+                        let _ = queries::fail_download(&worker_db, &worker_download_id, &message);
                     }
                 }
             } else if let Some(recording_id) = recording_id.as_deref() {
-                let _ = upsert_download_source(&db, recording_id, &entry.source, &destination);
-                let _ = crate::db::queries::set_in_library(&db, recording_id, true);
+                let _ =
+                    upsert_download_source(&worker_db, recording_id, &entry.source, &destination);
+                let _ = crate::db::queries::set_in_library(&worker_db, recording_id, true);
             }
 
             worker_manager.unregister(&worker_download_id);
         })
         .map_err(|e| {
             manager.unregister(&download_id);
-            format!("Failed to spawn download worker: {}", e)
+            let message = format!("Failed to spawn download worker: {}", e);
+            let _ = queries::fail_download(db, &download_id, &message);
+            message
         })?;
 
     Ok(download.id)
@@ -694,15 +870,62 @@ pub fn get_all_downloads(db: &DbPool) -> Result<Vec<Download>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{infer_extension, sync_completed_download_source_for_recording};
+    use super::{
+        infer_extension, prepare_download_directory, queue_download_for_entry,
+        reconcile_download_files, reserve_unique_output_path,
+        sync_completed_download_source_for_recording, sync_completed_download_sources,
+        DownloadManager,
+    };
     use crate::audio::queue::QueueEntry;
     use crate::db::{
         init_memory_db,
-        models::{Download, Recording},
+        models::{Download, Recording, TrackSource},
         queries,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn update_quiesce_and_download_reservation_share_one_gate() {
+        let db = init_memory_db().expect("db");
+        let manager = DownloadManager::default();
+        let live = manager.register("live-worker").expect("reserve worker");
+        assert!(!live.load(Ordering::Relaxed));
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 1);
+
+        manager.unregister("live-worker");
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 0);
+        assert!(manager.register("too-late").is_err());
+        assert!(manager.prepare_update_install(&db).is_err());
+    }
+
+    #[test]
+    fn stale_active_database_row_blocks_update_quiesce() {
+        let db = init_memory_db().expect("db");
+        let now = queries::now();
+        queries::insert_download(
+            &db,
+            &Download {
+                id: "stale-active".to_string(),
+                recording_id: None,
+                source: "youtube".to_string(),
+                source_url: "https://example.invalid/audio".to_string(),
+                status: "downloading".to_string(),
+                progress: 42.0,
+                file_path: None,
+                error_message: None,
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        )
+        .expect("insert stale active row");
+
+        let manager = DownloadManager::default();
+        assert_eq!(manager.prepare_update_install(&db).expect("prepare"), 1);
+        assert!(manager.register("still-allowed").is_ok());
+    }
 
     #[test]
     fn completed_download_is_promoted_to_local_track_source() {
@@ -774,5 +997,287 @@ mod tests {
         };
 
         assert_eq!(infer_extension(&entry), "mp3");
+    }
+
+    #[test]
+    fn missing_download_records_are_preserved_and_restore_when_the_file_returns() {
+        let db = init_memory_db().expect("db");
+        let now = queries::now();
+        let recording_id = queries::new_id();
+        queries::insert_recording(
+            &db,
+            &Recording {
+                id: recording_id.clone(),
+                title: "Portable Track".to_string(),
+                duration_ms: Some(90_000),
+                year: None,
+                genre: None,
+                cover_art_path: None,
+                cover_art_url: None,
+                loudness_lufs: None,
+                musicbrainz_id: None,
+                metadata_json: None,
+                is_in_library: true,
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .expect("insert recording");
+
+        queries::insert_track_source(
+            &db,
+            &TrackSource {
+                id: queries::new_id(),
+                recording_id: recording_id.clone(),
+                source: "youtube".to_string(),
+                source_id: Some("portable-remote".to_string()),
+                source_url: Some("https://example.com/audio".to_string()),
+                file_path: None,
+                file_format: Some("audio/mp4".to_string()),
+                file_size_bytes: None,
+                bitrate: None,
+                sample_rate: None,
+                quality_score: 80,
+                content_hash: None,
+                is_available: true,
+                metadata_json: None,
+                last_verified: Some(now.clone()),
+                created_at: now.clone(),
+                updated_at: now.clone(),
+            },
+        )
+        .expect("insert remote fallback");
+
+        let path = std::env::temp_dir().join(format!("mewsik-missing-{}.mp3", queries::new_id()));
+        fs::write(&path, b"audio").expect("write managed download");
+        let download = Download {
+            id: queries::new_id(),
+            recording_id: Some(recording_id.clone()),
+            source: "youtube".to_string(),
+            source_url: "https://example.com/audio".to_string(),
+            status: "completed".to_string(),
+            progress: 100.0,
+            file_path: Some(path.to_string_lossy().into_owned()),
+            error_message: None,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        queries::insert_download(&db, &download).expect("insert download");
+        sync_completed_download_source_for_recording(&db, &recording_id)
+            .expect("create managed source");
+
+        fs::remove_file(&path).expect("disconnect file");
+        sync_completed_download_source_for_recording(&db, &recording_id)
+            .expect("playback-boundary reconciliation marks file unavailable");
+
+        let missing = queries::get_download_by_id(&db, &download.id)
+            .expect("read download")
+            .expect("download row must be preserved");
+        assert_eq!(missing.status, "missing");
+        let unavailable_source = queries::find_source_by_file_path(
+            &db,
+            download.file_path.as_deref().expect("file path"),
+        )
+        .expect("read managed source")
+        .expect("managed source row must be preserved");
+        assert!(!unavailable_source.is_available);
+        let fallback = queries::get_best_source(&db, &recording_id)
+            .expect("read fallback")
+            .expect("remote source remains available");
+        assert_eq!(fallback.source, "youtube");
+        assert!(fallback.file_path.is_none());
+
+        fs::write(&path, b"audio restored").expect("restore file");
+        sync_completed_download_source_for_recording(&db, &recording_id)
+            .expect("playback-boundary reconciliation restores file availability");
+        let restored = queries::get_download_by_id(&db, &download.id)
+            .expect("read restored download")
+            .expect("download still exists");
+        assert_eq!(restored.status, "completed");
+        let restored_source = queries::find_source_by_file_path(
+            &db,
+            download.file_path.as_deref().expect("file path"),
+        )
+        .expect("read restored source")
+        .expect("managed source still exists");
+        assert!(restored_source.is_available);
+        let restored_best = queries::get_best_source(&db, &recording_id)
+            .expect("read restored best source")
+            .expect("restored local source wins");
+        assert_eq!(restored_best.source, "local");
+        assert_eq!(
+            restored_best.file_path.as_deref(),
+            download.file_path.as_deref()
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn directory_at_saved_audio_path_is_treated_as_missing() {
+        let db = init_memory_db().expect("db");
+        let path =
+            std::env::temp_dir().join(format!("mewsik-directory-audio-{}.mp3", queries::new_id()));
+        fs::create_dir_all(&path).expect("create directory at audio path");
+        let download = Download {
+            id: queries::new_id(),
+            recording_id: None,
+            source: "soundcloud".to_string(),
+            source_url: "https://example.com/not-a-directory".to_string(),
+            status: "completed".to_string(),
+            progress: 100.0,
+            file_path: Some(path.to_string_lossy().into_owned()),
+            error_message: None,
+            created_at: "2026-07-14T10:00:00Z".to_string(),
+            updated_at: "2026-07-14T10:00:00Z".to_string(),
+        };
+        queries::insert_download(&db, &download).expect("insert download");
+
+        reconcile_download_files(&db).expect("reconcile directory path");
+
+        let reconciled = queries::get_download_by_id(&db, &download.id)
+            .expect("read download")
+            .expect("download is preserved");
+        assert_eq!(reconciled.status, "missing");
+        fs::remove_dir_all(path).expect("remove test directory");
+    }
+
+    #[test]
+    fn newest_available_retry_owns_the_managed_local_source() {
+        let db = init_memory_db().expect("db");
+        let recording_id = queries::new_id();
+        queries::insert_recording(
+            &db,
+            &Recording {
+                id: recording_id.clone(),
+                title: "Retried Track".to_string(),
+                duration_ms: Some(120_000),
+                year: None,
+                genre: None,
+                cover_art_path: None,
+                cover_art_url: None,
+                loudness_lufs: None,
+                musicbrainz_id: None,
+                metadata_json: None,
+                is_in_library: true,
+                created_at: "2026-07-14T09:00:00Z".to_string(),
+                updated_at: "2026-07-14T09:00:00Z".to_string(),
+            },
+        )
+        .expect("insert recording");
+
+        let root = std::env::temp_dir().join(format!("mewsik-retries-{}", queries::new_id()));
+        fs::create_dir_all(&root).expect("create retry root");
+        let old_path = root.join("old.mp3");
+        let new_path = root.join("new.mp3");
+        fs::write(&old_path, b"old audio").expect("write old retry");
+        fs::write(&new_path, b"new audio").expect("write new retry");
+
+        for (id, path, created_at) in [
+            ("old", &old_path, "2026-07-14T10:00:00Z"),
+            ("new", &new_path, "2026-07-14T11:00:00Z"),
+        ] {
+            queries::insert_download(
+                &db,
+                &Download {
+                    id: format!("{id}-{}", queries::new_id()),
+                    recording_id: Some(recording_id.clone()),
+                    source: "youtube".to_string(),
+                    source_url: format!("https://example.com/{id}"),
+                    status: "completed".to_string(),
+                    progress: 100.0,
+                    file_path: Some(path.to_string_lossy().into_owned()),
+                    error_message: None,
+                    created_at: created_at.to_string(),
+                    updated_at: created_at.to_string(),
+                },
+            )
+            .expect("insert retry");
+        }
+
+        sync_completed_download_sources(&db).expect("synchronize retries");
+
+        let source = queries::get_best_source(&db, &recording_id)
+            .expect("read source")
+            .expect("managed local source exists");
+        assert_eq!(
+            source.file_path.as_deref(),
+            Some(new_path.to_string_lossy().as_ref())
+        );
+        fs::remove_dir_all(root).expect("remove retry root");
+    }
+
+    #[test]
+    fn concurrent_same_name_reservations_never_share_a_file() {
+        let root = std::env::temp_dir().join(format!("mewsik-reserve-{}", queries::new_id()));
+        prepare_download_directory(&root).expect("prepare destination");
+
+        let handles = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    reserve_unique_output_path(&root, "Artist - Track", "mp3")
+                        .expect("reserve unique file")
+                })
+            })
+            .collect::<Vec<_>>();
+        let paths = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("reservation thread"))
+            .collect::<HashSet<_>>();
+
+        assert_eq!(paths.len(), 8);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn queued_job_keeps_the_destination_captured_at_queue_time() {
+        let db = init_memory_db().expect("db");
+        let manager = std::sync::Arc::new(DownloadManager::default());
+        let root = std::env::temp_dir().join(format!("mewsik-captured-{}", queries::new_id()));
+        let first_destination = root.join("first");
+        let later_setting = root.join("later");
+        let source = root.join("source.mp3");
+        fs::create_dir_all(&root).expect("create test root");
+        fs::write(&source, b"captured destination audio").expect("write source");
+
+        let entry = QueueEntry {
+            recording_id: queries::new_id(),
+            title: "Captured Track".to_string(),
+            artist: "Artist".to_string(),
+            file_path: Some(source.to_string_lossy().into_owned()),
+            source_url: None,
+            source_headers: HashMap::new(),
+            stream_mime_type: Some("audio/mpeg".to_string()),
+            can_seek: true,
+            source: "local".to_string(),
+            duration_ms: Some(5_000),
+            cover_art: None,
+        };
+        let download_id =
+            queue_download_for_entry(&db, &manager, None, entry, first_destination.clone())
+                .expect("queue download");
+
+        // A later Settings change creates a different folder, but the worker
+        // owns the path supplied above and must not re-read mutable config.
+        prepare_download_directory(&later_setting).expect("prepare later setting");
+
+        let completed = (0..200).find_map(|_| {
+            let download = queries::get_download_by_id(&db, &download_id)
+                .expect("read queued download")
+                .expect("download exists");
+            if download.status == "completed" {
+                Some(download)
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                None
+            }
+        });
+        let completed = completed.expect("download should complete");
+        let output = PathBuf::from(completed.file_path.expect("completed path"));
+
+        assert!(output.starts_with(&first_destination));
+        assert!(!output.starts_with(&later_setting));
+        let _ = fs::remove_dir_all(root);
     }
 }
