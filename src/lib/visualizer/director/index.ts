@@ -10,6 +10,7 @@ import type {
 	MusicalPerformanceContext,
 	PerformanceKeyMode
 } from './types.js';
+import type { SignalSpectrumProfile } from '$lib/visualizer/signal/spectrum';
 import { clamp01, AsymmetricEnvelope } from './util.js';
 import { ClockTracker } from './clock.js';
 import { DropDetector } from './drop.js';
@@ -58,14 +59,26 @@ export class VisualDirector {
 	private rawMid = 0;
 	private rawTreble = 0;
 	private rawCentroid = 0.5;
+	private noveltyLatched = false;
 
-	update(features: AudioFeatureFrame | null | undefined, time: number): VisualDirectorFrame {
+	update(
+		features: AudioFeatureFrame | null | undefined,
+		time: number,
+		spectrum?: Readonly<SignalSpectrumProfile>
+	): VisualDirectorFrame {
 		const rms = features?.rms ?? 0;
-		const bass = features?.bass ?? 0;
-		const mid = features?.mid ?? 0;
-		const treble = features?.treble ?? 0;
-		const centroid = features?.centroid ?? 0.5;
-		const onset = features?.onset === true;
+		const bass = spectrum?.bass ?? features?.bass ?? 0;
+		const mid = spectrum?.mid ?? features?.mid ?? 0;
+		const treble = spectrum?.treble ?? features?.treble ?? 0;
+		const centroid = spectrum?.centroid ?? features?.centroid ?? 0.5;
+		const novelty = spectrum?.novelty ?? 0;
+		// Spectrum novelty is an attack/release envelope, not a one-frame event.
+		// Convert each excursion into one impulse so a single transient cannot be
+		// counted as a dozen onsets while the 240 ms release tail decays.
+		if (novelty < 0.36) this.noveltyLatched = false;
+		const noveltyOnset = novelty > 0.58 && !this.noveltyLatched;
+		if (noveltyOnset) this.noveltyLatched = true;
+		const onset = features?.onset === true || noveltyOnset;
 		const chromaKey = features?.chroma_key ?? 0;
 		const chromaStrength = features?.chroma_strength ?? 0;
 		const beatPhase = features?.beat_phase ?? 0;
@@ -92,8 +105,11 @@ export class VisualDirector {
 
 		// Approximate spectral flatness from FFT bins when available; otherwise
 		// fall back to a coarse estimate from (treble / (bass + mid + treble)).
-		const flatness = approxFlatness(features?.bins, bass, mid, treble);
-		const subBass = this.subBassEnv.tick(bass);
+		const flatness = spectrum?.flatness ?? approxFlatness(features?.bins, bass, mid, treble);
+		const subBassTarget = spectrum
+			? clamp01(spectrum.levels.sub * 0.62 + spectrum.levels.kick * 0.38)
+			: bass;
+		const subBass = this.subBassEnv.tick(subBassTarget);
 		const onsetDensity = this.onsetDensityEnv.tick(onset ? 1 : 0);
 		let dropState = this.drop.update({
 			time,
@@ -272,7 +288,9 @@ function scoreClock(
 		downbeatFlag: beatIndex === 0 && beatPhase < 0.12,
 		barIndex,
 		beatIndex,
-		phrasePos: (barIndex % phraseBars) / phraseBars + beatPhase / (4 * phraseBars),
+		phrasePos:
+			(barIndex % phraseBars) / phraseBars +
+			(beatIndex + beatPhase) / (4 * phraseBars),
 		phraseIndex: Math.floor(barIndex / phraseBars)
 	};
 }

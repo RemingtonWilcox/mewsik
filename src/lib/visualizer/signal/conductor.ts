@@ -50,7 +50,7 @@ export type SignalConductorFrame = {
 	phraseVariation: number;
 	/** Continuous contour offset; wraps without a visible phrase-boundary jump. */
 	spectrumTravel: number;
-	/** Shared renderer phase in radians; survives Signal component remounts. */
+	/** Monotonic shared renderer phase in radians; survives component remounts. */
 	tracePhase: number;
 	/** Smoothed fifth-axis key angle, 0..1 around the circle. */
 	key: number;
@@ -554,8 +554,10 @@ export class SignalConductor {
 				);
 		const traceSpeed =
 			0.012 + this.tempo * 0.052 + this.motion * 0.118 + spectrum.mid * 0.038;
-		this.tracePhase =
-			(this.tracePhase + dt * traceSpeed * traceActivity) % (Math.PI * 2);
+		// Keep this phase unwrapped. Several renderers intentionally sample it at
+		// non-integral frequencies; modulo 2π would make those consumers snap at
+		// every wrap even though ordinary sin/cos consumers remain continuous.
+		this.tracePhase += dt * traceSpeed * traceActivity;
 
 		writeProfileWeights(this.targetShapes, section.shapes);
 		// Phrase identity is bounded and zero-sum. Tonnetz and bands then make the

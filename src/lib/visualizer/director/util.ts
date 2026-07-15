@@ -23,6 +23,14 @@ export function wrap01(x: number) {
 	return f < 0 ? f + 1 : f;
 }
 
+/** Interpolate around a normalized circle by the shortest arc. */
+export function lerpCircular01(current: number, target: number, t: number) {
+	const from = wrap01(current);
+	const to = wrap01(target);
+	const delta = wrap01(to - from + 0.5) - 0.5;
+	return wrap01(from + delta * clamp01(t));
+}
+
 // alpha for one-pole IIR at frame rate fs with time-constant tau (seconds).
 // y[n] = a * x[n] + (1 - a) * y[n-1]
 export function alphaForTau(tau: number, fs: number) {

@@ -13,6 +13,7 @@ import {
 	type SignalConductorFrame
 } from '$lib/visualizer/signal/conductor';
 import { Mk2Conductor, type Mk2ConductorFrame } from '$lib/visualizer/mk2/conductor';
+import { LoomConductor, type LoomConductorFrame } from '$lib/visualizer/loom/conductor';
 
 /**
  * Atomic live view of one journey tick. Nested controller outputs and typed
@@ -24,10 +25,13 @@ export type VisualizerJourneySnapshot = {
 	readonly spectrum: Readonly<SignalSpectrumProfile>;
 	readonly signal: Readonly<SignalConductorFrame>;
 	readonly mk2: Readonly<Mk2ConductorFrame>;
+	readonly loom: Readonly<LoomConductorFrame>;
 	/** Deterministic per-source visual identity in the 0..1 range. */
 	readonly seed: number;
 	/** Monotonic source generation, so A -> B -> A is three distinct journeys. */
 	readonly sourceEpoch: number;
+	/** Monotonic seconds since this source epoch began; renderer-remount safe. */
+	readonly timelineSeconds: number;
 };
 
 function clamp(value: number, low: number, high: number): number {
@@ -60,6 +64,7 @@ export class VisualizerJourneyRuntime {
 	private spectrumTracker = new SignalSpectrumTracker();
 	private signalConductor: SignalConductor;
 	private mk2Conductor: Mk2Conductor;
+	private loomConductor: LoomConductor;
 	private snapshot: VisualizerJourneySnapshot | null = null;
 
 	constructor(sessionSeed = Math.random(), nowMs = 0) {
@@ -68,6 +73,7 @@ export class VisualizerJourneyRuntime {
 		this.epochAtMs = safeNow(nowMs);
 		this.signalConductor = new SignalConductor(this.seed);
 		this.mk2Conductor = new Mk2Conductor(this.seed);
+		this.loomConductor = new LoomConductor(this.seed);
 	}
 
 	get sourceIdentity(): string | null {
@@ -99,6 +105,7 @@ export class VisualizerJourneyRuntime {
 		this.spectrumTracker = new SignalSpectrumTracker();
 		this.signalConductor = new SignalConductor(this.seed);
 		this.mk2Conductor = new Mk2Conductor(this.seed);
+		this.loomConductor = new LoomConductor(this.seed);
 		this.snapshot = null;
 		return true;
 	}
@@ -118,18 +125,24 @@ export class VisualizerJourneyRuntime {
 			0.25
 		);
 		const timelineSeconds = Math.max(0, (now - this.epochAtMs) / 1000);
-		const director = this.director.update(features, timelineSeconds);
 		const spectrum = this.spectrumTracker.update(features, dt);
+		// Perceptual spectrum is shared analysis, not a Signal-only post-process.
+		// Advance it first so the director and every engine hear the same real-Hz
+		// bands, flatness, novelty, and centroid in this transaction.
+		const director = this.director.update(features, timelineSeconds, spectrum);
 		const signal = this.signalConductor.update(director, spectrum, dt);
 		const mk2 = this.mk2Conductor.update(director, signal, spectrum, dt);
+		const loom = this.loomConductor.update(director, spectrum, dt);
 		this.updatedAtMs = now;
 		this.snapshot = {
 			director,
 			spectrum,
 			signal,
 			mk2,
+			loom,
 			seed: this.seed,
-			sourceEpoch: this.epoch
+			sourceEpoch: this.epoch,
+			timelineSeconds
 		};
 		return this.snapshot;
 	}

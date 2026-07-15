@@ -7,7 +7,7 @@
 // The analyzer exposes chroma_key normalized to 0..1 (C=0, B=11/12) plus
 // chroma_strength. Convert to pitch-class units only at the Tonnetz boundary.
 
-import { wrap01, lerp, alphaForTau, AsymmetricEnvelope } from './util.js';
+import { wrap01, lerp, lerpCircular01, alphaForTau, AsymmetricEnvelope } from './util.js';
 import type { PaletteHSV } from './types.js';
 
 const TWO_PI = Math.PI * 2;
@@ -56,9 +56,9 @@ export class PaletteEngine {
 		const targetRim = wrap01(targetBase + (rimAngle / TWO_PI) * 0.22 + 0.5);
 
 		const aHue = alphaForTau(1.2, 60);
-		this.baseHue = wrap01(lerp(this.baseHue, targetBase, aHue));
-		this.accentHue = wrap01(lerp(this.accentHue, targetAccent, aHue));
-		this.rimHue = wrap01(lerp(this.rimHue, targetRim, aHue));
+		this.baseHue = lerpCircular01(this.baseHue, targetBase, aHue);
+		this.accentHue = lerpCircular01(this.accentHue, targetAccent, aHue);
+		this.rimHue = lerpCircular01(this.rimHue, targetRim, aHue);
 
 		const warmth = this.warmth.tick(0.5 + 0.5 * valence);
 		const saturation = this.saturation.tick(0.4 + 0.5 * arousal + 0.15 * energy);

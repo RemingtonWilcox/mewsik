@@ -4,6 +4,7 @@
 	import VisualizerMk1 from './visualizer.svelte';
 	import VisualizerMk2 from './visualizer-mk2.svelte';
 	import VisualizerSignal from './visualizer-signal.svelte';
+	import VisualizerLoom from './visualizer-loom.svelte';
 	import {
 		PRESET_NAMES,
 		VISUALIZER_CATALOG,
@@ -24,6 +25,7 @@
 	let keyboardFocusMode = true;
 	let hudSection = $state('intro');
 	let hudForm = $state('seed');
+	let hudTopology = $state('torus');
 	let hudTempo = $state(0);
 	let hudContext = $state<'live' | 'score'>('live');
 	let telemetryTimer: ReturnType<typeof setInterval> | null = null;
@@ -50,11 +52,22 @@
 		return dominant[0];
 	}
 
+	function dominantLoomTopology(journey: VisualizerJourneySnapshot['loom']): string {
+		const forms = Object.entries(journey.topologyWeights) as [
+			keyof VisualizerJourneySnapshot['loom']['topologyWeights'],
+			number
+		][];
+		let dominant = forms[0];
+		for (const form of forms) if (form[1] > dominant[1]) dominant = form;
+		return dominant[0];
+	}
+
 	function refreshTelemetry() {
 		if (!vis.active) return;
 		const journey = vis.getJourney();
 		hudSection = journey.director.section;
 		hudForm = dominantLifecycleForm(journey.mk2);
+		hudTopology = dominantLoomTopology(journey.loom);
 		hudTempo = journey.director.clock.tempoBpm;
 		hudContext = journey.director.context.source;
 	}
@@ -86,6 +99,16 @@
 		// chrome forever. The next real keyboard event restores focus-hold mode.
 		keyboardFocusMode = false;
 		visualizerChrome.setHold('engine-focus', false);
+	}
+
+	function handleStagePointerMove(event: PointerEvent) {
+		if (event.pointerType === 'touch') return;
+		// Reaching the stage proves the pointer is no longer over either control
+		// surface. Explicitly clear hover holds as a guard against WebView/DOM
+		// transitions that occasionally omit pointerleave and otherwise pin chrome.
+		visualizerChrome.setHold('engine-pointer', false);
+		visualizerChrome.setHold('player-pointer', false);
+		visualizerChrome.wake();
 	}
 
 	function toggleStageControls() {
@@ -219,8 +242,10 @@
 			<VisualizerMk1 />
 		{:else if vis.engine === 'mk2'}
 			<VisualizerMk2 />
-		{:else}
+		{:else if vis.engine === 'signal'}
 			<VisualizerSignal />
+		{:else}
+			<VisualizerLoom />
 		{/if}
 
 		<button
@@ -231,9 +256,7 @@
 				: visualizerChrome.visible
 					? 'Hide visualizer controls'
 					: 'Show visualizer controls'}
-			onpointermove={(event) => {
-				if (event.pointerType !== 'touch') visualizerChrome.wake();
-			}}
+			onpointermove={handleStagePointerMove}
 			onclick={toggleStageControls}
 		></button>
 
@@ -336,8 +359,10 @@
 							<span>{PRESET_NAMES[vis.preset] ?? 'kaleidoscope'}</span>
 						{:else if vis.engine === 'mk2'}
 							<span>{hudForm}</span>
-						{:else}
+						{:else if vis.engine === 'signal'}
 							<span>{hudContext}</span>
+						{:else}
+							<span>{hudTopology}</span>
 						{/if}
 					</div>
 

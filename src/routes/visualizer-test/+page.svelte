@@ -5,6 +5,7 @@
 	import VisualizerMk1 from '$lib/components/visualizer/visualizer.svelte';
 	import VisualizerMk2 from '$lib/components/visualizer/visualizer-mk2.svelte';
 	import VisualizerSignal from '$lib/components/visualizer/visualizer-signal.svelte';
+	import VisualizerLoom from '$lib/components/visualizer/visualizer-loom.svelte';
 	import {
 		PRESET_NAMES,
 		VISUALIZER_CATALOG,
@@ -185,6 +186,7 @@
 		else if (event.key.toLowerCase() === 'q') setEngine('mk1');
 		else if (event.key.toLowerCase() === 'w') setEngine('mk2');
 		else if (event.key.toLowerCase() === 'e') setEngine('signal');
+		else if (event.key.toLowerCase() === 'r') setEngine('loom');
 	}}
 />
 
@@ -212,6 +214,12 @@
 				class={`border-l border-white/20 px-3 py-1 ${engine === 'signal' ? 'bg-white text-black' : 'bg-black/40 hover:bg-white/10'}`}
 			>
 				{VISUALIZER_CATALOG.signal.name}
+			</button>
+			<button
+				onclick={() => setEngine('loom')}
+				class={`border-l border-white/20 px-3 py-1 ${engine === 'loom' ? 'bg-blue-200 text-black' : 'bg-black/40 text-blue-100 hover:bg-white/10'}`}
+			>
+				{VISUALIZER_CATALOG.loom.name}
 			</button>
 		</div>
 		<div class="flex overflow-hidden rounded border border-white/20">
@@ -255,10 +263,12 @@
 			</span>
 		{:else if engine === 'mk2'}
 			<span class="text-amber-200"><strong>{VISUALIZER_CATALOG.mk2.name} · mk2</strong> · living fractal</span>
-		{:else}
+		{:else if engine === 'signal'}
 			<span><strong>{VISUALIZER_CATALOG.signal.name}</strong> · phosphor score</span>
+		{:else}
+			<span class="text-blue-100"><strong>{VISUALIZER_CATALOG.loom.name}</strong> · harmonic weave</span>
 		{/if}
-		<span class="text-white/45">keys: q prism · w soma · e signal · 0–4 prism scenes</span>
+		<span class="text-white/45">keys: q prism · w soma · e signal · r loom · 0–4 prism scenes</span>
 		<span class="text-white/40">|</span>
 		{#if vis.latest}
 			<span>bpm {vis.latest.bpm.toFixed(0)}</span>
@@ -278,7 +288,9 @@
 		<VisualizerMk1 />
 	{:else if engine === 'mk2'}
 		<VisualizerMk2 />
-	{:else}
+	{:else if engine === 'signal'}
 		<VisualizerSignal />
+	{:else}
+		<VisualizerLoom />
 	{/if}
 {/if}

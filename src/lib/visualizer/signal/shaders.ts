@@ -142,6 +142,23 @@ fn ribbonForm(t: f32, phase: f32, presence: f32) -> vec2<f32> {
 	return vec2<f32>(x, y);
 }
 
+// A real open sweep gives Signal a second spatial grammar. It remains one
+// instrument trace: no texture layer is composited over the closed contour.
+fn sweepForm(fraction: f32, phase: f32, presence: f32, air: f32) -> vec2<f32> {
+	let x = fraction * 2.0 - 1.0;
+	let carrier = sin(x * (7.0 + presence * 4.0) + phase * 1.7) * (0.28 + presence * 0.16);
+	let modulation = sin(x * 19.0 - phase * 0.63) * air * 0.075;
+	return vec2<f32>(x * 1.08, carrier + modulation + x * x * x * 0.08);
+}
+
+// Tension winds the rosette into a coil; release unwinds it back into the
+// continuous contour. The radius never collapses to zero, avoiding a hot knot.
+fn coilForm(t: f32, fraction: f32, phase: f32, mid: f32) -> vec2<f32> {
+	let radius = mix(0.2, 0.92, fraction) * (0.9 + mid * 0.1);
+	let angle = t * 2.35 + phase * 0.42;
+	return vec2<f32>(cos(angle), sin(angle)) * radius;
+}
+
 // The stream is mono, so this is vectorscope-inspired rather than a fake L/R
 // phase plot. Frequency, rhythm, harmony and long-form context deform one trace.
 fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
@@ -190,6 +207,16 @@ fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
 		+ orbitForm(t, phase, musicalMids) * formWeights.y
 		+ ribbonForm(t, phase, presence) * formWeights.z
 		+ rosetteForm(t, phase, musicalMids) * formWeights.w;
+	let sweepAmount = clamp(
+		formWeights.z * (0.46 + abs(asymmetry) * 0.38)
+			+ sectionPulse * 0.12
+			+ max(-energySlope, 0.0) * 0.08,
+		0.0,
+		0.78
+	);
+	point = mix(point, sweepForm(fraction, phase, presence, air), sweepAmount);
+	let coilAmount = clamp(formWeights.w * tension * (1.0 - release * 0.72) * 0.72, 0.0, 0.62);
+	point = mix(point, coilForm(t, fraction, phase, musicalMids), coilAmount);
 
 	// Chroma/key and section asymmetry influence posture, not only hue. Gating by
 	// tonal strength prevents noisy/atonal material from jerking the geometry.
@@ -253,6 +280,11 @@ fn signalPoint(index: u32, instance: u32) -> vec2<f32> {
 		let echoDrive = max(transient, max(impact, ringOut));
 		point = rotate2(point, -echo * (0.010 + echoDrive * 0.030 + tension * 0.008));
 		point *= 1.0 + echo * (0.009 + echoDrive * 0.025);
+		let splitSign = select(-1.0, 1.0, instance == 2u);
+		let splitAmount = sweepAmount
+			* (0.045 + abs(asymmetry) * 0.11 + sectionPulse * 0.07 + presence * 0.035);
+		point.y += splitSign * splitAmount;
+		point.x *= 1.0 - splitAmount * 0.08;
 	}
 
 	let resolution = params.resolutionTimeDt.xy;
@@ -300,13 +332,13 @@ fn vs_main(
 
 	let signalGate = (1.0 - params.shape.z) * smoothstep(0.005, 0.055, params.audio.w);
 	let mainIntensity = (
-		0.060 + params.style.y * 0.065 + params.bandsA.y * 0.022 + params.journey.w * 0.030
+		0.32 + params.style.y * 0.28 + params.bandsA.y * 0.1 + params.journey.w * 0.14
 	) * signalGate;
 	let firstEcho = (
-		params.musical.x * 0.105 + params.journey.w * 0.075 + params.flow.x * 0.038
+		params.musical.x * 0.28 + params.journey.w * 0.2 + params.flow.x * 0.1
 	) * signalGate;
 	let secondEcho = (
-		params.flow.x * 0.078 + params.clock.w * 0.020
+		params.flow.x * 0.2 + params.clock.w * 0.06
 	) * signalGate;
 
 	var out: TraceOut;
@@ -353,26 +385,42 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let aspect = resolution.x / max(resolution.y, 1.0);
 	var scopePoint = in.uv * 2.0 - vec2<f32>(1.0);
 	scopePoint.x *= aspect;
+	let gridBreath = 1.0 + sin(params.clock.y * 6.28318530718) * 0.012
+		+ params.journey.z * 0.018;
+	scopePoint *= gridBreath;
+	let gridAngle = sin(params.clock.y * 6.28318530718) * (0.012 + params.bandsB.w * 0.018)
+		+ params.context.y * 0.025;
+	let gridC = cos(gridAngle);
+	let gridS = sin(gridAngle);
+	scopePoint = vec2<f32>(
+		gridC * scopePoint.x - gridS * scopePoint.y,
+		gridS * scopePoint.x + gridC * scopePoint.y
+	);
+	scopePoint.x += sin(scopePoint.y * 3.4 + params.flow.z * 6.28318530718)
+		* (0.008 + params.style.w * params.bandsB.x * 0.012);
+	scopePoint.y += sin(scopePoint.x * 2.8 - params.flow.z * 6.28318530718)
+		* params.context.z * 0.015;
 	let radius = length(scopePoint);
 	let pixel = 1.0 / max(resolution.y, 1.0);
 
 	let axisX = 1.0 - smoothstep(pixel * 0.6, pixel * 1.8, abs(scopePoint.x));
 	let axisY = 1.0 - smoothstep(pixel * 0.6, pixel * 1.8, abs(scopePoint.y));
-	let rings = ringLine(radius, 0.25, pixel)
-		+ ringLine(radius, 0.50, pixel)
-		+ ringLine(radius, 0.75, pixel);
+	let ringSpread = 1.0 + params.journey.z * 0.025 - params.journey.x * 0.015;
+	let rings = ringLine(radius, 0.25 * ringSpread, pixel)
+		+ ringLine(radius, 0.50 * ringSpread, pixel)
+		+ ringLine(radius, 0.75 * ringSpread, pixel);
 	let gridPulse = 0.86 + params.clock.x * 0.10 + params.journey.x * 0.08;
 	let graticule = clamp(((axisX + axisY) * 0.45 + rings * 0.30) * gridPulse, 0.0, 1.0);
 
 	let vignette = 1.0 - smoothstep(0.62, 1.45, radius);
-	let harmonicTint = vec3<f32>(0.004, 0.010, 0.012)
-		+ vec3<f32>(0.004, 0.012, 0.010) * params.shape.x;
-	let background = vec3<f32>(0.0015, 0.0045, 0.0080)
+	let harmonicTint = vec3<f32>(0.009, 0.021, 0.026)
+		+ vec3<f32>(0.008, 0.022, 0.018) * params.shape.x;
+	let background = vec3<f32>(0.0025, 0.007, 0.012)
 		+ harmonicTint * graticule
-		+ vec3<f32>(0.002, 0.008, 0.012) * vignette;
+		+ vec3<f32>(0.004, 0.014, 0.021) * vignette;
 
 	let stored = textureSampleLevel(phosphorFrame, phosphorSampler, in.uv, 0.0).rgb;
-	let exposure = 1.62 + params.style.y * 0.22 + params.journey.w * 0.20;
+	let exposure = 2.45 + params.style.y * 0.42 + params.journey.w * 0.36;
 	let signal = vec3<f32>(1.0) - exp(-stored * exposure);
 	let color = (background + signal) * (0.72 + vignette * 0.28);
 	return vec4<f32>(color, 1.0);

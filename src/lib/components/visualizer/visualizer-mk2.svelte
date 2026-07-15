@@ -26,8 +26,8 @@
 	//   • rms (slow)         → light shaft intensity
 	//   • onset (impulse)    → restrained root/surface impact only
 	//
-	// Future iterations: optional quality tiers, real circle-of-confusion DOF,
-	// Mandelbox / hybrid IFS variants per song seed.
+	// Future iterations: real circle-of-confusion DOF and Mandelbox / hybrid IFS
+	// variants per song seed.
 
 	import { onMount, onDestroy } from 'svelte';
 	import {
@@ -36,6 +36,14 @@
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
 	import { mk2ContinuousPaletteBlend } from '$lib/visualizer/mk2/conductor';
+	import {
+		SOMA_QUALITY_PROFILES,
+		SomaAutoQualityController,
+		selectSomaQuality,
+		somaBackingSize,
+		type SomaQualityProfile,
+		type SomaQualityTier
+	} from '$lib/visualizer/mk2/runtime';
 
 	const vis = useVisualizer();
 	const t0 = performance.now();
@@ -62,6 +70,8 @@
 	let temporalResetRequested = true;
 	let currentSection = $state('intro');
 	let currentForm = $state('seed');
+	let qualityTier = $state<SomaQualityTier>('ultra');
+	let renderPixels = $state(0);
 
 	function dominantLifecycleForm(journey: VisualizerJourneySnapshot['mk2']): string {
 		const forms = [
@@ -169,7 +179,7 @@
 	// 56-58 signed spectral lean / unwrapped spectral travel / travel rate
 	// 59-63 palette phase / warmth / density / iridescence / erosion
 	// 64-70 shot zoom / close study / detail / azimuth / elevation / framing x/y
-	// 71    padding
+	// 71    quality raymarch steps
 	const UNIFORM_FLOATS = 72;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
@@ -246,7 +256,7 @@ struct Uniforms {
 	perspectiveElevation: f32,
 	shotFramingX: f32,
 	shotFramingY: f32,
-	_shotPad: f32,
+	qualitySteps: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -954,6 +964,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	var t = 0.05 + dither(frag.xy) * 0.04; // dither breaks fog banding
 
 	for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
+		if (i >= i32(clamp(u.qualitySteps, 1.0, f32(MAX_STEPS)))) { break; }
 		if (i >= 48 && (u.closeStudy < 0.55 || u.detailFocus < 0.55)) { break; }
 		if (t > MAX_DIST) { break; }
 		let p = camPos + rd * t;
@@ -1600,20 +1611,55 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	};
 
 	let gpu: GPU | null = null;
-	const TARGET_FRAME_MS = 1000 / 60;
-	// Render at 72% of physical display resolution, then let the browser's
-	// linear canvas upscale recover the final edge. Combined with 60 Hz this
-	// keeps cost predictable on high-refresh / high-DPI displays.
-	const INTERNAL_RENDER_SCALE = 0.72;
-	const MAX_DEVICE_DPR = 1.5;
+	let qualityProfile: SomaQualityProfile = SOMA_QUALITY_PROFILES.ultra;
+	const autoQuality = new SomaAutoQualityController(qualityProfile.tier);
+	let autoQualityCeiling: SomaQualityTier | null = null;
+	let targetFrameMs = 1000 / qualityProfile.frameRate;
 	let schedulerTickAt = 0;
-	let renderBudgetMs = TARGET_FRAME_MS;
+	let renderBudgetMs = targetFrameMs;
 	let lastRenderedAt = 0;
 
 	function resetFrameScheduler() {
 		schedulerTickAt = 0;
-		renderBudgetMs = TARGET_FRAME_MS;
+		renderBudgetMs = targetFrameMs;
 		lastRenderedAt = 0;
+	}
+
+	function updateQualityProfile(elapsedMs: number | null): SomaQualityProfile {
+		if (!canvas) return qualityProfile;
+		const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+		const initial = selectSomaQuality(
+			canvas.clientWidth,
+			canvas.clientHeight,
+			window.devicePixelRatio || 1,
+			navigator.hardwareConcurrency,
+			deviceMemory
+		);
+		let sampleMs = elapsedMs;
+		if (autoQualityCeiling === null) {
+			autoQuality.reset(initial.tier);
+			autoQualityCeiling = initial.tier;
+			sampleMs = null;
+		} else if (initial.tier !== autoQualityCeiling) {
+			autoQuality.setCeiling(initial.tier);
+			autoQualityCeiling = initial.tier;
+			// A viewport workload change is not a performance sample. In particular,
+			// resizing must not combine with an almost-finished downgrade vote.
+			sampleMs = null;
+		}
+		if (sampleMs !== null && document.visibilityState === 'visible') {
+			autoQuality.observeFrame(sampleMs);
+		}
+
+		const active = autoQuality.profile;
+		if (active.tier !== qualityProfile.tier) {
+			qualityProfile = active;
+			qualityTier = active.tier;
+			targetFrameMs = 1000 / active.frameRate;
+			resetFrameScheduler();
+			temporalResetRequested = true;
+		}
+		return qualityProfile;
 	}
 
 	function buildTargets(device: GPUDevice, w: number, h: number) {
@@ -1914,32 +1960,41 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		if (!schedulerTickAt) {
 			schedulerTickAt = frameNow;
-			renderBudgetMs = TARGET_FRAME_MS;
+			renderBudgetMs = targetFrameMs;
 		} else {
 			const tickElapsed = Math.max(0, frameNow - schedulerTickAt);
 			schedulerTickAt = frameNow;
 			// Accumulate refresh intervals instead of phase-adjusting the previous
 			// render timestamp. Keep only a small catch-up budget so a stalled or
 			// backgrounded window renders one current frame, never an obsolete burst.
-			renderBudgetMs = Math.min(TARGET_FRAME_MS * 4, renderBudgetMs + tickElapsed);
+			renderBudgetMs = Math.min(targetFrameMs * 4, renderBudgetMs + tickElapsed);
 		}
-		if (renderBudgetMs + 0.25 < TARGET_FRAME_MS) return;
+		if (renderBudgetMs + 0.25 < targetFrameMs) return;
 		// Carry fractional refresh time forward. Subtract first to avoid a value
 		// microscopically below one interval wrapping to an almost-full budget.
-		let remainderMs = renderBudgetMs - TARGET_FRAME_MS;
-		if (remainderMs >= TARGET_FRAME_MS) remainderMs %= TARGET_FRAME_MS;
+		let remainderMs = renderBudgetMs - targetFrameMs;
+		if (remainderMs >= targetFrameMs) remainderMs %= targetFrameMs;
 		renderBudgetMs = Math.max(0, remainderMs);
 
 		// This is the actual time between rendered frames, independent of the
 		// scheduler's fractional budget, so smoothing remains time-correct on
 		// 60/75/90/120/144 Hz displays and after an occasional missed frame.
-		const elapsedMs = lastRenderedAt ? Math.max(0, frameNow - lastRenderedAt) : TARGET_FRAME_MS;
+		const hadPreviousRender = lastRenderedAt !== 0;
+		const elapsedMs = hadPreviousRender
+			? Math.max(0, frameNow - lastRenderedAt)
+			: targetFrameMs;
 		lastRenderedAt = frameNow;
 		const frameDt = Math.min(1, Math.max(0.001, elapsedMs / 1000));
 
-		const dpr = Math.min(window.devicePixelRatio || 1, MAX_DEVICE_DPR) * INTERNAL_RENDER_SCALE;
-		const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
-		const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+		const activeQuality = updateQualityProfile(hadPreviousRender ? elapsedMs : null);
+		const { width: w, height: h } = somaBackingSize(
+			canvas.clientWidth,
+			canvas.clientHeight,
+			window.devicePixelRatio || 1,
+			activeQuality
+		);
+		const nextRenderPixels = w * h;
+		if (renderPixels !== nextRenderPixels) renderPixels = nextRenderPixels;
 		if (canvas.width !== w || canvas.height !== h) {
 			canvas.width = w;
 			canvas.height = h;
@@ -2198,7 +2253,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[68] = journey.perspectiveElevation;
 		u[69] = journey.shotFramingX;
 		u[70] = journey.shotFramingY;
-		u[71] = 0;
+		u[71] = qualityProfile.raymarchSteps;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Upload decoded, baseline-relative detail. Static hiss and compressed
@@ -2435,6 +2490,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			data-mk2-form={currentForm}
 			data-mk2-uniform-bytes={UNIFORM_BYTES}
 			data-mk2-render-passes="8"
+			data-soma-quality={qualityTier}
+			data-soma-render-pixels={renderPixels}
+			data-soma-max-pixels={SOMA_QUALITY_PROFILES[qualityTier].maxPixels}
+			data-soma-frame-rate={SOMA_QUALITY_PROFILES[qualityTier].frameRate}
+			data-soma-raymarch-steps={SOMA_QUALITY_PROFILES[qualityTier].raymarchSteps}
 		></canvas>
 		{#if errorMsg}
 			<div class="pointer-events-none absolute left-6 top-16 z-30 max-w-md text-xs text-red-300/80">
