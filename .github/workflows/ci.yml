@@ -48,6 +48,7 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: ./src-tauri -> target
+          cache-on-failure: true
 
       - name: Install locked JavaScript dependencies
         run: pnpm install --frozen-lockfile
@@ -75,3 +76,12 @@ jobs:
 
       - name: Run browser end-to-end tests
         run: pnpm exec playwright test --workers=4
+
+      - name: Preserve browser traces after a failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: playwright-failure-${{ github.run_id }}
+          path: test-results
+          if-no-files-found: ignore
+          retention-days: 7
