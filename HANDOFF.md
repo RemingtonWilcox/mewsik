@@ -229,9 +229,8 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (22,112,256 bytes): SHA-256 `F93C8C25043EE217742765A84025026A091D70576CD25F38C4510608941DBDDE`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,060,667 bytes): SHA-256 `91E2112ECAC798CABB210D88C500FB63A6295DD06C7AC722BCE56182A145F2E2`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (22,112,256 bytes): SHA-256 `5DDBC9A0F87080085AC9F7446DA9636F3BD213FBFA3D7A5F2053B14C43F1CAF3`
+- `src-tauri/target/release/mewsik.exe` (22,007,808 bytes): SHA-256 `103ACAC4D116411CCD7ACB2C5A5709FCFF92F26C62F5CC312F733AD580F9ABBD`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,072,854 bytes): SHA-256 `32C1625EBA54A4D1E662744C0DE89F079C8926F7290BD8744818932333EB97F3`
 
 These local artifacts are intentionally unsigned and are for this machine/private testing only. The protected workflow must produce and verify a new Authenticode-signed candidate before anything is distributed as the public `0.2.0` bootstrap release.
 
