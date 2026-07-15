@@ -109,6 +109,34 @@ export type Mk2ConductorFrame = {
 	materialDensity: number;
 	materialIridescence: number;
 	materialErosion: number;
+	/** Long-horizon musical identity. Positive tilt means brighter/high-frequency weighted. */
+	styleLowHighTilt: number;
+	styleTonality: number;
+	stylePercussiveness: number;
+	styleRhythmicDensity: number;
+	/** Onset-distance-from-beat proxy; this is deliberately not advertised as a meter detector. */
+	styleSyncopation: number;
+	/** Persistent topology grammar. Each family is normalized independently to sum to one. */
+	topologyCocoon: number;
+	topologySpire: number;
+	topologyBilateral: number;
+	topologyTorus: number;
+	topologyCoral: number;
+	topologyShell: number;
+	cameraOrbit: number;
+	cameraProfile: number;
+	cameraOverhead: number;
+	cameraLow: number;
+	cameraMacro: number;
+	environmentVoid: number;
+	environmentCurrent: number;
+	environmentCavern: number;
+	environmentHorizon: number;
+	environmentCellular: number;
+	materialMembrane: number;
+	materialMineral: number;
+	materialVelvet: number;
+	materialCrystal: number;
 };
 
 export const MK2_CONDUCTOR_LIMITS = {
@@ -121,20 +149,20 @@ export const MK2_CONDUCTOR_LIMITS = {
 	impact: [0, 0.78],
 	rotationRateMagnitude: [0.006, 0.052],
 	cameraSpeed: [0.01, 0.045],
-	cameraDistance: [0.98, 1.1],
+	cameraDistance: [0.88, 1.22],
 	topologyBias: [-0.22, 0.35],
 	fogDensity: [0.032, 0.088],
 	shaftIntensity: [0.18, 0.8],
 	backgroundFlow: [0.005, 0.04],
-	postureYaw: [-0.1, 0.1],
-	posturePitch: [-0.07, 0.07],
-	shotZoom: [0.9, 1.85],
+	postureYaw: [-0.24, 0.24],
+	posturePitch: [-0.18, 0.18],
+	shotZoom: [0.82, 2.05],
 	closeStudy: [0, 1],
 	detailFocus: [0, 1],
-	perspectiveAzimuth: [-0.42, 0.42],
-	perspectiveElevation: [-0.3, 0.3],
-	shotFramingX: [-0.18, 0.18],
-	shotFramingY: [-0.14, 0.14],
+	perspectiveAzimuth: [-1.05, 1.05],
+	perspectiveElevation: [-0.7, 0.7],
+	shotFramingX: [-0.28, 0.28],
+	shotFramingY: [-0.22, 0.22],
 	seedForm: [0, 1],
 	sproutForm: [0, 1],
 	windingForm: [0, 1],
@@ -155,7 +183,32 @@ export const MK2_CONDUCTOR_LIMITS = {
 	paletteWarmth: [-1, 1],
 	materialDensity: [0.3, 1],
 	materialIridescence: [0, 1],
-	materialErosion: [0, 1]
+	materialErosion: [0, 1],
+	styleLowHighTilt: [-1, 1],
+	styleTonality: [0, 1],
+	stylePercussiveness: [0, 1],
+	styleRhythmicDensity: [0, 1],
+	styleSyncopation: [0, 1],
+	topologyCocoon: [0, 1],
+	topologySpire: [0, 1],
+	topologyBilateral: [0, 1],
+	topologyTorus: [0, 1],
+	topologyCoral: [0, 1],
+	topologyShell: [0, 1],
+	cameraOrbit: [0, 1],
+	cameraProfile: [0, 1],
+	cameraOverhead: [0, 1],
+	cameraLow: [0, 1],
+	cameraMacro: [0, 1],
+	environmentVoid: [0, 1],
+	environmentCurrent: [0, 1],
+	environmentCavern: [0, 1],
+	environmentHorizon: [0, 1],
+	environmentCellular: [0, 1],
+	materialMembrane: [0, 1],
+	materialMineral: [0, 1],
+	materialVelvet: [0, 1],
+	materialCrystal: [0, 1]
 } as const;
 
 type Mk2ShotProfile = {
@@ -388,6 +441,75 @@ const LIFECYCLE_ARCS: Readonly<Record<VisualizerSection, LifecycleArc>> = {
 	}
 };
 
+const TOPOLOGY_COUNT = 6;
+const CAMERA_COUNT = 5;
+const ENVIRONMENT_COUNT = 5;
+const MATERIAL_COUNT = 4;
+
+type GrammarSectionModifier = {
+	topology: readonly [number, number, number, number, number, number];
+	camera: readonly [number, number, number, number, number];
+	environment: readonly [number, number, number, number, number];
+};
+
+/**
+ * Sections bend a track's persistent grammar; they do not select it. These
+ * deliberately modest offsets leave room for seed and measured style to make
+ * two songs in the same section retain different bodies, shots, and worlds.
+ */
+const GRAMMAR_SECTION_MODIFIERS: Readonly<Record<VisualizerSection, GrammarSectionModifier>> = {
+	calm: {
+		topology: [0.16, -0.04, -0.02, -0.05, -0.05, 0.1],
+		camera: [0.08, -0.03, 0.02, -0.04, 0.09],
+		environment: [0.16, -0.04, 0.03, 0.08, -0.08]
+	},
+	intro: {
+		topology: [0.13, 0.05, 0.01, -0.04, -0.04, 0.02],
+		camera: [0.1, 0.02, 0.01, -0.03, 0.04],
+		environment: [0.08, 0.08, 0.01, 0.05, -0.04]
+	},
+	verse: {
+		topology: [-0.03, 0.08, 0.1, 0.01, 0.05, -0.03],
+		camera: [0.05, 0.11, -0.02, 0.03, 0.02],
+		environment: [-0.02, 0.12, 0.02, 0.06, 0.02]
+	},
+	pre_chorus: {
+		topology: [-0.06, 0.12, 0.03, 0.12, 0.07, -0.03],
+		camera: [0.08, 0.1, 0.04, 0.09, -0.04],
+		environment: [-0.05, 0.14, 0.05, -0.04, 0.09]
+	},
+	build: {
+		topology: [-0.08, 0.13, 0.02, 0.15, 0.09, -0.04],
+		camera: [0.06, 0.11, 0.05, 0.12, -0.05],
+		environment: [-0.06, 0.16, 0.07, -0.05, 0.11]
+	},
+	drop: {
+		topology: [-0.09, 0.01, 0.08, 0.18, 0.15, -0.05],
+		camera: [0.05, 0.03, 0.1, 0.17, -0.08],
+		environment: [-0.08, 0.1, 0.04, 0.03, 0.18]
+	},
+	chorus: {
+		topology: [-0.06, 0.04, 0.12, 0.12, 0.1, -0.02],
+		camera: [0.08, 0.07, 0.07, 0.09, 0.01],
+		environment: [-0.04, 0.1, 0.01, 0.1, 0.11]
+	},
+	bridge: {
+		topology: [-0.04, -0.03, 0.08, -0.03, 0.08, 0.18],
+		camera: [-0.03, 0.13, 0.04, -0.02, 0.18],
+		environment: [0.02, -0.03, 0.18, 0.02, 0.07]
+	},
+	breakdown: {
+		topology: [0.05, -0.06, -0.02, -0.04, 0.02, 0.2],
+		camera: [0.01, 0.06, 0.12, -0.06, 0.2],
+		environment: [0.08, -0.05, 0.2, 0.02, -0.01]
+	},
+	outro: {
+		topology: [0.16, -0.06, -0.04, -0.06, -0.04, 0.08],
+		camera: [0.09, 0.01, 0.03, -0.05, 0.08],
+		environment: [0.15, -0.05, 0.04, 0.08, -0.06]
+	}
+};
+
 function finite(value: number | undefined, fallback = 0): number {
 	return Number.isFinite(value) ? (value as number) : fallback;
 }
@@ -485,6 +607,68 @@ function signedHash(seedWord: number, channel: number): number {
 	return (mix32(seedWord ^ Math.imul(channel, 0x9e3779b1)) / 0x1_0000_0000 - 0.5) * 2;
 }
 
+function unitHash(seedWord: number, channel: number): number {
+	return mix32(seedWord ^ Math.imul(channel, 0x9e3779b1)) / 0x1_0000_0000;
+}
+
+function normalizeWeightVector(values: Float64Array): void {
+	let sum = 0;
+	for (let i = 0; i < values.length; i += 1) {
+		values[i] = Math.max(0.0001, finite(values[i], 0.0001));
+		sum += values[i];
+	}
+	if (sum <= 1e-9) {
+		values.fill(1 / Math.max(1, values.length));
+		return;
+	}
+	for (let i = 0; i < values.length; i += 1) values[i] /= sum;
+}
+
+/** Seed identity is a real recipe, not the former sub-pixel scalar nudge. */
+function fillSeedGrammar(out: Float64Array, seedWord: number, channel: number): void {
+	const count = out.length;
+	const primary = mix32(seedWord ^ Math.imul(channel, 0x85ebca6b)) % count;
+	let secondary = mix32(seedWord ^ Math.imul(channel + 17, 0xc2b2ae35)) % count;
+	if (secondary === primary) secondary = (secondary + 1 + (seedWord % (count - 1))) % count;
+	for (let i = 0; i < count; i += 1) {
+		out[i] = 0.025 + unitHash(seedWord, channel * 31 + i + 1) * 0.035;
+	}
+	out[primary] += 0.62;
+	out[secondary] += 0.24;
+	normalizeWeightVector(out);
+}
+
+/** A held, zero-mean phrase plan. It changes only when phraseIndex changes. */
+function fillPhraseBias(
+	out: Float64Array,
+	seedWord: number,
+	phraseIndex: number,
+	channel: number,
+	amplitude: number
+): void {
+	const phraseWord = mix32(
+		seedWord ^ Math.imul((Math.floor(phraseIndex) + 1) | 0, 0x85ebca6b) ^ channel
+	);
+	let mean = 0;
+	for (let i = 0; i < out.length; i += 1) {
+		out[i] = signedHash(phraseWord, channel + i * 7) * amplitude;
+		mean += out[i] / out.length;
+	}
+	for (let i = 0; i < out.length; i += 1) out[i] -= mean;
+}
+
+function approachWeightVector(
+	current: Float64Array,
+	target: Float64Array,
+	tauSeconds: number,
+	dtSeconds: number
+): void {
+	for (let i = 0; i < current.length; i += 1) {
+		current[i] = approach(current[i], target[i], tauSeconds, dtSeconds);
+	}
+	normalizeWeightVector(current);
+}
+
 /** Pure section baseline for tests, tooling, and renderer diagnostics. */
 export function getMk2SectionProfile(section: VisualizerSection): Readonly<Mk2SectionProfile> {
 	return SECTION_PROFILES[section];
@@ -563,6 +747,33 @@ export class Mk2Conductor {
 	private materialDensity = 0.72;
 	private materialIridescence = 0.2;
 	private materialErosion = 0.04;
+	private styleLowHighTilt = 0;
+	private styleTonality = 0.55;
+	private stylePercussiveness = 0.4;
+	private styleRhythmicDensity = 0.35;
+	private styleSyncopation = 0.2;
+	private noveltyLatched = false;
+	private noveltyCadence = 0;
+	private syncopationEvidence = 0.2;
+	private plannedPhraseIndex = Number.MIN_SAFE_INTEGER;
+	private readonly seedTopologyGrammar = new Float64Array(TOPOLOGY_COUNT);
+	private readonly topology = new Float64Array(TOPOLOGY_COUNT);
+	private readonly topologyTarget = new Float64Array(TOPOLOGY_COUNT);
+	private readonly topologyPhraseBias = new Float64Array(TOPOLOGY_COUNT);
+	private readonly topologyStyle = new Float64Array(TOPOLOGY_COUNT);
+	private readonly seedCamera = new Float64Array(CAMERA_COUNT);
+	private readonly camera = new Float64Array(CAMERA_COUNT);
+	private readonly cameraTarget = new Float64Array(CAMERA_COUNT);
+	private readonly cameraPhraseBias = new Float64Array(CAMERA_COUNT);
+	private readonly cameraStyle = new Float64Array(CAMERA_COUNT);
+	private readonly seedEnvironment = new Float64Array(ENVIRONMENT_COUNT);
+	private readonly environment = new Float64Array(ENVIRONMENT_COUNT);
+	private readonly environmentTarget = new Float64Array(ENVIRONMENT_COUNT);
+	private readonly environmentPhraseBias = new Float64Array(ENVIRONMENT_COUNT);
+	private readonly environmentStyle = new Float64Array(ENVIRONMENT_COUNT);
+	private readonly seedMaterial = new Float64Array(MATERIAL_COUNT);
+	private readonly material = new Float64Array(MATERIAL_COUNT);
+	private readonly materialTarget = new Float64Array(MATERIAL_COUNT);
 
 	private readonly output: Mk2ConductorFrame = {
 		section: 'intro',
@@ -615,7 +826,32 @@ export class Mk2Conductor {
 		paletteWarmth: 0,
 		materialDensity: 0.72,
 		materialIridescence: 0.2,
-		materialErosion: 0.04
+		materialErosion: 0.04,
+		styleLowHighTilt: 0,
+		styleTonality: 0.55,
+		stylePercussiveness: 0.4,
+		styleRhythmicDensity: 0.35,
+		styleSyncopation: 0.2,
+		topologyCocoon: 0.46,
+		topologySpire: 0.16,
+		topologyBilateral: 0.12,
+		topologyTorus: 0.08,
+		topologyCoral: 0.08,
+		topologyShell: 0.1,
+		cameraOrbit: 0.5,
+		cameraProfile: 0.16,
+		cameraOverhead: 0.1,
+		cameraLow: 0.08,
+		cameraMacro: 0.16,
+		environmentVoid: 0.32,
+		environmentCurrent: 0.3,
+		environmentCavern: 0.12,
+		environmentHorizon: 0.18,
+		environmentCellular: 0.08,
+		materialMembrane: 0.42,
+		materialMineral: 0.18,
+		materialVelvet: 0.22,
+		materialCrystal: 0.18
 	};
 
 	constructor(seed: Mk2Seed = 0) {
@@ -701,6 +937,33 @@ export class Mk2Conductor {
 		this.materialDensity = 0.72;
 		this.materialIridescence = 0.2;
 		this.materialErosion = 0.04;
+		// Cold start already has a strong per-source identity. Measured musical
+		// style replaces these priors gradually, so the first seconds are composed
+		// rather than generic while two tracks still converge on their own sound.
+		this.styleLowHighTilt = signedHash(this.seedWord, 101) * 0.72;
+		this.styleTonality = 0.12 + unitHash(this.seedWord, 103) * 0.76;
+		this.stylePercussiveness = 0.1 + unitHash(this.seedWord, 107) * 0.76;
+		this.styleRhythmicDensity = 0.08 + unitHash(this.seedWord, 109) * 0.74;
+		this.styleSyncopation = 0.06 + unitHash(this.seedWord, 113) * 0.72;
+		this.noveltyLatched = false;
+		this.noveltyCadence = this.styleRhythmicDensity * 0.35;
+		this.syncopationEvidence = this.styleSyncopation;
+		this.plannedPhraseIndex = Number.MIN_SAFE_INTEGER;
+		fillSeedGrammar(this.seedTopologyGrammar, this.seedWord, 127);
+		fillSeedGrammar(this.seedCamera, this.seedWord, 131);
+		fillSeedGrammar(this.seedEnvironment, this.seedWord, 137);
+		fillSeedGrammar(this.seedMaterial, this.seedWord, 139);
+		this.topology.set(this.seedTopologyGrammar);
+		this.topologyTarget.set(this.seedTopologyGrammar);
+		this.topologyPhraseBias.fill(0);
+		this.camera.set(this.seedCamera);
+		this.cameraTarget.set(this.seedCamera);
+		this.cameraPhraseBias.fill(0);
+		this.environment.set(this.seedEnvironment);
+		this.environmentTarget.set(this.seedEnvironment);
+		this.environmentPhraseBias.fill(0);
+		this.material.set(this.seedMaterial);
+		this.materialTarget.set(this.seedMaterial);
 
 		this.output.section = 'intro';
 		this.writeOutput();
@@ -769,10 +1032,198 @@ export class Mk2Conductor {
 			this.seedWord ^ Math.imul((phraseIndex + 1) | 0, 0x85ebca6b)
 		);
 
+		// ── Persistent musical style ────────────────────────────────────────
+		// Use cross-band slow magnitudes for identity. Per-band adaptive levels
+		// intentionally make quiet and loud recordings similarly responsive, but
+		// they are too self-normalizing to distinguish a bass-heavy mix from a
+		// bright/noisy one over an entire song.
+		const slowSub = Math.max(0, finite(spectrum.slow?.sub));
+		const slowKick = Math.max(0, finite(spectrum.slow?.kick));
+		const slowBody = Math.max(0, finite(spectrum.slow?.body));
+		const slowMids = Math.max(0, finite(spectrum.slow?.mids));
+		const slowPresence = Math.max(0, finite(spectrum.slow?.presence));
+		const slowAir = Math.max(0, finite(spectrum.slow?.air));
+		const slowMagnitudeSum = slowSub + slowKick + slowBody + slowMids + slowPresence + slowAir;
+		const slowTotal = Math.max(1e-6, slowMagnitudeSum);
+		const lowShare = (slowSub + slowKick + slowBody * 0.55) / slowTotal;
+		const highShare = (slowPresence + slowAir + slowMids * 0.35) / slowTotal;
+		const kickShare = slowKick / slowTotal;
+		const novelty = clamp01(finite(spectrum.novelty));
+		if (novelty < 0.28) this.noveltyLatched = false;
+		const noveltyEvent = novelty > 0.56 && !this.noveltyLatched;
+		if (noveltyEvent) this.noveltyLatched = true;
+		this.noveltyCadence = approachAsymmetric(
+			this.noveltyCadence,
+			noveltyEvent ? 1 : 0,
+			0.18,
+			3.4,
+			dt
+		);
+		if (noveltyEvent) {
+			const beatPhase = wrap01(finite(frame.clock?.beatPhase));
+			// Zero on the beat and one halfway between beats. This is a useful
+			// syncopation proxy, not a claim that the live analyzer knows meter.
+			const offbeatEvidence = Math.pow(Math.sin(beatPhase * Math.PI), 2);
+			this.syncopationEvidence =
+				this.syncopationEvidence * 0.78 + offbeatEvidence * 0.22;
+		}
+		const flatness = clamp01(finite(spectrum.flatness, 0.5));
+		const crest = clamp01(finite(spectrum.crestFactor));
+		const styleKeyConfidence = clamp01(finite(context?.keyConfidence));
+		const styleLowHighTiltTarget = clamp(
+			(highShare - lowShare) * 1.45 + (centroid - 0.5) * 0.58,
+			-1,
+			1
+		);
+		const styleTonalityTarget = clamp01((1 - flatness) * 0.78 + styleKeyConfidence * 0.22);
+		const stylePercussivenessTarget = clamp01(
+			crest * 0.5 + this.noveltyCadence * 0.33 + kickShare * 0.8
+		);
+		const styleRhythmicDensityTarget = clamp01(
+			this.noveltyCadence * 0.48 + spectralMotion * 0.24 + signalMotion * 0.18 + crest * 0.1
+		);
+		// Silence is not a musical style. Preserve the seeded/current identity
+		// until decoded spectrum supplies actual evidence instead of letting zero
+		// bins slowly turn every idle organism into the same "tonal" recipe.
+		if (!frame.silence && slowMagnitudeSum > 1e-5) {
+			this.styleLowHighTilt = approach(this.styleLowHighTilt, styleLowHighTiltTarget, 8.5, dt);
+			this.styleTonality = approach(this.styleTonality, styleTonalityTarget, 10.5, dt);
+			this.stylePercussiveness = approach(
+				this.stylePercussiveness,
+				stylePercussivenessTarget,
+				7.5,
+				dt
+			);
+			this.styleRhythmicDensity = approach(
+				this.styleRhythmicDensity,
+				styleRhythmicDensityTarget,
+				6.5,
+				dt
+			);
+			this.styleSyncopation = approach(
+				this.styleSyncopation,
+				this.syncopationEvidence,
+				11,
+				dt
+			);
+		}
+
+		// ── Phrase-held world grammar ───────────────────────────────────────
+		// Phrase identity elects a plan once. Audio can slowly bend it, but raw
+		// phrasePos never drives a target and therefore cannot reverse the plan at
+		// the 1 -> 0 wrap in live/radio mode.
+		if (phraseIndex !== this.plannedPhraseIndex) {
+			this.plannedPhraseIndex = phraseIndex;
+			fillPhraseBias(this.topologyPhraseBias, this.seedWord, phraseIndex, 0x243f6a88, 0.075);
+			fillPhraseBias(this.cameraPhraseBias, this.seedWord, phraseIndex, 0x85a308d3, 0.09);
+			fillPhraseBias(
+				this.environmentPhraseBias,
+				this.seedWord,
+				phraseIndex,
+				0x13198a2e,
+				0.065
+			);
+		}
+		const sectionGrammar = GRAMMAR_SECTION_MODIFIERS[sectionName];
+		const brightStyle = clamp01((this.styleLowHighTilt + 1) * 0.5);
+		const darkStyle = 1 - brightStyle;
+		const sparseStyle = 1 - this.styleRhythmicDensity;
+		const noisyStyle = 1 - this.styleTonality;
+
+		this.topologyStyle[0] =
+			0.1 + sparseStyle * 0.42 + (1 - this.stylePercussiveness) * 0.18;
+		this.topologyStyle[1] = 0.1 + darkStyle * 0.3 + this.styleTonality * 0.17;
+		this.topologyStyle[2] =
+			0.1 + this.styleTonality * 0.27 + (1 - this.styleSyncopation) * 0.12;
+		this.topologyStyle[3] =
+			0.08 + this.stylePercussiveness * 0.31 + this.styleSyncopation * 0.19 + signalTempo * 0.1;
+		this.topologyStyle[4] =
+			0.07 + noisyStyle * 0.31 + this.styleRhythmicDensity * 0.27 + brightStyle * 0.13;
+		this.topologyStyle[5] =
+			0.09 + sparseStyle * 0.2 + darkStyle * 0.14 + this.styleSyncopation * 0.14;
+		for (let i = 0; i < TOPOLOGY_COUNT; i += 1) {
+			this.topologyTarget[i] =
+				this.seedTopologyGrammar[i] * 0.38 +
+				this.topologyStyle[i] * 0.5 +
+				sectionGrammar.topology[i] +
+				this.topologyPhraseBias[i];
+		}
+		normalizeWeightVector(this.topologyTarget);
+		approachWeightVector(
+			this.topology,
+			this.topologyTarget,
+			4.2 + (1 - signalMotion) * 2.2,
+			dt
+		);
+
+		this.cameraStyle[0] =
+			0.18 + (1 - this.styleSyncopation) * 0.2 + this.styleRhythmicDensity * 0.08;
+		this.cameraStyle[1] =
+			0.12 + this.styleTonality * 0.22 + Math.abs(this.styleLowHighTilt) * 0.14;
+		this.cameraStyle[2] = 0.08 + brightStyle * 0.23 + this.topology[3] * 0.2;
+		this.cameraStyle[3] = 0.08 + darkStyle * 0.31 + this.stylePercussiveness * 0.19;
+		this.cameraStyle[4] =
+			0.09 +
+			sparseStyle * 0.29 +
+			this.styleTonality * 0.16 +
+			(1 - this.stylePercussiveness) * 0.1;
+		for (let i = 0; i < CAMERA_COUNT; i += 1) {
+			this.cameraTarget[i] =
+				this.seedCamera[i] * 0.38 +
+				this.cameraStyle[i] * 0.5 +
+				sectionGrammar.camera[i] +
+				this.cameraPhraseBias[i];
+		}
+		normalizeWeightVector(this.cameraTarget);
+		approachWeightVector(this.camera, this.cameraTarget, 6.2 + sparseStyle * 2.2, dt);
+
+		this.environmentStyle[0] = 0.11 + sparseStyle * 0.36 + this.styleTonality * 0.1;
+		this.environmentStyle[1] =
+			0.12 +
+			(1 - this.stylePercussiveness) * 0.25 +
+			(1 - Math.abs(this.styleLowHighTilt)) * 0.1;
+		this.environmentStyle[2] = 0.09 + darkStyle * 0.29 + this.topology[5] * 0.2;
+		this.environmentStyle[3] =
+			0.09 + this.styleTonality * 0.23 + (1 - this.styleSyncopation) * 0.13;
+		this.environmentStyle[4] =
+			0.07 +
+			noisyStyle * 0.28 +
+			this.styleRhythmicDensity * 0.26 +
+			this.stylePercussiveness * 0.12;
+		for (let i = 0; i < ENVIRONMENT_COUNT; i += 1) {
+			this.environmentTarget[i] =
+				this.seedEnvironment[i] * 0.36 +
+				this.environmentStyle[i] * 0.52 +
+				sectionGrammar.environment[i] +
+				this.environmentPhraseBias[i];
+		}
+		normalizeWeightVector(this.environmentTarget);
+		approachWeightVector(this.environment, this.environmentTarget, 8 + sparseStyle * 2.8, dt);
+
+		this.materialTarget[0] =
+			this.seedMaterial[0] * 0.34 +
+			(0.1 + this.styleTonality * 0.34 + (1 - this.stylePercussiveness) * 0.18) * 0.62;
+		this.materialTarget[1] =
+			this.seedMaterial[1] * 0.34 +
+			(0.1 + darkStyle * 0.26 + noisyStyle * 0.2 + this.stylePercussiveness * 0.12) * 0.62;
+		this.materialTarget[2] =
+			this.seedMaterial[2] * 0.34 + (0.09 + sparseStyle * 0.34 + darkStyle * 0.14) * 0.62;
+		this.materialTarget[3] =
+			this.seedMaterial[3] * 0.34 +
+			(0.08 + brightStyle * 0.25 + this.styleTonality * 0.2 + this.stylePercussiveness * 0.12) * 0.62;
+		normalizeWeightVector(this.materialTarget);
+		approachWeightVector(this.material, this.materialTarget, 6.8, dt);
+
 		// Section progress moves through a form arc; a multi-second low-pass makes
 		// even hard metadata boundaries become physical metamorphoses.
 		const lifecycleArc = LIFECYCLE_ARCS[sectionName] ?? LIFECYCLE_ARCS.intro;
-		const lifecycleProgress = smoothstep(0.02, 0.98, sectionProgress);
+		// A scored section has a real, non-wrapping beginning and end. Live/radio
+		// fallback only has phrasePos, which wraps every eight bars; treating that
+		// value as section progress made Soma grow and then visibly rewind forever.
+		// Live sections now hold their elected endpoint while the phrase grammar
+		// above supplies ongoing evolution without reversing at a clock wrap.
+		const lifecycleProgress =
+			context?.source === 'score' ? smoothstep(0.02, 0.98, sectionProgress) : 1;
 		const lifecycleTau = 2.1 + (1 - signalMotion) * 0.8;
 		this.seedForm = approach(
 			this.seedForm,
@@ -1018,7 +1469,14 @@ export class Mk2Conductor {
 			profile.cameraDistance +
 				this.seedDistance -
 				this.suspense * 0.008 -
-				(releaseTarget - 0.3) * 0.004,
+				(releaseTarget - 0.3) * 0.004 -
+				// Macro DNA chooses an angle; only an elected close study earns a
+				// sustained physical push toward the organism. This keeps sparse styles
+				// from living permanently inside a close-up merely because they favor
+				// the macro camera family.
+				this.camera[4] * (0.018 + this.closeStudy * 0.087) +
+				this.camera[0] * 0.035 +
+				this.camera[1] * 0.025,
 			...MK2_CONDUCTOR_LIMITS.cameraDistance
 		);
 		this.cameraSpeed = approach(this.cameraSpeed, cameraSpeedTarget, 2.2, dt);
@@ -1044,13 +1502,16 @@ export class Mk2Conductor {
 		const closeStudyTarget = clamp(
 			phraseStudyElection *
 				shotProfile.studyAffinity *
-				(0.54 + anatomicalDetail * 0.46),
+				(0.54 + anatomicalDetail * 0.46) +
+				this.camera[4] * anatomicalDetail * 0.2,
 			...MK2_CONDUCTOR_LIMITS.closeStudy
 		);
 		const shotZoomTarget = clamp(
 			shotProfile.heroZoom -
 				this.bloomForm * 0.035 +
-				closeStudyTarget * (0.61 + anatomicalDetail * 0.18),
+				closeStudyTarget * (0.61 + anatomicalDetail * 0.18) +
+				this.camera[4] * (0.045 + closeStudyTarget * 0.235) -
+				this.camera[0] * 0.045,
 			...MK2_CONDUCTOR_LIMITS.shotZoom
 		);
 		const detailFocusTarget = clamp(
@@ -1062,21 +1523,27 @@ export class Mk2Conductor {
 		const phraseFramingX = signedHash(phraseWord, 43);
 		const phraseFramingY = signedHash(phraseWord, 47);
 		const perspectiveAzimuthTarget = clamp(
-			phraseAzimuth * (0.075 + closeStudyTarget * 0.31) + this.spectralLean * 0.024,
+			phraseAzimuth * (0.18 + closeStudyTarget * 0.43) +
+				(this.camera[1] - this.camera[0]) * 0.14 +
+				this.spectralLean * 0.05,
 			...MK2_CONDUCTOR_LIMITS.perspectiveAzimuth
 		);
 		const perspectiveElevationTarget = clamp(
 			shotProfile.elevation +
-				phraseElevation * (0.04 + closeStudyTarget * 0.105) -
+				phraseElevation * (0.095 + closeStudyTarget * 0.16) +
+				this.camera[2] * 0.42 -
+				this.camera[3] * 0.3 -
 				this.suspense * 0.025,
 			...MK2_CONDUCTOR_LIMITS.perspectiveElevation
 		);
 		const shotFramingXTarget = clamp(
-			phraseFramingX * (0.012 + closeStudyTarget * 0.16),
+			phraseFramingX * (0.025 + closeStudyTarget * 0.2) +
+				(this.camera[1] - this.camera[0]) * 0.035,
 			...MK2_CONDUCTOR_LIMITS.shotFramingX
 		);
 		const shotFramingYTarget = clamp(
-			phraseFramingY * (0.01 + closeStudyTarget * 0.12),
+			phraseFramingY * (0.02 + closeStudyTarget * 0.15) +
+				(this.camera[2] - this.camera[3]) * 0.04,
 			...MK2_CONDUCTOR_LIMITS.shotFramingY
 		);
 		this.closeStudy = approachAsymmetric(
@@ -1097,13 +1564,13 @@ export class Mk2Conductor {
 		this.perspectiveAzimuth = approach(
 			this.perspectiveAzimuth,
 			perspectiveAzimuthTarget,
-			4.2,
+			7.2,
 			dt
 		);
 		this.perspectiveElevation = approach(
 			this.perspectiveElevation,
 			perspectiveElevationTarget,
-			4.6,
+			7.6,
 			dt
 		);
 		this.shotFramingX = approach(this.shotFramingX, shotFramingXTarget, 3.5, dt);
@@ -1326,5 +1793,42 @@ export class Mk2Conductor {
 			this.materialErosion,
 			...MK2_CONDUCTOR_LIMITS.materialErosion
 		);
+		this.output.styleLowHighTilt = clamp(
+			this.styleLowHighTilt,
+			...MK2_CONDUCTOR_LIMITS.styleLowHighTilt
+		);
+		this.output.styleTonality = clamp(this.styleTonality, ...MK2_CONDUCTOR_LIMITS.styleTonality);
+		this.output.stylePercussiveness = clamp(
+			this.stylePercussiveness,
+			...MK2_CONDUCTOR_LIMITS.stylePercussiveness
+		);
+		this.output.styleRhythmicDensity = clamp(
+			this.styleRhythmicDensity,
+			...MK2_CONDUCTOR_LIMITS.styleRhythmicDensity
+		);
+		this.output.styleSyncopation = clamp(
+			this.styleSyncopation,
+			...MK2_CONDUCTOR_LIMITS.styleSyncopation
+		);
+		this.output.topologyCocoon = clamp(this.topology[0], 0, 1);
+		this.output.topologySpire = clamp(this.topology[1], 0, 1);
+		this.output.topologyBilateral = clamp(this.topology[2], 0, 1);
+		this.output.topologyTorus = clamp(this.topology[3], 0, 1);
+		this.output.topologyCoral = clamp(this.topology[4], 0, 1);
+		this.output.topologyShell = clamp(this.topology[5], 0, 1);
+		this.output.cameraOrbit = clamp(this.camera[0], 0, 1);
+		this.output.cameraProfile = clamp(this.camera[1], 0, 1);
+		this.output.cameraOverhead = clamp(this.camera[2], 0, 1);
+		this.output.cameraLow = clamp(this.camera[3], 0, 1);
+		this.output.cameraMacro = clamp(this.camera[4], 0, 1);
+		this.output.environmentVoid = clamp(this.environment[0], 0, 1);
+		this.output.environmentCurrent = clamp(this.environment[1], 0, 1);
+		this.output.environmentCavern = clamp(this.environment[2], 0, 1);
+		this.output.environmentHorizon = clamp(this.environment[3], 0, 1);
+		this.output.environmentCellular = clamp(this.environment[4], 0, 1);
+		this.output.materialMembrane = clamp(this.material[0], 0, 1);
+		this.output.materialMineral = clamp(this.material[1], 0, 1);
+		this.output.materialVelvet = clamp(this.material[2], 0, 1);
+		this.output.materialCrystal = clamp(this.material[3], 0, 1);
 	}
 }

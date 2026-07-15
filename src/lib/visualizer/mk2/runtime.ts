@@ -15,24 +15,24 @@ export const SOMA_MAX_PIXEL_RATIO = 1.5;
 export const SOMA_QUALITY_PROFILES = {
 	eco: {
 		tier: 'eco',
-		scale: 0.58,
+		scale: 0.68,
 		maxPixels: 1280 * 720,
 		frameRate: 40,
-		raymarchSteps: 40
+		raymarchSteps: 46
 	},
 	balanced: {
 		tier: 'balanced',
-		scale: 0.66,
+		scale: 0.84,
 		maxPixels: 1600 * 900,
 		frameRate: 50,
-		raymarchSteps: 48
+		raymarchSteps: 56
 	},
 	ultra: {
 		tier: 'ultra',
-		scale: 0.72,
+		scale: 1,
 		maxPixels: 1920 * 1080,
 		frameRate: 60,
-		raymarchSteps: 56
+		raymarchSteps: 64
 	}
 } as const satisfies Record<SomaQualityTier, SomaQualityProfile>;
 

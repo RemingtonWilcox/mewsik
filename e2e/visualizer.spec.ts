@@ -101,11 +101,11 @@ test.describe('visualizer engine roster', () => {
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'288'
+			'368'
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',
-			/seed|sprout|winding|bloom|shedding|dormancy/
+			/cocoon|spire|bilateral|torus|coral|shell/
 		);
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'signal');

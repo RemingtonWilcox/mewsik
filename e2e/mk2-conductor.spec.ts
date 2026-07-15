@@ -87,6 +87,7 @@ const FIXTURES = {
 		centroidVelocity: 0,
 		crestRatio: 2.1,
 		crestFactor: 0.28,
+		flatness: 0.35,
 		bass: 0.44,
 		mid: 0.49,
 		treble: 0.34
@@ -291,7 +292,32 @@ test.describe('Mk2 macro conductor', () => {
 			'paletteWarmth',
 			'materialDensity',
 			'materialIridescence',
-			'materialErosion'
+			'materialErosion',
+			'styleLowHighTilt',
+			'styleTonality',
+			'stylePercussiveness',
+			'styleRhythmicDensity',
+			'styleSyncopation',
+			'topologyCocoon',
+			'topologySpire',
+			'topologyBilateral',
+			'topologyTorus',
+			'topologyCoral',
+			'topologyShell',
+			'cameraOrbit',
+			'cameraProfile',
+			'cameraOverhead',
+			'cameraLow',
+			'cameraMacro',
+			'environmentVoid',
+			'environmentCurrent',
+			'environmentCavern',
+			'environmentHorizon',
+			'environmentCellular',
+			'materialMembrane',
+			'materialMineral',
+			'materialVelvet',
+			'materialCrystal'
 		] as const;
 		for (const key of slowRails) {
 			expect(Math.abs(samples.hz30[key] - samples.hz144[key]), `30/144 ${key}`).toBeLessThan(
@@ -934,6 +960,217 @@ test.describe('Mk2 macro conductor', () => {
 
 		expect(result.fast).toBeGreaterThan(result.slow + 0.0025);
 		expect(Math.abs(result.paletteBeforeWrap - result.paletteAfterWrap)).toBeLessThan(0.00001);
+	});
+
+	test('style, topology, camera, environment, and material grammars stay bounded and normalized', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const conductor = new Mk2Conductor('normalized-grammar');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			const families = [
+				[
+					'topologyCocoon',
+					'topologySpire',
+					'topologyBilateral',
+					'topologyTorus',
+					'topologyCoral',
+					'topologyShell'
+				],
+				['cameraOrbit', 'cameraProfile', 'cameraOverhead', 'cameraLow', 'cameraMacro'],
+				[
+					'environmentVoid',
+					'environmentCurrent',
+					'environmentCavern',
+					'environmentHorizon',
+					'environmentCellular'
+				],
+				['materialMembrane', 'materialMineral', 'materialVelvet', 'materialCrystal']
+			];
+			const styleNames = [
+				'styleLowHighTilt',
+				'styleTonality',
+				'stylePercussiveness',
+				'styleRhythmicDensity',
+				'styleSyncopation'
+			];
+			let maxSumError = 0;
+			const invalid: string[] = [];
+			let output: any;
+			for (let i = 0; i < 24 * 60; i += 1) {
+				const sectionCycle = ['verse', 'build', 'drop', 'bridge', 'breakdown'];
+				const section = sectionCycle[Math.floor(i / (4.8 * 60)) % sectionCycle.length];
+				frame.section = signal.section = section;
+				frame.clock.phraseIndex = Math.floor(i / (3 * 60));
+				frame.clock.beatPhase = (i % 30) / 30;
+				frame.context.sectionProgress = (i % 288) / 287;
+				frame.drop.buildActive = section === 'build';
+				frame.drop.anticipation = section === 'build' ? 0.8 : 0;
+				spectrum.novelty = i % 37 === 0 ? 0.95 : 0.05;
+				spectrum.flatness = 0.12 + ((i % 240) / 240) * 0.75;
+				spectrum.crestFactor = 0.15 + ((i % 180) / 180) * 0.8;
+				output = conductor.update(frame, signal, spectrum, 1 / 60);
+				for (const family of families) {
+					let sum = 0;
+					for (const name of family) {
+						const value = Number(output[name]);
+						if (!Number.isFinite(value) || value < 0 || value > 1) invalid.push(name);
+						sum += value;
+					}
+					maxSumError = Math.max(maxSumError, Math.abs(1 - sum));
+				}
+				for (const name of styleNames) {
+					const value = Number(output[name]);
+					const low = name === 'styleLowHighTilt' ? -1 : 0;
+					if (!Number.isFinite(value) || value < low || value > 1) invalid.push(name);
+				}
+			}
+			return { invalid: [...new Set(invalid)], maxSumError };
+		}, FIXTURES);
+
+		expect(result.invalid).toEqual([]);
+		expect(result.maxSumError).toBeLessThan(1e-9);
+	});
+
+	test('the same seed develops deterministic but music-separated world signatures', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const signatureNames = [
+				'styleLowHighTilt',
+				'styleTonality',
+				'stylePercussiveness',
+				'styleRhythmicDensity',
+				'styleSyncopation',
+				'topologyCocoon',
+				'topologySpire',
+				'topologyBilateral',
+				'topologyTorus',
+				'topologyCoral',
+				'topologyShell',
+				'cameraOrbit',
+				'cameraProfile',
+				'cameraOverhead',
+				'cameraLow',
+				'cameraMacro',
+				'environmentVoid',
+				'environmentCurrent',
+				'environmentCavern',
+				'environmentHorizon',
+				'environmentCellular',
+				'materialMembrane',
+				'materialMineral',
+				'materialVelvet',
+				'materialCrystal'
+			];
+			const profiles: Record<string, any> = {
+				rooted: {
+					slow: { sub: 0.82, kick: 0.12, body: 0.38, mids: 0.09, presence: 0.025, air: 0.01 },
+					flatness: 0.08,
+					crest: 0.16,
+					motion: 0.05,
+					eventEvery: 180,
+					eventPhase: 0
+				},
+				airborne: {
+					slow: { sub: 0.015, kick: 0.04, body: 0.08, mids: 0.24, presence: 0.68, air: 0.86 },
+					flatness: 0.7,
+					crest: 0.92,
+					motion: 0.84,
+					eventEvery: 24,
+					eventPhase: 0.5
+				},
+				sustained: {
+					slow: { sub: 0.08, kick: 0.05, body: 0.25, mids: 0.74, presence: 0.3, air: 0.09 },
+					flatness: 0.04,
+					crest: 0.08,
+					motion: 0.12,
+					eventEvery: 240,
+					eventPhase: 0.12
+				}
+			};
+			const run = (profileName: string) => {
+				const profile = profiles[profileName];
+				const conductor = new Mk2Conductor('same-style-seed');
+				const frame: any = structuredClone(fixtures.director);
+				const signal: any = structuredClone(fixtures.signal);
+				const spectrum: any = structuredClone(fixtures.spectrum);
+				frame.context.source = 'live';
+				frame.section = signal.section = 'verse';
+				Object.assign(spectrum.slow, profile.slow);
+				spectrum.flatness = profile.flatness;
+				spectrum.crestFactor = profile.crest;
+				spectrum.spectralMotion = profile.motion;
+				signal.motion = profile.motion;
+				let output: any;
+				for (let i = 0; i < 48 * 60; i += 1) {
+					const event = i % profile.eventEvery === 0;
+					spectrum.novelty = event ? 0.96 : 0.04;
+					frame.clock.beatPhase = event ? profile.eventPhase : (i % 30) / 30;
+					frame.clock.phraseIndex = Math.floor(i / (8 * 60));
+					frame.clock.phrasePos = (i % (8 * 60)) / (8 * 60);
+					output = conductor.update(frame, signal, spectrum, 1 / 60);
+				}
+				return signatureNames.map((name) => Number(output[name]));
+			};
+			const rooted = run('rooted');
+			const rootedAgain = run('rooted');
+			const airborne = run('airborne');
+			const sustained = run('sustained');
+			const distance = (a: number[], b: number[]) =>
+				Math.hypot(...a.map((value, index) => value - b[index]));
+			return {
+				rooted,
+				rootedAgain,
+				distances: [
+					distance(rooted, airborne),
+					distance(rooted, sustained),
+					distance(airborne, sustained)
+				]
+			};
+		}, FIXTURES);
+
+		expect(result.rootedAgain).toEqual(result.rooted);
+		for (const distance of result.distances) expect(distance).toBeGreaterThan(0.42);
+	});
+
+	test('live phrase position wrap cannot reverse the held lifecycle plan', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const conductor = new Mk2Conductor('live-wrap-plan');
+			const frame: any = structuredClone(fixtures.director);
+			const signal: any = structuredClone(fixtures.signal);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			frame.context.source = 'live';
+			frame.section = signal.section = 'verse';
+			let output: any;
+			for (let i = 0; i < 12 * 60; i += 1) {
+				frame.clock.phraseIndex = 3;
+				frame.clock.phrasePos = 0.72 + (i / (12 * 60)) * 0.279;
+				frame.context.sectionProgress = frame.clock.phrasePos;
+				output = conductor.update(frame, signal, spectrum, 1 / 60);
+			}
+			const before = { ...output };
+			for (let i = 0; i < 2.5 * 60; i += 1) {
+				frame.clock.phraseIndex = 4;
+				frame.clock.phrasePos = i / (2.5 * 60) / 4;
+				frame.context.sectionProgress = frame.clock.phrasePos;
+				output = conductor.update(frame, signal, spectrum, 1 / 60);
+			}
+			return { before, after: { ...output } };
+		}, FIXTURES);
+
+		expect(result.after.sproutForm).toBeLessThanOrEqual(result.before.sproutForm + 0.003);
+		expect(result.after.windingForm).toBeGreaterThanOrEqual(result.before.windingForm - 0.003);
+		expect(result.after.bloomForm).toBeGreaterThanOrEqual(result.before.bloomForm - 0.003);
 	});
 
 });
