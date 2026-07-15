@@ -15,11 +15,15 @@ const previous = await loadPreviousSnapshot({
   url: values['previous-url'],
 });
 
+const enabled = (value) => typeof value === 'string' && value.trim().toLowerCase() === 'true';
+
 const { outputPath, snapshot } = await writeSnapshot({
   outputDirectory: values.output,
   previous,
   youtubeApiKey: process.env.MEWSIK_YOUTUBE_API_KEY,
   lastfmApiKey: process.env.MEWSIK_LASTFM_API_KEY,
+  youtubeEnabled: enabled(process.env.MEWSIK_ENABLE_YOUTUBE_DISCOVERY),
+  lastfmEnabled: enabled(process.env.MEWSIK_ENABLE_LASTFM_DISCOVERY),
 });
 
 // Log only public state. Provider credentials and request URLs are never serialized or printed.

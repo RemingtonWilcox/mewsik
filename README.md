@@ -5,23 +5,23 @@
 <h1 align="center">mewsik</h1>
 
 <p align="center">
-  A free, open-source desktop music player that searches and plays music from YouTube, SoundCloud, and Bandcamp in one place. Built with Tauri, Svelte, and Rust.
+  An open-source desktop music player and visualizer prototype built with Tauri, Svelte, and Rust.
 </p>
 
 <p align="center">
-  <a href="https://github.com/RemingtonWilcox/mewsik/releases/latest">Early beta downloads</a>
+  <a href="https://github.com/RemingtonWilcox/mewsik/releases">Release history and signing status</a>
 </p>
 
 ---
 
-## Features
+## Prototype features
 
-- **Search everything at once** - YouTube, SoundCloud, and Bandcamp results in a single search
-- **Stream instantly** - Click a song and it plays, no account needed
-- **Build your library** - Save songs to your library, download for offline playback
+- **Experimental provider search** - Local development builds aggregate YouTube, SoundCloud, and Bandcamp, but those unofficial integrations are not approved for distribution and are blocked by the release gate
+- **Local music library** - Scan and play user-owned files with playlists and listening history
 - **Radio stations** - Browse 30,000+ internet radio stations by genre
 - **Discover** - Listening stats, recently played, and personalized recommendations
 - **Playlists** - Create and manage playlists from any source
+- **Audio-reactive visuals** - Prism, Soma, and Signal engines with shared musical analysis
 - **Keyboard shortcuts** - `Cmd+K` for quick search, `Space` for play/pause
 
 ## Screenshot
@@ -30,7 +30,7 @@
 
 ## Install (early beta)
 
-This repository builds native Windows and macOS applications, but the public release process is still being hardened. Check each GitHub release for its exact supported platforms and signing status. Version 0.1 cannot update itself, so moving to the first signed 0.2 release is a one-time manual install. Signed stable Windows releases built by the protected release workflow can then check for newer signed releases and offer an opt-in update in Settings. Local, source-built, unsigned, and current macOS builds keep the updater disabled and are updated manually.
+There is not yet a current signed public installer. The existing `v0.1.0` release is a legacy Mac artifact, not the reviewed Windows/macOS bootstrap described below. The release workflow is fail-closed while the prototype's unofficial YouTube, SoundCloud, and Bandcamp search/playback/download paths are replaced, licensed, or disabled for distributed builds. This repository builds native Windows and macOS applications, but the public release process is still being hardened. Check each GitHub release for its exact supported platforms and signing status. Version 0.1 cannot update itself, so moving to the first signed updater-capable release is a one-time manual install. Signed stable Windows releases built by the protected release workflow can then check for newer signed releases and offer an opt-in update in Settings. Local, source-built, unsigned, and current macOS builds keep the updater disabled and are updated manually.
 
 ### Windows 10/11 (x64)
 

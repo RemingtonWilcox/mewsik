@@ -106,9 +106,10 @@ The current analyzer exposes mono spectral features rather than raw stereo sampl
 
 The product surfaces were rebuilt around explicit jobs instead of overlapping dashboards.
 
-- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial with a credential-free shared snapshot for YouTube and Last.fm. GitHub Actions owns the optional provider keys and publishes only normalized public chart batches to GitHub Pages; ordinary listeners never create or paste keys.
+- Discovery v2 combines Apple's public U.S., U.K., Japan, and Brazil charts, ListenBrainz fresh releases, and current Bandcamp Daily editorial with a credential-free shared snapshot boundary for YouTube and Last.fm. GitHub Actions can own optional provider keys; ordinary listeners never create or paste them. Both hosted providers are currently parked and excluded from mewsik-derived shelves until their activation gates pass.
 - The hosted endpoint is pinned to `https://remingtonwilcox.github.io/mewsik/discovery/v1/snapshot.json`. The client accepts schema v1 only, allowlists the two hosted source IDs and provider URL hosts, caps the response at 2 MiB and 200 items per source, validates timestamps/cadences, and rejects unknown, malformed, future-dated, or over-age content.
-- The publisher runs hourly while preserving each provider's cadence: YouTube refreshes hourly and Last.fm every four hours. A recent prior batch is `cached`; a failed refresh can be `stale` for at most three cadences; absent credentials or expired fallback data is `unavailable`. The desktop preserves these delivery labels instead of relabeling hosted data as live.
+- The publisher runs hourly while preserving each provider's cadence: YouTube can refresh hourly and Last.fm every four hours. A key plus an explicit repository activation variable is required before any call. A recent prior batch is `cached`; a failed refresh can be `stale` for at most three cadences; a disabled gate, absent credential, or expired fallback is `unavailable`. The desktop preserves these delivery labels instead of relabeling hosted data as live.
+- YouTube API keys are sent in `x-goog-api-key`, never in URLs. YouTube data cannot enter cross-provider or personalized scoring; a future clearly branded shelf needs unmodified provider order plus versioned Terms/Privacy consent. Last.fm requests identify mewsik, validate provider linkbacks, omit Last.fm artwork/audio, and remain disabled pending written public-use approval plus visible attribution.
 - Apple, ListenBrainz, and Bandcamp remain direct public inputs. Personal library history, interactions, taste profile, and final ranking remain local and are never uploaded to the public snapshot.
 - Cold Search and Discover loads now show an accessible staged status panel with real elapsed time and an indeterminate progress bar. Apple territories refresh concurrently and remain deterministically ordered, reducing their worst-case cold delay from four serial request windows to one.
 - Every source has bounded requests, a declared refresh cadence, typed track/release/editorial records, stable provider IDs, and separately stored listeners, plays, views, and likes. A stale Bandcamp feed is rejected instead of presented as current.
@@ -163,6 +164,9 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 
 ### Windows updates and release safety
 
+- Ordinary pull requests and `main` now run a least-privilege Windows CI workflow covering version consistency, Svelte/type checks, the discovery publisher contract, Rust formatting/tests, the production frontend/sidecar build, and four-worker Playwright. GitHub secret scanning, push protection, and Dependabot security updates are enabled.
+- Stable distribution is fail-closed in `release/provider-policy.json` and `scripts/release-policy.mjs`. The current file intentionally blocks every release: unofficial YouTube audio extraction/download, SoundCloud's scraped client/combined playback/download, Bandcamp scraping, and missing final Terms/Privacy must be replaced, licensed, or disabled in a reviewed exact-version change before preflight can reach signing.
+- The official-source evidence and fastest release-safe product shape are in `docs/provider-distribution-strategy-2026-07-14.md`.
 - Version `0.2.0` introduces the updater UI and native shutdown gate. Normal source/local builds deliberately do not register the updater plugin and report updates unavailable; only the protected release build supplies a public key, endpoint, and `MEWSIK_UPDATE_CHANNEL=stable`.
 - Update install is user-confirmed. The package is downloaded and signature-verified first, then native code atomically blocks new music downloads, refuses to proceed while one is active, and shuts down the sidecar, playback, and tracked FFmpeg children before handing control to NSIS.
 - A music download that starts while the application package is downloading postpones installation without throwing away the verified package. Repeated clicks and install/relaunch recovery paths are guarded and covered by browser tests.
@@ -170,7 +174,7 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - Release configuration is generated into an ignored credential-free merge file. The workflow has no unsigned fallback and no real private key, password, certificate, or Azure secret is stored in this repository.
 - Version `0.1.0` cannot update itself; installing the first signed `0.2.0` candidate is a one-time manual bootstrap. macOS still uses the existing native sign/notarize script and does not yet participate in the updater feed.
 - The current local/installed `0.2.0` is unsigned private-test output. The protected `release` environment and a cryptographically verified, locally recoverable updater keypair are configured; one separate disaster-recovery backup, Azure signing account/profile credentials, and a usable `latest.json` are still absent, so this is not a distributable bootstrap release yet.
-- A reachable Apple Silicon Mac has the native notarization tools but currently lacks pnpm, a Developer ID Application identity, and the `mewsik-notary` Keychain profile. The MacBook that may hold the existing signing identity was unreachable during the audit. No current Mac artifact is ready to distribute.
+- A fresh clean Apple Silicon Mac mini checkout now has the exact pinned Node, pnpm, and Rust toolchains and passes dependency, Svelte, sidecar, runtime-resource, and Rust checks. It still lacks a Developer ID Application identity/private key and the `mewsik-notary` Keychain profile. The MacBook that may hold the existing identity was unreachable during the audit. No current Mac artifact is ready to distribute.
 
 ### Audio-level contract
 
@@ -185,8 +189,9 @@ Completed on the combined branch and packaged native release:
 - `pnpm check`: 0 errors, 0 warnings
 - `pnpm build`: pass
 - `pnpm test:e2e -- --workers=4`: 69/69 pass on a clean Vite server, including 11 updater state/race/recovery scenarios and Prism's scheduler/pixel/seed foundation
-- `pnpm test:discovery-snapshot`: 10/10 pass, including provider-failure retention, credential exclusion, strict sanitization, and atomic publication
-- `cargo test --all-targets`: 149 pass, 0 fail, 3 intentionally ignored live-provider tests
+- `pnpm test:discovery-snapshot`: 14/14 pass, including explicit activation gates, header-only YouTube credentials, provider-failure retention, credential exclusion, Last.fm live/cached linkback sanitization, and atomic publication
+- `pnpm test:release-policy`: 6/6 pass; the checked-in policy is fail-closed, version-bound, review-referenced, and cannot approve with open blockers
+- `cargo test --all-targets`: 155 pass, 0 fail, 3 intentionally ignored live-provider tests
 - Disposable release-contract test: a real generated Tauri keypair passed sign/verify and credential-exclusion checks; wrong refs, prerelease versions, non-increasing versions, and mismatched keys were rejected. The disposable key and generated config were removed afterward.
 - Local-build startup smoke: the updater plugin remains unregistered when no signed release configuration exists; the fresh debug app stayed responsive and closed through the normal window path.
 - Exact packaged-search regression: the native sidecar manager completed `Ella Langley Choosin' Texas` through YouTube, restarted the child, and completed the same query through SoundCloud; the explicit ignored live smoke passed.
@@ -224,9 +229,8 @@ Old Mk2 measured 73.677% average / 75.163% peak GPU on the same machine. Rebuilt
 
 ### Release artifacts
 
-- `src-tauri/target/release/mewsik.exe` (22,112,256 bytes): SHA-256 `F93C8C25043EE217742765A84025026A091D70576CD25F38C4510608941DBDDE`
-- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,060,667 bytes): SHA-256 `91E2112ECAC798CABB210D88C500FB63A6295DD06C7AC722BCE56182A145F2E2`
-- Installed NSIS payload at `C:\Users\og10ktech\AppData\Local\mewsik\mewsik.exe` (22,112,256 bytes): SHA-256 `5DDBC9A0F87080085AC9F7446DA9636F3BD213FBFA3D7A5F2053B14C43F1CAF3`
+- `src-tauri/target/release/mewsik.exe` (22,007,808 bytes): SHA-256 `103ACAC4D116411CCD7ACB2C5A5709FCFF92F26C62F5CC312F733AD580F9ABBD`
+- `src-tauri/target/release/bundle/nsis/mewsik_0.2.0_x64-setup.exe` (51,072,854 bytes): SHA-256 `32C1625EBA54A4D1E662744C0DE89F079C8926F7290BD8744818932333EB97F3`
 
 These local artifacts are intentionally unsigned and are for this machine/private testing only. The protected workflow must produce and verify a new Authenticode-signed candidate before anything is distributed as the public `0.2.0` bootstrap release.
 

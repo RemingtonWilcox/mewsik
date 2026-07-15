@@ -9,6 +9,7 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const FAILURE_RETRY_SECS = 60 * 60;
 const CLOCK_SKEW_SECS = 5 * 60;
+const LASTFM_USER_AGENT = 'mewsik-discovery-snapshot/1 (+https://github.com/RemingtonWilcox/mewsik)';
 
 const YOUTUBE = Object.freeze({
   id: 'youtube_most_popular_music',
@@ -127,7 +128,7 @@ function normalizedTags(values) {
 
 function youtubeItems(payload, now) {
   if (!Array.isArray(payload?.items)) throw new ProviderFailure('invalid provider response');
-  const items = payload.items.slice(0, YOUTUBE.limit).flatMap((video, index) => {
+  const items = payload.items.slice(0, YOUTUBE.limit).flatMap((video) => {
     const id = cleanText(video?.id, 128);
     const title = cleanText(video?.snippet?.title, 512);
     const channel = cleanText(video?.snippet?.channelTitle, 512);
@@ -144,8 +145,10 @@ function youtubeItems(payload, now) {
       album: null,
       artwork_url: youtubeArtwork(video?.snippet?.thumbnails),
       release_date: safeIsoDate(cleanText(video?.snippet?.publishedAt, 10)),
-      rank: index + 1,
-      audience_count: viewCount,
+      // Preserve the API response order in the array without manufacturing a
+      // numeric chart rank or a cross-provider headline metric.
+      rank: null,
+      audience_count: null,
       metrics: {
         listener_count: null,
         play_count: null,
@@ -174,6 +177,9 @@ function lastFmItems(payload, now) {
     const recordingMbid = safeMbid(track?.mbid);
     const artistMbid = safeMbid(track?.artist?.mbid);
     const trackUrl = safeLastFmUrl(track?.url);
+    const artistUrl = safeLastFmUrl(track?.artist?.url);
+    const linkback = trackUrl ?? artistUrl;
+    if (!linkback) return [];
     const listenerCount = safeCount(track?.listeners);
     const playCount = safeCount(track?.playcount);
     const externalIds = {};
@@ -202,7 +208,7 @@ function lastFmItems(payload, now) {
       tags: [],
       market: null,
       observed_at: now,
-      editorial_url: null,
+      editorial_url: linkback,
       external_ids: externalIds,
     }];
   });
@@ -210,11 +216,13 @@ function lastFmItems(payload, now) {
   return items;
 }
 
-async function fetchJson(fetchImpl, url) {
+async function fetchJson(fetchImpl, url, additionalHeaders = undefined) {
   let response;
   try {
+    const headers = new Headers(additionalHeaders);
+    headers.set('accept', 'application/json');
     response = await fetchImpl(url, {
-      headers: { accept: 'application/json' },
+      headers,
       redirect: 'error',
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
@@ -249,8 +257,7 @@ async function fetchYouTube(fetchImpl, apiKey, now) {
   url.searchParams.set('regionCode', 'US');
   url.searchParams.set('videoCategoryId', '10');
   url.searchParams.set('maxResults', String(YOUTUBE.limit));
-  url.searchParams.set('key', apiKey);
-  const payload = await fetchJson(fetchImpl, url);
+  const payload = await fetchJson(fetchImpl, url, { 'x-goog-api-key': apiKey });
   return {
     source: YOUTUBE.id,
     label: YOUTUBE.label,
@@ -267,7 +274,7 @@ async function fetchLastFm(fetchImpl, apiKey, now) {
   url.searchParams.set('format', 'json');
   url.searchParams.set('limit', String(LASTFM.limit));
   url.searchParams.set('page', '1');
-  const payload = await fetchJson(fetchImpl, url);
+  const payload = await fetchJson(fetchImpl, url, { 'user-agent': LASTFM_USER_AGENT });
   return {
     source: LASTFM.id,
     label: LASTFM.label,
@@ -297,6 +304,10 @@ function sanitizePreviousItem(definition, candidate, now) {
   const viewCount = safeCount(candidate.metrics?.view_count);
   const likeCount = safeCount(candidate.metrics?.like_count);
   const externalIds = {};
+  const editorialUrl = definition.id === LASTFM.id
+    ? safeLastFmUrl(candidate.editorial_url)
+    : null;
+  let lastFmTrackUrl = null;
   if (definition.id === YOUTUBE.id) {
     const videoId = cleanText(candidate.external_ids?.youtube_video_id, 128);
     if (!videoId || videoId !== sourceItemId) return null;
@@ -304,15 +315,17 @@ function sanitizePreviousItem(definition, candidate, now) {
   } else {
     const recordingMbid = safeMbid(candidate.external_ids?.musicbrainz_recording_id);
     const artistMbid = safeMbid(candidate.external_ids?.musicbrainz_artist_id);
-    const trackUrl = safeLastFmUrl(candidate.external_ids?.lastfm_track_url);
+    lastFmTrackUrl = safeLastFmUrl(candidate.external_ids?.lastfm_track_url);
     const hasCanonicalSourceId = recordingMbid
       ? sourceItemId === recordingMbid
       : /^lastfm-text-[0-9a-f]{32}$/u.test(sourceItemId);
     if (!hasCanonicalSourceId) return null;
     if (recordingMbid) externalIds.musicbrainz_recording_id = recordingMbid;
     if (artistMbid) externalIds.musicbrainz_artist_id = artistMbid;
-    if (trackUrl) externalIds.lastfm_track_url = trackUrl;
+    if (lastFmTrackUrl) externalIds.lastfm_track_url = lastFmTrackUrl;
   }
+  const lastFmLinkback = definition.id === LASTFM.id ? editorialUrl ?? lastFmTrackUrl : null;
+  if (definition.id === LASTFM.id && !lastFmLinkback) return null;
   return {
     source: definition.id,
     source_family: definition.family,
@@ -325,15 +338,15 @@ function sanitizePreviousItem(definition, candidate, now) {
       ? safeHttpsUrl(candidate.artwork_url, (host) => host === 'ytimg.com' || host.endsWith('.ytimg.com'))
       : null,
     release_date: definition.id === YOUTUBE.id ? safeIsoDate(candidate.release_date) : null,
-    rank: safeRank(candidate.rank, definition.limit),
-    audience_count: definition.id === YOUTUBE.id ? viewCount : listenerCount,
+    rank: definition.id === YOUTUBE.id ? null : safeRank(candidate.rank, definition.limit),
+    audience_count: definition.id === YOUTUBE.id ? null : listenerCount,
     metrics: definition.id === YOUTUBE.id
       ? { listener_count: null, play_count: null, view_count: viewCount, like_count: likeCount }
       : { listener_count: listenerCount, play_count: playCount, view_count: null, like_count: null },
     tags: definition.id === YOUTUBE.id ? normalizedTags(candidate.tags) : [],
     market: definition.id === YOUTUBE.id && candidate.market === 'US' ? 'US' : null,
     observed_at: observedAt,
-    editorial_url: null,
+    editorial_url: lastFmLinkback,
     external_ids: externalIds,
   };
 }
@@ -379,7 +392,16 @@ function hasCredential(value) {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-async function resolveSource({ definition, apiKey, previous, fetchImpl, now }) {
+async function resolveSource({ definition, enabled, apiKey, previous, fetchImpl, now }) {
+  if (!enabled) {
+    return {
+      id: definition.id,
+      state: 'unavailable',
+      last_attempt_at: now,
+      detail: 'This shared source is disabled until its provider approval and presentation requirements are complete.',
+      batch: null,
+    };
+  }
   const prior = previousSource(previous, definition, now);
   const dueAt = prior ? prior.batch.fetched_at + definition.cadenceSecs : 0;
   if (prior && now < dueAt) {
@@ -473,6 +495,8 @@ function assertCredentialsAreAbsent(value, credentials) {
 export async function buildSnapshot({
   now = Math.floor(Date.now() / 1_000),
   previous = null,
+  youtubeEnabled = false,
+  lastfmEnabled = false,
   youtubeApiKey = '',
   lastfmApiKey = '',
   fetchImpl = globalThis.fetch,
@@ -483,9 +507,14 @@ export async function buildSnapshot({
     [YOUTUBE.id, youtubeApiKey],
     [LASTFM.id, lastfmApiKey],
   ]);
+  const enabledSources = new Map([
+    [YOUTUBE.id, youtubeEnabled === true],
+    [LASTFM.id, lastfmEnabled === true],
+  ]);
   const sources = await Promise.all(SOURCE_DEFINITIONS.map((definition) =>
     resolveSource({
       definition,
+      enabled: enabledSources.get(definition.id),
       apiKey: credentials.get(definition.id),
       previous,
       fetchImpl,

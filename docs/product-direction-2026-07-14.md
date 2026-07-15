@@ -84,7 +84,8 @@ Queue planning must therefore move into the backend instead of introducing a sec
 - Personal Discover is primarily deterministic and library/listening-history driven: rotation, rediscovery, affinities, unfinished exploration, and useful bridges beyond the library.
 - Internet trend data may seed exploration or autoplay candidates, but should not masquerade as a deeply personalized black-box feed.
 - Every recommendation needs an inspectable reason and honest source freshness.
-- Installed apps do not contain shared provider secrets or require ordinary listeners to create developer accounts. The implemented beta split keeps Apple, ListenBrainz, and Bandcamp as direct public inputs while a scheduled GitHub Actions publisher serves credentialed YouTube and Last.fm batches from a versioned GitHub Pages snapshot. Personal history and final ranking stay local; see [Discovery provider strategy](discovery-provider-strategy-2026-07-14.md).
+- Installed apps do not contain shared provider secrets or require ordinary listeners to create developer accounts. The implemented beta split keeps Apple, ListenBrainz, and Bandcamp as direct public inputs while a scheduled GitHub Actions publisher owns the optional YouTube and Last.fm delivery boundary. Those two providers are currently parked and excluded from derived shelves until their separate policy/UI gates pass. Personal history and final ranking stay local; see [Discovery provider strategy](discovery-provider-strategy-2026-07-14.md).
+- Public distribution is a separate boundary from local prototyping. The current unofficial YouTube, SoundCloud, and Bandcamp search/playback/download paths cannot ship as-is; `release/provider-policy.json` blocks release until approved replacements or server-side distributed-build gates exist.
 
 ## Track D: visualizer evolution
 
@@ -145,7 +146,7 @@ The first delivery step is implemented on `codex/visualizer-rebuild`:
 - Normal Downloads polling is database-only. The explicit **Check files** action runs the potentially slow filesystem scan on a blocking worker, avoiding a route-load freeze on offline network paths.
 - Same-title jobs reserve output names atomically, eliminating the prior check-then-overwrite race.
 
-The backend-owned playback context and deterministic continuation milestone is also implemented, along with the shared discovery delivery foundation and Prism's performance/determinism prerequisite. The hosted snapshot still needs its repository provider credentials before YouTube or Last.fm can report live data.
+The backend-owned playback context and deterministic continuation milestone is also implemented, along with the shared discovery delivery foundation and Prism's performance/determinism prerequisite. The hosted snapshot is deployed and healthy; activating YouTube or Last.fm now requires the documented consent/attribution/approval gates, not merely adding credentials.
 
 The next implementation work is true prepared-next/prebuffered handoff, Soma's absolute pixel ceiling and measured quality tiers, and then the bounded visual-foundation prototypes described above.
 

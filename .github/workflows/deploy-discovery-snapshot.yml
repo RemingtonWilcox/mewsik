@@ -49,6 +49,8 @@ jobs:
         run: node scripts/discovery-snapshot/generate.mjs --output _site
         env:
           MEWSIK_DISCOVERY_PREVIOUS_URL: ${{ steps.pages.outputs.base_url }}/discovery/v1/snapshot.json
+          MEWSIK_ENABLE_YOUTUBE_DISCOVERY: ${{ vars.MEWSIK_ENABLE_YOUTUBE_DISCOVERY }}
+          MEWSIK_ENABLE_LASTFM_DISCOVERY: ${{ vars.MEWSIK_ENABLE_LASTFM_DISCOVERY }}
           MEWSIK_YOUTUBE_API_KEY: ${{ secrets.MEWSIK_YOUTUBE_API_KEY }}
           MEWSIK_LASTFM_API_KEY: ${{ secrets.MEWSIK_LASTFM_API_KEY }}
 

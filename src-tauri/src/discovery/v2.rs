@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 const SNAPSHOT_KEY: &str = "search-discovery-v2";
-const ALGORITHM_VERSION: &str = "discovery-v2.3";
+const ALGORITHM_VERSION: &str = "discovery-v2.4";
 const SECTION_SIZE: usize = 8;
 const FAILURE_RETRY_SECS: i64 = 60;
 const HOSTED_RETRY_SECS: i64 = 15 * 60;
@@ -1010,19 +1010,33 @@ struct PreviousMetric {
     audience: Option<u64>,
 }
 
-fn build_feed(
+/// YouTube and Last.fm data remain fetchable/cacheable so source health can be
+/// reported, but neither provider may enter Mewsik's derived discovery model
+/// until each has a compliant, provider-isolated presentation.
+fn participates_in_derived_discovery(batch: &SourceBatch, item: &SourceItem) -> bool {
+    !matches!(batch.source.as_str(), YOUTUBE_SOURCE | LASTFM_SOURCE)
+        && !matches!(item.source.as_str(), YOUTUBE_SOURCE | LASTFM_SOURCE)
+        && !item.source_family.eq_ignore_ascii_case("youtube")
+        && !item.source_family.eq_ignore_ascii_case("lastfm")
+}
+
+fn status_participates_in_derived_discovery(status: &DiscoverySourceStatus) -> bool {
+    !matches!(status.id.as_str(), YOUTUBE_SOURCE | LASTFM_SOURCE)
+}
+
+fn build_derived_candidates(
     db: &DbPool,
     batches: &[SourceBatch],
-    statuses: Vec<DiscoverySourceStatus>,
     taste: &TasteProfile,
-    now: DateTime<Utc>,
-) -> Result<(SearchDiscoveryFeed, String), String> {
+    now: &DateTime<Utc>,
+) -> BTreeMap<String, Candidate> {
     let previous = previous_metrics(db, batches);
     let mut candidates = BTreeMap::<String, Candidate>::new();
     for batch in batches {
         let chart_sizes = batch
             .items
             .iter()
+            .filter(|item| participates_in_derived_discovery(batch, item))
             .filter_map(|item| Some((item, item.rank?)))
             .fold(HashMap::<String, u32>::new(), |mut sizes, (item, rank)| {
                 sizes
@@ -1031,7 +1045,11 @@ fn build_feed(
                     .or_insert(rank);
                 sizes
             });
-        for item in &batch.items {
+        for item in batch
+            .items
+            .iter()
+            .filter(|item| participates_in_derived_discovery(batch, item))
+        {
             let entity_id = entity_id_for_item(item);
             let match_key = candidate_match_key(item);
             let Some(new_candidate) = Candidate::from_item(item, entity_id.clone()) else {
@@ -1071,6 +1089,17 @@ fn build_feed(
     for candidate in candidates.values_mut() {
         score_candidate(candidate, taste, now.date_naive(), max_audience_log);
     }
+    candidates
+}
+
+fn build_feed(
+    db: &DbPool,
+    batches: &[SourceBatch],
+    statuses: Vec<DiscoverySourceStatus>,
+    taste: &TasteProfile,
+    now: DateTime<Utc>,
+) -> Result<(SearchDiscoveryFeed, String), String> {
+    let candidates = build_derived_candidates(db, batches, taste, &now);
 
     let mut used_entities = HashSet::new();
     let mut artist_appearances = HashMap::<String, usize>::new();
@@ -1238,6 +1267,7 @@ fn build_feed(
     let snapshot_id = format!("{}-{}", now.timestamp(), &fingerprint[..12]);
     let source_labels = statuses
         .iter()
+        .filter(|status| status_participates_in_derived_discovery(status))
         .filter(|status| status.state == "live" || status.state == "cached")
         .map(|status| status.label.clone())
         .collect::<Vec<_>>();
@@ -1251,6 +1281,7 @@ fn build_feed(
         },
         is_stale: statuses
             .iter()
+            .filter(|status| status_participates_in_derived_discovery(status))
             .all(|status| status.state != "live" && status.state != "cached"),
         is_fallback: false,
         has_history,
@@ -1267,7 +1298,11 @@ fn previous_metrics(
 ) -> HashMap<(String, String, String), PreviousMetric> {
     let mut pairs = BTreeSet::new();
     for batch in batches {
-        for item in &batch.items {
+        for item in batch
+            .items
+            .iter()
+            .filter(|item| participates_in_derived_discovery(batch, item))
+        {
             pairs.insert((item.source_family.clone(), scope_for_item(item)));
         }
     }
@@ -1790,7 +1825,11 @@ fn validated_artwork_url(value: Option<&str>) -> Option<String> {
 fn input_fingerprint(batches: &[SourceBatch], taste: &TasteProfile) -> String {
     let mut parts = Vec::new();
     for batch in batches {
-        for item in &batch.items {
+        for item in batch
+            .items
+            .iter()
+            .filter(|item| participates_in_derived_discovery(batch, item))
+        {
             parts.push(format!(
                 "{}|{}|{}|{}|{:?}|{:?}",
                 batch.source,
@@ -1979,6 +2018,65 @@ mod tests {
             label: "Apple Music charts".to_string(),
             fetched_at: at,
             cadence_secs: 14_400,
+            items,
+        }
+    }
+
+    fn parked_provider_item(
+        source: &str,
+        family: &str,
+        id: &str,
+        artist: &str,
+        title: &str,
+        rank: u32,
+        audience: u64,
+        at: i64,
+    ) -> SourceItem {
+        let metrics = if family == "youtube" {
+            SourceMetrics {
+                view_count: Some(audience),
+                like_count: Some(audience / 10),
+                ..SourceMetrics::default()
+            }
+        } else {
+            SourceMetrics {
+                listener_count: Some(audience),
+                play_count: Some(audience.saturating_mul(10)),
+                ..SourceMetrics::default()
+            }
+        };
+        SourceItem {
+            source: source.to_string(),
+            source_family: family.to_string(),
+            source_item_id: id.to_string(),
+            item_kind: SourceItemKind::Track,
+            title: title.to_string(),
+            artist: Some(artist.to_string()),
+            album: None,
+            artwork_url: None,
+            release_date: None,
+            rank: Some(rank),
+            audience_count: Some(audience),
+            metrics,
+            tags: vec!["Electronic".to_string()],
+            market: Some("US".to_string()),
+            observed_at: at,
+            editorial_url: None,
+            external_ids: BTreeMap::from([(format!("{family}_id"), id.to_string())]),
+        }
+    }
+
+    fn parked_provider_batch(
+        source: &str,
+        label: &str,
+        items: Vec<SourceItem>,
+        at: i64,
+    ) -> SourceBatch {
+        SourceBatch {
+            source: source.to_string(),
+            label: label.to_string(),
+            fetched_at: at,
+            cadence_secs: 3_600,
             items,
         }
     }
@@ -2179,6 +2277,239 @@ mod tests {
             input_fingerprint(&[first], &TasteProfile::default()),
             input_fingerprint(&[second], &TasteProfile::default())
         );
+    }
+
+    #[test]
+    fn parked_providers_cannot_change_candidates_shelves_or_fingerprint() {
+        let db = init_memory_db().expect("database");
+        let now = DateTime::from_timestamp(100, 0).expect("time");
+        let taste = TasteProfile::default();
+        let apple = batch(
+            (0..24)
+                .map(|index| {
+                    apple_item(
+                        &format!("apple-{index}"),
+                        &format!("Artist {index}"),
+                        &format!("Song {index}"),
+                        "US",
+                        index + 1,
+                        100,
+                    )
+                })
+                .collect(),
+            100,
+        );
+        let duplicate = apple.items.last().expect("Apple duplicate target");
+        let youtube_only = parked_provider_item(
+            YOUTUBE_SOURCE,
+            "youtube",
+            "youtube-only",
+            "YouTube Artist",
+            "YouTube Song",
+            1,
+            u64::MAX,
+            100,
+        );
+        let youtube_only_key = candidate_match_key(&youtube_only);
+        let youtube = parked_provider_batch(
+            YOUTUBE_SOURCE,
+            "YouTube music heat",
+            vec![
+                parked_provider_item(
+                    YOUTUBE_SOURCE,
+                    "youtube",
+                    "youtube-duplicate",
+                    duplicate.artist.as_deref().expect("artist"),
+                    &duplicate.title,
+                    1,
+                    u64::MAX,
+                    100,
+                ),
+                youtube_only,
+            ],
+            100,
+        );
+        let lastfm_only = parked_provider_item(
+            LASTFM_SOURCE,
+            "lastfm",
+            "lastfm-only",
+            "Last.fm Artist",
+            "Last.fm Song",
+            1,
+            u64::MAX,
+            100,
+        );
+        let lastfm_only_key = candidate_match_key(&lastfm_only);
+        let lastfm = parked_provider_batch(
+            LASTFM_SOURCE,
+            "Last.fm charts",
+            vec![
+                parked_provider_item(
+                    LASTFM_SOURCE,
+                    "lastfm",
+                    "lastfm-duplicate",
+                    duplicate.artist.as_deref().expect("artist"),
+                    &duplicate.title,
+                    1,
+                    u64::MAX,
+                    100,
+                ),
+                lastfm_only,
+            ],
+            100,
+        );
+        let all_batches = vec![apple.clone(), youtube, lastfm];
+
+        let baseline = build_derived_candidates(&db, std::slice::from_ref(&apple), &taste, &now);
+        let combined = build_derived_candidates(&db, &all_batches, &taste, &now);
+        let duplicate_key = candidate_match_key(duplicate);
+        let baseline_duplicate = baseline.get(&duplicate_key).expect("Apple candidate");
+        let combined_duplicate = combined.get(&duplicate_key).expect("Apple candidate");
+
+        assert_eq!(combined.len(), baseline.len());
+        assert!(!combined.contains_key(&youtube_only_key));
+        assert!(!combined.contains_key(&lastfm_only_key));
+        assert_eq!(combined_duplicate.id, baseline_duplicate.id);
+        assert_eq!(
+            combined_duplicate.source_labels,
+            BTreeSet::from(["Apple Music charts".to_string()])
+        );
+        assert_eq!(combined_duplicate.signals.len(), 1);
+        assert_eq!(combined_duplicate.signals[0].source_family, "apple");
+        assert_eq!(
+            combined_duplicate.rank_strength,
+            baseline_duplicate.rank_strength
+        );
+        assert_eq!(combined_duplicate.agreement, baseline_duplicate.agreement);
+        assert_eq!(combined_duplicate.momentum, baseline_duplicate.momentum);
+        assert_eq!(
+            combined_duplicate.audience_growth,
+            baseline_duplicate.audience_growth
+        );
+        assert_eq!(
+            combined_duplicate.audience_strength,
+            baseline_duplicate.audience_strength
+        );
+        assert_eq!(
+            combined_duplicate.external_quality,
+            baseline_duplicate.external_quality
+        );
+        assert_eq!(
+            input_fingerprint(&all_batches, &taste),
+            input_fingerprint(std::slice::from_ref(&apple), &taste)
+        );
+
+        let statuses = vec![
+            DiscoverySourceStatus {
+                id: APPLE_SOURCE.to_string(),
+                label: "Apple Music charts".to_string(),
+                state: "live".to_string(),
+                updated_at: Some(100),
+                detail: None,
+            },
+            DiscoverySourceStatus {
+                id: YOUTUBE_SOURCE.to_string(),
+                label: "YouTube music heat".to_string(),
+                state: "live".to_string(),
+                updated_at: Some(100),
+                detail: None,
+            },
+            DiscoverySourceStatus {
+                id: LASTFM_SOURCE.to_string(),
+                label: "Last.fm charts".to_string(),
+                state: "cached".to_string(),
+                updated_at: Some(100),
+                detail: None,
+            },
+        ];
+        let (baseline_feed, baseline_fingerprint) = build_feed(
+            &db,
+            std::slice::from_ref(&apple),
+            statuses.clone(),
+            &taste,
+            now,
+        )
+        .expect("baseline feed");
+        let (combined_feed, combined_fingerprint) =
+            build_feed(&db, &all_batches, statuses.clone(), &taste, now).expect("combined feed");
+
+        assert_eq!(combined_feed.sections, baseline_feed.sections);
+        assert_eq!(combined_fingerprint, baseline_fingerprint);
+        assert_eq!(combined_feed.source, "Apple Music charts");
+        assert_eq!(combined_feed.source_statuses, statuses);
+    }
+
+    #[test]
+    fn parked_provider_history_is_not_loaded_as_previous_metrics() {
+        let db = init_memory_db().expect("database");
+        for observed_at in [100, 200] {
+            let youtube = parked_provider_batch(
+                YOUTUBE_SOURCE,
+                "YouTube music heat",
+                vec![parked_provider_item(
+                    YOUTUBE_SOURCE,
+                    "youtube",
+                    "video",
+                    "Artist",
+                    "Song",
+                    1,
+                    observed_at as u64,
+                    observed_at,
+                )],
+                observed_at,
+            );
+            let lastfm = parked_provider_batch(
+                LASTFM_SOURCE,
+                "Last.fm charts",
+                vec![parked_provider_item(
+                    LASTFM_SOURCE,
+                    "lastfm",
+                    "track",
+                    "Artist",
+                    "Song",
+                    1,
+                    observed_at as u64,
+                    observed_at,
+                )],
+                observed_at,
+            );
+            ingest_batch(&db, &youtube).expect("YouTube ingest");
+            ingest_batch(&db, &lastfm).expect("Last.fm ingest");
+        }
+        let current_batches = vec![
+            parked_provider_batch(
+                YOUTUBE_SOURCE,
+                "YouTube music heat",
+                vec![parked_provider_item(
+                    YOUTUBE_SOURCE,
+                    "youtube",
+                    "video",
+                    "Artist",
+                    "Song",
+                    1,
+                    200,
+                    200,
+                )],
+                200,
+            ),
+            parked_provider_batch(
+                LASTFM_SOURCE,
+                "Last.fm charts",
+                vec![parked_provider_item(
+                    LASTFM_SOURCE,
+                    "lastfm",
+                    "track",
+                    "Artist",
+                    "Song",
+                    1,
+                    200,
+                    200,
+                )],
+                200,
+            ),
+        ];
+
+        assert!(previous_metrics(&db, &current_batches).is_empty());
     }
 
     #[test]

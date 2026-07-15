@@ -290,7 +290,9 @@ fn build_request(
     headers: &HashMap<String, String>,
     is_live: bool,
 ) -> reqwest::blocking::RequestBuilder {
-    let mut request = client.get(url).header("User-Agent", "mewsik/0.1");
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("mewsik/", env!("CARGO_PKG_VERSION")));
     if is_live {
         request = request.header("Icy-MetaData", "0");
     }

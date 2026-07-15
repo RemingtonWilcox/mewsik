@@ -339,6 +339,11 @@ fn validate_item(
                     "hosted YouTube item has an unsupported market".to_string(),
                 ));
             }
+            if item.rank.is_some() || item.audience_count.is_some() {
+                return Err(SourceError::Parse(
+                    "hosted YouTube item contains a derived rank or headline metric".to_string(),
+                ));
+            }
             if item
                 .artwork_url
                 .as_deref()
@@ -371,10 +376,10 @@ fn validate_item(
             if item
                 .editorial_url
                 .as_deref()
-                .is_some_and(|url| !allowed_https_subdomain_url(url, "last.fm"))
+                .is_none_or(|url| !allowed_https_subdomain_url(url, "last.fm"))
             {
                 return Err(SourceError::Parse(
-                    "hosted Last.fm item contains an unapproved URL".to_string(),
+                    "hosted Last.fm item is missing its approved provider linkback".to_string(),
                 ));
             }
             validate_lastfm_external_ids(item)?;
@@ -510,8 +515,8 @@ mod tests {
             album: None,
             artwork_url: Some("https://i.ytimg.com/vi/video-1/hqdefault.jpg".to_string()),
             release_date: Some("2026-07-14".to_string()),
-            rank: Some(1),
-            audience_count: Some(100),
+            rank: None,
+            audience_count: None,
             metrics: SourceMetrics {
                 view_count: Some(100),
                 like_count: Some(10),
@@ -532,6 +537,41 @@ mod tests {
             fetched_at: now,
             cadence_secs: YOUTUBE_CADENCE_SECS,
             items: vec![youtube_item(now)],
+        }
+    }
+
+    fn lastfm_item(now: i64) -> SourceItem {
+        let recording_id = "11111111-2222-3333-4444-555555555555";
+        SourceItem {
+            source: LASTFM_SOURCE.to_string(),
+            source_family: "lastfm".to_string(),
+            source_item_id: recording_id.to_string(),
+            item_kind: SourceItemKind::Track,
+            title: "A chart track".to_string(),
+            artist: Some("Artist".to_string()),
+            album: None,
+            artwork_url: None,
+            release_date: None,
+            rank: Some(1),
+            audience_count: Some(100),
+            metrics: SourceMetrics {
+                listener_count: Some(100),
+                ..SourceMetrics::default()
+            },
+            tags: Vec::new(),
+            market: None,
+            observed_at: now,
+            editorial_url: Some("https://www.last.fm/music/Artist/_/A+chart+track".to_string()),
+            external_ids: BTreeMap::from([
+                (
+                    "musicbrainz_recording_id".to_string(),
+                    recording_id.to_string(),
+                ),
+                (
+                    "lastfm_track_url".to_string(),
+                    "https://www.last.fm/music/Artist/_/A+chart+track".to_string(),
+                ),
+            ]),
         }
     }
 
@@ -646,6 +686,23 @@ mod tests {
         assert!(
             parse_hosted_snapshot(&serde_json::to_vec(&alternate_thumbnail).unwrap(), now).is_ok()
         );
+    }
+
+    #[test]
+    fn lastfm_contract_requires_a_valid_provider_linkback() {
+        let now = 1_800_000_000;
+        let mut item = lastfm_item(now);
+        let batch = SourceBatch {
+            source: LASTFM_SOURCE.to_string(),
+            label: "Last.fm top tracks".to_string(),
+            fetched_at: now,
+            cadence_secs: LASTFM_CADENCE_SECS,
+            items: vec![item.clone()],
+        };
+
+        assert!(validate_item(&item, &batch, "lastfm", 100, now).is_ok());
+        item.editorial_url = None;
+        assert!(validate_item(&item, &batch, "lastfm", 100, now).is_err());
     }
 
     #[test]

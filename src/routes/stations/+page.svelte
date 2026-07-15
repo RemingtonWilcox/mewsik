@@ -821,7 +821,7 @@
 					<div class="relative mt-5 flex items-end justify-between gap-3 border-t border-white/[0.07] pt-3">
 						<div class="min-w-0">
 							<p class="truncate text-[11px] font-medium text-white/70">{station.quality}</p>
-							<p class="mt-1 truncate text-[10px] text-primary/65">{station.adLabel}</p>
+							<p class="mt-1 truncate text-[10px] text-primary/65">Station profile · {station.adLabel}</p>
 							<p class="mt-1 truncate text-[10px] text-white/35">
 								{station.country} · {station.codec} {station.bitrate ? `· ${station.bitrate} kbps` : ''}
 							</p>

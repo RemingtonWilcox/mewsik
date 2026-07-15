@@ -25,6 +25,10 @@ VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
 BUNDLE_ID="$(node -p "require('./src-tauri/tauri.conf.json').identifier")"
 ARCH="$(uname -m)"
 
+# Fail before touching signing identities or notarization credentials. The
+# checked-in review gate applies equally to Windows and macOS distribution.
+node scripts/check-release-policy.mjs "$VERSION"
+
 case "$ARCH" in
   arm64) TAURI_ARCH="aarch64" ;;
   x86_64) TAURI_ARCH="x64" ;;
