@@ -177,4 +177,29 @@ test.describe('Soma render runtime', () => {
 			afterIgnoredPause: 'eco'
 		});
 	});
+
+	test('keeps autonomous clocks out of Soma geometry and camera composition', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const source = await page.evaluate(async () => {
+			const modulePath = '/src/lib/components/visualizer/visualizer-mk2.svelte?raw';
+			return (await import(/* @vite-ignore */ modulePath)).default as string;
+		});
+		const camera = source.slice(
+			source.indexOf('function getCameraPos('),
+			source.indexOf('function dominantGesture(')
+		);
+		const geometry = source.slice(
+			source.indexOf('fn organismWarp('),
+			source.indexOf('// 4-tap tetrahedral normal estimation.')
+		);
+
+		expect(camera).not.toContain('cameraPhase');
+		expect(camera).not.toContain('journey.cameraPhase');
+		expect(geometry).not.toContain('u.morphPhase');
+		expect(geometry).not.toContain('u.spectralTravelPhase');
+		expect(geometry).not.toContain('u.backgroundPhase');
+		expect(geometry).not.toContain('u.journeyPhase');
+	});
 });

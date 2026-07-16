@@ -118,13 +118,12 @@
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// One continuous, non-resetting camera drift inside a bounded arc. Camera
-	// phase never becomes azimuth directly: that created the permanent clockwise
-	// turntable the eye could predict after a few seconds. Irrationally-related
-	// sways now explore one musical shot, while phrase rails choose new shots.
+	// Camera placement is a held musical shot. Phrase rails interpolate between
+	// compositions; elapsed time never orbits, breathes, or nudges the camera.
+	// This is intentionally boring at the frame level: Soma itself can evolve
+	// without a perpetual handheld wobble being mistaken for audio reactivity.
 	// ──────────────────────────────────────────────────────────────────────────
 	function getCameraPos(
-		cameraPhase: number,
 		perspectiveAzimuth: number,
 		perspectiveElevation: number,
 		cameraOrbit: number,
@@ -134,30 +133,22 @@
 		cameraMacro: number
 	): [number, number, number] {
 		const seedAngle = mk2SongSeed * Math.PI * 2;
-		const orbitSway =
-			Math.sin(cameraPhase * 0.71 + seedAngle * 0.31) * (0.2 + cameraOrbit * 0.3) +
-			Math.sin(cameraPhase * 0.23 - seedAngle * 0.47) * 0.09;
 		const azimuth =
 			seedAngle +
-			orbitSway +
 			perspectiveAzimuth +
 			cameraProfile * 0.22 -
 			cameraLow * 0.08;
 		const baseRadius =
-			(3.48 +
-				Math.sin(cameraPhase * 0.173 + seedAngle * 0.7) * 0.22 +
-				Math.sin(cameraPhase * 0.071 - seedAngle) * 0.1) *
+			(3.48 + (mk2SongSeed - 0.5) * 0.24) *
 			(1 + cameraOrbit * 0.035 + cameraOverhead * 0.055 - cameraMacro * 0.025);
 		const radius = baseRadius * Math.cos(perspectiveElevation * 0.82);
 		const sideDrift =
-			Math.sin(cameraPhase * 0.119 + seedAngle * 1.3) *
-			(0.14 + cameraOrbit * 0.08 + cameraProfile * 0.06);
+			(mk2SongSeed - 0.5) * 2 * (0.1 + cameraOrbit * 0.06 + cameraProfile * 0.05);
 		const altitudeBias =
 			cameraOverhead * 0.72 - cameraLow * 0.48 + cameraProfile * 0.1 - cameraMacro * 0.08;
 		return [
 			Math.cos(azimuth) * radius + Math.cos(azimuth * 0.37 + seedAngle) * sideDrift,
 			1.12 +
-				Math.sin(cameraPhase * 0.227 + seedAngle * 0.4) * (0.34 + cameraOverhead * 0.12) +
 				Math.sin(perspectiveElevation) * baseRadius * 0.86 +
 				altitudeBias,
 			Math.sin(azimuth) * radius + Math.sin(azimuth * 0.41 - seedAngle) * sideDrift
@@ -605,13 +596,16 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	q.y = pitched.x;
 	q.z = pitched.y;
 
-	// Morph phase never wraps or resets. Its low physical rate produces long,
-	// coherent development rather than a short canned wobble.
-	let tSlow = u.morphPhase + u.spectralTravelPhase * 0.22;
+	// Spatial asymmetry gives the tissue a living bias, but it is a held pose.
+	// No elapsed-time phase may deform the whole coordinate field: even a very
+	// slow sine eventually reads as the same canned inhale-and-twist loop.
+	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
+		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
+		+ (coil - divide) * 0.42 + (reach - hollow) * 0.31;
 	let drift = vec3<f32>(
-		sin(q.y * 1.05 + tSlow) * 0.045 + cos(q.z * 0.73 - tSlow * 0.61) * 0.030,
-		sin(q.x * 0.82 - tSlow * 0.43) * 0.032,
-		cos(q.x * 0.92 + tSlow * 0.79) * 0.045 + sin(q.y * 0.71 + tSlow * 0.53) * 0.030
+		sin(q.y * 1.05 + poseIdentity) * 0.045 + cos(q.z * 0.73 - poseIdentity * 0.61) * 0.030,
+		sin(q.x * 0.82 - poseIdentity * 0.43) * 0.032,
+		cos(q.x * 0.92 + poseIdentity * 0.79) * 0.045 + sin(q.y * 0.71 + poseIdentity * 0.53) * 0.030
 	);
 	q = q + drift * (
 		0.22 + growth * 0.22 + u.sproutForm * 0.18 + u.sheddingForm * 0.15
@@ -639,10 +633,10 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	// bloom releases that stored pressure laterally, while dormancy settles flat.
 	let sproutBend = (u.sproutForm + reach * 0.72 + spire * 0.30)
 		* (0.07 + u.axialStretch * 0.075);
-	let growthIdentity = (u.paletteFamily + 1.0) * 2.17;
+	let growthIdentity = poseIdentity;
 	let growthLeanX = sin(growthIdentity);
 	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
-	let sproutCurve = sin(q.y * 1.18 + tSlow * 0.23) * sproutBend
+	let sproutCurve = sin(q.y * 1.18 + poseIdentity * 0.23) * sproutBend
 		+ q.y * q.y * u.sproutForm * 0.045;
 	q.x = q.x - sproutCurve * growthLeanX;
 	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
@@ -674,15 +668,15 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		0.16 + tension * 0.32 + u.windingForm * 1.08 + u.foldDepth * 0.62
 			+ coil * 1.24 + shell * 0.74
 	)
-		+ sin(q.z * 1.52 + tSlow * 1.09) * (0.045 + u.foldDepth * 0.16)
+		+ sin(q.z * 1.52 + poseIdentity * 1.09) * (0.045 + u.foldDepth * 0.16)
 		+ u.chromaX * chromaPull * 0.045;
 	let rxz = rot2(q.xz, twist);
 	q.x = rxz.x;
 	q.z = rxz.y;
-	let rxy = rot2(q.xy, sin(q.z * 0.96 + tSlow * 0.67) * (0.035 + u.foldDepth * 0.14));
+	let rxy = rot2(q.xy, sin(q.z * 0.96 + poseIdentity * 0.67) * (0.035 + u.foldDepth * 0.14));
 	q.x = rxy.x;
 	q.y = rxy.y;
-	q.y = q.y + sin(q.x * 1.75 + tSlow * 0.59) * (0.022 + u.foldDepth * 0.075);
+	q.y = q.y + sin(q.x * 1.75 + poseIdentity * 0.59) * (0.022 + u.foldDepth * 0.075);
 	return q;
 }
 
@@ -700,6 +694,10 @@ fn map(p: vec3<f32>) -> f32 {
 	let divideGesture = pow(max(u.gestureDivide, 0.0), 1.15);
 	let hollowGesture = pow(max(u.gestureHollow, 0.0), 1.15);
 	let stillGesture = pow(max(u.gestureStillness, 0.0), 1.15);
+	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
+		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
+		+ (coilGesture - divideGesture) * 0.42
+		+ (reachGesture - hollowGesture) * 0.31;
 	// Cheap conservative scene bound. All lifecycle appendages and shed fragments
 	// remain within this envelope, so empty screen rays avoid the fractal entirely.
 	let outerBound = length(p) - 1.95;
@@ -822,8 +820,10 @@ fn map(p: vec3<f32>) -> f32 {
 			mix(direction, windingDirection(i), windingMix * 0.82),
 			direction
 		);
-		let travelTurn = u.morphPhase * (0.26 + f32(i) * 0.025)
-			+ u.spectralTravelPhase * (0.18 + f32(i) * 0.035) * lanePolarity;
+		let travelTurn = u.postureYaw * (0.92 + f32(i) * 0.08)
+			+ u.posturePitch * 0.54 * lanePolarity
+			+ (coilGesture - divideGesture) * (0.22 + f32(i) * 0.025)
+			+ u.paletteFamily * 0.17 * lanePolarity;
 		let turned = rot2(direction.xz, travelTurn);
 		direction.x = turned.x;
 		direction.z = turned.y;
@@ -848,7 +848,7 @@ fn map(p: vec3<f32>) -> f32 {
 		) * laneVariation;
 		let a = direction * (0.14 + u.windingForm * 0.13);
 		var b = direction * reach;
-		b.y = b.y + sin(u.morphPhase * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
+		b.y = b.y + sin(poseIdentity * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
 		b.x = b.x + u.spectralLean * lanePolarity * (0.035 + u.lobeSplit * 0.055);
 		let branchRadius = 0.050 + u.rootMass * 0.020 + u.lobeSplit * 0.025
 			+ u.bloomForm * 0.030 + u.filamentReach * 0.015;
@@ -867,7 +867,7 @@ fn map(p: vec3<f32>) -> f32 {
 	// tiny internal spheres, this negative space reaches the silhouette from most
 	// camera angles and makes shedding unmistakably different from bloom.
 	var cavityQ = q;
-	let cavityTurn = u.morphPhase * 0.31 + u.spectralLean * 0.36
+	let cavityTurn = u.posturePitch * 1.24 + u.postureYaw * 0.46
 		+ shellDNA * 0.54 + coilGesture * 0.62;
 	let cavityYZ = rot2(cavityQ.yz, cavityTurn);
 	cavityQ.y = cavityYZ.x;
@@ -897,14 +897,14 @@ fn map(p: vec3<f32>) -> f32 {
 	let shedGate = clamp(u.sheddingForm * 1.12 + hollowGesture * 0.34 + shellDNA * 0.12, 0.0, 1.0);
 	let fragmentDrift = 0.72 + shedGate * 0.43;
 	let fragmentAOffset = vec3<f32>(
-		fragmentDrift + sin(u.morphPhase * 0.61) * 0.12,
-		0.30 + shedGate * 0.18 + cos(u.morphPhase * 0.47) * 0.13,
-		-0.20 - shedGate * 0.10 + sin(u.morphPhase * 0.39) * 0.10
+		fragmentDrift + sin(poseIdentity * 0.61) * 0.12,
+		0.30 + shedGate * 0.18 + cos(poseIdentity * 0.47) * 0.13,
+		-0.20 - shedGate * 0.10 + sin(poseIdentity * 0.39) * 0.10
 	);
 	let fragmentBOffset = vec3<f32>(
-		-fragmentDrift * 0.88 + cos(u.morphPhase * 0.53) * 0.15,
-		-0.36 - shedGate * 0.16 + sin(u.morphPhase * 0.43) * 0.12,
-		0.43 + shedGate * 0.20 + cos(u.morphPhase * 0.31) * 0.11
+		-fragmentDrift * 0.88 + cos(poseIdentity * 0.53) * 0.15,
+		-0.36 - shedGate * 0.16 + sin(poseIdentity * 0.43) * 0.12,
+		0.43 + shedGate * 0.20 + cos(poseIdentity * 0.31) * 0.11
 	);
 	let fragmentRadius = 0.15 + u.filamentReach * 0.060 + u.materialErosion * 0.050;
 	let fragmentA = sdEllipsoid(
@@ -1489,7 +1489,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let hitCenter = vec3<f32>(
 				u.spectralLean * 0.24,
 				-0.48,
-				sin(u.paletteFamily * 1.71 + u.spectralTravelPhase * 0.08) * 0.22
+				sin(u.paletteFamily * 1.71 + u.postureYaw * 0.8) * 0.22
 			);
 			let hitMask = 1.0 - smoothstep(0.10, 0.31, length(surfQ - hitCenter));
 			let impactGain = 1.0 + hitMask * (u.rootPulse * 0.075 + u.surfaceImpact * 0.04);
@@ -2528,9 +2528,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			requestedFovScale /
 			(1 + (subjectExtent - 1) * (1 - intentionalMacro * 0.72));
 
-		// The camera follows a continuous path at the conductor's physical rate.
-		// Harmony can gently reframe the target, but phrases and drops never add
-		// accumulated offsets and impacts never shake the camera.
+		// Camera composition moves only when the phrase-held shot rails change.
+		// Impacts, FFT deltas, and autonomous clocks never move the camera.
 		const sessionTargetY =
 			-0.08 +
 			(mk2SongSeed - 0.5) * 0.1 +
@@ -2538,7 +2537,6 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			journey.lobeSplit * 0.025;
 		const sessionRoll = (mk2SongSeed - 0.5) * 0.14;
 		const camPosRaw = getCameraPos(
-			journey.cameraPhase,
 			journey.perspectiveAzimuth,
 			journey.perspectiveElevation,
 			cameraOrbit,

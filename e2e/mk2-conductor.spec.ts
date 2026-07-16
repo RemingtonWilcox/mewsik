@@ -709,6 +709,65 @@ test.describe('Mk2 macro conductor', () => {
 		expect(result.spectralLeanDelta).toBeLessThan(0.002);
 	});
 
+	test('alternating live envelopes cannot recreate a whole-body groove loop', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const a = new Mk2Conductor('groove-loop-isolation');
+			const b = new Mk2Conductor('groove-loop-isolation');
+			const frameA: any = structuredClone(fixtures.director);
+			const frameB: any = structuredClone(fixtures.director);
+			const signalA: any = structuredClone(fixtures.signal);
+			const signalB: any = structuredClone(fixtures.signal);
+			const spectrumA: any = structuredClone(fixtures.spectrum);
+			const spectrumB: any = structuredClone(fixtures.spectrum);
+			const macroRails = [
+				'growth', 'tension', 'release', 'openness', 'postureYaw', 'posturePitch',
+				'perspectiveAzimuth', 'perspectiveElevation', 'shotZoom', 'cameraDistance',
+				'seedForm', 'sproutForm', 'windingForm', 'bloomForm', 'sheddingForm',
+				'dormancyForm', 'rootMass', 'axialStretch', 'lobeSplit', 'foldDepth',
+				'cavityOpen', 'filamentReach', 'gestureReach', 'gestureCoil',
+				'gestureDivide', 'gestureHollow', 'gestureStillness'
+			];
+			for (let i = 0; i < 18 * 60; i += 1) {
+				a.update(frameA, signalA, spectrumA, 1 / 60);
+				b.update(frameB, signalB, spectrumB, 1 / 60);
+			}
+			let maxDelta = 0;
+			let maxRail = '';
+			for (let i = 0; i < 12 * 60; i += 1) {
+				const highA = Math.floor(i / 6) % 2 === 0;
+				const setEnvelope = (signal: any, spectrum: any, high: boolean) => {
+					const value = high ? 1 : 0;
+					signal.tension = value;
+					signal.release = value;
+					signal.openness = value;
+					signal.motion = value;
+					signal.phraseVariation = value;
+					spectrum.spectralDirection = high ? 1 : -1;
+					spectrum.spectralMotion = 1;
+				};
+				setEnvelope(signalA, spectrumA, highA);
+				setEnvelope(signalB, spectrumB, !highA);
+				const outA: any = a.update(frameA, signalA, spectrumA, 1 / 60);
+				const outB: any = b.update(frameB, signalB, spectrumB, 1 / 60);
+				for (const name of macroRails) {
+					const delta = Math.abs(outA[name] - outB[name]);
+					if (delta > maxDelta) {
+						maxDelta = delta;
+						maxRail = name;
+					}
+				}
+			}
+			return { maxDelta, maxRail };
+		}, FIXTURES);
+
+		expect(result.maxDelta, result.maxRail).toBeLessThan(0.004);
+	});
+
 	test('spectral travel and harmonic palette cross direction and hue wraps without snapping', async ({
 		page
 	}) => {
@@ -751,10 +810,13 @@ test.describe('Mk2 macro conductor', () => {
 			};
 		}, FIXTURES);
 
-		expect(result.forward.spectralLean).toBeGreaterThan(0.12);
 		expect(result.forward.spectralTravelRate).toBeGreaterThan(0.1);
-		expect(result.reverse.spectralLean).toBeLessThan(-0.09);
 		expect(result.reverse.spectralTravelRate).toBeLessThan(-0.1);
+		// Direction still moves fine surface/environment travel, but no longer
+		// leans the complete organism left and right with the live spectrum.
+		expect(
+			Math.abs(result.reverse.spectralLean - result.forward.spectralLean)
+		).toBeLessThan(0.01);
 		expect(result.reverse.spectralTravelPhase).toBeLessThan(result.phaseBeforeReverse);
 		expect(result.maxTravelStep).toBeLessThan(0.003);
 		expect(result.maxPaletteStep).toBeLessThan(0.002);

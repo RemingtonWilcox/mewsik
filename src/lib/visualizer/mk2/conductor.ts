@@ -1068,7 +1068,6 @@ export class Mk2Conductor {
 
 		const signalTension = clamp01(finite(signal.tension, profile.tension));
 		const signalRelease = clamp01(finite(signal.release, profile.release));
-		const signalOpenness = clamp01(finite(signal.openness, profile.openness));
 		const signalMotion = clamp01(finite(signal.motion, profile.motion));
 		const energy = clamp01(finite(frame.energy));
 		const sectionEnergy = clamp01(finite(context?.sectionEnergy, energy));
@@ -1233,7 +1232,11 @@ export class Mk2Conductor {
 		const gestureSection = GESTURE_SECTION_MODIFIERS[sectionName];
 		this.gestureTarget[0] =
 			this.seedGesture[0] * 0.28 +
-			(0.1 + this.topology[1] * 0.46 + brightStyle * 0.2 + signalMotion * 0.16) * 0.5 +
+			(0.1 +
+				this.topology[1] * 0.46 +
+				brightStyle * 0.2 +
+				this.styleRhythmicDensity * 0.16) *
+				0.5 +
 			gestureSection[0] +
 			this.gesturePhraseBias[0];
 		this.gestureTarget[1] =
@@ -1250,13 +1253,13 @@ export class Mk2Conductor {
 			this.gesturePhraseBias[2];
 		this.gestureTarget[3] =
 			this.seedGesture[3] * 0.28 +
-			(0.08 + this.topology[3] * 0.34 + this.topology[5] * 0.26 + signalRelease * 0.16) *
+			(0.08 + this.topology[3] * 0.34 + this.topology[5] * 0.26 + sparseStyle * 0.16) *
 				0.5 +
 			gestureSection[3] +
 			this.gesturePhraseBias[3];
 		this.gestureTarget[4] =
 			this.seedGesture[4] * 0.28 +
-			(0.1 + sparseStyle * 0.4 + (1 - signalMotion) * 0.22 + this.topology[0] * 0.2) * 0.5 +
+			(0.1 + sparseStyle * 0.62 + this.topology[0] * 0.2) * 0.5 +
 			gestureSection[4] +
 			this.gesturePhraseBias[4];
 		normalizeWeightVector(this.gestureTarget);
@@ -1375,15 +1378,15 @@ export class Mk2Conductor {
 		const targetBloom = baseBloom + this.gesture[2] * 0.82 * lifecycleMutation;
 		const targetShedding = baseShedding + this.gesture[3] * 0.78 * lifecycleMutation;
 		const targetDormancy =
-			baseDormancy + this.gesture[4] * (0.28 + (1 - signalMotion) * 0.34) * lifecycleMutation;
+			baseDormancy + this.gesture[4] * (0.28 + sparseStyle * 0.34) * lifecycleMutation;
 		const targetLifecycleSum = Math.max(
 			1e-6,
 			targetSeed + targetSprout + targetWinding + targetBloom + targetShedding + targetDormancy
 		);
 		const lifecycleTau =
 			context?.source === 'score'
-				? 2.1 + (1 - signalMotion) * 0.8
-				: 4.3 + (1 - signalMotion) * 1.8;
+				? 2.1 + sparseStyle * 0.8
+				: 4.3 + sparseStyle * 1.8;
 		this.seedForm = approach(
 			this.seedForm,
 			targetSeed / targetLifecycleSum,
@@ -1490,7 +1493,7 @@ export class Mk2Conductor {
 				this.sheddingForm * 0.86 +
 				this.gesture[3] * 0.52 +
 				this.dormancyForm * 0.08 +
-				signalRelease * 0.08 -
+				sparseStyle * 0.05 -
 				this.seedForm * 0.1
 		);
 		const surfaceRidgesTarget = clamp01(
@@ -1523,8 +1526,7 @@ export class Mk2Conductor {
 		this.filamentReach = approachAsymmetric(this.filamentReach, filamentReachTarget, 3, 5, dt);
 
 		const spectralLeanTarget = clamp(
-			spectralDirection * (0.07 + spectralMotion * 0.11)
-				+ (identityAir - identitySub) * 0.2
+			(identityAir - identitySub) * 0.2
 				+ (this.gesture[0] - this.gesture[3]) * 0.1,
 			...MK2_CONDUCTOR_LIMITS.spectralLean
 		);
@@ -1543,15 +1545,20 @@ export class Mk2Conductor {
 		this.spectralTravelPhase =
 			finite(this.spectralTravelPhase) + this.spectralTravelRate * dt;
 
+		// These rails deform the complete organism, so their targets are chapter,
+		// phrase-grammar, and long-horizon identity only. Feeding the live signal
+		// envelopes here recreated a tiny inhale-and-twist cycle on every groove.
 		const releaseTarget = clamp(
-			profile.release * 0.58 +
-				signalRelease * 0.42 +
-				clamp01(finite(frame.drop?.postDropDecay)) * 0.06,
+			profile.release * 0.78 +
+				this.gesture[3] * 0.14 +
+				this.gesture[2] * 0.08 +
+				clamp01(finite(frame.drop?.postDropDecay)) * 0.04,
 			...MK2_CONDUCTOR_LIMITS.release
 		);
 		const tensionTarget = clamp(
-			profile.tension * 0.62 +
-				signalTension * 0.38 +
+			profile.tension * 0.78 +
+				this.gesture[1] * 0.16 +
+				this.styleSyncopation * 0.06 +
 				this.suspense * 0.12 +
 				this.stylePercussiveness * 0.018 -
 				releaseTarget * 0.05,
@@ -1559,18 +1566,21 @@ export class Mk2Conductor {
 		);
 		const growthTarget = clamp(
 			profile.growth +
-				(signalOpenness - 0.5) * 0.035 +
-				(signalRelease - 0.4) * 0.035 +
+				(this.sproutForm - this.dormancyForm) * 0.045 +
+				(this.gesture[0] - this.gesture[4]) * 0.03 +
 				(identityBody - 1 / BAND_IDENTITY_COUNT) * 0.05 -
 				this.suspense * 0.06 +
 				this.seedGrowth,
 			...MK2_CONDUCTOR_LIMITS.growth
 		);
 		const opennessTarget = clamp(
-			profile.openness * 0.65 +
-				signalOpenness * 0.35 +
+			profile.openness * 0.76 +
+				this.gesture[2] * 0.15 +
+				this.gesture[0] * 0.07 -
+				this.gesture[1] * 0.06 -
+				this.gesture[4] * 0.05 +
 				releaseTarget * 0.035 +
-				(centroid - 0.5) * 0.02 -
+				(this.styleLowHighTilt * 0.5) * 0.02 -
 				this.suspense * 0.08,
 			...MK2_CONDUCTOR_LIMITS.openness
 		);
@@ -1758,7 +1768,6 @@ export class Mk2Conductor {
 			profile.topologyBias +
 				(tensionTarget - profile.tension) * 0.08 +
 				(releaseTarget - 0.4) * 0.025 +
-				spectralDirection * 0.018 +
 				this.suspense * 0.03 +
 				this.seedTopology,
 			...MK2_CONDUCTOR_LIMITS.topologyBias
@@ -1867,18 +1876,13 @@ export class Mk2Conductor {
 
 		const phraseYaw = signedHash(phraseWord, 11);
 		const phrasePitch = signedHash(phraseWord, 17);
-		const phraseSignal = (clamp01(finite(signal.phraseVariation, 0.5)) - 0.5) * 2;
-		const keyAngle = this.keyPosition * Math.PI * 2;
 		const postureYawTarget = clamp(
-			Math.sin(keyAngle) * (0.04 + keyConfidence * 0.025) +
-				phraseYaw * (0.07 + this.gesture[1] * 0.055) +
-				phraseSignal * 0.018 +
+			phraseYaw * (0.085 + this.gesture[1] * 0.055) +
 				(this.gesture[1] - this.gesture[2]) * 0.045,
 			...MK2_CONDUCTOR_LIMITS.postureYaw
 		);
 		const posturePitchTarget = clamp(
-			Math.cos(keyAngle) * 0.032 +
-				phrasePitch * (0.055 + this.gesture[0] * 0.035) +
+			phrasePitch * (0.072 + this.gesture[0] * 0.035) +
 				modeBias * keyConfidence * 0.018 +
 				(this.gesture[0] - this.gesture[4]) * 0.035,
 			...MK2_CONDUCTOR_LIMITS.posturePitch
