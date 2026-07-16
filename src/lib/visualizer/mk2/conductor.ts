@@ -1292,8 +1292,7 @@ export class Mk2Conductor {
 		const rootPulseTarget = clamp01(
 			positiveSub * 0.34 +
 				positiveKick * 0.72 +
-				clamp01(finite(frame.bassPunch)) * 0.48 +
-				clamp01(finite(frame.clock?.beatPulse)) * kick * 0.32
+				clamp01(finite(frame.bassPunch)) * 0.48
 		);
 		const axialStretchTarget = clamp01(
 			0.04 +
@@ -1424,18 +1423,13 @@ export class Mk2Conductor {
 			dt
 		);
 
-		const beatImpact =
-			clamp01(finite(frame.clock?.beatPulse)) *
-			(clamp01(finite(spectrum.levels?.kick)) * 0.28 +
-				clamp01(finite(spectrum.crestFactor)) * 0.08);
 		const impactTarget = clamp(
 			Math.max(
 				clamp01(finite(signal.impact)) * 0.72,
 				positiveKick * 0.62 +
 					positiveBody * 0.16 +
 					clamp01(finite(spectrum.novelty)) * 0.14,
-				clamp01(finite(frame.bassPunch)) * 0.42,
-				beatImpact
+				clamp01(finite(frame.bassPunch)) * 0.42
 			),
 			...MK2_CONDUCTOR_LIMITS.impact
 		);

@@ -62,6 +62,7 @@
 	// identity, FOV, roll — and every different song gets a different world.
 	// Falls back to a random session seed when nothing identifiable plays.
 	let mk2SongSeed = 0.5;
+	let mk2SecondaryPaletteFamily = 2;
 	let rendererSourceEpoch = -1;
 	let rendererSyncRequested = true;
 
@@ -103,6 +104,8 @@
 		flash: 0,
 		staccato: 0,
 		sustain: 0,
+		paletteXSlow: 1,
+		paletteYSlow: 0,
 		responseMotion: 1,
 		responseImpact: 1,
 		responseFog: 1,
@@ -114,11 +117,10 @@
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// One continuous, non-resetting camera drift. The former authored waypoint
-	// loop eased to a full stop at every knot, which made the organism appear to
-	// twitch backwards even while its own rotation phase stayed continuous.
-	// Irrationally-related drift rates keep this path from advertising a short
-	// repeated loop during a song.
+	// One continuous, non-resetting camera drift inside a bounded arc. Camera
+	// phase never becomes azimuth directly: that created the permanent clockwise
+	// turntable the eye could predict after a few seconds. Irrationally-related
+	// sways now explore one musical shot, while phrase rails choose new shots.
 	// ──────────────────────────────────────────────────────────────────────────
 	function getCameraPos(
 		cameraPhase: number,
@@ -131,9 +133,12 @@
 		cameraMacro: number
 	): [number, number, number] {
 		const seedAngle = mk2SongSeed * Math.PI * 2;
+		const orbitSway =
+			Math.sin(cameraPhase * 0.71 + seedAngle * 0.31) * (0.2 + cameraOrbit * 0.3) +
+			Math.sin(cameraPhase * 0.23 - seedAngle * 0.47) * 0.09;
 		const azimuth =
 			seedAngle +
-			cameraPhase * (0.54 + mk2SongSeed * 0.08) +
+			orbitSway +
 			perspectiveAzimuth +
 			cameraProfile * 0.22 -
 			cameraLow * 0.08;
@@ -151,7 +156,7 @@
 		return [
 			Math.cos(azimuth) * radius + Math.cos(azimuth * 0.37 + seedAngle) * sideDrift,
 			1.12 +
-				Math.sin(cameraPhase * 0.227 + seedAngle * 0.4) * 0.58 +
+				Math.sin(cameraPhase * 0.227 + seedAngle * 0.4) * (0.34 + cameraOverhead * 0.12) +
 				Math.sin(perspectiveElevation) * baseRadius * 0.86 +
 				altitudeBias,
 			Math.sin(azimuth) * radius + Math.sin(azimuth * 0.41 - seedAngle) * sideDrift
@@ -162,6 +167,13 @@
 		if (snapshot.sourceEpoch === rendererSourceEpoch) return;
 		rendererSourceEpoch = snapshot.sourceEpoch;
 		mk2SongSeed = snapshot.seed;
+		const primaryFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
+		const stableKey =
+			snapshot.director.context.keyConfidence > 0.35
+				? snapshot.director.context.keyPitchClass
+				: snapshot.signal.key;
+		const familyStep = 2 + Math.floor((((stableKey % 1) + 1) % 1) * 5);
+		mk2SecondaryPaletteFamily = (primaryFamily + familyStep) % 8;
 		currentSection = snapshot.director.section;
 		rendererSyncRequested = true;
 		temporalResetRequested = true;
@@ -530,20 +542,24 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let breath = 1.0
 		+ growth * 0.045
 		+ openness * 0.028
-		+ u.surfaceImpact * 0.008
 		+ u.bloomForm * 0.045
 		- u.seedForm * 0.035
 		- u.dormancyForm * 0.085;
 	var q = p / breath;
 
-	// Rotation is now a secondary, multi-minute drift. Phrase posture only bends
-	// the anatomy; it no longer rotates the body and camera in opposite directions.
-	let globalYaw = u.journeyPhase * 0.52 + u.postureYaw * 0.30
-		+ sin(u.morphPhase * 0.37) * 0.055;
+	// Rotation phase drives bounded posture—not a monotonically increasing angle.
+	// Soma can expose different sides, settle, and reverse naturally, but never
+	// sits on an endless 360-degree display turntable.
+	let postureSway = sin(u.journeyPhase * 1.37 + u.paletteFamily * 0.71) * 0.14
+		+ sin(u.journeyPhase * 0.43 - u.paletteFamily * 0.29) * 0.055;
+	let globalYaw = postureSway + u.postureYaw * 0.46 + u.spectralLean * 0.07;
 	let yawed = rot2(q.xz, globalYaw);
 	q.x = yawed.x;
 	q.z = yawed.y;
-	let pitched = rot2(q.yz, u.posturePitch * 0.55);
+	let pitched = rot2(
+		q.yz,
+		u.posturePitch * 0.64 + sin(u.journeyPhase * 0.79 + u.paletteFamily) * 0.035
+	);
 	q.y = pitched.x;
 	q.z = pitched.y;
 
@@ -575,8 +591,13 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	// orb. Winding then pulls the cross-section inward before applying its twist;
 	// bloom releases that stored pressure laterally, while dormancy settles flat.
 	let sproutBend = u.sproutForm * (0.08 + u.axialStretch * 0.08);
-	q.x = q.x - sin(q.y * 1.18 + tSlow * 0.23) * sproutBend
-		- q.y * q.y * u.sproutForm * 0.045;
+	let growthIdentity = (u.paletteFamily + 1.0) * 2.17;
+	let growthLeanX = sin(growthIdentity);
+	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
+	let sproutCurve = sin(q.y * 1.18 + tSlow * 0.23) * sproutBend
+		+ q.y * q.y * u.sproutForm * 0.045;
+	q.x = q.x - sproutCurve * growthLeanX;
+	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
 	let windingCompression = 1.0 + u.windingForm * (0.10 + u.foldDepth * 0.18);
 	q.x = q.x * windingCompression;
 	q.z = q.z * windingCompression;
@@ -585,9 +606,10 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	// fullscreen overlay. Root energy expands only the lower anatomy.
 	q.x = q.x - q.y * u.spectralLean * (0.10 + u.axialStretch * 0.13);
 	let rootZone = 1.0 - smoothstep(-0.58, 0.34, q.y);
-	let rootExpansion = 1.0 + rootZone * (u.rootMass * 0.18 + u.rootPulse * 0.11);
-	q.x = q.x / rootExpansion;
-	q.z = q.z / rootExpansion;
+	let rootExpansionX = 1.0 + rootZone * (u.rootMass * 0.18 + u.rootPulse * 0.035);
+	let rootExpansionZ = 1.0 + rootZone * (u.rootMass * 0.15 + u.rootPulse * 0.018);
+	q.x = q.x / rootExpansionX;
+	q.z = q.z / rootExpansionZ;
 
 	// Use the circular key vector directly. Unlike atan2(), these controls remain
 	// continuous when pitch class crosses the 0/1 boundary.
@@ -662,9 +684,9 @@ fn map(p: vec3<f32>) -> f32 {
 	let rootLobe = sdEllipsoid(
 		q - rootCenter,
 		vec3<f32>(
-			0.31 + u.rootMass * 0.20 + u.rootPulse * 0.08,
-			0.25 + u.rootMass * 0.13 + u.rootPulse * 0.04,
-			0.30 + u.rootMass * 0.18 + u.rootPulse * 0.07
+			0.31 + u.rootMass * 0.20 + u.rootPulse * 0.035,
+			0.25 + u.rootMass * 0.13 + u.rootPulse * 0.012,
+			0.30 + u.rootMass * 0.18 + u.rootPulse * 0.022
 		)
 	);
 	body = smin(body, rootLobe, 0.085 + u.rootMass * 0.035);
@@ -885,8 +907,8 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	let upT = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
 	let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
 		+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
-	let baseT = u.paletteOffset + u.palettePhase * 0.34
-		+ u.paletteWarmth * 0.075 + lifecycleHue;
+	let baseT = u.paletteOffset + u.palettePhase * 0.16
+		+ u.paletteWarmth * 0.04 + lifecycleHue;
 	let growth = clamp(u._pad0, 0.0, 1.0);
 	let tension = clamp(u._pad1, 0.0, 1.0);
 	let voidRaw = pow(max(u.environmentVoid, 0.0), 1.8);
@@ -1019,7 +1041,7 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	);
 	bg = bg * (1.0 - current * currentW * (0.045 + tension * 0.02));
 	bg = bg + currentCol * current * (0.42 + currentW * 0.72 + cellularW * 0.16) * (
-		0.030 + u.rms * 0.020 + growth * 0.019 + u.sproutForm * 0.006
+		0.030 + u.rms * 0.004 + growth * 0.019 + u.sproutForm * 0.006
 			+ u.bloomForm * 0.036 + u.sheddingForm * 0.018
 			+ atmosphereTransfer * 0.015 + u.suspense * 0.008
 	);
@@ -2252,6 +2274,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const responseImpactTarget = response.impact;
 		const responseFogTarget = response.fog;
 		const responseShaftsTarget = response.shafts;
+		const baseHue = directed.palette.baseHue;
+		const hueDelta = ((directed.palette.accentHue - baseHue + 1.5) % 1) - 0.5;
+		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
+		const paletteTarget =
+			baseHue + hueDelta * tonnetzBlend + (spectrum.centroid - 0.5) * 0.055;
+		const paletteTargetAngle = paletteTarget * Math.PI * 2;
+		const paletteXTarget = Math.cos(paletteTargetAngle);
+		const paletteYTarget = Math.sin(paletteTargetAngle);
 		if (rendererSyncRequested) {
 			smoothed.bass = spectrum.bass;
 			smoothed.mid = spectrum.mid;
@@ -2264,6 +2294,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.sustain = journey.openness;
 			smoothed.chromaXSlow = Math.cos(chromaAngle);
 			smoothed.chromaYSlow = Math.sin(chromaAngle);
+			smoothed.paletteXSlow = paletteXTarget;
+			smoothed.paletteYSlow = paletteYTarget;
 			smoothed.responseMotion = responseMotionTarget;
 			smoothed.responseImpact = responseImpactTarget;
 			smoothed.responseFog = responseFogTarget;
@@ -2274,13 +2306,23 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.mid = lerp(smoothed.mid, spectrum.mid, alpha(0.09));
 			smoothed.treble = lerp(smoothed.treble, spectrum.treble, alpha(0.15));
 			smoothed.centroidSlow = lerp(smoothed.centroidSlow, spectrum.centroid, alpha(0.025));
-			smoothed.rmsSlow = lerp(smoothed.rmsSlow, journey.macroEnergy, alpha(0.035));
+			smoothed.rmsSlow = lerp(smoothed.rmsSlow, journey.macroEnergy, alpha(0.012));
 			smoothed.bpmNormSlow = lerp(smoothed.bpmNormSlow, signalJourney.tempo, alpha(0.02));
 			smoothed.flash = lerp(smoothed.flash, journey.impact, alpha(0.32));
 			smoothed.staccato = lerp(smoothed.staccato, journey.impact, alpha(0.38));
 			smoothed.sustain = lerp(smoothed.sustain, journey.openness, alpha(0.035));
 			smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.025));
 			smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.025));
+			const paletteX = lerp(smoothed.paletteXSlow, paletteXTarget, alpha(0.0045));
+			const paletteY = lerp(smoothed.paletteYSlow, paletteYTarget, alpha(0.0045));
+			const paletteLength = Math.hypot(paletteX, paletteY);
+			if (paletteLength > 0.001) {
+				smoothed.paletteXSlow = paletteX / paletteLength;
+				smoothed.paletteYSlow = paletteY / paletteLength;
+			} else {
+				smoothed.paletteXSlow = paletteXTarget;
+				smoothed.paletteYSlow = paletteYTarget;
+			}
 			// Response changes are instrument gestures, not edits to the camera cut.
 			// Glide them onto the renderer so changing modes cannot dolly-jump Soma.
 			smoothed.responseMotion = lerp(smoothed.responseMotion, responseMotionTarget, alpha(0.045));
@@ -2302,14 +2344,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 					smoothed.mid * 0.16
 			)
 		);
-		const baseHue = directed.palette.baseHue;
-		const hueDelta = ((directed.palette.accentHue - baseHue + 1.5) % 1) - 0.5;
-		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
 		const paletteOffset =
-			baseHue + hueDelta * tonnetzBlend + (smoothed.centroidSlow - 0.5) * 0.055;
+			((Math.atan2(smoothed.paletteYSlow, smoothed.paletteXSlow) / (Math.PI * 2)) % 1 + 1) % 1;
 		const paletteFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
-		const harmonicFamilyStep = 2 + Math.floor((((signalJourney.key % 1) + 1) % 1) * 5);
-		const paletteFamilyB = (paletteFamily + harmonicFamilyStep) % 8;
+		const paletteFamilyB = mk2SecondaryPaletteFamily;
 		const paletteFamilyBlend = Math.max(
 			0.04,
 			Math.min(
