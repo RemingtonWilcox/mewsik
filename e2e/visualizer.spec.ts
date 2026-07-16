@@ -101,7 +101,7 @@ test.describe('visualizer engine roster', () => {
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'336'
+			'384'
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',

@@ -1140,37 +1140,137 @@ test.describe('Mk2 macro conductor', () => {
 		for (const distance of result.distances) expect(distance).toBeGreaterThan(0.42);
 	});
 
-	test('live phrase position wrap cannot reverse the held lifecycle plan', async ({ page }) => {
+	test('a live verse evolves through distinct phrase-held behaviors and world arrangements', async ({
+		page
+	}) => {
 		await page.goto('/');
 		const result = await page.evaluate(async (fixtures) => {
 			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
 			const { Mk2Conductor } = await import(modulePath);
-			const conductor = new Mk2Conductor('live-wrap-plan');
+			const conductor = new Mk2Conductor('live-evolution-depth');
 			const frame: any = structuredClone(fixtures.director);
 			const signal: any = structuredClone(fixtures.signal);
 			const spectrum: any = structuredClone(fixtures.spectrum);
 			frame.context.source = 'live';
 			frame.section = signal.section = 'verse';
-			let output: any;
-			for (let i = 0; i < 12 * 60; i += 1) {
-				frame.clock.phraseIndex = 3;
-				frame.clock.phrasePos = 0.72 + (i / (12 * 60)) * 0.279;
-				frame.context.sectionProgress = frame.clock.phrasePos;
-				output = conductor.update(frame, signal, spectrum, 1 / 60);
+			const gestureNames = [
+				'gestureReach', 'gestureCoil', 'gestureDivide', 'gestureHollow', 'gestureStillness'
+			];
+			const formNames = [
+				'seedForm', 'sproutForm', 'windingForm', 'bloomForm', 'sheddingForm', 'dormancyForm'
+			];
+			const topologyNames = [
+				'topologyCocoon', 'topologySpire', 'topologyBilateral',
+				'topologyTorus', 'topologyCoral', 'topologyShell'
+			];
+			const environmentNames = [
+				'environmentVoid', 'environmentCurrent', 'environmentCavern',
+				'environmentHorizon', 'environmentCellular'
+			];
+			const samples: any[] = [];
+			for (let phrase = 0; phrase < 12; phrase += 1) {
+				frame.clock.phraseIndex = phrase;
+				let output: any;
+				for (let i = 0; i < 8 * 30; i += 1) {
+					frame.clock.phrasePos = (i + 1) / (8 * 30);
+					frame.context.sectionProgress = frame.clock.phrasePos;
+					output = conductor.update(frame, signal, spectrum, 1 / 30);
+				}
+				samples.push({ ...output });
 			}
-			const before = { ...output };
-			for (let i = 0; i < 2.5 * 60; i += 1) {
-				frame.clock.phraseIndex = 4;
-				frame.clock.phrasePos = i / (2.5 * 60) / 4;
-				frame.context.sectionProgress = frame.clock.phrasePos;
-				output = conductor.update(frame, signal, spectrum, 1 / 60);
-			}
-			return { before, after: { ...output } };
+			const dominantGestures = new Set(
+				samples.map((sample) =>
+					gestureNames.reduce((best, name) => (sample[name] > sample[best] ? name : best))
+				)
+			);
+			const maxDistance = (names: string[]) => {
+				let maximum = 0;
+				for (let a = 0; a < samples.length; a += 1) {
+					for (let b = a + 1; b < samples.length; b += 1) {
+						maximum = Math.max(
+							maximum,
+							Math.hypot(...names.map((name) => samples[a][name] - samples[b][name]))
+						);
+					}
+				}
+				return maximum;
+			};
+			return {
+				dominantGestureCount: dominantGestures.size,
+				gestureDistance: maxDistance(gestureNames),
+				formDistance: maxDistance(formNames),
+				topologyDistance: maxDistance(topologyNames),
+				environmentDistance: maxDistance(environmentNames),
+				shotZoomRange:
+					Math.max(...samples.map((sample) => sample.shotZoom)) -
+					Math.min(...samples.map((sample) => sample.shotZoom)),
+				maxGestureSumError: Math.max(
+					...samples.map((sample) =>
+						Math.abs(gestureNames.reduce((sum, name) => sum + sample[name], 0) - 1)
+					)
+				)
+			};
 		}, FIXTURES);
 
-		expect(result.after.sproutForm).toBeLessThanOrEqual(result.before.sproutForm + 0.003);
-		expect(result.after.windingForm).toBeGreaterThanOrEqual(result.before.windingForm - 0.003);
-		expect(result.after.bloomForm).toBeGreaterThanOrEqual(result.before.bloomForm - 0.003);
+		expect(result.dominantGestureCount).toBeGreaterThanOrEqual(3);
+		expect(result.gestureDistance).toBeGreaterThan(0.28);
+		expect(result.formDistance).toBeGreaterThan(0.12);
+		expect(result.topologyDistance).toBeGreaterThan(0.14);
+		expect(result.environmentDistance).toBeGreaterThan(0.12);
+		expect(result.shotZoomRange).toBeGreaterThan(0.08);
+		expect(result.maxGestureSumError).toBeLessThan(1e-6);
+	});
+
+	test('live phrase position wrap cannot reset the newly elected evolution plan', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const wrapped = new Mk2Conductor('live-wrap-plan');
+			const held = new Mk2Conductor('live-wrap-plan');
+			const wrappedFrame: any = structuredClone(fixtures.director);
+			const heldFrame: any = structuredClone(fixtures.director);
+			const wrappedSignal: any = structuredClone(fixtures.signal);
+			const heldSignal: any = structuredClone(fixtures.signal);
+			const wrappedSpectrum: any = structuredClone(fixtures.spectrum);
+			const heldSpectrum: any = structuredClone(fixtures.spectrum);
+			wrappedFrame.context.source = heldFrame.context.source = 'live';
+			wrappedFrame.section = heldFrame.section = wrappedSignal.section = heldSignal.section = 'verse';
+			let wrappedOutput: any;
+			let heldOutput: any;
+			for (let i = 0; i < 12 * 60; i += 1) {
+				wrappedFrame.clock.phraseIndex = heldFrame.clock.phraseIndex = 3;
+				wrappedFrame.clock.phrasePos = heldFrame.clock.phrasePos =
+					0.72 + (i / (12 * 60)) * 0.279;
+				wrappedFrame.context.sectionProgress = heldFrame.context.sectionProgress =
+					wrappedFrame.clock.phrasePos;
+				wrappedOutput = wrapped.update(wrappedFrame, wrappedSignal, wrappedSpectrum, 1 / 60);
+				heldOutput = held.update(heldFrame, heldSignal, heldSpectrum, 1 / 60);
+			}
+			const before = { ...wrappedOutput };
+			for (let i = 0; i < 2.5 * 60; i += 1) {
+				wrappedFrame.clock.phraseIndex = heldFrame.clock.phraseIndex = 4;
+				wrappedFrame.clock.phrasePos = i / (2.5 * 60) / 4;
+				heldFrame.clock.phrasePos = 0.999;
+				wrappedFrame.context.sectionProgress = wrappedFrame.clock.phrasePos;
+				heldFrame.context.sectionProgress = heldFrame.clock.phrasePos;
+				wrappedOutput = wrapped.update(wrappedFrame, wrappedSignal, wrappedSpectrum, 1 / 60);
+				heldOutput = held.update(heldFrame, heldSignal, heldSpectrum, 1 / 60);
+			}
+			return { before, wrapped: { ...wrappedOutput }, held: { ...heldOutput } };
+		}, FIXTURES);
+
+		const heldRails = [
+			'seedForm', 'sproutForm', 'windingForm', 'bloomForm', 'sheddingForm', 'dormancyForm',
+			'gestureReach', 'gestureCoil', 'gestureDivide', 'gestureHollow', 'gestureStillness'
+		];
+		for (const rail of heldRails) {
+			expect(result.wrapped[rail], rail).toBeCloseTo(result.held[rail], 8);
+		}
+		const evolutionDelta = Math.max(
+			...heldRails.map((rail) => Math.abs(result.wrapped[rail] - result.before[rail]))
+		);
+		expect(evolutionDelta).toBeGreaterThan(0.01);
 	});
 
 });

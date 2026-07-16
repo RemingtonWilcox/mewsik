@@ -16,11 +16,11 @@
 	//     signature without pasted-on lens overlays.
 	//
 	// Audio routing (multiple timescales):
-	//   • sub/kick            → localized root mass and rooted punch
+	//   • sub/kick            → localized root pigment/material response
 	//   • body/mids           → axial growth, lobe splitting, winding and folds
 	//   • presence/air        → ridges, filaments, erosion and surface emission
 	//   • spectral direction  → signed anatomical lean and travelling deformation
-	//   • section/phrase      → seed → sprout → winding → bloom → shedding → dormancy
+	//   • section/phrase      → lifecycle plus reach / coil / divide / hollow / stillness
 	//   • harmony/key         → continuous palette and material development
 	//   • bpmNorm (slow)     → camera traversal speed multiplier
 	//   • rms (slow)         → light shaft intensity
@@ -71,6 +71,7 @@
 	let temporalResetRequested = true;
 	let currentSection = $state('intro');
 	let currentForm = $state('seed');
+	let currentGesture = $state('reach');
 	let qualityTier = $state<SomaQualityTier>('ultra');
 	let renderPixels = $state(0);
 
@@ -163,6 +164,19 @@
 		];
 	}
 
+	function dominantGesture(journey: VisualizerJourneySnapshot['mk2']): string {
+		const gestures = [
+			['reach', journey.gestureReach],
+			['coil', journey.gestureCoil],
+			['divide', journey.gestureDivide],
+			['hollow', journey.gestureHollow],
+			['stillness', journey.gestureStillness]
+		] as const;
+		let dominant: (typeof gestures)[number] = gestures[0];
+		for (const gesture of gestures) if (gesture[1] > dominant[1]) dominant = gesture;
+		return dominant[0];
+	}
+
 	function syncRendererToJourney(snapshot: VisualizerJourneySnapshot) {
 		if (snapshot.sourceEpoch === rendererSourceEpoch) return;
 		rendererSourceEpoch = snapshot.sourceEpoch;
@@ -181,7 +195,7 @@
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// Uniform layout — 84 f32s = 336 bytes (multiple of 16 ✓)
+	// Uniform layout — 96 f32s = 384 bytes (multiple of 16 ✓)
 	// 0-1  resolution
 	// 2    time
 	// 3-7  audio: bass, mid, treble, centroid, rms
@@ -211,8 +225,11 @@
 	// 72-76 environment DNA: void / current / cavern / horizon / cellular
 	// 77-80 material DNA: membrane / mineral / velvet / crystal
 	// 81-82 secondary palette family / continuous family blend
-	// 83    alignment / future grammar
-	const UNIFORM_FLOATS = 84;
+	// 83    alignment
+	// 84-89 topology grammar: cocoon / spire / bilateral / torus / coral / shell
+	// 90-94 phrase gesture: reach / coil / divide / hollow / stillness
+	// 95    alignment / future grammar
+	const UNIFORM_FLOATS = 96;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
 	const SCENE_WGSL = /* wgsl */ `
@@ -301,6 +318,18 @@ struct Uniforms {
 	paletteFamilyB: f32,
 	paletteFamilyBlend: f32,
 	_pad2: f32,
+	topologyCocoon: f32,
+	topologySpire: f32,
+	topologyBilateral: f32,
+	topologyTorus: f32,
+	topologyCoral: f32,
+	topologyShell: f32,
+	gestureReach: f32,
+	gestureCoil: f32,
+	gestureDivide: f32,
+	gestureHollow: f32,
+	gestureStillness: f32,
+	_pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -537,21 +566,37 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let growth = u._pad0;
 	let tension = u._pad1;
 	let openness = clamp(u.openness, 0.0, 1.0);
+	let spire = pow(max(u.topologySpire, 0.0), 1.25);
+	let bilateral = pow(max(u.topologyBilateral, 0.0), 1.25);
+	let torus = pow(max(u.topologyTorus, 0.0), 1.25);
+	let coral = pow(max(u.topologyCoral, 0.0), 1.25);
+	let shell = pow(max(u.topologyShell, 0.0), 1.25);
+	let reach = pow(max(u.gestureReach, 0.0), 1.15);
+	let coil = pow(max(u.gestureCoil, 0.0), 1.15);
+	let divide = pow(max(u.gestureDivide, 0.0), 1.15);
+	let hollow = pow(max(u.gestureHollow, 0.0), 1.15);
+	let stillness = pow(max(u.gestureStillness, 0.0), 1.15);
 	// Whole-body breathing is deliberately restrained. Sub and kick now own a
-	// localized root mass below, instead of scaling the same orb every beat.
+	// localized material change below. Phrase gestures own silhouette scale.
 	let breath = 1.0
 		+ growth * 0.045
 		+ openness * 0.028
 		+ u.bloomForm * 0.045
+		+ divide * 0.055
+		+ reach * 0.025
 		- u.seedForm * 0.035
-		- u.dormancyForm * 0.085;
+		- u.dormancyForm * 0.085
+		- stillness * 0.055
+		- hollow * 0.018;
 	var q = p / breath;
 
 	// Rotation phase drives bounded posture—not a monotonically increasing angle.
 	// Soma can expose different sides, settle, and reverse naturally, but never
 	// sits on an endless 360-degree display turntable.
-	let postureSway = sin(u.journeyPhase * 1.37 + u.paletteFamily * 0.71) * 0.14
-		+ sin(u.journeyPhase * 0.43 - u.paletteFamily * 0.29) * 0.055;
+	let postureSway = (
+		sin(u.journeyPhase * 1.37 + u.paletteFamily * 0.71) * 0.105
+			+ sin(u.journeyPhase * 0.43 - u.paletteFamily * 0.29) * 0.045
+	) * (1.0 - stillness * 0.72);
 	let globalYaw = postureSway + u.postureYaw * 0.46 + u.spectralLean * 0.07;
 	let yawed = rot2(q.xz, globalYaw);
 	q.x = yawed.x;
@@ -571,18 +616,23 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		sin(q.x * 0.82 - tSlow * 0.43) * 0.032,
 		cos(q.x * 0.92 + tSlow * 0.79) * 0.045 + sin(q.y * 0.71 + tSlow * 0.53) * 0.030
 	);
-	q = q + drift * (0.32 + growth * 0.28 + u.sproutForm * 0.22 + u.sheddingForm * 0.18);
+	q = q + drift * (
+		0.22 + growth * 0.22 + u.sproutForm * 0.18 + u.sheddingForm * 0.15
+			+ coral * 0.28 + reach * 0.16 + hollow * 0.1 - stillness * 0.14
+	);
 
 	// Body/mids own large silhouette changes: long sprout, wound build, wide
 	// bloom, and contracted dormancy are genuinely different coordinate fields.
 	let stretchY = max(0.52,
 		0.82 + u.axialStretch * 0.70 + u.sproutForm * 0.14 + u.windingForm * 0.08
-		- u.bloomForm * 0.14 - u.dormancyForm * 0.28);
+		+ spire * 0.58 + reach * 0.42 - torus * 0.20 - shell * 0.16
+		- u.bloomForm * 0.14 - u.dormancyForm * 0.28 - stillness * 0.16);
 	let stretchX = max(0.64,
-		0.80 + u.lobeSplit * 0.34 + u.bloomForm * 0.28 + u.dormancyForm * 0.12);
+		0.80 + u.lobeSplit * 0.24 + u.bloomForm * 0.18 + u.dormancyForm * 0.12
+		+ bilateral * 0.22 + torus * 0.18 + divide * 0.24 - spire * 0.14);
 	let stretchZ = max(0.64,
 		0.82 + u.lobeSplit * 0.27 + u.bloomForm * 0.20 + u.rootMass * 0.08
-		+ u.dormancyForm * 0.14);
+		+ u.dormancyForm * 0.14 + torus * 0.32 + shell * 0.25 + divide * 0.24);
 	q.x = q.x / stretchX;
 	q.y = q.y / stretchY;
 	q.z = q.z / stretchZ;
@@ -590,7 +640,8 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	// Sprout grows as one visibly biased shoot instead of a uniformly stretched
 	// orb. Winding then pulls the cross-section inward before applying its twist;
 	// bloom releases that stored pressure laterally, while dormancy settles flat.
-	let sproutBend = u.sproutForm * (0.08 + u.axialStretch * 0.08);
+	let sproutBend = (u.sproutForm + reach * 0.72 + spire * 0.30)
+		* (0.07 + u.axialStretch * 0.075);
 	let growthIdentity = (u.paletteFamily + 1.0) * 2.17;
 	let growthLeanX = sin(growthIdentity);
 	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
@@ -598,7 +649,8 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		+ q.y * q.y * u.sproutForm * 0.045;
 	q.x = q.x - sproutCurve * growthLeanX;
 	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
-	let windingCompression = 1.0 + u.windingForm * (0.10 + u.foldDepth * 0.18);
+	let windingCompression = 1.0
+		+ (u.windingForm + coil * 0.82 + shell * 0.46) * (0.08 + u.foldDepth * 0.16);
 	q.x = q.x * windingCompression;
 	q.z = q.z * windingCompression;
 
@@ -606,8 +658,8 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	// fullscreen overlay. Root energy expands only the lower anatomy.
 	q.x = q.x - q.y * u.spectralLean * (0.10 + u.axialStretch * 0.13);
 	let rootZone = 1.0 - smoothstep(-0.58, 0.34, q.y);
-	let rootExpansionX = 1.0 + rootZone * (u.rootMass * 0.18 + u.rootPulse * 0.035);
-	let rootExpansionZ = 1.0 + rootZone * (u.rootMass * 0.15 + u.rootPulse * 0.018);
+	let rootExpansionX = 1.0 + rootZone * u.rootMass * 0.18;
+	let rootExpansionZ = 1.0 + rootZone * u.rootMass * 0.15;
 	q.x = q.x / rootExpansionX;
 	q.z = q.z / rootExpansionZ;
 
@@ -621,7 +673,10 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 
 	// Builds physically wind inward; mids determine fold depth. Bloom releases
 	// that stored twist into separated lobes rather than a uniform scale pulse.
-	let twist = q.y * (0.20 + tension * 0.38 + u.windingForm * 1.18 + u.foldDepth * 0.72)
+	let twist = q.y * (
+		0.16 + tension * 0.32 + u.windingForm * 1.08 + u.foldDepth * 0.62
+			+ coil * 1.24 + shell * 0.74
+	)
 		+ sin(q.z * 1.52 + tSlow * 1.09) * (0.045 + u.foldDepth * 0.16)
 		+ u.chromaX * chromaPull * 0.045;
 	let rxz = rot2(q.xz, twist);
@@ -637,6 +692,17 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 fn map(p: vec3<f32>) -> f32 {
 	let growth = u._pad0;
 	let tension = u._pad1;
+	let cocoonDNA = pow(max(u.topologyCocoon, 0.0), 1.25);
+	let spireDNA = pow(max(u.topologySpire, 0.0), 1.25);
+	let bilateralDNA = pow(max(u.topologyBilateral, 0.0), 1.25);
+	let torusDNA = pow(max(u.topologyTorus, 0.0), 1.25);
+	let coralDNA = pow(max(u.topologyCoral, 0.0), 1.25);
+	let shellDNA = pow(max(u.topologyShell, 0.0), 1.25);
+	let reachGesture = pow(max(u.gestureReach, 0.0), 1.15);
+	let coilGesture = pow(max(u.gestureCoil, 0.0), 1.15);
+	let divideGesture = pow(max(u.gestureDivide, 0.0), 1.15);
+	let hollowGesture = pow(max(u.gestureHollow, 0.0), 1.15);
+	let stillGesture = pow(max(u.gestureStillness, 0.0), 1.15);
 	// Cheap conservative scene bound. All lifecycle appendages and shed fragments
 	// remain within this envelope, so empty screen rays avoid the fractal entirely.
 	let outerBound = length(p) - 1.95;
@@ -644,15 +710,32 @@ fn map(p: vec3<f32>) -> f32 {
 		return outerBound * 0.76;
 	}
 	let q = organismWarp(p);
+	let bilateralMorph = clamp(bilateralDNA * (0.26 + divideGesture * 0.48), 0.0, 0.68);
+	var coreQ = q;
+	// Fold one true fractal field into two coherent lobes. This preserves the
+	// organism's surface vocabulary instead of gluing smooth primitive balloons
+	// onto its sides.
+	coreQ.x = mix(
+		coreQ.x,
+		abs(coreQ.x) - (0.13 + divideGesture * 0.09),
+		bilateralMorph
+	);
+	let shellCurl = shellDNA * (0.18 + coilGesture * 0.42);
+	let shellTurn = rot2(coreQ.xy, shellCurl * (0.55 + coreQ.z * 0.35));
+	coreQ.x = shellTurn.x - shellDNA * 0.045;
+	coreQ.y = shellTurn.y + shellDNA * 0.025;
 
 	// A single expensive Mandelbulb remains the organic heart. Intro/outro blend
 	// toward a waxy cocoon; active sections reveal the fractal continuously.
 	let cocoonRadii = vec3<f32>(
-		0.60 + u.rootMass * 0.08 + u.bloomForm * 0.12 + u.dormancyForm * 0.10,
-		0.68 + u.axialStretch * 0.18 + u.sproutForm * 0.12 - u.dormancyForm * 0.14,
+		0.60 + u.rootMass * 0.08 + u.bloomForm * 0.12 + u.dormancyForm * 0.10
+			+ cocoonDNA * 0.08 + divideGesture * 0.06,
+		0.68 + u.axialStretch * 0.18 + u.sproutForm * 0.12 - u.dormancyForm * 0.14
+			+ spireDNA * 0.12 + reachGesture * 0.08 - stillGesture * 0.08,
 		0.58 + u.lobeSplit * 0.12 + u.bloomForm * 0.10 + u.dormancyForm * 0.12
+			+ shellDNA * 0.08 + torusDNA * 0.06
 	);
-	let cocoon = sdEllipsoid(q, cocoonRadii);
+	let cocoon = sdEllipsoid(coreQ, cocoonRadii);
 	// A lifecycle-owned core scale keeps the expensive fractal itself from reading
 	// as the same ball in every section. Larger coordinate scale means a smaller,
 	// denser core; bloom deliberately moves in the opposite direction.
@@ -666,17 +749,33 @@ fn map(p: vec3<f32>) -> f32 {
 	if (u.closeStudy > 0.55 && u.detailFocus > 0.58) { fractalIterations = 7; }
 	if (u.closeStudy > 0.84 && u.detailFocus > 0.90) { fractalIterations = 8; }
 	let fractal = mandelbulbDE(
-		q * bodyScale,
+		coreQ * bodyScale,
 		u.mandelbulbPower + tension * 0.28 + u.foldDepth * 0.24 - u.bloomForm * 0.16,
 		fractalIterations
 	) * (1.01 - growth * 0.045);
 	let fractalReveal = clamp(
-		0.24 + u.sproutForm * 0.44 + u.windingForm * 0.62 + u.bloomForm * 0.76
-		+ u.sheddingForm * 0.50 - u.seedForm * 0.08 - u.dormancyForm * 0.12,
-		0.14,
-		1.0
+		0.34 + u.sproutForm * 0.32 + u.windingForm * 0.46 + u.bloomForm * 0.52
+		+ u.sheddingForm * 0.40 + coralDNA * 0.18 + bilateralDNA * 0.10
+		- cocoonDNA * 0.18 - u.seedForm * 0.08 - u.dormancyForm * 0.12,
+		0.16,
+		0.86
 	);
 	var body = mix(cocoon, fractal, fractalReveal);
+
+	// Torus DNA is expressed as a tunnel through the existing living tissue, not
+	// as a replacement primitive. It can open the silhouette and expose the inner
+	// fractal, but it can never inflate Soma into a giant smooth rubber ring.
+	var torusQ = q;
+	let torusTurn = rot2(torusQ.yz, 0.28 + coilGesture * 0.72 + shellDNA * 0.35);
+	torusQ.y = torusTurn.x;
+	torusQ.z = torusTurn.y;
+	let tunnelRadius = 0.10 + torusDNA * 0.11 + hollowGesture * 0.08;
+	let hollowTunnel = max(
+		length(torusQ.xy) - tunnelRadius,
+		abs(torusQ.z) - (0.46 + divideGesture * 0.10)
+	);
+	let hollowMorph = clamp(torusDNA * (0.18 + hollowGesture * 0.62), 0.0, 0.76);
+	body = mix(body, max(body, -hollowTunnel), hollowMorph);
 
 	// Sub energy grows a rooted lower lobe. This is spatially localized, so a
 	// kick reads as weight entering the organism rather than a fullscreen pulse.
@@ -684,9 +783,9 @@ fn map(p: vec3<f32>) -> f32 {
 	let rootLobe = sdEllipsoid(
 		q - rootCenter,
 		vec3<f32>(
-			0.31 + u.rootMass * 0.20 + u.rootPulse * 0.035,
-			0.25 + u.rootMass * 0.13 + u.rootPulse * 0.012,
-			0.30 + u.rootMass * 0.18 + u.rootPulse * 0.022
+			0.31 + u.rootMass * 0.20,
+			0.25 + u.rootMass * 0.13,
+			0.30 + u.rootMass * 0.18
 		)
 	);
 	body = smin(body, rootLobe, 0.085 + u.rootMass * 0.035);
@@ -736,37 +835,43 @@ fn map(p: vec3<f32>) -> f32 {
 
 		let presence = clamp(
 			u.sproutForm * sproutGate + u.windingForm * windingGate
-			+ u.bloomForm * bloomGate + u.sheddingForm * 0.14,
+			+ u.bloomForm * bloomGate + u.sheddingForm * 0.14
+			+ coralDNA * (0.42 + bloomGate * 0.34)
+			+ reachGesture * sproutGate * 0.38
+			+ divideGesture * bloomGate * 0.24
+			- stillGesture * 0.24,
 			0.0,
 			1.0
 		);
 		let laneVariation = 0.90 + f32(i) * 0.055 + lanePolarity * u.spectralLean * 0.08;
 		let reach = (
-			0.52 + u.axialStretch * 0.28 + u.lobeSplit * 0.38
-			+ u.bloomForm * 0.42 + u.filamentReach * 0.14 - u.windingForm * 0.12
+			0.46 + u.axialStretch * 0.22 + u.lobeSplit * 0.24
+			+ u.bloomForm * 0.25 + u.filamentReach * 0.10 - u.windingForm * 0.10
+			+ coralDNA * 0.25 + reachGesture * 0.26 + divideGesture * 0.12
 		) * laneVariation;
 		let a = direction * (0.14 + u.windingForm * 0.13);
 		var b = direction * reach;
 		b.y = b.y + sin(u.morphPhase * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
 		b.x = b.x + u.spectralLean * lanePolarity * (0.035 + u.lobeSplit * 0.055);
-		let branchRadius = 0.070 + u.rootMass * 0.030 + u.lobeSplit * 0.070
-			+ u.bloomForm * 0.075 + u.filamentReach * 0.025;
+		let branchRadius = 0.050 + u.rootMass * 0.020 + u.lobeSplit * 0.025
+			+ u.bloomForm * 0.030 + u.filamentReach * 0.015;
 		let branch = sdCapsule(q, a, b, branchRadius);
-		let budRadius = 0.100 + u.lobeSplit * 0.100 + u.bloomForm * 0.140
-			+ u.rootPulse * 0.018;
+		let budRadius = 0.075 + u.lobeSplit * 0.040 + u.bloomForm * 0.055
+			+ divideGesture * 0.020 + coralDNA * 0.015;
 		let bud = sdEllipsoid(
 			q - b,
 			vec3<f32>(budRadius * (1.12 + u.lobeSplit * 0.18), budRadius * 0.86, budRadius)
 		);
 		let appendage = min(branch, bud) + (1.0 - presence) * 0.34;
-		body = smin(body, appendage, 0.050 + presence * 0.060);
+		body = smin(body, appendage, 0.035 + presence * 0.030);
 	}
 
 	// Bridge/breakdown opens a real exterior-intersecting tunnel. Unlike the old
 	// tiny internal spheres, this negative space reaches the silhouette from most
 	// camera angles and makes shedding unmistakably different from bloom.
 	var cavityQ = q;
-	let cavityTurn = u.morphPhase * 0.31 + u.spectralLean * 0.36;
+	let cavityTurn = u.morphPhase * 0.31 + u.spectralLean * 0.36
+		+ shellDNA * 0.54 + coilGesture * 0.62;
 	let cavityYZ = rot2(cavityQ.yz, cavityTurn);
 	cavityQ.y = cavityYZ.x;
 	cavityQ.z = cavityYZ.y;
@@ -774,17 +879,25 @@ fn map(p: vec3<f32>) -> f32 {
 		cavityQ,
 		vec3<f32>(-1.35, 0.0, 0.0),
 		vec3<f32>(1.35, 0.0, 0.0),
-		0.070 + u.cavityOpen * 0.38
+		0.070 + u.cavityOpen * 0.30 + hollowGesture * 0.24 + torusDNA * 0.13
 	);
-	let cavityGate = smoothstep(0.08, 0.74, u.cavityOpen);
+	let cavityGate = smoothstep(
+		0.08,
+		0.74,
+		u.cavityOpen + hollowGesture * 0.58 + torusDNA * 0.28 + shellDNA * 0.12
+	);
 	body = smax(body, -tunnel - (1.0 - cavityGate) * 0.46, 0.052);
 	let pocket = length(cavityQ - vec3<f32>(0.34, 0.29, 0.18))
 		- (0.11 + u.cavityOpen * 0.21);
-	body = smax(body, -pocket - (1.0 - u.sheddingForm) * 0.36, 0.044);
+	body = smax(
+		body,
+		-pocket - (1.0 - max(u.sheddingForm, hollowGesture * 0.8)) * 0.36,
+		0.044
+	);
 
 	// Two coherent shed fragments drift away during bridge/breakdown. They remain
 	// part of this one world-space SDF—no translucent texture layer is involved.
-	let shedGate = clamp(u.sheddingForm * 1.18, 0.0, 1.0);
+	let shedGate = clamp(u.sheddingForm * 1.12 + hollowGesture * 0.34 + shellDNA * 0.12, 0.0, 1.0);
 	let fragmentDrift = 0.72 + shedGate * 0.43;
 	let fragmentAOffset = vec3<f32>(
 		fragmentDrift + sin(u.morphPhase * 0.61) * 0.12,
@@ -1376,7 +1489,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			// already present; there is no stripe mask, unlit emission, or screen
 			// flash. Crevice color is derived from real AO and stays deliberately low.
 			let rootMask = 1.0 - smoothstep(-0.92, 0.24, surfQ.y);
-			let impactGain = 1.0 + rootMask * (u.rootPulse * 0.09 + u.surfaceImpact * 0.045);
+			let impactGain = 1.0 + rootMask * (u.rootPulse * 0.045 + u.surfaceImpact * 0.025);
 			let crevice = palette7(surfacePalette + 0.34) * pow(1.0 - ao, 2.0)
 				* (porous * 0.026 + crystal * 0.014);
 			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
@@ -2263,6 +2376,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const journey = shared.mk2;
 		currentSection = directed.section;
 		currentForm = dominantLifecycleForm(journey);
+		currentGesture = dominantGesture(journey);
 
 		// Time-correct renderer-side polish. The musical controller already owns
 		// the longer envelopes; this final smoothing only keeps GPU uniforms calm.
@@ -2397,11 +2511,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// elected study the camera remains outside the organism's scene bound.
 		const dollyScale = 1 / (1 + effectiveZoomDelta * 0.32);
 		const shotLens =
-			cameraOrbit * 1.52 +
-			cameraProfile * 1.62 +
-			cameraOverhead * 1.5 +
-			cameraLow * 1.46 +
-			cameraMacro * 1.72;
+			cameraOrbit * 0.86 +
+			cameraProfile * 0.96 +
+			cameraOverhead * 0.88 +
+			cameraLow * 0.82 +
+			cameraMacro * 1.24;
 		const requestedFovScale =
 			(shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
 		const subjectExtent =
@@ -2521,7 +2635,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		// Per-track palette family stays stable; harmonic analysis moves within
 		// it, so the track develops without looking like a preset roulette.
 		u[32] = paletteFamily;
-		u[33] = Math.min(1, smoothed.staccato * responseImpact);
+		u[33] = Math.min(1, smoothed.staccato * responseImpact * 0.4);
 		u[34] = smoothed.sustain;
 		u[35] = journey.rotationPhase;
 		u[36] = journey.backgroundFlowPhase;
@@ -2537,7 +2651,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[46] = journey.morphPhase;
 		u[47] = journey.morphRate;
 		u[48] = journey.rootMass;
-		u[49] = Math.min(1, journey.rootPulse * responseImpact);
+		u[49] = Math.min(1, journey.rootPulse * responseImpact * 0.55);
 		u[50] = journey.axialStretch;
 		u[51] = journey.lobeSplit;
 		u[52] = journey.foldDepth;
@@ -2572,6 +2686,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[81] = paletteFamilyB;
 		u[82] = paletteFamilyBlend;
 		u[83] = 0;
+		u[84] = journey.topologyCocoon;
+		u[85] = journey.topologySpire;
+		u[86] = journey.topologyBilateral;
+		u[87] = journey.topologyTorus;
+		u[88] = journey.topologyCoral;
+		u[89] = journey.topologyShell;
+		u[90] = journey.gestureReach;
+		u[91] = journey.gestureCoil;
+		u[92] = journey.gestureDivide;
+		u[93] = journey.gestureHollow;
+		u[94] = journey.gestureStillness;
+		u[95] = 0;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Upload decoded, baseline-relative detail. Static hiss and compressed
@@ -2806,6 +2932,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			aria-label="Soma audio visualizer"
 			data-mk2-section={currentSection}
 			data-mk2-form={currentForm}
+			data-mk2-gesture={currentGesture}
 			data-mk2-uniform-bytes={UNIFORM_BYTES}
 			data-mk2-render-passes="8"
 			data-soma-quality={qualityTier}

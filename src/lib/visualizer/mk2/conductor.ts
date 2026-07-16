@@ -137,6 +137,17 @@ export type Mk2ConductorFrame = {
 	materialMineral: number;
 	materialVelvet: number;
 	materialCrystal: number;
+	/**
+	 * Phrase-held behavior grammar. Unlike `impact`, these gestures take several
+	 * seconds to arrive and remain elected for a whole phrase. They let the same
+	 * anatomy reach, coil, divide, hollow, or become still without replaying one
+	 * beat-synchronous deformation.
+	 */
+	gestureReach: number;
+	gestureCoil: number;
+	gestureDivide: number;
+	gestureHollow: number;
+	gestureStillness: number;
 };
 
 export const MK2_CONDUCTOR_LIMITS = {
@@ -208,7 +219,12 @@ export const MK2_CONDUCTOR_LIMITS = {
 	materialMembrane: [0, 1],
 	materialMineral: [0, 1],
 	materialVelvet: [0, 1],
-	materialCrystal: [0, 1]
+	materialCrystal: [0, 1],
+	gestureReach: [0, 1],
+	gestureCoil: [0, 1],
+	gestureDivide: [0, 1],
+	gestureHollow: [0, 1],
+	gestureStillness: [0, 1]
 } as const;
 
 type Mk2ShotProfile = {
@@ -445,11 +461,38 @@ const TOPOLOGY_COUNT = 6;
 const CAMERA_COUNT = 5;
 const ENVIRONMENT_COUNT = 5;
 const MATERIAL_COUNT = 4;
+const GESTURE_COUNT = 5;
 
 type GrammarSectionModifier = {
 	topology: readonly [number, number, number, number, number, number];
 	camera: readonly [number, number, number, number, number];
 	environment: readonly [number, number, number, number, number];
+};
+
+type GestureWeights = readonly [
+	reach: number,
+	coil: number,
+	divide: number,
+	hollow: number,
+	stillness: number
+];
+
+/**
+ * A section biases behavior without prescribing a canned animation. Phrase
+ * identity, persistent track DNA, and measured style still decide which
+ * gesture wins, so two verses or choruses do not have to stage the same shot.
+ */
+const GESTURE_SECTION_MODIFIERS: Readonly<Record<VisualizerSection, GestureWeights>> = {
+	calm: [-0.08, -0.06, -0.08, 0.1, 0.26],
+	intro: [0.2, 0.02, -0.06, -0.08, 0.12],
+	verse: [0.16, 0.12, 0.02, -0.04, 0],
+	pre_chorus: [0.12, 0.28, 0.06, -0.06, -0.1],
+	build: [0.07, 0.36, 0.1, -0.08, -0.14],
+	drop: [0.04, -0.08, 0.38, 0.02, -0.17],
+	chorus: [0.08, 0.02, 0.32, 0.05, -0.14],
+	bridge: [-0.04, 0.03, 0.06, 0.36, 0.08],
+	breakdown: [-0.1, -0.05, -0.08, 0.3, 0.28],
+	outro: [-0.16, -0.1, -0.1, 0.16, 0.38]
 };
 
 /**
@@ -774,6 +817,11 @@ export class Mk2Conductor {
 	private readonly seedMaterial = new Float64Array(MATERIAL_COUNT);
 	private readonly material = new Float64Array(MATERIAL_COUNT);
 	private readonly materialTarget = new Float64Array(MATERIAL_COUNT);
+	private readonly materialPhraseBias = new Float64Array(MATERIAL_COUNT);
+	private readonly seedGesture = new Float64Array(GESTURE_COUNT);
+	private readonly gesture = new Float64Array(GESTURE_COUNT);
+	private readonly gestureTarget = new Float64Array(GESTURE_COUNT);
+	private readonly gesturePhraseBias = new Float64Array(GESTURE_COUNT);
 
 	private readonly output: Mk2ConductorFrame = {
 		section: 'intro',
@@ -851,7 +899,12 @@ export class Mk2Conductor {
 		materialMembrane: 0.42,
 		materialMineral: 0.18,
 		materialVelvet: 0.22,
-		materialCrystal: 0.18
+		materialCrystal: 0.18,
+		gestureReach: 0.36,
+		gestureCoil: 0.16,
+		gestureDivide: 0.12,
+		gestureHollow: 0.1,
+		gestureStillness: 0.26
 	};
 
 	constructor(seed: Mk2Seed = 0) {
@@ -953,6 +1006,7 @@ export class Mk2Conductor {
 		fillSeedGrammar(this.seedCamera, this.seedWord, 131);
 		fillSeedGrammar(this.seedEnvironment, this.seedWord, 137);
 		fillSeedGrammar(this.seedMaterial, this.seedWord, 139);
+		fillSeedGrammar(this.seedGesture, this.seedWord, 149);
 		this.topology.set(this.seedTopologyGrammar);
 		this.topologyTarget.set(this.seedTopologyGrammar);
 		this.topologyPhraseBias.fill(0);
@@ -964,6 +1018,10 @@ export class Mk2Conductor {
 		this.environmentPhraseBias.fill(0);
 		this.material.set(this.seedMaterial);
 		this.materialTarget.set(this.seedMaterial);
+		this.materialPhraseBias.fill(0);
+		this.gesture.set(this.seedGesture);
+		this.gestureTarget.set(this.seedGesture);
+		this.gesturePhraseBias.fill(0);
 
 		this.output.section = 'intro';
 		this.writeOutput();
@@ -1114,15 +1172,17 @@ export class Mk2Conductor {
 		// the 1 -> 0 wrap in live/radio mode.
 		if (phraseIndex !== this.plannedPhraseIndex) {
 			this.plannedPhraseIndex = phraseIndex;
-			fillPhraseBias(this.topologyPhraseBias, this.seedWord, phraseIndex, 0x243f6a88, 0.075);
-			fillPhraseBias(this.cameraPhraseBias, this.seedWord, phraseIndex, 0x85a308d3, 0.09);
+			fillPhraseBias(this.topologyPhraseBias, this.seedWord, phraseIndex, 0x243f6a88, 0.14);
+			fillPhraseBias(this.cameraPhraseBias, this.seedWord, phraseIndex, 0x85a308d3, 0.14);
 			fillPhraseBias(
 				this.environmentPhraseBias,
 				this.seedWord,
 				phraseIndex,
 				0x13198a2e,
-				0.065
+				0.13
 			);
+			fillPhraseBias(this.materialPhraseBias, this.seedWord, phraseIndex, 0xa4093822, 0.14);
+			fillPhraseBias(this.gesturePhraseBias, this.seedWord, phraseIndex, 0x299f31d0, 0.24);
 		}
 		const sectionGrammar = GRAMMAR_SECTION_MODIFIERS[sectionName];
 		const brightStyle = clamp01((this.styleLowHighTilt + 1) * 0.5);
@@ -1152,21 +1212,73 @@ export class Mk2Conductor {
 		approachWeightVector(
 			this.topology,
 			this.topologyTarget,
-			4.2 + (1 - signalMotion) * 2.2,
+			5.2 + (1 - signalMotion) * 2.4,
 			dt
 		);
 
+		// ── Phrase-held behavior grammar ────────────────────────────────────
+		// These are slow acting verbs, not visual presets. A phrase elects a
+		// behavior and the existing anatomy performs it over several seconds.
+		// Measured musical style and current topology make the election coherent:
+		// dark/wound music tends to coil, tonal/open music can divide, sparse
+		// passages invite stillness, and shell/torus bodies are able to hollow.
+		const gestureSection = GESTURE_SECTION_MODIFIERS[sectionName];
+		this.gestureTarget[0] =
+			this.seedGesture[0] * 0.28 +
+			(0.1 + this.topology[1] * 0.46 + brightStyle * 0.2 + signalMotion * 0.16) * 0.5 +
+			gestureSection[0] +
+			this.gesturePhraseBias[0];
+		this.gestureTarget[1] =
+			this.seedGesture[1] * 0.28 +
+			(0.1 + this.topology[5] * 0.32 + darkStyle * 0.18 + this.stylePercussiveness * 0.18) *
+				0.5 +
+			gestureSection[1] +
+			this.gesturePhraseBias[1];
+		this.gestureTarget[2] =
+			this.seedGesture[2] * 0.28 +
+			(0.09 + this.topology[2] * 0.38 + this.topology[4] * 0.2 + this.styleTonality * 0.18) *
+				0.5 +
+			gestureSection[2] +
+			this.gesturePhraseBias[2];
+		this.gestureTarget[3] =
+			this.seedGesture[3] * 0.28 +
+			(0.08 + this.topology[3] * 0.34 + this.topology[5] * 0.26 + signalRelease * 0.16) *
+				0.5 +
+			gestureSection[3] +
+			this.gesturePhraseBias[3];
+		this.gestureTarget[4] =
+			this.seedGesture[4] * 0.28 +
+			(0.1 + sparseStyle * 0.4 + (1 - signalMotion) * 0.22 + this.topology[0] * 0.2) * 0.5 +
+			gestureSection[4] +
+			this.gesturePhraseBias[4];
+		normalizeWeightVector(this.gestureTarget);
+		approachWeightVector(this.gesture, this.gestureTarget, 4.4 + sparseStyle * 1.8, dt);
+
 		this.cameraStyle[0] =
-			0.18 + (1 - this.styleSyncopation) * 0.2 + this.styleRhythmicDensity * 0.08;
+			0.18 +
+			(1 - this.styleSyncopation) * 0.2 +
+			this.styleRhythmicDensity * 0.08 +
+			this.gesture[2] * 0.16;
 		this.cameraStyle[1] =
-			0.12 + this.styleTonality * 0.22 + Math.abs(this.styleLowHighTilt) * 0.14;
-		this.cameraStyle[2] = 0.08 + brightStyle * 0.23 + this.topology[3] * 0.2;
-		this.cameraStyle[3] = 0.08 + darkStyle * 0.31 + this.stylePercussiveness * 0.19;
+			0.12 +
+			this.styleTonality * 0.22 +
+			Math.abs(this.styleLowHighTilt) * 0.14 +
+			this.gesture[0] * 0.16 +
+			this.gesture[1] * 0.1;
+		this.cameraStyle[2] =
+			0.08 + brightStyle * 0.23 + this.topology[3] * 0.2 + this.gesture[3] * 0.18;
+		this.cameraStyle[3] =
+			0.08 +
+			darkStyle * 0.31 +
+			this.stylePercussiveness * 0.19 +
+			this.gesture[1] * 0.14;
 		this.cameraStyle[4] =
 			0.09 +
 			sparseStyle * 0.29 +
 			this.styleTonality * 0.16 +
-			(1 - this.stylePercussiveness) * 0.1;
+			(1 - this.stylePercussiveness) * 0.1 +
+			this.gesture[3] * 0.2 +
+			this.gesture[4] * 0.24;
 		for (let i = 0; i < CAMERA_COUNT; i += 1) {
 			this.cameraTarget[i] =
 				this.seedCamera[i] * 0.38 +
@@ -1175,21 +1287,29 @@ export class Mk2Conductor {
 				this.cameraPhraseBias[i];
 		}
 		normalizeWeightVector(this.cameraTarget);
-		approachWeightVector(this.camera, this.cameraTarget, 6.2 + sparseStyle * 2.2, dt);
+		approachWeightVector(this.camera, this.cameraTarget, 5.6 + sparseStyle * 2.2, dt);
 
-		this.environmentStyle[0] = 0.11 + sparseStyle * 0.36 + this.styleTonality * 0.1;
+		this.environmentStyle[0] =
+			0.11 + sparseStyle * 0.36 + this.styleTonality * 0.1 + this.gesture[4] * 0.2;
 		this.environmentStyle[1] =
 			0.12 +
 			(1 - this.stylePercussiveness) * 0.25 +
-			(1 - Math.abs(this.styleLowHighTilt)) * 0.1;
-		this.environmentStyle[2] = 0.09 + darkStyle * 0.29 + this.topology[5] * 0.2;
+			(1 - Math.abs(this.styleLowHighTilt)) * 0.1 +
+			this.gesture[0] * 0.16;
+		this.environmentStyle[2] =
+			0.09 + darkStyle * 0.29 + this.topology[5] * 0.2 + this.gesture[3] * 0.22;
 		this.environmentStyle[3] =
-			0.09 + this.styleTonality * 0.23 + (1 - this.styleSyncopation) * 0.13;
+			0.09 +
+			this.styleTonality * 0.23 +
+			(1 - this.styleSyncopation) * 0.13 +
+			this.gesture[2] * 0.18;
 		this.environmentStyle[4] =
 			0.07 +
 			noisyStyle * 0.28 +
 			this.styleRhythmicDensity * 0.26 +
-			this.stylePercussiveness * 0.12;
+			this.stylePercussiveness * 0.12 +
+			this.gesture[1] * 0.13 +
+			this.gesture[2] * 0.12;
 		for (let i = 0; i < ENVIRONMENT_COUNT; i += 1) {
 			this.environmentTarget[i] =
 				this.seedEnvironment[i] * 0.36 +
@@ -1198,24 +1318,34 @@ export class Mk2Conductor {
 				this.environmentPhraseBias[i];
 		}
 		normalizeWeightVector(this.environmentTarget);
-		approachWeightVector(this.environment, this.environmentTarget, 8 + sparseStyle * 2.8, dt);
+		approachWeightVector(this.environment, this.environmentTarget, 6.8 + sparseStyle * 2.5, dt);
 
 		this.materialTarget[0] =
 			this.seedMaterial[0] * 0.34 +
-			(0.1 + this.styleTonality * 0.34 + (1 - this.stylePercussiveness) * 0.18) * 0.62;
+			(0.1 + this.styleTonality * 0.34 + (1 - this.stylePercussiveness) * 0.18 +
+				this.gesture[0] * 0.18 + this.gesture[4] * 0.12) * 0.62 +
+			this.materialPhraseBias[0];
 		this.materialTarget[1] =
 			this.seedMaterial[1] * 0.34 +
-			(0.1 + darkStyle * 0.26 + noisyStyle * 0.2 + this.stylePercussiveness * 0.12) * 0.62;
+			(0.1 + darkStyle * 0.26 + noisyStyle * 0.2 + this.stylePercussiveness * 0.12 +
+				this.gesture[1] * 0.22 + this.gesture[3] * 0.12) * 0.62 +
+			this.materialPhraseBias[1];
 		this.materialTarget[2] =
-			this.seedMaterial[2] * 0.34 + (0.09 + sparseStyle * 0.34 + darkStyle * 0.14) * 0.62;
+			this.seedMaterial[2] * 0.34 +
+			(0.09 + sparseStyle * 0.34 + darkStyle * 0.14 + this.gesture[4] * 0.24 +
+				this.gesture[3] * 0.12) * 0.62 +
+			this.materialPhraseBias[2];
 		this.materialTarget[3] =
 			this.seedMaterial[3] * 0.34 +
-			(0.08 + brightStyle * 0.25 + this.styleTonality * 0.2 + this.stylePercussiveness * 0.12) * 0.62;
+			(0.08 + brightStyle * 0.25 + this.styleTonality * 0.2 + this.stylePercussiveness * 0.12 +
+				this.gesture[2] * 0.26) * 0.62 +
+			this.materialPhraseBias[3];
 		normalizeWeightVector(this.materialTarget);
-		approachWeightVector(this.material, this.materialTarget, 6.8, dt);
+		approachWeightVector(this.material, this.materialTarget, 5.8, dt);
 
-		// Section progress moves through a form arc; a multi-second low-pass makes
-		// even hard metadata boundaries become physical metamorphoses.
+		// Section progress establishes dramatic intent. Phrase-held gestures then
+		// mutate that intent into a lived-in chapter, so a long live/radio verse no
+		// longer reaches one endpoint and spends the rest of the song twitching.
 		const lifecycleArc = LIFECYCLE_ARCS[sectionName] ?? LIFECYCLE_ARCS.intro;
 		// A scored section has a real, non-wrapping beginning and end. Live/radio
 		// fallback only has phrasePos, which wraps every eight bars; treating that
@@ -1224,40 +1354,61 @@ export class Mk2Conductor {
 		// above supplies ongoing evolution without reversing at a clock wrap.
 		const lifecycleProgress =
 			context?.source === 'score' ? smoothstep(0.02, 0.98, sectionProgress) : 1;
-		const lifecycleTau = 2.1 + (1 - signalMotion) * 0.8;
+		const lifecycleMutation = context?.source === 'score' ? 0 : 0.48;
+		const baseSeed = mix(lifecycleArc.start[0], lifecycleArc.end[0], lifecycleProgress);
+		const baseSprout = mix(lifecycleArc.start[1], lifecycleArc.end[1], lifecycleProgress);
+		const baseWinding = mix(lifecycleArc.start[2], lifecycleArc.end[2], lifecycleProgress);
+		const baseBloom = mix(lifecycleArc.start[3], lifecycleArc.end[3], lifecycleProgress);
+		const baseShedding = mix(lifecycleArc.start[4], lifecycleArc.end[4], lifecycleProgress);
+		const baseDormancy = mix(lifecycleArc.start[5], lifecycleArc.end[5], lifecycleProgress);
+		const targetSeed = baseSeed + this.gesture[4] * (1 - energy) * 0.44 * lifecycleMutation;
+		const targetSprout = baseSprout + this.gesture[0] * 0.74 * lifecycleMutation;
+		const targetWinding = baseWinding + this.gesture[1] * 0.78 * lifecycleMutation;
+		const targetBloom = baseBloom + this.gesture[2] * 0.82 * lifecycleMutation;
+		const targetShedding = baseShedding + this.gesture[3] * 0.78 * lifecycleMutation;
+		const targetDormancy =
+			baseDormancy + this.gesture[4] * (0.28 + (1 - signalMotion) * 0.34) * lifecycleMutation;
+		const targetLifecycleSum = Math.max(
+			1e-6,
+			targetSeed + targetSprout + targetWinding + targetBloom + targetShedding + targetDormancy
+		);
+		const lifecycleTau =
+			context?.source === 'score'
+				? 2.1 + (1 - signalMotion) * 0.8
+				: 4.3 + (1 - signalMotion) * 1.8;
 		this.seedForm = approach(
 			this.seedForm,
-			mix(lifecycleArc.start[0], lifecycleArc.end[0], lifecycleProgress),
+			targetSeed / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
 		this.sproutForm = approach(
 			this.sproutForm,
-			mix(lifecycleArc.start[1], lifecycleArc.end[1], lifecycleProgress),
+			targetSprout / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
 		this.windingForm = approach(
 			this.windingForm,
-			mix(lifecycleArc.start[2], lifecycleArc.end[2], lifecycleProgress),
+			targetWinding / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
 		this.bloomForm = approach(
 			this.bloomForm,
-			mix(lifecycleArc.start[3], lifecycleArc.end[3], lifecycleProgress),
+			targetBloom / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
 		this.sheddingForm = approach(
 			this.sheddingForm,
-			mix(lifecycleArc.start[4], lifecycleArc.end[4], lifecycleProgress),
+			targetShedding / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
 		this.dormancyForm = approach(
 			this.dormancyForm,
-			mix(lifecycleArc.start[5], lifecycleArc.end[5], lifecycleProgress),
+			targetDormancy / targetLifecycleSum,
 			lifecycleTau,
 			dt
 		);
@@ -1298,13 +1449,16 @@ export class Mk2Conductor {
 			0.04 +
 				this.sproutForm * 0.78 +
 				this.windingForm * 0.3 +
+				this.gesture[0] * 0.34 +
 				body * 0.28 +
 				positiveBody * 0.12 -
-				this.dormancyForm * 0.24
+				this.dormancyForm * 0.24 -
+				this.gesture[4] * 0.18
 		);
 		const lobeSplitTarget = clamp01(
 			0.02 +
 				this.bloomForm * 0.82 +
+				this.gesture[2] * 0.38 +
 				mids * 0.24 +
 				positiveMids * 0.14 -
 				this.seedForm * 0.12 -
@@ -1313,6 +1467,7 @@ export class Mk2Conductor {
 		const foldDepthTarget = clamp01(
 			0.04 +
 				this.windingForm * 0.72 +
+				this.gesture[1] * 0.42 +
 				mids * 0.24 +
 				spectralMotion * 0.12 +
 				positiveMids * 0.1 -
@@ -1321,6 +1476,7 @@ export class Mk2Conductor {
 		const cavityOpenTarget = clamp01(
 			0.01 +
 				this.sheddingForm * 0.86 +
+				this.gesture[3] * 0.52 +
 				this.dormancyForm * 0.08 +
 				signalRelease * 0.08 -
 				this.seedForm * 0.1
@@ -1330,7 +1486,9 @@ export class Mk2Conductor {
 				presence * 0.54 +
 				positivePresence * 0.26 +
 				signalTension * 0.12 +
-				this.windingForm * 0.08
+				this.windingForm * 0.08 +
+				this.gesture[1] * 0.18 +
+				this.gesture[2] * 0.1
 		);
 		const filamentReachTarget = clamp01(
 			0.02 +
@@ -1339,7 +1497,9 @@ export class Mk2Conductor {
 				positiveAir * 0.18 +
 				centroid * 0.08 +
 				this.bloomForm * 0.32 +
-				this.sheddingForm * 0.08
+				this.sheddingForm * 0.08 +
+				this.gesture[0] * 0.26 +
+				this.gesture[3] * 0.12
 		);
 		this.rootMass = approachAsymmetric(this.rootMass, rootMassTarget, 0.34, 0.95, dt);
 		this.rootPulse = approachAsymmetric(this.rootPulse, rootPulseTarget, 0.018, 0.22, dt);
@@ -1483,7 +1643,7 @@ export class Mk2Conductor {
 		// disconnected from beatPulse, impact, onset deltas, and rootPulse.
 		const shotProfile = SHOT_PROFILES[sectionName] ?? SHOT_PROFILES.intro;
 		const studyDraw = signedHash(phraseWord, 31) * 0.5 + 0.5;
-		const phraseStudyElection = smoothstep(0.81, 0.9, studyDraw);
+		const phraseStudyElection = smoothstep(0.72, 0.88, studyDraw);
 		const anatomicalDetail = clamp01(
 			presence * 0.24 +
 				air * 0.2 +
@@ -1497,7 +1657,9 @@ export class Mk2Conductor {
 			phraseStudyElection *
 				shotProfile.studyAffinity *
 				(0.54 + anatomicalDetail * 0.46) +
-				this.camera[4] * anatomicalDetail * 0.2,
+				this.camera[4] * anatomicalDetail * 0.24 +
+				phraseStudyElection *
+					(this.gesture[3] * 0.18 + this.gesture[4] * 0.16 + this.gesture[1] * 0.08),
 			...MK2_CONDUCTOR_LIMITS.closeStudy
 		);
 		const shotZoomTarget = clamp(
@@ -1505,7 +1667,12 @@ export class Mk2Conductor {
 				this.bloomForm * 0.035 +
 				closeStudyTarget * (0.61 + anatomicalDetail * 0.18) +
 				this.camera[4] * (0.045 + closeStudyTarget * 0.235) -
-				this.camera[0] * 0.045,
+				this.camera[0] * 0.045 +
+				this.gesture[3] * 0.12 +
+				this.gesture[4] * 0.14 +
+				this.gesture[1] * 0.04 -
+				this.gesture[2] * 0.08 -
+				this.gesture[0] * 0.04,
 			...MK2_CONDUCTOR_LIMITS.shotZoom
 		);
 		const detailFocusTarget = clamp(
@@ -1517,14 +1684,15 @@ export class Mk2Conductor {
 		const phraseFramingX = signedHash(phraseWord, 43);
 		const phraseFramingY = signedHash(phraseWord, 47);
 		const perspectiveAzimuthTarget = clamp(
-			phraseAzimuth * (0.18 + closeStudyTarget * 0.43) +
+			phraseAzimuth * (0.3 + closeStudyTarget * 0.52) +
 				(this.camera[1] - this.camera[0]) * 0.14 +
-				this.spectralLean * 0.05,
+				this.spectralLean * 0.05 +
+				(this.gesture[1] - this.gesture[2]) * 0.12,
 			...MK2_CONDUCTOR_LIMITS.perspectiveAzimuth
 		);
 		const perspectiveElevationTarget = clamp(
 			shotProfile.elevation +
-				phraseElevation * (0.095 + closeStudyTarget * 0.16) +
+				phraseElevation * (0.14 + closeStudyTarget * 0.2) +
 				this.camera[2] * 0.42 -
 				this.camera[3] * 0.3 -
 				this.suspense * 0.025,
@@ -1543,11 +1711,11 @@ export class Mk2Conductor {
 		this.closeStudy = approachAsymmetric(
 			this.closeStudy,
 			closeStudyTarget,
-			3.2,
-			3.8,
+			4.2,
+			5.2,
 			dt
 		);
-		this.shotZoom = approachAsymmetric(this.shotZoom, shotZoomTarget, 3.15, 3.9, dt);
+		this.shotZoom = approachAsymmetric(this.shotZoom, shotZoomTarget, 4.4, 5.4, dt);
 		this.detailFocus = approachAsymmetric(
 			this.detailFocus,
 			detailFocusTarget,
@@ -1684,17 +1852,21 @@ export class Mk2Conductor {
 		const phraseSignal = (clamp01(finite(signal.phraseVariation, 0.5)) - 0.5) * 2;
 		const keyAngle = this.keyPosition * Math.PI * 2;
 		const postureYawTarget = clamp(
-			Math.sin(keyAngle) * (0.032 + keyConfidence * 0.018) +
-				phraseYaw * 0.024 +
-				phraseSignal * 0.008,
+			Math.sin(keyAngle) * (0.04 + keyConfidence * 0.025) +
+				phraseYaw * (0.07 + this.gesture[1] * 0.055) +
+				phraseSignal * 0.018 +
+				(this.gesture[1] - this.gesture[2]) * 0.045,
 			...MK2_CONDUCTOR_LIMITS.postureYaw
 		);
 		const posturePitchTarget = clamp(
-			Math.cos(keyAngle) * 0.025 + phrasePitch * 0.018 + modeBias * keyConfidence * 0.012,
+			Math.cos(keyAngle) * 0.032 +
+				phrasePitch * (0.055 + this.gesture[0] * 0.035) +
+				modeBias * keyConfidence * 0.018 +
+				(this.gesture[0] - this.gesture[4]) * 0.035,
 			...MK2_CONDUCTOR_LIMITS.posturePitch
 		);
-		this.postureYaw = approach(this.postureYaw, postureYawTarget, 2.8, dt);
-		this.posturePitch = approach(this.posturePitch, posturePitchTarget, 3.1, dt);
+		this.postureYaw = approach(this.postureYaw, postureYawTarget, 5.2, dt);
+		this.posturePitch = approach(this.posturePitch, posturePitchTarget, 5.6, dt);
 
 		this.output.section = sectionName;
 		this.writeOutput();
@@ -1824,5 +1996,10 @@ export class Mk2Conductor {
 		this.output.materialMineral = clamp(this.material[1], 0, 1);
 		this.output.materialVelvet = clamp(this.material[2], 0, 1);
 		this.output.materialCrystal = clamp(this.material[3], 0, 1);
+		this.output.gestureReach = clamp(this.gesture[0], 0, 1);
+		this.output.gestureCoil = clamp(this.gesture[1], 0, 1);
+		this.output.gestureDivide = clamp(this.gesture[2], 0, 1);
+		this.output.gestureHollow = clamp(this.gesture[3], 0, 1);
+		this.output.gestureStillness = clamp(this.gesture[4], 0, 1);
 	}
 }
