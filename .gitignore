@@ -6,6 +6,8 @@ src-tauri/resources/bin
 test-results
 tmp
 *.log
+/.playwright-cli/
+/output/playwright/
 
 # Output
 .output

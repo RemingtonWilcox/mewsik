@@ -228,7 +228,7 @@
 	// 83    alignment
 	// 84-89 topology grammar: cocoon / spire / bilateral / torus / coral / shell
 	// 90-94 phrase gesture: reach / coil / divide / hollow / stillness
-	// 95    alignment / future grammar
+	// 95    long-horizon rhythmic density
 	const UNIFORM_FLOATS = 96;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
@@ -329,7 +329,7 @@ struct Uniforms {
 	gestureDivide: f32,
 	gestureHollow: f32,
 	gestureStillness: f32,
-	_pad3: f32,
+	styleRhythmicDensity: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -590,20 +590,17 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		- hollow * 0.018;
 	var q = p / breath;
 
-	// Rotation phase drives bounded posture—not a monotonically increasing angle.
-	// Soma can expose different sides, settle, and reverse naturally, but never
-	// sits on an endless 360-degree display turntable.
-	let postureSway = (
-		sin(u.journeyPhase * 1.37 + u.paletteFamily * 0.71) * 0.105
-			+ sin(u.journeyPhase * 0.43 - u.paletteFamily * 0.29) * 0.045
-	) * (1.0 - stillness * 0.72);
-	let globalYaw = postureSway + u.postureYaw * 0.46 + u.spectralLean * 0.07;
+	// Whole-body orientation is a held compositional decision. No clock, FFT
+	// delta, spectral lean, kick, or impact is allowed to twist the entire subject.
+	// Perspective changes come from patient camera grammar and phrase posture.
+	let globalYaw = u.postureYaw * 0.62
+		+ (coil - divide) * 0.065 + (shell - bilateral) * 0.035;
 	let yawed = rot2(q.xz, globalYaw);
 	q.x = yawed.x;
 	q.z = yawed.y;
 	let pitched = rot2(
 		q.yz,
-		u.posturePitch * 0.64 + sin(u.journeyPhase * 0.79 + u.paletteFamily) * 0.035
+		u.posturePitch * 0.70 + (reach - hollow) * 0.045 - stillness * 0.018
 	);
 	q.y = pitched.x;
 	q.z = pitched.y;
@@ -1105,15 +1102,16 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	let across = dot(worldP, sideAxis);
 	let lift = dot(worldP, liftAxis);
 
-	// The CPU integrates this phase from the shared song journey. Mids/tension
-	// bend the current, while bass/growth change its body; no transient rail
-	// touches background luminance.
+	// The CPU integrates this phase from the shared song journey. Persistent
+	// rhythmic identity and tension bend the current; no transient rail touches
+	// background luminance or geometry.
 	// Suspense accelerates the CPU-integrated phase instead of offsetting it here,
 	// so the foreshadowing current can never rewind when anticipation releases.
 	let flowPhase = u.backgroundPhase + familyPhase + u.morphPhase * 0.21;
 	let warpP = worldP * 0.24 + currentAxis * flowPhase * 0.20;
 	let warp = vn3(warpP) - 0.5;
-	let bend = sin(along * 0.54 + flowPhase + warp * 2.0) * (0.30 + u.mid * 0.16)
+	let bend = sin(along * 0.54 + flowPhase + warp * 2.0)
+		* (0.30 + u.styleRhythmicDensity * 0.16)
 		+ sin(lift * 0.31 - flowPhase * 0.47 + familyPhase) * (0.10 + tension * 0.10);
 	let currentCoord = across * 0.30 + bend;
 	let currentWidth = 0.32 + u.rootMass * 0.08 + growth * 0.05 + u.openness * 0.05
@@ -1485,11 +1483,16 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let rim = rimTint * cosNR * rimFresnel * rimStrength
 				* (0.78 + u.openness * 0.18);
 
-			// Hits remain local to the lower anatomy and modulate the material
-			// already present; there is no stripe mask, unlit emission, or screen
-			// flash. Crevice color is derived from real AO and stays deliberately low.
-			let rootMask = 1.0 - smoothstep(-0.92, 0.24, surfQ.y);
-			let impactGain = 1.0 + rootMask * (u.rootPulse * 0.045 + u.surfaceImpact * 0.025);
+			// Hits illuminate one small anatomical patch instead of brightening the
+			// whole lower half. This preserves percussion detail without creating the
+			// optical illusion that Soma scales or punches as one object on every kick.
+			let hitCenter = vec3<f32>(
+				u.spectralLean * 0.24,
+				-0.48,
+				sin(u.paletteFamily * 1.71 + u.spectralTravelPhase * 0.08) * 0.22
+			);
+			let hitMask = 1.0 - smoothstep(0.10, 0.31, length(surfQ - hitCenter));
+			let impactGain = 1.0 + hitMask * (u.rootPulse * 0.075 + u.surfaceImpact * 0.04);
 			let crevice = palette7(surfacePalette + 0.34) * pow(1.0 - ao, 2.0)
 				* (porous * 0.026 + crystal * 0.014);
 			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
@@ -2454,8 +2457,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				7.05 +
 					journey.topologyBias * 1.15 +
 					journey.styleLowHighTilt * 0.38 +
+					(journey.styleTonality - 0.5) * 0.24 +
 					(journey.materialMineral - journey.materialMembrane) * 0.22 +
-					smoothed.mid * 0.16
+					(journey.gestureCoil - journey.gestureDivide) * 0.18
 			)
 		);
 		const paletteOffset =
@@ -2637,7 +2641,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[32] = paletteFamily;
 		u[33] = Math.min(1, smoothed.staccato * responseImpact * 0.4);
 		u[34] = smoothed.sustain;
-		u[35] = journey.rotationPhase;
+		// Reserved legacy slot. Whole-subject clock rotation is intentionally disabled.
+		u[35] = 0;
 		u[36] = journey.backgroundFlowPhase;
 		u[37] = journey.postureYaw;
 		u[38] = journey.posturePitch;
@@ -2697,7 +2702,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[92] = journey.gestureDivide;
 		u[93] = journey.gestureHollow;
 		u[94] = journey.gestureStillness;
-		u[95] = 0;
+		u[95] = journey.styleRhythmicDensity;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Upload decoded, baseline-relative detail. Static hiss and compressed

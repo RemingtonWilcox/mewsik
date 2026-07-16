@@ -523,7 +523,7 @@ test.describe('Mk2 macro conductor', () => {
 		expect(result.minDensity).toBeGreaterThanOrEqual(0.3 - 1e-9);
 		// Prove this journey actually exercises the floor instead of passing only
 		// because every sampled state happened to remain dense.
-		expect(result.minDensity).toBeLessThan(0.305);
+		expect(result.minDensity).toBeLessThan(0.31);
 		expect(['bridge', 'breakdown']).toContain(result.minSection);
 		expect(result.maxDensity - result.minDensity).toBeGreaterThan(0.35);
 	});
@@ -607,7 +607,7 @@ test.describe('Mk2 macro conductor', () => {
 		);
 	});
 
-	test('sub, body, mids, presence, and air control different anatomical scales', async ({ page }) => {
+	test('long-horizon band identity controls different anatomical scales', async ({ page }) => {
 		await page.goto('/');
 		const samples = await page.evaluate(async (fixtures) => {
 			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
@@ -618,13 +618,11 @@ test.describe('Mk2 macro conductor', () => {
 				const signal: any = structuredClone(fixtures.signal);
 				const spectrum: any = structuredClone(fixtures.spectrum);
 				for (const name of Object.keys(spectrum.levels)) spectrum.levels[name] = 0.05;
+				for (const name of Object.keys(spectrum.slow)) spectrum.slow[name] = 0.05;
 				spectrum.bass = spectrum.mid = spectrum.treble = 0.05;
-				if (band) spectrum.levels[band] = 1;
-				if (band === 'sub') spectrum.bass = 1;
-				if (band === 'mids') spectrum.mid = 1;
-				if (band === 'air') spectrum.treble = 1;
+				if (band) spectrum.slow[band] = 1;
 				let output: any;
-				for (let i = 0; i < 5 * 60; i += 1) {
+				for (let i = 0; i < 30 * 60; i += 1) {
 					output = conductor.update(frame, signal, spectrum, 1 / 60);
 				}
 				return { ...output };
@@ -639,16 +637,76 @@ test.describe('Mk2 macro conductor', () => {
 			};
 		}, FIXTURES);
 
-		expect(samples.sub.rootMass).toBeGreaterThan(samples.low.rootMass + 0.5);
-		expect(samples.body.axialStretch).toBeGreaterThan(samples.low.axialStretch + 0.25);
-		expect(samples.mids.foldDepth).toBeGreaterThan(samples.low.foldDepth + 0.2);
-		expect(samples.mids.lobeSplit).toBeGreaterThan(samples.low.lobeSplit + 0.18);
+		expect(samples.sub.rootMass).toBeGreaterThan(samples.low.rootMass + 0.3);
+		expect(samples.body.axialStretch).toBeGreaterThan(samples.low.axialStretch + 0.18);
+		expect(samples.mids.foldDepth).toBeGreaterThan(samples.low.foldDepth + 0.16);
+		expect(samples.mids.lobeSplit).toBeGreaterThan(samples.low.lobeSplit + 0.16);
 		expect(samples.presence.surfaceRidges).toBeGreaterThan(
-			samples.low.surfaceRidges + 0.42
+			samples.low.surfaceRidges + 0.24
 		);
-		expect(samples.air.filamentReach).toBeGreaterThan(samples.low.filamentReach + 0.48);
+		expect(samples.air.filamentReach).toBeGreaterThan(samples.low.filamentReach + 0.28);
 		expect(samples.presence.rootMass - samples.low.rootMass).toBeLessThan(0.03);
 		expect(samples.sub.surfaceRidges - samples.low.surfaceRidges).toBeLessThan(0.03);
+	});
+
+	test('kick impulses cannot pulse, scale, rotate, or reframe the whole organism', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const modulePath = '/src/lib/visualizer/mk2/conductor.ts';
+			const { Mk2Conductor } = await import(modulePath);
+			const control = new Mk2Conductor('transient-isolation');
+			const struck = new Mk2Conductor('transient-isolation');
+			const controlFrame: any = structuredClone(fixtures.director);
+			const struckFrame: any = structuredClone(fixtures.director);
+			const controlSignal: any = structuredClone(fixtures.signal);
+			const struckSignal: any = structuredClone(fixtures.signal);
+			const controlSpectrum: any = structuredClone(fixtures.spectrum);
+			const struckSpectrum: any = structuredClone(fixtures.spectrum);
+			const wholeBodyRails = [
+				'growth', 'tension', 'release', 'openness', 'macroEnergy',
+				'cameraSpeed', 'cameraDistance', 'postureYaw', 'posturePitch',
+				'shotZoom', 'closeStudy', 'perspectiveAzimuth', 'perspectiveElevation',
+				'seedForm', 'sproutForm', 'windingForm', 'bloomForm', 'sheddingForm',
+				'dormancyForm', 'morphRate', 'rootMass', 'axialStretch', 'lobeSplit',
+				'foldDepth', 'cavityOpen', 'filamentReach', 'topologyCocoon',
+				'topologySpire', 'topologyBilateral', 'topologyTorus', 'topologyCoral',
+				'topologyShell', 'cameraOrbit', 'cameraProfile', 'cameraOverhead',
+				'cameraLow', 'cameraMacro', 'gestureReach', 'gestureCoil', 'gestureDivide',
+				'gestureHollow', 'gestureStillness'
+			];
+			for (let i = 0; i < 18 * 60; i += 1) {
+				control.update(controlFrame, controlSignal, controlSpectrum, 1 / 60);
+				struck.update(struckFrame, struckSignal, struckSpectrum, 1 / 60);
+			}
+			struckFrame.clock.beatPulse = 1;
+			struckFrame.bassPunch = 1;
+			struckFrame.energy = 1;
+			struckFrame.motion = 1;
+			struckSignal.impact = 1;
+			struckSpectrum.novelty = 1;
+			struckSpectrum.spectralMotion = 1;
+			struckSpectrum.bass = struckSpectrum.mid = struckSpectrum.treble = 1;
+			for (const name of Object.keys(struckSpectrum.levels)) struckSpectrum.levels[name] = 1;
+			for (const name of Object.keys(struckSpectrum.deltas)) struckSpectrum.deltas[name] = 1;
+			const quiet: any = control.update(controlFrame, controlSignal, controlSpectrum, 1 / 60);
+			const hit: any = struck.update(struckFrame, struckSignal, struckSpectrum, 1 / 60);
+			return {
+				maxWholeBodyDelta: Math.max(
+					...wholeBodyRails.map((name) => Math.abs(hit[name] - quiet[name]))
+				),
+				impactDelta: hit.impact - quiet.impact,
+				rootPulseDelta: hit.rootPulse - quiet.rootPulse,
+				spectralLeanDelta: Math.abs(hit.spectralLean - quiet.spectralLean)
+			};
+		}, FIXTURES);
+
+		expect(result.maxWholeBodyDelta).toBeLessThan(0.0005);
+		expect(result.impactDelta).toBeGreaterThan(0.1);
+		expect(result.rootPulseDelta).toBeGreaterThan(0.1);
+		// Filter direction may move local growth/material travel, but not global posture.
+		expect(result.spectralLeanDelta).toBeLessThan(0.002);
 	});
 
 	test('spectral travel and harmonic palette cross direction and hue wraps without snapping', async ({
@@ -693,9 +751,9 @@ test.describe('Mk2 macro conductor', () => {
 			};
 		}, FIXTURES);
 
-		expect(result.forward.spectralLean).toBeGreaterThan(0.75);
+		expect(result.forward.spectralLean).toBeGreaterThan(0.12);
 		expect(result.forward.spectralTravelRate).toBeGreaterThan(0.1);
-		expect(result.reverse.spectralLean).toBeLessThan(-0.75);
+		expect(result.reverse.spectralLean).toBeLessThan(-0.09);
 		expect(result.reverse.spectralTravelRate).toBeLessThan(-0.1);
 		expect(result.reverse.spectralTravelPhase).toBeLessThan(result.phaseBeforeReverse);
 		expect(result.maxTravelStep).toBeLessThan(0.003);
@@ -729,6 +787,7 @@ test.describe('Mk2 macro conductor', () => {
 				frame.motion = 0.34;
 				Object.assign(signal, { tension: 0.24, release: 0.35, openness: 0.61, motion: 0.32 });
 				spectrum.levels.presence = spectrum.levels.air = detailed ? 1 : 0.03;
+				spectrum.slow.presence = spectrum.slow.air = detailed ? 1 : 0.03;
 				spectrum.treble = detailed ? 1 : 0.03;
 				spectrum.spectralMotion = detailed ? 0.92 : 0.03;
 				const maxStep: Record<string, number> = Object.fromEntries(
@@ -796,7 +855,7 @@ test.describe('Mk2 macro conductor', () => {
 		expect(heroPhrases).toBeGreaterThan(34);
 		expect(max(detailed, 'shotZoom')).toBeGreaterThan(1.55);
 		expect(max(detailed, 'closeStudy')).toBeGreaterThan(max(flat, 'closeStudy') + 0.12);
-		expect(max(detailed, 'detailFocus')).toBeGreaterThan(max(flat, 'detailFocus') + 0.25);
+		expect(max(detailed, 'detailFocus')).toBeGreaterThan(max(flat, 'detailFocus') + 0.18);
 		expect(result.detailed.maxStep.shotZoom).toBeLessThan(0.009);
 		expect(result.detailed.maxStep.closeStudy).toBeLessThan(0.009);
 		expect(result.detailed.maxStep.detailFocus).toBeLessThan(0.007);

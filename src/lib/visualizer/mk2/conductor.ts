@@ -25,9 +25,9 @@ export type Mk2SectionProfile = {
 
 /**
  * Slow, bounded controls for Mk2. `impact` and the sub/kick-specific
- * `rootPulse` are the only intentionally fast rails; the component can layer
- * them over these values without moving the camera or switching topology on
- * individual beats.
+ * `rootPulse` are the only intentionally fast rails, and are restricted to a
+ * small material patch by the renderer. They never move the camera, rotate the
+ * organism, or change whole-body anatomy on individual beats.
  */
 export type Mk2ConductorFrame = {
 	section: VisualizerSection;
@@ -85,7 +85,7 @@ export type Mk2ConductorFrame = {
 	/** Unwrapped slow organism clock; use sin/cos in the renderer, never fract(). */
 	morphPhase: number;
 	morphRate: number;
-	/** Sub and kick own the root mass. `rootPulse` is the second intentionally fast rail. */
+	/** Long-horizon low-band identity owns mass; `rootPulse` is local material only. */
 	rootMass: number;
 	rootPulse: number;
 	/** Body and mids own large-scale elongation, splitting, and folded topology. */
@@ -462,6 +462,7 @@ const CAMERA_COUNT = 5;
 const ENVIRONMENT_COUNT = 5;
 const MATERIAL_COUNT = 4;
 const GESTURE_COUNT = 5;
+const BAND_IDENTITY_COUNT = 6;
 
 type GrammarSectionModifier = {
 	topology: readonly [number, number, number, number, number, number];
@@ -798,6 +799,9 @@ export class Mk2Conductor {
 	private noveltyLatched = false;
 	private noveltyCadence = 0;
 	private syncopationEvidence = 0.2;
+	/** Long-horizon sub/kick/body/mids/presence/air shares; never a beat envelope. */
+	private readonly bandIdentity = new Float64Array(BAND_IDENTITY_COUNT);
+	private readonly bandIdentityTarget = new Float64Array(BAND_IDENTITY_COUNT);
 	private plannedPhraseIndex = Number.MIN_SAFE_INTEGER;
 	private readonly seedTopologyGrammar = new Float64Array(TOPOLOGY_COUNT);
 	private readonly topology = new Float64Array(TOPOLOGY_COUNT);
@@ -1001,6 +1005,8 @@ export class Mk2Conductor {
 		this.noveltyLatched = false;
 		this.noveltyCadence = this.styleRhythmicDensity * 0.35;
 		this.syncopationEvidence = this.styleSyncopation;
+		fillSeedGrammar(this.bandIdentity, this.seedWord, 151);
+		this.bandIdentityTarget.set(this.bandIdentity);
 		this.plannedPhraseIndex = Number.MIN_SAFE_INTEGER;
 		fillSeedGrammar(this.seedTopologyGrammar, this.seedWord, 127);
 		fillSeedGrammar(this.seedCamera, this.seedWord, 131);
@@ -1067,22 +1073,11 @@ export class Mk2Conductor {
 		const energy = clamp01(finite(frame.energy));
 		const sectionEnergy = clamp01(finite(context?.sectionEnergy, energy));
 		const centroid = clamp01(finite(spectrum.centroid, 0.42));
-		const sub = clamp01(finite(spectrum.levels?.sub));
-		const kick = clamp01(finite(spectrum.levels?.kick));
-		const body = clamp01(finite(spectrum.levels?.body));
-		const mids = clamp01(finite(spectrum.levels?.mids));
-		const presence = clamp01(finite(spectrum.levels?.presence));
-		const air = clamp01(finite(spectrum.levels?.air));
-		const bass = clamp01(finite(spectrum.bass));
-		const treble = clamp01(finite(spectrum.treble));
 		const spectralMotion = clamp01(finite(spectrum.spectralMotion));
 		const spectralDirection = clamp(finite(spectrum.spectralDirection), -1, 1);
 		const positiveSub = Math.max(0, finite(spectrum.deltas?.sub));
 		const positiveKick = Math.max(0, finite(spectrum.deltas?.kick));
 		const positiveBody = Math.max(0, finite(spectrum.deltas?.body));
-		const positiveMids = Math.max(0, finite(spectrum.deltas?.mids));
-		const positivePresence = Math.max(0, finite(spectrum.deltas?.presence));
-		const positiveAir = Math.max(0, finite(spectrum.deltas?.air));
 		const tempo = clamp01((finite(frame.clock?.tempoBpm, 120) - 60) / 120);
 		const signalTempo = clamp01(finite(signal.tempo, tempo));
 		const phraseIndex = Math.floor(finite(frame.clock?.phraseIndex));
@@ -1144,6 +1139,13 @@ export class Mk2Conductor {
 		// until decoded spectrum supplies actual evidence instead of letting zero
 		// bins slowly turn every idle organism into the same "tonal" recipe.
 		if (!frame.silence && slowMagnitudeSum > 1e-5) {
+			this.bandIdentityTarget[0] = slowSub / slowTotal;
+			this.bandIdentityTarget[1] = slowKick / slowTotal;
+			this.bandIdentityTarget[2] = slowBody / slowTotal;
+			this.bandIdentityTarget[3] = slowMids / slowTotal;
+			this.bandIdentityTarget[4] = slowPresence / slowTotal;
+			this.bandIdentityTarget[5] = slowAir / slowTotal;
+			approachWeightVector(this.bandIdentity, this.bandIdentityTarget, 9.5, dt);
 			this.styleLowHighTilt = approach(this.styleLowHighTilt, styleLowHighTiltTarget, 8.5, dt);
 			this.styleTonality = approach(this.styleTonality, styleTonalityTarget, 10.5, dt);
 			this.stylePercussiveness = approach(
@@ -1165,6 +1167,12 @@ export class Mk2Conductor {
 				dt
 			);
 		}
+		const identitySub = this.bandIdentity[0];
+		const identityKick = this.bandIdentity[1];
+		const identityBody = this.bandIdentity[2];
+		const identityMids = this.bandIdentity[3];
+		const identityPresence = this.bandIdentity[4];
+		const identityAir = this.bandIdentity[5];
 
 		// ── Phrase-held world grammar ───────────────────────────────────────
 		// Phrase identity elects a plan once. Audio can slowly bend it, but raw
@@ -1429,16 +1437,19 @@ export class Mk2Conductor {
 		this.dormancyForm /= lifecycleSum;
 
 		const morphRateTarget = clamp(
-			0.012 + signalTempo * 0.01 + signalMotion * 0.012 + spectralMotion * 0.012,
+			0.012 + signalTempo * 0.009 + this.styleRhythmicDensity * 0.012
+				+ this.styleSyncopation * 0.006,
 			...MK2_CONDUCTOR_LIMITS.morphRate
 		);
 		this.morphRate = approach(this.morphRate, morphRateTarget, 2.6, dt);
 		this.morphPhase = finite(this.morphPhase) + this.morphRate * dt;
 
-		// Each band owns a different spatial scale. These are envelopes, not raw
-		// FFT values, so the body can answer music without fizzing frame-to-frame.
+		// Each band owns a different spatial scale, but only through the long-horizon
+		// mix identity above. A kick can light one material patch; it cannot make the
+		// whole organism inhale, stretch, split, fold, or snap back on every beat.
 		const rootMassTarget = clamp01(
-			0.08 + sub * 0.5 + bass * 0.2 + body * 0.08 + this.seedForm * 0.1 + this.bloomForm * 0.08
+			0.12 + identitySub * 0.72 + identityKick * 0.22 + this.seedForm * 0.12
+				+ this.bloomForm * 0.08 + this.gesture[4] * 0.05
 		);
 		const rootPulseTarget = clamp01(
 			positiveSub * 0.34 +
@@ -1447,30 +1458,31 @@ export class Mk2Conductor {
 		);
 		const axialStretchTarget = clamp01(
 			0.04 +
-				this.sproutForm * 0.78 +
-				this.windingForm * 0.3 +
-				this.gesture[0] * 0.34 +
-				body * 0.28 +
-				positiveBody * 0.12 -
+				this.sproutForm * 0.72 +
+				this.windingForm * 0.26 +
+				this.gesture[0] * 0.44 +
+				identityBody * 0.52 +
+				Math.max(0, this.styleLowHighTilt) * 0.1 -
 				this.dormancyForm * 0.24 -
 				this.gesture[4] * 0.18
 		);
 		const lobeSplitTarget = clamp01(
 			0.02 +
-				this.bloomForm * 0.82 +
-				this.gesture[2] * 0.38 +
-				mids * 0.24 +
-				positiveMids * 0.14 -
+				this.bloomForm * 0.76 +
+				this.gesture[2] * 0.46 +
+				identityMids * 0.54 +
+				this.styleRhythmicDensity * 0.12 +
+				this.styleSyncopation * 0.08 -
 				this.seedForm * 0.12 -
 				this.windingForm * 0.05
 		);
 		const foldDepthTarget = clamp01(
 			0.04 +
-				this.windingForm * 0.72 +
-				this.gesture[1] * 0.42 +
-				mids * 0.24 +
-				spectralMotion * 0.12 +
-				positiveMids * 0.1 -
+				this.windingForm * 0.68 +
+				this.gesture[1] * 0.48 +
+				identityMids * 0.48 +
+				this.styleSyncopation * 0.16 +
+				(1 - this.styleTonality) * 0.08 -
 				this.bloomForm * 0.14
 		);
 		const cavityOpenTarget = clamp01(
@@ -1483,8 +1495,9 @@ export class Mk2Conductor {
 		);
 		const surfaceRidgesTarget = clamp01(
 			0.04 +
-				presence * 0.54 +
-				positivePresence * 0.26 +
+				identityPresence * 0.68 +
+				this.stylePercussiveness * 0.16 +
+				this.styleRhythmicDensity * 0.12 +
 				signalTension * 0.12 +
 				this.windingForm * 0.08 +
 				this.gesture[1] * 0.18 +
@@ -1492,38 +1505,39 @@ export class Mk2Conductor {
 		);
 		const filamentReachTarget = clamp01(
 			0.02 +
-				air * 0.42 +
-				treble * 0.14 +
-				positiveAir * 0.18 +
-				centroid * 0.08 +
+				identityAir * 0.72 +
+				identityPresence * 0.12 +
+				Math.max(0, this.styleLowHighTilt) * 0.14 +
 				this.bloomForm * 0.32 +
 				this.sheddingForm * 0.08 +
 				this.gesture[0] * 0.26 +
 				this.gesture[3] * 0.12
 		);
-		this.rootMass = approachAsymmetric(this.rootMass, rootMassTarget, 0.34, 0.95, dt);
+		this.rootMass = approachAsymmetric(this.rootMass, rootMassTarget, 3.4, 5.6, dt);
 		this.rootPulse = approachAsymmetric(this.rootPulse, rootPulseTarget, 0.018, 0.22, dt);
-		this.axialStretch = approachAsymmetric(this.axialStretch, axialStretchTarget, 0.62, 1.35, dt);
-		this.lobeSplit = approachAsymmetric(this.lobeSplit, lobeSplitTarget, 0.72, 1.4, dt);
-		this.foldDepth = approachAsymmetric(this.foldDepth, foldDepthTarget, 0.42, 0.9, dt);
+		this.axialStretch = approachAsymmetric(this.axialStretch, axialStretchTarget, 2.8, 4.4, dt);
+		this.lobeSplit = approachAsymmetric(this.lobeSplit, lobeSplitTarget, 3.2, 4.8, dt);
+		this.foldDepth = approachAsymmetric(this.foldDepth, foldDepthTarget, 2.6, 4, dt);
 		this.cavityOpen = approachAsymmetric(this.cavityOpen, cavityOpenTarget, 1.15, 1.9, dt);
-		this.surfaceRidges = approachAsymmetric(this.surfaceRidges, surfaceRidgesTarget, 0.13, 0.58, dt);
-		this.filamentReach = approachAsymmetric(this.filamentReach, filamentReachTarget, 0.18, 0.78, dt);
+		this.surfaceRidges = approachAsymmetric(this.surfaceRidges, surfaceRidgesTarget, 2.4, 4, dt);
+		this.filamentReach = approachAsymmetric(this.filamentReach, filamentReachTarget, 3, 5, dt);
 
 		const spectralLeanTarget = clamp(
-			spectralDirection * (0.35 + spectralMotion * 0.65),
+			spectralDirection * (0.07 + spectralMotion * 0.11)
+				+ (identityAir - identitySub) * 0.2
+				+ (this.gesture[0] - this.gesture[3]) * 0.1,
 			...MK2_CONDUCTOR_LIMITS.spectralLean
 		);
 		const spectralTravelRateTarget = clamp(
 			spectralDirection * (0.025 + spectralMotion * 0.13) +
-				this.rotationDirection * (0.004 + air * 0.006),
+				this.rotationDirection * (0.004 + identityAir * 0.018),
 			...MK2_CONDUCTOR_LIMITS.spectralTravelRate
 		);
-		this.spectralLean = approach(this.spectralLean, spectralLeanTarget, 0.42, dt);
+		this.spectralLean = approach(this.spectralLean, spectralLeanTarget, 3.6, dt);
 		this.spectralTravelRate = approach(
 			this.spectralTravelRate,
 			spectralTravelRateTarget,
-			0.68,
+			2.8,
 			dt
 		);
 		this.spectralTravelPhase =
@@ -1539,7 +1553,7 @@ export class Mk2Conductor {
 			profile.tension * 0.62 +
 				signalTension * 0.38 +
 				this.suspense * 0.12 +
-				Math.max(0, finite(spectrum.deltas?.presence)) * 0.025 -
+				this.stylePercussiveness * 0.018 -
 				releaseTarget * 0.05,
 			...MK2_CONDUCTOR_LIMITS.tension
 		);
@@ -1547,7 +1561,7 @@ export class Mk2Conductor {
 			profile.growth +
 				(signalOpenness - 0.5) * 0.035 +
 				(signalRelease - 0.4) * 0.035 +
-				(body - 0.4) * 0.018 -
+				(identityBody - 1 / BAND_IDENTITY_COUNT) * 0.05 -
 				this.suspense * 0.06 +
 				this.seedGrowth,
 			...MK2_CONDUCTOR_LIMITS.growth
@@ -1562,11 +1576,11 @@ export class Mk2Conductor {
 		);
 		const macroEnergyTarget = clamp(
 			profile.macroEnergy * 0.72 +
-				energy * 0.11 +
-				sectionEnergy * 0.07 +
-				signalMotion * 0.07 +
+				sectionEnergy * 0.1 +
+				this.styleRhythmicDensity * 0.08 +
+				this.stylePercussiveness * 0.04 +
 				releaseTarget * 0.06 +
-				body * 0.03 -
+				identityBody * 0.08 -
 				this.suspense * 0.025,
 			...MK2_CONDUCTOR_LIMITS.macroEnergy
 		);
@@ -1595,12 +1609,13 @@ export class Mk2Conductor {
 		);
 		this.impact = approachAsymmetric(this.impact, impactTarget, 0.018, 0.3, dt);
 
-		const directorMotion = clamp01(finite(frame.motion));
 		const motionBlend = clamp01(
-			profile.motion * 0.42 + signalMotion * 0.34 + directorMotion * 0.16 + spectralMotion * 0.08
+			profile.motion * 0.5 + this.styleRhythmicDensity * 0.28
+				+ this.styleSyncopation * 0.14 + this.stylePercussiveness * 0.08
 		);
 		const rotationMagnitudeTarget = clamp(
-			0.008 + motionBlend * 0.022 + tempo * 0.007 + mids * 0.005 + this.seedRotation,
+			0.008 + motionBlend * 0.018 + tempo * 0.006
+				+ this.styleRhythmicDensity * 0.006 + identityMids * 0.01 + this.seedRotation,
 			...MK2_CONDUCTOR_LIMITS.rotationRateMagnitude
 		);
 		const rotationRateTarget = this.rotationDirection * rotationMagnitudeTarget;
@@ -1613,10 +1628,11 @@ export class Mk2Conductor {
 
 		const cameraSpeedTarget = clamp(
 			profile.cameraSpeed +
-				(signalMotion - 0.5) * 0.0045 +
 				(signalTempo - 0.5) * 0.003 +
+				(this.styleRhythmicDensity - 0.5) * 0.004 +
+				(this.styleSyncopation - 0.5) * 0.0015 +
 				this.suspense * 0.004 +
-				spectralMotion * 0.002,
+				identityAir * 0.0015,
 			...MK2_CONDUCTOR_LIMITS.cameraSpeed
 		);
 		const cameraDistanceTarget = clamp(
@@ -1645,9 +1661,9 @@ export class Mk2Conductor {
 		const studyDraw = signedHash(phraseWord, 31) * 0.5 + 0.5;
 		const phraseStudyElection = smoothstep(0.72, 0.88, studyDraw);
 		const anatomicalDetail = clamp01(
-			presence * 0.24 +
-				air * 0.2 +
-				spectralMotion * 0.18 +
+			identityPresence * 0.42 +
+				identityAir * 0.36 +
+				this.styleRhythmicDensity * 0.12 +
 				this.surfaceRidges * 0.13 +
 				this.filamentReach * 0.11 +
 				this.windingForm * 0.06 +
@@ -1748,17 +1764,19 @@ export class Mk2Conductor {
 			...MK2_CONDUCTOR_LIMITS.topologyBias
 		);
 		const fogTarget = clamp(
-			profile.fogDensity + (macroEnergyTarget - 0.5) * 0.005 + bass * 0.003,
+			profile.fogDensity + (macroEnergyTarget - 0.5) * 0.005
+				+ (identitySub + identityKick) * 0.004,
 			...MK2_CONDUCTOR_LIMITS.fogDensity
 		);
 		const shaftTarget = clamp(
-			profile.shaftIntensity + releaseTarget * 0.025 + treble * 0.035,
+			profile.shaftIntensity + releaseTarget * 0.025
+				+ (identityPresence + identityAir) * 0.06,
 			...MK2_CONDUCTOR_LIMITS.shaftIntensity
 		);
 		const backgroundTarget = clamp(
 			profile.backgroundFlow +
-				(signalMotion - 0.5) * 0.002 +
-				spectralMotion * 0.003 +
+				(this.styleRhythmicDensity - 0.5) * 0.003 +
+				this.styleSyncopation * 0.0015 +
 				// Anticipation only adds forward speed. The integrated phase therefore
 				// foreshadows the next form without snapping backward on release.
 				this.suspense * 0.009,
@@ -1791,7 +1809,7 @@ export class Mk2Conductor {
 		const paletteWarmthTarget = clamp(
 			(clamp01(finite(frame.valence, 0.5)) - 0.5) * 1.05 +
 				modeBias * keyConfidence * 0.22 +
-				(centroid - 0.5) * 0.28 +
+				this.styleLowHighTilt * 0.14 +
 				this.bloomForm * 0.12 -
 				this.sheddingForm * 0.12,
 			...MK2_CONDUCTOR_LIMITS.paletteWarmth
@@ -1813,16 +1831,16 @@ export class Mk2Conductor {
 			0.06 +
 				this.bloomForm * 0.34 +
 				keyConfidence * 0.18 +
-				presence * 0.18 +
-				air * 0.18 +
+				identityPresence * 0.34 +
+				identityAir * 0.4 +
 				signalRelease * 0.08
 		);
 		const materialErosionTarget = clamp01(
 			0.02 +
 				this.sheddingForm * 0.72 +
 				this.cavityOpen * 0.14 +
-				positivePresence * 0.08 +
-				spectralMotion * 0.08
+				(1 - this.styleTonality) * 0.08 +
+				this.styleRhythmicDensity * 0.06
 		);
 		this.paletteWarmth = approach(this.paletteWarmth, paletteWarmthTarget, 2.9, dt);
 		this.materialDensity = approachAsymmetric(
