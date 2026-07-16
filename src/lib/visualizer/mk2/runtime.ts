@@ -12,6 +12,22 @@ export interface SomaQualityProfile {
 
 export const SOMA_MAX_PIXEL_RATIO = 1.5;
 
+/**
+ * Choose a whole-number display-vsync divisor for a quality target. Rendering
+ * 50 or 60 frames on a 143/144 Hz display with a millisecond budget produces
+ * an uneven 2/3-vsync cadence that reads as a repeated camera jolt. A divisor
+ * keeps every presented Soma frame evenly spaced; quality comes from resolution
+ * and raymarch work instead of deliberately irregular frame delivery.
+ */
+export function somaFrameStride(refreshIntervalMs: number, targetFrameRate: number): number {
+	const safeInterval = Number.isFinite(refreshIntervalMs)
+		? clamp(refreshIntervalMs, 1000 / 360, 1000 / 24)
+		: 1000 / 60;
+	const safeTarget = Number.isFinite(targetFrameRate) ? clamp(targetFrameRate, 15, 240) : 60;
+	const refreshRate = 1000 / safeInterval;
+	return Math.max(1, Math.min(8, Math.round(refreshRate / safeTarget + 1e-6)));
+}
+
 export const SOMA_QUALITY_PROFILES = {
 	eco: {
 		tier: 'eco',

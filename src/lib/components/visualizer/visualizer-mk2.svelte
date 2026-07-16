@@ -8,8 +8,8 @@
 	//     and phase-weighted key light, while the hero retains real soft shadow.
 	//     Atmosphere stays dimensional without nesting a shadow raymarch inside
 	//     every fog sample.
-	//   • One continuous seeded camera drift with no knots, segment resets, or
-	//     short advertised loop. The organism remains the subject, not the camera.
+	//   • Phrase-held seeded camera compositions with render-rate interpolation.
+	//     The organism evolves inside the shot; the camera never runs a turntable.
 	//   • Photographic 7-stop palette interpolated smoothly — golden hour /
 	//     dusk / deep space stops, never cosine RGB.
 	//   • AgX filmic tone map + stable dither for a clean post-processing
@@ -19,10 +19,10 @@
 	//   • sub/kick            → localized root pigment/material response
 	//   • body/mids           → axial growth, lobe splitting, winding and folds
 	//   • presence/air        → ridges, filaments, erosion and surface emission
-	//   • spectral direction  → signed anatomical lean and travelling deformation
+	//   • spectral direction  → fine surface/environment travel, never rigid-body lean
 	//   • section/phrase      → lifecycle plus reach / coil / divide / hollow / stillness
 	//   • harmony/key         → continuous palette and material development
-	//   • bpmNorm (slow)     → camera traversal speed multiplier
+	//   • bpmNorm (slow)     → long-form tissue development rate
 	//   • rms (slow)         → light shaft intensity
 	//   • onset (impulse)    → restrained root/surface impact only
 	//
@@ -35,12 +35,16 @@
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
-	import { mk2ContinuousPaletteBlend } from '$lib/visualizer/mk2/conductor';
+	import {
+		mk2ContinuousPaletteBlend,
+		type Mk2ConductorFrame
+	} from '$lib/visualizer/mk2/conductor';
 	import {
 		SOMA_QUALITY_PROFILES,
 		SomaAutoQualityController,
 		selectSomaQuality,
 		somaBackingSize,
+		somaFrameStride,
 		type SomaQualityProfile,
 		type SomaQualityTier
 	} from '$lib/visualizer/mk2/runtime';
@@ -65,6 +69,7 @@
 	let mk2SecondaryPaletteFamily = 2;
 	let rendererSourceEpoch = -1;
 	let rendererSyncRequested = true;
+	let poseSyncRequested = true;
 
 	// Mk2 borrows Signal's persistent song journey, then moves on deliberately
 	// slower rails. Only root punch and a restrained surface impact react quickly.
@@ -74,6 +79,8 @@
 	let currentGesture = $state('reach');
 	let qualityTier = $state<SomaQualityTier>('ultra');
 	let renderPixels = $state(0);
+	let renderStride = $state(1);
+	let measuredRefreshRate = $state(60);
 
 	function dominantLifecycleForm(journey: VisualizerJourneySnapshot['mk2']): string {
 		const forms = [
@@ -115,6 +122,125 @@
 
 	function lerp(a: number, b: number, t: number) {
 		return a + (b - a) * t;
+	}
+
+	// Analyzer events arrive at roughly 60 Hz and are not phase-locked to the
+	// display. Using their already-slow conductor values raw still creates a
+	// hold/jump/hold cadence on a 143/144 Hz panel. Interpolate every macro rail
+	// at render cadence, while advancing unbounded surface phases continuously.
+	const RENDER_POSE_KEYS = [
+		'growth',
+		'tension',
+		'openness',
+		'suspense',
+		'postureYaw',
+		'posturePitch',
+		'seedForm',
+		'sproutForm',
+		'windingForm',
+		'bloomForm',
+		'sheddingForm',
+		'dormancyForm',
+		'rootMass',
+		'axialStretch',
+		'lobeSplit',
+		'foldDepth',
+		'cavityOpen',
+		'surfaceRidges',
+		'filamentReach',
+		'spectralLean',
+		'morphRate',
+		'spectralTravelRate',
+		'backgroundFlow',
+		'palettePhase',
+		'paletteWarmth',
+		'materialDensity',
+		'materialIridescence',
+		'materialErosion',
+		'shotZoom',
+		'closeStudy',
+		'detailFocus',
+		'perspectiveAzimuth',
+		'perspectiveElevation',
+		'shotFramingX',
+		'shotFramingY',
+		'cameraDistance',
+		'fogDensity',
+		'shaftIntensity',
+		'environmentVoid',
+		'environmentCurrent',
+		'environmentCavern',
+		'environmentHorizon',
+		'environmentCellular',
+		'materialMembrane',
+		'materialMineral',
+		'materialVelvet',
+		'materialCrystal',
+		'topologyCocoon',
+		'topologySpire',
+		'topologyBilateral',
+		'topologyTorus',
+		'topologyCoral',
+		'topologyShell',
+		'cameraOrbit',
+		'cameraProfile',
+		'cameraOverhead',
+		'cameraLow',
+		'cameraMacro',
+		'gestureReach',
+		'gestureCoil',
+		'gestureDivide',
+		'gestureHollow',
+		'gestureStillness',
+		'styleRhythmicDensity',
+		'topologyBias',
+		'styleLowHighTilt',
+		'styleTonality'
+	] as const satisfies readonly (keyof Mk2ConductorFrame)[];
+	type RenderPoseKey = (typeof RENDER_POSE_KEYS)[number];
+	const renderPose = Object.fromEntries(RENDER_POSE_KEYS.map((key) => [key, 0])) as Record<
+		RenderPoseKey,
+		number
+	>;
+	const CAMERA_POSE_KEYS = new Set<RenderPoseKey>([
+		'shotZoom',
+		'closeStudy',
+		'detailFocus',
+		'perspectiveAzimuth',
+		'perspectiveElevation',
+		'shotFramingX',
+		'shotFramingY',
+		'cameraDistance',
+		'cameraOrbit',
+		'cameraProfile',
+		'cameraOverhead',
+		'cameraLow',
+		'cameraMacro'
+	]);
+	const renderPhases = {
+		backgroundFlowPhase: 0,
+		morphPhase: 0,
+		spectralTravelPhase: 0
+	};
+
+	function updateRenderPose(journey: Readonly<Mk2ConductorFrame>, dt: number) {
+		if (poseSyncRequested) {
+			for (const key of RENDER_POSE_KEYS) renderPose[key] = journey[key];
+			renderPhases.backgroundFlowPhase = journey.backgroundFlowPhase;
+			renderPhases.morphPhase = journey.morphPhase;
+			renderPhases.spectralTravelPhase = journey.spectralTravelPhase;
+			poseSyncRequested = false;
+			return renderPose;
+		}
+		for (const key of RENDER_POSE_KEYS) {
+			const tau = CAMERA_POSE_KEYS.has(key) ? 0.2 : 0.13;
+			const smoothing = 1 - Math.exp(-dt / tau);
+			renderPose[key] = lerp(renderPose[key], journey[key], smoothing);
+		}
+		renderPhases.backgroundFlowPhase += renderPose.backgroundFlow * dt;
+		renderPhases.morphPhase += renderPose.morphRate * dt;
+		renderPhases.spectralTravelPhase += renderPose.spectralTravelRate * dt;
+		return renderPose;
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
@@ -181,6 +307,7 @@
 		mk2SecondaryPaletteFamily = (primaryFamily + familyStep) % 8;
 		currentSection = snapshot.director.section;
 		rendererSyncRequested = true;
+		poseSyncRequested = true;
 		temporalResetRequested = true;
 		resetFrameScheduler();
 	}
@@ -602,10 +729,16 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
 		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
 		+ (coil - divide) * 0.42 + (reach - hollow) * 0.31;
+	// A long-form local deformation clock changes anatomy from within. Its
+	// incommensurate, very low rates never rotate, translate, or scale the rigid
+	// subject; they only let different tissue regions grow and relax over minutes.
+	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
 	let drift = vec3<f32>(
-		sin(q.y * 1.05 + poseIdentity) * 0.045 + cos(q.z * 0.73 - poseIdentity * 0.61) * 0.030,
-		sin(q.x * 0.82 - poseIdentity * 0.43) * 0.032,
-		cos(q.x * 0.92 + poseIdentity * 0.79) * 0.045 + sin(q.y * 0.71 + poseIdentity * 0.53) * 0.030
+		sin(q.y * 1.05 + poseIdentity + evolutionPhase * 0.37) * 0.045
+			+ cos(q.z * 0.73 - poseIdentity * 0.61 - evolutionPhase * 0.19) * 0.030,
+		sin(q.x * 0.82 - poseIdentity * 0.43 + evolutionPhase * 0.23) * 0.032,
+		cos(q.x * 0.92 + poseIdentity * 0.79 + evolutionPhase * 0.31) * 0.045
+			+ sin(q.y * 0.71 + poseIdentity * 0.53 - evolutionPhase * 0.17) * 0.030
 	);
 	q = q + drift * (
 		0.22 + growth * 0.22 + u.sproutForm * 0.18 + u.sheddingForm * 0.15
@@ -628,6 +761,18 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	q.y = q.y / stretchY;
 	q.z = q.z / stretchZ;
 
+	// Tissue migrates between upper/lower and near/far regions instead of the
+	// entire organism breathing as one sphere. This produces obvious growth over
+	// a musical passage while keeping the centroid and total scale essentially
+	// stable—expansion in one anatomical region is balanced by contraction in another.
+	let migration = sin(q.y * 1.36 + evolutionPhase * 0.73 + poseIdentity * 0.31);
+	let migrationStrength = (0.035 + growth * 0.038 + reach * 0.025 + divide * 0.03)
+		* (1.0 - stillness * 0.68);
+	q.x = q.x / max(0.82, 1.0 + migration * migrationStrength);
+	q.z = q.z / max(0.84, 1.0 - migration * migrationStrength * 0.78);
+	q.y = q.y + sin(q.x * 1.24 - evolutionPhase * 0.39 + poseIdentity)
+		* migrationStrength * 0.18;
+
 	// Sprout grows as one visibly biased shoot instead of a uniformly stretched
 	// orb. Winding then pulls the cross-section inward before applying its twist;
 	// bloom releases that stored pressure laterally, while dormancy settles flat.
@@ -636,7 +781,7 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 	let growthIdentity = poseIdentity;
 	let growthLeanX = sin(growthIdentity);
 	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
-	let sproutCurve = sin(q.y * 1.18 + poseIdentity * 0.23) * sproutBend
+	let sproutCurve = sin(q.y * 1.18 + poseIdentity * 0.23 + evolutionPhase * 0.29) * sproutBend
 		+ q.y * q.y * u.sproutForm * 0.045;
 	q.x = q.x - sproutCurve * growthLeanX;
 	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
@@ -668,15 +813,21 @@ fn organismWarp(p: vec3<f32>) -> vec3<f32> {
 		0.16 + tension * 0.32 + u.windingForm * 1.08 + u.foldDepth * 0.62
 			+ coil * 1.24 + shell * 0.74
 	)
-		+ sin(q.z * 1.52 + poseIdentity * 1.09) * (0.045 + u.foldDepth * 0.16)
+		+ sin(q.z * 1.52 + poseIdentity * 1.09 + evolutionPhase * 0.41)
+			* (0.045 + u.foldDepth * 0.16)
 		+ u.chromaX * chromaPull * 0.045;
 	let rxz = rot2(q.xz, twist);
 	q.x = rxz.x;
 	q.z = rxz.y;
-	let rxy = rot2(q.xy, sin(q.z * 0.96 + poseIdentity * 0.67) * (0.035 + u.foldDepth * 0.14));
+	let rxy = rot2(
+		q.xy,
+		sin(q.z * 0.96 + poseIdentity * 0.67 - evolutionPhase * 0.27)
+			* (0.035 + u.foldDepth * 0.14)
+	);
 	q.x = rxy.x;
 	q.y = rxy.y;
-	q.y = q.y + sin(q.x * 1.75 + poseIdentity * 0.59) * (0.022 + u.foldDepth * 0.075);
+	q.y = q.y + sin(q.x * 1.75 + poseIdentity * 0.59 + evolutionPhase * 0.21)
+		* (0.022 + u.foldDepth * 0.075);
 	return q;
 }
 
@@ -698,6 +849,7 @@ fn map(p: vec3<f32>) -> f32 {
 		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
 		+ (coilGesture - divideGesture) * 0.42
 		+ (reachGesture - hollowGesture) * 0.31;
+	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
 	// Cheap conservative scene bound. All lifecycle appendages and shed fragments
 	// remain within this envelope, so empty screen rays avoid the fractal entirely.
 	let outerBound = length(p) - 1.95;
@@ -823,7 +975,8 @@ fn map(p: vec3<f32>) -> f32 {
 		let travelTurn = u.postureYaw * (0.92 + f32(i) * 0.08)
 			+ u.posturePitch * 0.54 * lanePolarity
 			+ (coilGesture - divideGesture) * (0.22 + f32(i) * 0.025)
-			+ u.paletteFamily * 0.17 * lanePolarity;
+			+ u.paletteFamily * 0.17 * lanePolarity
+			+ evolutionPhase * (0.085 + f32(i) * 0.009) * lanePolarity;
 		let turned = rot2(direction.xz, travelTurn);
 		direction.x = turned.x;
 		direction.z = turned.y;
@@ -1942,15 +2095,30 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let qualityProfile: SomaQualityProfile = SOMA_QUALITY_PROFILES.ultra;
 	const autoQuality = new SomaAutoQualityController(qualityProfile.tier);
 	let autoQualityCeiling: SomaQualityTier | null = null;
-	let targetFrameMs = 1000 / qualityProfile.frameRate;
 	let schedulerTickAt = 0;
-	let renderBudgetMs = targetFrameMs;
+	let refreshIntervalMs = 1000 / 60;
+	let activeFrameStride = 1;
+	let framesUntilRender = 0;
 	let lastRenderedAt = 0;
 
 	function resetFrameScheduler() {
 		schedulerTickAt = 0;
-		renderBudgetMs = targetFrameMs;
+		framesUntilRender = 0;
 		lastRenderedAt = 0;
+	}
+
+	function observeDisplayCadence(tickElapsedMs: number) {
+		if (tickElapsedMs < 1000 / 360 || tickElapsedMs > 1000 / 24) return;
+		// Converge quickly downward when discovering a high-refresh panel, then
+		// ignore obvious multi-vsync hitches so one missed RAF cannot halve the
+		// estimated refresh rate and reshuffle the presentation cadence.
+		if (tickElapsedMs < refreshIntervalMs * 0.8) {
+			refreshIntervalMs = lerp(refreshIntervalMs, tickElapsedMs, 0.38);
+		} else if (tickElapsedMs <= refreshIntervalMs * 1.35) {
+			refreshIntervalMs = lerp(refreshIntervalMs, tickElapsedMs, 0.08);
+		}
+		const nextRefreshRate = Math.round(1000 / refreshIntervalMs);
+		if (nextRefreshRate !== measuredRefreshRate) measuredRefreshRate = nextRefreshRate;
 	}
 
 	function updateQualityProfile(elapsedMs: number | null): SomaQualityProfile {
@@ -1983,7 +2151,6 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		if (active.tier !== qualityProfile.tier) {
 			qualityProfile = active;
 			qualityTier = active.tier;
-			targetFrameMs = 1000 / active.frameRate;
 			resetFrameScheduler();
 			temporalResetRequested = true;
 		}
@@ -2305,21 +2472,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		if (!schedulerTickAt) {
 			schedulerTickAt = frameNow;
-			renderBudgetMs = targetFrameMs;
 		} else {
 			const tickElapsed = Math.max(0, frameNow - schedulerTickAt);
 			schedulerTickAt = frameNow;
-			// Accumulate refresh intervals instead of phase-adjusting the previous
-			// render timestamp. Keep only a small catch-up budget so a stalled or
-			// backgrounded window renders one current frame, never an obsolete burst.
-			renderBudgetMs = Math.min(targetFrameMs * 4, renderBudgetMs + tickElapsed);
+			observeDisplayCadence(tickElapsed);
 		}
-		if (renderBudgetMs + 0.25 < targetFrameMs) return;
-		// Carry fractional refresh time forward. Subtract first to avoid a value
-		// microscopically below one interval wrapping to an almost-full budget.
-		let remainderMs = renderBudgetMs - targetFrameMs;
-		if (remainderMs >= targetFrameMs) remainderMs %= targetFrameMs;
-		renderBudgetMs = Math.max(0, remainderMs);
+		const nextFrameStride = somaFrameStride(refreshIntervalMs, qualityProfile.frameRate);
+		if (nextFrameStride !== activeFrameStride) {
+			activeFrameStride = nextFrameStride;
+			renderStride = nextFrameStride;
+			framesUntilRender = 0;
+		}
+		if (framesUntilRender > 0) {
+			framesUntilRender--;
+			return;
+		}
+		framesUntilRender = activeFrameStride - 1;
 
 		// This is the actual time between rendered frames, independent of the
 		// scheduler's fractional budget, so smoothing remains time-correct on
@@ -2327,7 +2495,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const hadPreviousRender = lastRenderedAt !== 0;
 		const elapsedMs = hadPreviousRender
 			? Math.max(0, frameNow - lastRenderedAt)
-			: targetFrameMs;
+			: refreshIntervalMs * activeFrameStride;
 		lastRenderedAt = frameNow;
 		const frameDt = Math.min(1, Math.max(0.001, elapsedMs / 1000));
 
@@ -2377,6 +2545,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const spectrum = shared.spectrum;
 		const signalJourney = shared.signal;
 		const journey = shared.mk2;
+		const pose = updateRenderPose(journey, frameDt);
 		currentSection = directed.section;
 		currentForm = dominantLifecycleForm(journey);
 		currentGesture = dominantGesture(journey);
@@ -2408,7 +2577,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.bpmNormSlow = signalJourney.tempo;
 			smoothed.flash = 0;
 			smoothed.staccato = 0;
-			smoothed.sustain = journey.openness;
+			smoothed.sustain = pose.openness;
 			smoothed.chromaXSlow = Math.cos(chromaAngle);
 			smoothed.chromaYSlow = Math.sin(chromaAngle);
 			smoothed.paletteXSlow = paletteXTarget;
@@ -2427,7 +2596,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.bpmNormSlow = lerp(smoothed.bpmNormSlow, signalJourney.tempo, alpha(0.02));
 			smoothed.flash = lerp(smoothed.flash, journey.impact, alpha(0.32));
 			smoothed.staccato = lerp(smoothed.staccato, journey.impact, alpha(0.38));
-			smoothed.sustain = lerp(smoothed.sustain, journey.openness, alpha(0.035));
+			smoothed.sustain = lerp(smoothed.sustain, pose.openness, alpha(0.035));
 			smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.025));
 			smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.025));
 			const paletteX = lerp(smoothed.paletteXSlow, paletteXTarget, alpha(0.0045));
@@ -2448,18 +2617,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			smoothed.responseShafts = lerp(smoothed.responseShafts, responseShaftsTarget, alpha(0.04));
 		}
 
-		const growth = journey.growth;
-		const tension = journey.tension;
+		const growth = pose.growth;
+		const tension = pose.tension;
 		const mandelbulbPower = Math.max(
 			6.15,
 			Math.min(
 				8.45,
 				7.05 +
-					journey.topologyBias * 1.15 +
-					journey.styleLowHighTilt * 0.38 +
-					(journey.styleTonality - 0.5) * 0.24 +
-					(journey.materialMineral - journey.materialMembrane) * 0.22 +
-					(journey.gestureCoil - journey.gestureDivide) * 0.18
+					pose.topologyBias * 1.15 +
+					pose.styleLowHighTilt * 0.38 +
+					(pose.styleTonality - 0.5) * 0.24 +
+					(pose.materialMineral - pose.materialMembrane) * 0.22 +
+					(pose.gestureCoil - pose.gestureDivide) * 0.18
 			)
 		);
 		const paletteOffset =
@@ -2472,7 +2641,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				0.3,
 				0.055 +
 					Math.abs(hueDelta) * 0.16 +
-					journey.materialIridescence * 0.12 +
+					pose.materialIridescence * 0.12 +
 					directed.context.keyConfidence * 0.055
 			)
 		);
@@ -2480,22 +2649,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const responseImpact = smoothed.responseImpact;
 		const fogDensity = Math.max(
 			0.032,
-			Math.min(0.088, journey.fogDensity * smoothed.responseFog)
+			Math.min(0.088, pose.fogDensity * smoothed.responseFog)
 		);
 		const lightShaftIntensity = Math.max(
 			0.18,
-			Math.min(0.8, journey.shaftIntensity * smoothed.responseShafts)
+			Math.min(0.8, pose.shaftIntensity * smoothed.responseShafts)
 		);
-		const responseShotZoom = 1 + (journey.shotZoom - 1) * responseMotion;
+		const responseShotZoom = 1 + (pose.shotZoom - 1) * responseMotion;
 		const shotZoom = Math.max(0.9, Math.min(1.72, responseShotZoom));
-		const closeStudy = Math.max(0, Math.min(1, journey.closeStudy * responseMotion));
-		const detailFocus = Math.max(0, Math.min(1, journey.detailFocus * responseMotion));
+		const closeStudy = Math.max(0, Math.min(1, pose.closeStudy * responseMotion));
+		const detailFocus = Math.max(0, Math.min(1, pose.detailFocus * responseMotion));
 		const zoomDelta = shotZoom - 1;
-		let cameraOrbit = Math.pow(Math.max(0, journey.cameraOrbit), 1.75);
-		let cameraProfile = Math.pow(Math.max(0, journey.cameraProfile), 1.75);
-		let cameraOverhead = Math.pow(Math.max(0, journey.cameraOverhead), 1.75);
-		let cameraLow = Math.pow(Math.max(0, journey.cameraLow), 1.75);
-		let cameraMacro = Math.pow(Math.max(0, journey.cameraMacro), 1.75);
+		let cameraOrbit = Math.pow(Math.max(0, pose.cameraOrbit), 1.75);
+		let cameraProfile = Math.pow(Math.max(0, pose.cameraProfile), 1.75);
+		let cameraOverhead = Math.pow(Math.max(0, pose.cameraOverhead), 1.75);
+		let cameraLow = Math.pow(Math.max(0, pose.cameraLow), 1.75);
+		let cameraMacro = Math.pow(Math.max(0, pose.cameraMacro), 1.75);
 		const cameraWeightSum = Math.max(
 			0.0001,
 			cameraOrbit + cameraProfile + cameraOverhead + cameraLow + cameraMacro
@@ -2523,7 +2692,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const requestedFovScale =
 			(shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
 		const subjectExtent =
-			1 + journey.axialStretch * 0.28 + journey.filamentReach * 0.09 + journey.lobeSplit * 0.07;
+			1 + pose.axialStretch * 0.28 + pose.filamentReach * 0.09 + pose.lobeSplit * 0.07;
 		const fovScale =
 			requestedFovScale /
 			(1 + (subjectExtent - 1) * (1 - intentionalMacro * 0.72));
@@ -2533,19 +2702,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const sessionTargetY =
 			-0.08 +
 			(mk2SongSeed - 0.5) * 0.1 +
-			journey.axialStretch * 0.14 -
-			journey.lobeSplit * 0.025;
+			pose.axialStretch * 0.14 -
+			pose.lobeSplit * 0.025;
 		const sessionRoll = (mk2SongSeed - 0.5) * 0.14;
 		const camPosRaw = getCameraPos(
-			journey.perspectiveAzimuth,
-			journey.perspectiveElevation,
+			pose.perspectiveAzimuth,
+			pose.perspectiveElevation,
 			cameraOrbit,
 			cameraProfile,
 			cameraOverhead,
 			cameraLow,
 			cameraMacro
 		);
-		const cameraScale = journey.cameraDistance * dollyScale;
+		const cameraScale = pose.cameraDistance * dollyScale;
 		const camPos: [number, number, number] = [
 			camPosRaw[0] * cameraScale,
 			camPosRaw[1] * cameraScale,
@@ -2559,9 +2728,9 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const framingRightZ = -camPos[0] / horizontalLength;
 		const framingScale = 1 - closeStudy * 0.34;
 		const camTarget: [number, number, number] = [
-			framingRightX * journey.shotFramingX * framingScale,
-			sessionTargetY + journey.shotFramingY * framingScale,
-			framingRightZ * journey.shotFramingX * framingScale
+			framingRightX * pose.shotFramingX * framingScale,
+			sessionTargetY + pose.shotFramingY * framingScale,
+			framingRightZ * pose.shotFramingX * framingScale
 		];
 		const fwd: [number, number, number] = [
 			camTarget[0] - camPos[0],
@@ -2641,66 +2810,66 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[34] = smoothed.sustain;
 		// Reserved legacy slot. Whole-subject clock rotation is intentionally disabled.
 		u[35] = 0;
-		u[36] = journey.backgroundFlowPhase;
-		u[37] = journey.postureYaw;
-		u[38] = journey.posturePitch;
-		u[39] = journey.suspense;
-		u[40] = journey.seedForm;
-		u[41] = journey.sproutForm;
-		u[42] = journey.windingForm;
-		u[43] = journey.bloomForm;
-		u[44] = journey.sheddingForm;
-		u[45] = journey.dormancyForm;
-		u[46] = journey.morphPhase;
-		u[47] = journey.morphRate;
-		u[48] = journey.rootMass;
+		u[36] = renderPhases.backgroundFlowPhase;
+		u[37] = pose.postureYaw;
+		u[38] = pose.posturePitch;
+		u[39] = pose.suspense;
+		u[40] = pose.seedForm;
+		u[41] = pose.sproutForm;
+		u[42] = pose.windingForm;
+		u[43] = pose.bloomForm;
+		u[44] = pose.sheddingForm;
+		u[45] = pose.dormancyForm;
+		u[46] = renderPhases.morphPhase;
+		u[47] = pose.morphRate;
+		u[48] = pose.rootMass;
 		u[49] = Math.min(1, journey.rootPulse * responseImpact * 0.55);
-		u[50] = journey.axialStretch;
-		u[51] = journey.lobeSplit;
-		u[52] = journey.foldDepth;
-		u[53] = journey.cavityOpen;
-		u[54] = journey.surfaceRidges;
-		u[55] = journey.filamentReach;
-		u[56] = journey.spectralLean;
-		u[57] = journey.spectralTravelPhase;
-		u[58] = journey.spectralTravelRate;
-		u[59] = journey.palettePhase;
-		u[60] = journey.paletteWarmth;
-		u[61] = journey.materialDensity;
-		u[62] = journey.materialIridescence;
-		u[63] = journey.materialErosion;
+		u[50] = pose.axialStretch;
+		u[51] = pose.lobeSplit;
+		u[52] = pose.foldDepth;
+		u[53] = pose.cavityOpen;
+		u[54] = pose.surfaceRidges;
+		u[55] = pose.filamentReach;
+		u[56] = pose.spectralLean;
+		u[57] = renderPhases.spectralTravelPhase;
+		u[58] = pose.spectralTravelRate;
+		u[59] = pose.palettePhase;
+		u[60] = pose.paletteWarmth;
+		u[61] = pose.materialDensity;
+		u[62] = pose.materialIridescence;
+		u[63] = pose.materialErosion;
 		u[64] = shotZoom;
 		u[65] = closeStudy;
 		u[66] = detailFocus;
-		u[67] = journey.perspectiveAzimuth;
-		u[68] = journey.perspectiveElevation;
-		u[69] = journey.shotFramingX;
-		u[70] = journey.shotFramingY;
+		u[67] = pose.perspectiveAzimuth;
+		u[68] = pose.perspectiveElevation;
+		u[69] = pose.shotFramingX;
+		u[70] = pose.shotFramingY;
 		u[71] = qualityProfile.raymarchSteps;
-		u[72] = journey.environmentVoid;
-		u[73] = journey.environmentCurrent;
-		u[74] = journey.environmentCavern;
-		u[75] = journey.environmentHorizon;
-		u[76] = journey.environmentCellular;
-		u[77] = journey.materialMembrane;
-		u[78] = journey.materialMineral;
-		u[79] = journey.materialVelvet;
-		u[80] = journey.materialCrystal;
+		u[72] = pose.environmentVoid;
+		u[73] = pose.environmentCurrent;
+		u[74] = pose.environmentCavern;
+		u[75] = pose.environmentHorizon;
+		u[76] = pose.environmentCellular;
+		u[77] = pose.materialMembrane;
+		u[78] = pose.materialMineral;
+		u[79] = pose.materialVelvet;
+		u[80] = pose.materialCrystal;
 		u[81] = paletteFamilyB;
 		u[82] = paletteFamilyBlend;
 		u[83] = 0;
-		u[84] = journey.topologyCocoon;
-		u[85] = journey.topologySpire;
-		u[86] = journey.topologyBilateral;
-		u[87] = journey.topologyTorus;
-		u[88] = journey.topologyCoral;
-		u[89] = journey.topologyShell;
-		u[90] = journey.gestureReach;
-		u[91] = journey.gestureCoil;
-		u[92] = journey.gestureDivide;
-		u[93] = journey.gestureHollow;
-		u[94] = journey.gestureStillness;
-		u[95] = journey.styleRhythmicDensity;
+		u[84] = pose.topologyCocoon;
+		u[85] = pose.topologySpire;
+		u[86] = pose.topologyBilateral;
+		u[87] = pose.topologyTorus;
+		u[88] = pose.topologyCoral;
+		u[89] = pose.topologyShell;
+		u[90] = pose.gestureReach;
+		u[91] = pose.gestureCoil;
+		u[92] = pose.gestureDivide;
+		u[93] = pose.gestureHollow;
+		u[94] = pose.gestureStillness;
+		u[95] = pose.styleRhythmicDensity;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Upload decoded, baseline-relative detail. Static hiss and compressed
@@ -2942,6 +3111,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			data-soma-render-pixels={renderPixels}
 			data-soma-max-pixels={SOMA_QUALITY_PROFILES[qualityTier].maxPixels}
 			data-soma-frame-rate={SOMA_QUALITY_PROFILES[qualityTier].frameRate}
+			data-soma-frame-stride={renderStride}
+			data-soma-refresh-rate={measuredRefreshRate}
 			data-soma-raymarch-steps={SOMA_QUALITY_PROFILES[qualityTier].raymarchSteps}
 		></canvas>
 		{#if errorMsg}

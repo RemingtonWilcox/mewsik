@@ -65,6 +65,33 @@ test.describe('Soma render runtime', () => {
 		expect(result.balanced.steps).toBeLessThan(result.ultra.steps);
 	});
 
+	test('paces Soma on whole display-vsync divisors instead of a repeating skip cadence', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/mk2/runtime.ts';
+			const { somaFrameStride } = await import(modulePath);
+			return {
+				hz143: {
+					ultra: somaFrameStride(1000 / 143, 60),
+					balanced: somaFrameStride(1000 / 143, 50),
+					eco: somaFrameStride(1000 / 143, 40)
+				},
+				hz60: {
+					ultra: somaFrameStride(1000 / 60, 60),
+					balanced: somaFrameStride(1000 / 60, 50),
+					eco: somaFrameStride(1000 / 60, 40)
+				}
+			};
+		});
+
+		expect(result).toEqual({
+			hz143: { ultra: 2, balanced: 3, eco: 4 },
+			hz60: { ultra: 1, balanced: 1, eco: 2 }
+		});
+	});
+
 	test('preserves aspect ratio at ordinary and high-DPI viewport sizes', async ({ page }) => {
 		await page.goto('/');
 		const result = await page.evaluate(async () => {
@@ -178,7 +205,7 @@ test.describe('Soma render runtime', () => {
 		});
 	});
 
-	test('keeps autonomous clocks out of Soma geometry and camera composition', async ({
+	test('keeps autonomous clocks out of rigid camera composition while retaining local evolution', async ({
 		page
 	}) => {
 		await page.goto('/');
@@ -197,8 +224,7 @@ test.describe('Soma render runtime', () => {
 
 		expect(camera).not.toContain('cameraPhase');
 		expect(camera).not.toContain('journey.cameraPhase');
-		expect(geometry).not.toContain('u.morphPhase');
-		expect(geometry).not.toContain('u.spectralTravelPhase');
+		expect(geometry).toContain('let evolutionPhase');
 		expect(geometry).not.toContain('u.backgroundPhase');
 		expect(geometry).not.toContain('u.journeyPhase');
 	});

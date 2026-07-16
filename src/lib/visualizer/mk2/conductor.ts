@@ -1179,17 +1179,17 @@ export class Mk2Conductor {
 		// the 1 -> 0 wrap in live/radio mode.
 		if (phraseIndex !== this.plannedPhraseIndex) {
 			this.plannedPhraseIndex = phraseIndex;
-			fillPhraseBias(this.topologyPhraseBias, this.seedWord, phraseIndex, 0x243f6a88, 0.14);
-			fillPhraseBias(this.cameraPhraseBias, this.seedWord, phraseIndex, 0x85a308d3, 0.14);
+			fillPhraseBias(this.topologyPhraseBias, this.seedWord, phraseIndex, 0x243f6a88, 0.22);
+			fillPhraseBias(this.cameraPhraseBias, this.seedWord, phraseIndex, 0x85a308d3, 0.17);
 			fillPhraseBias(
 				this.environmentPhraseBias,
 				this.seedWord,
 				phraseIndex,
 				0x13198a2e,
-				0.13
+				0.18
 			);
-			fillPhraseBias(this.materialPhraseBias, this.seedWord, phraseIndex, 0xa4093822, 0.14);
-			fillPhraseBias(this.gesturePhraseBias, this.seedWord, phraseIndex, 0x299f31d0, 0.24);
+			fillPhraseBias(this.materialPhraseBias, this.seedWord, phraseIndex, 0xa4093822, 0.2);
+			fillPhraseBias(this.gesturePhraseBias, this.seedWord, phraseIndex, 0x299f31d0, 0.4);
 		}
 		const sectionGrammar = GRAMMAR_SECTION_MODIFIERS[sectionName];
 		const brightStyle = clamp01((this.styleLowHighTilt + 1) * 0.5);
@@ -1365,7 +1365,7 @@ export class Mk2Conductor {
 		// above supplies ongoing evolution without reversing at a clock wrap.
 		const lifecycleProgress =
 			context?.source === 'score' ? smoothstep(0.02, 0.98, sectionProgress) : 1;
-		const lifecycleMutation = context?.source === 'score' ? 0 : 0.48;
+		const lifecycleMutation = context?.source === 'score' ? 0 : 0.68;
 		const baseSeed = mix(lifecycleArc.start[0], lifecycleArc.end[0], lifecycleProgress);
 		const baseSprout = mix(lifecycleArc.start[1], lifecycleArc.end[1], lifecycleProgress);
 		const baseWinding = mix(lifecycleArc.start[2], lifecycleArc.end[2], lifecycleProgress);
@@ -1877,12 +1877,12 @@ export class Mk2Conductor {
 		const phraseYaw = signedHash(phraseWord, 11);
 		const phrasePitch = signedHash(phraseWord, 17);
 		const postureYawTarget = clamp(
-			phraseYaw * (0.085 + this.gesture[1] * 0.055) +
+			phraseYaw * (0.11 + this.gesture[1] * 0.065) +
 				(this.gesture[1] - this.gesture[2]) * 0.045,
 			...MK2_CONDUCTOR_LIMITS.postureYaw
 		);
 		const posturePitchTarget = clamp(
-			phrasePitch * (0.072 + this.gesture[0] * 0.035) +
+			phrasePitch * (0.09 + this.gesture[0] * 0.045) +
 				modeBias * keyConfidence * 0.018 +
 				(this.gesture[0] - this.gesture[4]) * 0.035,
 			...MK2_CONDUCTOR_LIMITS.posturePitch
