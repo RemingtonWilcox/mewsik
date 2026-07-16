@@ -7,6 +7,7 @@
 	} from '$lib/state/visualizer.svelte';
 	import {
 		LOOM_COMPOSITE_WGSL,
+		LOOM_INSTANCES,
 		LOOM_SCENE_WGSL,
 		LOOM_STRANDS,
 		LOOM_VERTEX_COUNT
@@ -17,7 +18,7 @@
 	const UNIFORM_FLOATS = 52;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 	const DETAIL_BYTES = 64 * 4;
-	const FRAME_INTERVAL_MS = 1000 / 60;
+	const TARGET_FRAME_RATE = 60;
 	const INTERNAL_SCALE = 0.78;
 	const MAX_INTERNAL_PIXELS = 1600 * 900;
 
@@ -33,13 +34,21 @@
 	let initVersion = 0;
 	let initializing = false;
 	let schedulerTickAt = 0;
-	let renderBudgetMs = FRAME_INTERVAL_MS;
+	let refreshIntervalMs = 1000 / 60;
+	let activeFrameStride = $state(1);
+	let framesUntilRender = 0;
+	let measuredRefreshRate = $state(60);
 	let lastRenderedAt = 0;
 	let startTime = 0;
 	let rendererSourceEpoch = -1;
 	let rms = 0;
+	let renderCentroid = 0;
+	let renderSpectralMotion = 0;
+	let renderSectionEnergy = 0;
 	let silence = 1;
 	let quietFor = 0;
+	let poseSyncRequested = true;
+	const renderDetailBins = new Float32Array(64);
 
 	type LoomTargets = {
 		scene: GPUTexture;
@@ -67,12 +76,133 @@
 
 	let gpu: LoomGpu | null = null;
 
+	type LoomFrame = VisualizerJourneySnapshot['loom'];
+	const LOOM_POSE_KEYS = [
+		'tension',
+		'release',
+		'openness',
+		'dropOpenness',
+		'braid',
+		'twist',
+		'depth',
+		'impact',
+		'reweave',
+		'sectionPulse',
+		'signedAsymmetry',
+		'motion',
+		'macroEnergy',
+		'phraseVariation',
+		'tempo',
+		'key',
+		'mode',
+		'crossingOrder',
+		'harmonicSpread',
+		'spectralLean',
+		'topologyRate',
+		'weaveRate',
+		'longRate',
+		'cameraYaw',
+		'cameraPitch',
+		'cameraDistance',
+		'cameraRoll'
+	] as const satisfies readonly (keyof LoomFrame)[];
+	type LoomPoseKey = (typeof LOOM_POSE_KEYS)[number];
+	const renderPose = Object.fromEntries(LOOM_POSE_KEYS.map((key) => [key, 0])) as Record<
+		LoomPoseKey,
+		number
+	>;
+	const renderTopology = { torus: 1, helix: 0, saddle: 0, knot: 0, cage: 0 };
+	const renderBands = { sub: 0, kick: 0, body: 0, mids: 0, presence: 0, air: 0 };
+	const renderPalette = { baseHue: 0, accentHue: 0, rimHue: 0, saturation: 0 };
+	const renderPhases = { topology: 0, weave: 0, long: 0, signalTravel: 0 };
+	const CAMERA_KEYS = new Set<LoomPoseKey>([
+		'cameraYaw',
+		'cameraPitch',
+		'cameraDistance',
+		'cameraRoll'
+	]);
+	const TRANSIENT_KEYS = new Set<LoomPoseKey>(['impact', 'reweave', 'sectionPulse']);
+	const TOPOLOGY_KEYS = ['torus', 'helix', 'saddle', 'knot', 'cage'] as const;
+	const BAND_KEYS = ['sub', 'kick', 'body', 'mids', 'presence', 'air'] as const;
+
 	function clamp(value: number, min: number, max: number) {
 		return Math.min(max, Math.max(min, value));
 	}
 
 	function approach(current: number, target: number, rate: number, dt: number) {
 		return current + (target - current) * (1 - Math.exp(-rate * dt));
+	}
+
+	function approachHue(current: number, target: number, rate: number, dt: number) {
+		const delta = ((((target - current + 0.5) % 1) + 1) % 1) - 0.5;
+		return ((current + delta * (1 - Math.exp(-rate * dt))) % 1 + 1) % 1;
+	}
+
+	function displayFrameStride(refreshMs: number, targetFrameRate: number) {
+		const safeRefresh = clamp(refreshMs, 1000 / 360, 1000 / 24);
+		return Math.max(1, Math.min(8, Math.round(1000 / safeRefresh / targetFrameRate)));
+	}
+
+	function observeDisplayCadence(tickElapsedMs: number) {
+		if (tickElapsedMs < 1000 / 360 || tickElapsedMs > 1000 / 24) return;
+		if (tickElapsedMs < refreshIntervalMs * 0.8) {
+			refreshIntervalMs += (tickElapsedMs - refreshIntervalMs) * 0.38;
+		} else if (tickElapsedMs <= refreshIntervalMs * 1.35) {
+			refreshIntervalMs += (tickElapsedMs - refreshIntervalMs) * 0.08;
+		}
+		measuredRefreshRate = Math.round(1000 / refreshIntervalMs);
+	}
+
+	function syncRenderPose(
+		loom: Readonly<LoomFrame>,
+		palette: VisualizerJourneySnapshot['director']['palette']
+	) {
+		for (const key of LOOM_POSE_KEYS) renderPose[key] = loom[key];
+		for (const key of TOPOLOGY_KEYS) renderTopology[key] = loom.topologyWeights[key];
+		for (const key of BAND_KEYS) renderBands[key] = loom.strandEnergy[key];
+		renderPalette.baseHue = palette.baseHue;
+		renderPalette.accentHue = palette.accentHue;
+		renderPalette.rimHue = palette.rimHue;
+		renderPalette.saturation = palette.saturation;
+		renderPhases.topology = loom.topologyPhase;
+		renderPhases.weave = loom.weavePhase;
+		renderPhases.long = loom.longPhase;
+		renderPhases.signalTravel = loom.phraseVariation;
+		poseSyncRequested = false;
+	}
+
+	function updateRenderPose(
+		loom: Readonly<LoomFrame>,
+		palette: VisualizerJourneySnapshot['director']['palette'],
+		dt: number
+	) {
+		if (poseSyncRequested) syncRenderPose(loom, palette);
+		else {
+			for (const key of LOOM_POSE_KEYS) {
+				const tau = CAMERA_KEYS.has(key) ? 0.24 : TRANSIENT_KEYS.has(key) ? 0.045 : 0.13;
+				const rate = 1 / tau;
+				if (key === 'key') renderPose[key] = approachHue(renderPose[key], loom[key], rate, dt);
+				else renderPose[key] = approach(renderPose[key], loom[key], rate, dt);
+			}
+			const topologyMix = 1 - Math.exp(-dt / 0.18);
+			const bandMix = 1 - Math.exp(-dt / 0.055);
+			for (const key of TOPOLOGY_KEYS) {
+				renderTopology[key] += (loom.topologyWeights[key] - renderTopology[key]) * topologyMix;
+			}
+			for (const key of BAND_KEYS) {
+				renderBands[key] += (loom.strandEnergy[key] - renderBands[key]) * bandMix;
+			}
+			renderPalette.baseHue = approachHue(renderPalette.baseHue, palette.baseHue, 4.5, dt);
+			renderPalette.accentHue = approachHue(renderPalette.accentHue, palette.accentHue, 4.5, dt);
+			renderPalette.rimHue = approachHue(renderPalette.rimHue, palette.rimHue, 4.5, dt);
+			renderPalette.saturation = approach(renderPalette.saturation, palette.saturation, 4.5, dt);
+			renderPhases.topology += renderPose.topologyRate * dt;
+			renderPhases.weave += renderPose.weaveRate * dt;
+			renderPhases.long += renderPose.longRate * dt;
+			const travelRate = 0.055 + renderPose.tempo * 0.06 + renderPose.motion * 0.025;
+			renderPhases.signalTravel = (renderPhases.signalTravel + travelRate * dt) % 1;
+		}
+		return renderPose;
 	}
 
 	function backingSize(targetCanvas: HTMLCanvasElement) {
@@ -152,23 +282,7 @@
 					fragment: {
 						module: sceneModule,
 						entryPoint: 'fs_main',
-						targets: [
-							{
-								format: 'rgba16float',
-								blend: {
-									color: {
-										srcFactor: 'one',
-										dstFactor: 'one-minus-src-alpha',
-										operation: 'add'
-									},
-									alpha: {
-										srcFactor: 'one',
-										dstFactor: 'one-minus-src-alpha',
-										operation: 'add'
-									}
-								}
-							}
-						]
+						targets: [{ format: 'rgba16float' }]
 					},
 					primitive: { topology: 'triangle-list', cullMode: 'none' },
 					depthStencil: {
@@ -287,6 +401,13 @@
 		if (rendererSourceEpoch !== shared.sourceEpoch) {
 			rendererSourceEpoch = shared.sourceEpoch;
 			rms = clamp(feature?.rms ?? 0, 0, 1);
+			renderCentroid = shared.spectrum.centroid;
+			renderSpectralMotion = shared.spectrum.spectralMotion;
+			renderSectionEnergy = shared.director.context.sectionEnergy;
+			for (let index = 0; index < renderDetailBins.length; index += 1) {
+				renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
+			}
+			poseSyncRequested = true;
 			quietFor = feature ? 0 : 0.5;
 			silence = feature ? 0 : 1;
 		}
@@ -298,69 +419,91 @@
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
+		const pose = updateRenderPose(loom, directed.palette, dt);
+		renderCentroid = approach(renderCentroid, spectrum.centroid, 8, dt);
+		renderSpectralMotion = approach(renderSpectralMotion, spectrum.spectralMotion, 11, dt);
+		renderSectionEnergy = approach(
+			renderSectionEnergy,
+			directed.context.sectionEnergy,
+			5,
+			dt
+		);
+		const detailMix = 1 - Math.exp(-dt / 0.05);
+		for (let index = 0; index < renderDetailBins.length; index += 1) {
+			renderDetailBins[index] +=
+				((spectrum.detailBins[index] ?? 0) - renderDetailBins[index]) * detailMix;
+		}
 		const response = VISUALIZER_RESPONSE_PROFILES.loom[vis.response];
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
-		const energy = clamp(loom.macroEnergy * 0.72 + rms * 0.18 + spectrum.spectralMotion * 0.1, 0, 1);
-		const impact = clamp(loom.impact * responseImpact, 0, 1);
-		const weights = loom.topologyWeights;
+		const energy = clamp(
+			pose.macroEnergy * 0.72 + rms * 0.18 + renderSpectralMotion * 0.1,
+			0,
+			1
+		);
+		const impact = clamp(pose.impact * responseImpact, 0, 1);
+		const weights = renderTopology;
 		const uniforms = state.uniforms;
 		uniforms[0] = size.width;
 		uniforms[1] = size.height;
 		uniforms[2] = (now - startTime) / 1000;
 		uniforms[3] = dt;
-		uniforms[4] = directed.clock.beatPulse;
-		uniforms[5] = directed.clock.beatPhase;
+		uniforms[4] = impact;
+		uniforms[5] = renderPhases.signalTravel;
 		uniforms[6] = loom.phrase;
-		uniforms[7] = loom.tempo;
+		uniforms[7] = pose.tempo;
 		uniforms[8] = rms;
-		uniforms[9] = loom.strandEnergy.sub;
-		uniforms[10] = loom.strandEnergy.kick;
-		uniforms[11] = loom.strandEnergy.body;
-		uniforms[12] = loom.strandEnergy.mids;
-		uniforms[13] = loom.strandEnergy.presence;
-		uniforms[14] = loom.strandEnergy.air;
-		uniforms[15] = spectrum.centroid;
+		uniforms[9] = renderBands.sub;
+		uniforms[10] = renderBands.kick;
+		uniforms[11] = renderBands.body;
+		uniforms[12] = renderBands.mids;
+		uniforms[13] = renderBands.presence;
+		uniforms[14] = renderBands.air;
+		uniforms[15] = renderCentroid;
 		uniforms[16] = energy;
-		uniforms[17] = spectrum.spectralMotion;
+		uniforms[17] = renderSpectralMotion;
 		uniforms[18] = impact;
-		uniforms[19] = clamp(loom.openness + loom.dropOpenness * 0.18, 0, 1);
-		uniforms[20] = loom.tension;
-		uniforms[21] = loom.release;
-		uniforms[22] = loom.crossingOrder;
-		uniforms[23] = loom.topologyPhase;
+		uniforms[19] = clamp(pose.openness + pose.dropOpenness * 0.18, 0, 1);
+		uniforms[20] = pose.tension;
+		uniforms[21] = pose.release;
+		uniforms[22] = pose.crossingOrder;
+		uniforms[23] = renderPhases.topology;
 		uniforms[24] = weights.torus;
 		uniforms[25] = weights.helix;
 		uniforms[26] = weights.saddle;
 		uniforms[27] = weights.knot;
 		uniforms[28] = weights.cage;
-		uniforms[29] = loom.braid;
-		uniforms[30] = loom.twist;
-		uniforms[31] = loom.signedAsymmetry;
-		uniforms[32] = directed.palette.baseHue;
-		uniforms[33] = directed.palette.accentHue;
-		uniforms[34] = directed.palette.rimHue;
-		uniforms[35] = directed.palette.saturation;
+		uniforms[29] = pose.braid;
+		uniforms[30] = pose.twist;
+		uniforms[31] = pose.signedAsymmetry;
+		uniforms[32] = renderPalette.baseHue;
+		uniforms[33] = renderPalette.accentHue;
+		uniforms[34] = renderPalette.rimHue;
+		uniforms[35] = renderPalette.saturation;
 		// These three slots were previously renderer-inert director values. Loom's
 		// phrase conductor now owns them without changing uniform size/alignment.
-		uniforms[36] = loom.reweave;
-		uniforms[37] = loom.sectionPulse;
-		uniforms[38] = loom.depth;
-		uniforms[39] = directed.context.sectionEnergy;
-		uniforms[40] = loom.cameraYaw;
-		uniforms[41] = loom.cameraPitch;
-		uniforms[42] = loom.cameraDistance;
-		uniforms[43] = loom.cameraRoll;
-		uniforms[44] = clamp((0.011 + spectrum.levels.body * 0.004 + impact * 0.002) * response.width, 0.008, 0.022);
-		uniforms[45] = clamp((0.55 + energy * 0.5 + impact * 0.3) * response.glow, 0.35, 1.45);
+		uniforms[36] = pose.reweave;
+		uniforms[37] = pose.sectionPulse;
+		uniforms[38] = pose.depth;
+		uniforms[39] = renderSectionEnergy;
+		uniforms[40] = pose.cameraYaw;
+		uniforms[41] = pose.cameraPitch;
+		uniforms[42] = pose.cameraDistance;
+		uniforms[43] = pose.cameraRoll;
+		uniforms[44] = clamp(
+			(0.012 + renderBands.body * 0.004 + impact * 0.0015) * response.width,
+			0.008,
+			0.022
+		);
+		uniforms[45] = clamp((0.42 + energy * 0.34) * response.glow, 0.3, 1.05);
 		uniforms[46] = silence;
 		uniforms[47] = responseMotion;
 		// Persistent phases are song time, not response-mode time. Scaling an
 		// unwrapped phase here made Calm -> Surge jump to a different posture.
-		uniforms[48] = loom.longPhase;
-		uniforms[49] = loom.weavePhase;
-		uniforms[50] = loom.phraseVariation;
-		uniforms[51] = loom.key;
+		uniforms[48] = renderPhases.long;
+		uniforms[49] = renderPhases.weave;
+		uniforms[50] = pose.phraseVariation;
+		uniforms[51] = pose.key;
 
 		state.device.queue.writeBuffer(
 			state.uniformBuffer,
@@ -372,13 +515,13 @@
 		state.device.queue.writeBuffer(
 			state.detailBuffer,
 			0,
-			spectrum.detailBins.buffer,
-			spectrum.detailBins.byteOffset,
-			spectrum.detailBins.byteLength
+			renderDetailBins.buffer,
+			renderDetailBins.byteOffset,
+			renderDetailBins.byteLength
 		);
 
 		hudSection = loom.section;
-		hudTopology = dominantTopology(weights);
+		hudTopology = dominantTopology(loom.topologyWeights);
 		const encoder = state.device.createCommandEncoder({ label: 'Loom frame' });
 		{
 			const pass = encoder.beginRenderPass({
@@ -386,7 +529,7 @@
 				colorAttachments: [
 					{
 						view: state.targets.sceneView,
-						clearValue: { r: 0, g: 0, b: 0, a: 0 },
+						clearValue: { r: 0, g: 0, b: 0, a: 1 },
 						loadOp: 'clear',
 						storeOp: 'store'
 					}
@@ -400,7 +543,7 @@
 			});
 			pass.setPipeline(state.scenePipeline);
 			pass.setBindGroup(0, state.sceneBindGroup);
-			pass.draw(LOOM_VERTEX_COUNT, LOOM_STRANDS);
+			pass.draw(LOOM_VERTEX_COUNT, LOOM_INSTANCES);
 			pass.end();
 		}
 		{
@@ -429,17 +572,24 @@
 		if (!canvas || !gpu) return;
 		if (!schedulerTickAt) {
 			schedulerTickAt = now;
-			renderBudgetMs = FRAME_INTERVAL_MS;
 		} else {
 			const elapsed = Math.max(0, now - schedulerTickAt);
 			schedulerTickAt = now;
-			renderBudgetMs = Math.min(FRAME_INTERVAL_MS * 4, renderBudgetMs + elapsed);
+			observeDisplayCadence(elapsed);
 		}
-		if (renderBudgetMs + 0.25 < FRAME_INTERVAL_MS) return;
-		let remainder = renderBudgetMs - FRAME_INTERVAL_MS;
-		if (remainder >= FRAME_INTERVAL_MS) remainder %= FRAME_INTERVAL_MS;
-		renderBudgetMs = Math.max(0, remainder);
-		const elapsedMs = lastRenderedAt ? now - lastRenderedAt : FRAME_INTERVAL_MS;
+		const nextFrameStride = displayFrameStride(refreshIntervalMs, TARGET_FRAME_RATE);
+		if (nextFrameStride !== activeFrameStride) {
+			activeFrameStride = nextFrameStride;
+			framesUntilRender = 0;
+		}
+		if (framesUntilRender > 0) {
+			framesUntilRender--;
+			return;
+		}
+		framesUntilRender = activeFrameStride - 1;
+		const elapsedMs = lastRenderedAt
+			? now - lastRenderedAt
+			: refreshIntervalMs * activeFrameStride;
 		lastRenderedAt = now;
 		try {
 			renderFrame(gpu, now, clamp(elapsedMs / 1000, 0.001, 0.25));
@@ -471,8 +621,11 @@
 				gpu = state;
 				startTime = performance.now();
 				schedulerTickAt = 0;
-				renderBudgetMs = FRAME_INTERVAL_MS;
+				refreshIntervalMs = 1000 / 60;
+				activeFrameStride = 1;
+				framesUntilRender = 0;
 				lastRenderedAt = 0;
+				poseSyncRequested = true;
 				ready = true;
 			})
 			.catch((error) => {
@@ -517,6 +670,8 @@
 			data-loom-topology={hudTopology}
 			data-loom-render-passes="2"
 			data-loom-strands={LOOM_STRANDS}
+			data-loom-frame-stride={activeFrameStride}
+			data-loom-refresh-rate={measuredRefreshRate}
 			data-loom-internal-pixels={internalPixels}
 			data-loom-ready={String(ready)}
 		></canvas>
