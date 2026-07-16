@@ -123,21 +123,37 @@
 	function getCameraPos(
 		cameraPhase: number,
 		perspectiveAzimuth: number,
-		perspectiveElevation: number
+		perspectiveElevation: number,
+		cameraOrbit: number,
+		cameraProfile: number,
+		cameraOverhead: number,
+		cameraLow: number,
+		cameraMacro: number
 	): [number, number, number] {
 		const seedAngle = mk2SongSeed * Math.PI * 2;
 		const azimuth =
-			seedAngle + cameraPhase * (0.56 + mk2SongSeed * 0.08) + perspectiveAzimuth;
+			seedAngle +
+			cameraPhase * (0.54 + mk2SongSeed * 0.08) +
+			perspectiveAzimuth +
+			cameraProfile * 0.22 -
+			cameraLow * 0.08;
 		const baseRadius =
-			3.45 + Math.sin(cameraPhase * 0.173 + seedAngle * 0.7) * 0.22 +
-			Math.sin(cameraPhase * 0.071 - seedAngle) * 0.1;
+			(3.48 +
+				Math.sin(cameraPhase * 0.173 + seedAngle * 0.7) * 0.22 +
+				Math.sin(cameraPhase * 0.071 - seedAngle) * 0.1) *
+			(1 + cameraOrbit * 0.035 + cameraOverhead * 0.055 - cameraMacro * 0.025);
 		const radius = baseRadius * Math.cos(perspectiveElevation * 0.82);
-		const sideDrift = Math.sin(cameraPhase * 0.119 + seedAngle * 1.3) * 0.18;
+		const sideDrift =
+			Math.sin(cameraPhase * 0.119 + seedAngle * 1.3) *
+			(0.14 + cameraOrbit * 0.08 + cameraProfile * 0.06);
+		const altitudeBias =
+			cameraOverhead * 0.72 - cameraLow * 0.48 + cameraProfile * 0.1 - cameraMacro * 0.08;
 		return [
 			Math.cos(azimuth) * radius + Math.cos(azimuth * 0.37 + seedAngle) * sideDrift,
-			1.25 +
+			1.12 +
 				Math.sin(cameraPhase * 0.227 + seedAngle * 0.4) * 0.58 +
-				Math.sin(perspectiveElevation) * baseRadius * 0.86,
+				Math.sin(perspectiveElevation) * baseRadius * 0.86 +
+				altitudeBias,
 			Math.sin(azimuth) * radius + Math.sin(azimuth * 0.41 - seedAngle) * sideDrift
 		];
 	}
@@ -153,7 +169,7 @@
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// Uniform layout — 72 f32s = 288 bytes (multiple of 16 ✓)
+	// Uniform layout — 84 f32s = 336 bytes (multiple of 16 ✓)
 	// 0-1  resolution
 	// 2    time
 	// 3-7  audio: bass, mid, treble, centroid, rms
@@ -180,7 +196,11 @@
 	// 59-63 palette phase / warmth / density / iridescence / erosion
 	// 64-70 shot zoom / close study / detail / azimuth / elevation / framing x/y
 	// 71    quality raymarch steps
-	const UNIFORM_FLOATS = 72;
+	// 72-76 environment DNA: void / current / cavern / horizon / cellular
+	// 77-80 material DNA: membrane / mineral / velvet / crystal
+	// 81-82 secondary palette family / continuous family blend
+	// 83    alignment / future grammar
+	const UNIFORM_FLOATS = 84;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
 	const SCENE_WGSL = /* wgsl */ `
@@ -257,6 +277,18 @@ struct Uniforms {
 	shotFramingX: f32,
 	shotFramingY: f32,
 	qualitySteps: f32,
+	environmentVoid: f32,
+	environmentCurrent: f32,
+	environmentCavern: f32,
+	environmentHorizon: f32,
+	environmentCellular: f32,
+	materialMembrane: f32,
+	materialMineral: f32,
+	materialVelvet: f32,
+	materialCrystal: f32,
+	paletteFamilyB: f32,
+	paletteFamilyBlend: f32,
+	_pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -272,7 +304,9 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 7-stop palette LUT — six families, picked per song via u.paletteFamily.
+// 7-stop palette LUT — eight coordinated colour worlds. A track keeps a
+// stable primary family and slowly borrows pigment from a harmonically chosen
+// secondary family, so colour develops without flashing between presets.
 // Each family is a totally distinct visual world rather than a rotation
 // through the same hues. Picked by song seed so every track lands a
 // different colour world.
@@ -283,12 +317,11 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
 //   4 bioluminous UV → cyan → green → chartreuse on near-black field
 //   5 oil-on-water iridescent — petrol blues → magenta → gold → mint shifts
 // ═══════════════════════════════════════════════════════════════════════════
-fn palette7(t: f32) -> vec3<f32> {
+fn paletteFamily(t: f32, family: i32) -> vec3<f32> {
 	let s = fract(t);
 	let x = s * 7.0;
 	let i = i32(floor(x));
 	let f = smoothstep(0.0, 1.0, x - floor(x));
-	let family = i32(u.paletteFamily);
 	var stops = array<vec3<f32>, 7>(
 		vec3<f32>(0.020, 0.025, 0.080),
 		vec3<f32>(0.090, 0.045, 0.150),
@@ -353,10 +386,45 @@ fn palette7(t: f32) -> vec3<f32> {
 			vec3<f32>(0.580, 0.940, 0.640),
 			vec3<f32>(0.380, 0.120, 0.520)
 		);
+	} else if (family == 6) {
+		// obsidian mineral
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.008, 0.010, 0.014),
+			vec3<f32>(0.055, 0.065, 0.072),
+			vec3<f32>(0.060, 0.250, 0.235),
+			vec3<f32>(0.520, 0.290, 0.110),
+			vec3<f32>(0.840, 0.650, 0.270),
+			vec3<f32>(0.740, 0.710, 0.610),
+			vec3<f32>(0.120, 0.150, 0.160)
+		);
+	} else if (family == 7) {
+		// verdant deep sea
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.005, 0.018, 0.016),
+			vec3<f32>(0.018, 0.095, 0.070),
+			vec3<f32>(0.120, 0.360, 0.160),
+			vec3<f32>(0.680, 0.320, 0.180),
+			vec3<f32>(0.940, 0.620, 0.360),
+			vec3<f32>(0.500, 0.800, 0.700),
+			vec3<f32>(0.050, 0.210, 0.250)
+		);
 	}
 	let a = stops[(i % 7 + 7) % 7];
 	let b = stops[((i + 1) % 7 + 7) % 7];
 	return mix(a, b, f);
+}
+
+fn palette7(t: f32) -> vec3<f32> {
+	let primary = paletteFamily(t, i32(u.paletteFamily));
+	let secondary = paletteFamily(t + u.paletteWarmth * 0.035, i32(u.paletteFamilyB));
+	let familyBlend = clamp(u.paletteFamilyBlend, 0.0, 0.36);
+	let blended = mix(primary, secondary, familyBlend);
+	let luma = dot(blended, vec3<f32>(0.2126, 0.7152, 0.0722));
+	return clamp(
+		mix(vec3<f32>(luma), blended, 1.08 + familyBlend * 0.18),
+		vec3<f32>(0.0),
+		vec3<f32>(1.0)
+	);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -821,10 +889,26 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 		+ u.paletteWarmth * 0.075 + lifecycleHue;
 	let growth = clamp(u._pad0, 0.0, 1.0);
 	let tension = clamp(u._pad1, 0.0, 1.0);
-	let horizon = palette7(baseT) * (
-		0.030 + growth * 0.010 + u.bloomForm * 0.012 - u.dormancyForm * 0.009
+	let voidRaw = pow(max(u.environmentVoid, 0.0), 1.8);
+	let currentRaw = pow(max(u.environmentCurrent, 0.0), 1.8);
+	let cavernRaw = pow(max(u.environmentCavern, 0.0), 1.8);
+	let horizonRaw = pow(max(u.environmentHorizon, 0.0), 1.8);
+	let cellularRaw = pow(max(u.environmentCellular, 0.0), 1.8);
+	let environmentWeight = max(
+		voidRaw + currentRaw + cavernRaw + horizonRaw + cellularRaw,
+		0.0001
 	);
-	let zenith = palette7(baseT + 0.70 + u.materialErosion * 0.08) * 0.008;
+	let voidW = voidRaw / environmentWeight;
+	let currentW = currentRaw / environmentWeight;
+	let cavernW = cavernRaw / environmentWeight;
+	let horizonW = horizonRaw / environmentWeight;
+	let cellularW = cellularRaw / environmentWeight;
+	let horizon = palette7(baseT + 0.03) * (
+		0.010 + currentW * 0.015 + horizonW * 0.014 + cellularW * 0.011
+			+ growth * 0.005 - voidW * 0.004
+	);
+	let zenith = palette7(baseT + 0.70 + u.materialErosion * 0.08)
+		* (0.003 + cavernW * 0.004 + cellularW * 0.003);
 	var bg = mix(horizon, zenith, smoothstep(0.0, 1.0, upT));
 
 	let camPos = vec3<f32>(u.camPosX, u.camPosY, u.camPosZ);
@@ -833,6 +917,44 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 		vec3<f32>(0.0, 0.0, -1.0)
 	);
 	let worldP = camPos + rd * 8.0;
+
+	// These are alternate structures inside one coherent 3D atmosphere. They are
+	// sampled in world space, so camera movement reveals parallax instead of
+	// sliding a transparent texture across the screen.
+	let cavernNoise = vn3(
+		worldP * vec3<f32>(0.18, 0.28, 0.18)
+			+ vec3<f32>(u.backgroundPhase * 0.018, 0.0, 0.0)
+	);
+	let cavernStrata = smoothstep(
+		0.50,
+		0.86,
+		0.5 + 0.5 * cos(length(worldP.xz) * 0.72 + worldP.y * 0.34 + cavernNoise * 2.1)
+	);
+	let horizonBand = exp(-abs(rd.y + 0.08 + u.perspectiveElevation * 0.08) * 12.0);
+	let cellularPhase = sin(worldP.x * 0.72 + u.backgroundPhase * 0.11)
+		* sin(worldP.y * 0.61 - u.morphPhase * 0.07)
+		* sin(worldP.z * 0.67 + u.spectralTravelPhase * 0.09);
+	let cellularMembrane = smoothstep(0.22, 0.76, abs(cellularPhase));
+	let depthNoise = vn3(
+		worldP * 0.105 + vec3<f32>(u.backgroundPhase * 0.012, u.morphPhase * 0.006, 0.0)
+	);
+	let parallaxVein = smoothstep(
+		0.54,
+		0.82,
+		vn3(worldP * 0.31 + vec3<f32>(0.0, u.backgroundPhase * 0.022, u.morphPhase * 0.01))
+	);
+	let depthPresence = clamp(cavernW * 0.82 + cellularW * 0.48 + currentW * 0.28, 0.0, 0.78);
+	bg = bg * mix(1.0, mix(0.62, 1.34, depthNoise), depthPresence);
+	bg = bg
+		+ palette7(baseT + 0.58) * cavernStrata * cavernW * 0.15
+		+ palette7(baseT + 0.19) * horizonBand * horizonW * (0.14 + growth * 0.018)
+		+ palette7(baseT + 0.62) * cellularMembrane * cellularW * 0.105
+		+ palette7(baseT + 0.79) * parallaxVein * (cavernW + cellularW * 0.72) * 0.052;
+	bg = bg * (
+		1.0 - cavernW * (1.0 - cavernStrata) * 0.42
+			- cellularW * (1.0 - cellularMembrane) * 0.22
+			- voidW * 0.22
+	);
 	let familyPhase = u.paletteFamily * 1.04719755 + baseT * 1.7
 		+ u.spectralTravelPhase * 0.16;
 	let currentAxis = safeNormalize(
@@ -895,8 +1017,9 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 		0.0,
 		1.0
 	);
-	bg = bg + currentCol * current * (
-		0.023 + u.rms * 0.018 + growth * 0.018 + u.sproutForm * 0.006
+	bg = bg * (1.0 - current * currentW * (0.045 + tension * 0.02));
+	bg = bg + currentCol * current * (0.42 + currentW * 0.72 + cellularW * 0.16) * (
+		0.030 + u.rms * 0.020 + growth * 0.019 + u.sproutForm * 0.006
 			+ u.bloomForm * 0.036 + u.sheddingForm * 0.018
 			+ atmosphereTransfer * 0.015 + u.suspense * 0.008
 	);
@@ -905,6 +1028,9 @@ fn sky(rd: vec3<f32>) -> vec3<f32> {
 	// the periphery and through negative-space openings without becoming a halo.
 	let heroFocus = pow(clamp(dot(rd, camFwd), 0.0, 1.0), 18.0);
 	bg = bg * (1.0 - heroFocus * (0.24 + tension * 0.05 + u.dormancyForm * 0.08));
+	let backgroundLuma = max(dot(bg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
+	let backgroundCeiling = 0.13 + horizonW * 0.035 + cellularW * 0.022;
+	bg = bg * min(1.0, backgroundCeiling / backgroundLuma);
 
 	return bg;
 }
@@ -1014,6 +1140,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				surfQ * (5.4 + u.materialErosion * 4.8 + u.detailFocus * 3.2)
 					+ familyOffset + vec3<f32>(u.morphPhase * 0.012)
 			);
+			let anatomicalNoise = vn3(
+				surfQ * (1.75 + u.materialMineral * 0.55 + u.materialVelvet * 0.22)
+					+ familyOffset * 0.31 - vec3<f32>(u.morphPhase * 0.004)
+			);
 			// One hit-time octave gives broad cocoon lobes actual skin. Its spatial
 			// scale stays fixed while audio changes contrast/roughness, so pores breathe
 			// without crawling or rescaling. This never runs inside the raymarch, SDF
@@ -1088,15 +1218,27 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				0.0,
 				0.94
 			);
+			let broadPigment = smoothstep(0.16, 0.84, anatomicalNoise * 0.68 + surfaceNoise * 0.32);
 			let pigmentGrain = clamp(
-				0.94 + (surfaceNoise - 0.5) * 0.24
-					+ (microNoise - 0.5) * (0.20 + u.surfaceRidges * 0.10),
-				0.72,
-				1.10
+				0.70 + broadPigment * 0.54
+					+ (surfaceNoise - 0.5) * 0.12
+					+ (microNoise - 0.5) * (0.07 + u.surfaceRidges * 0.045),
+				0.58,
+				1.26
 			);
 			// Pale palette stops retain their hue, but are pulled back into a deeper
 			// lifecycle pigment before lighting. White can remain a highlight, not a body.
 			var baseCol = mix(rawBaseCol, pigmentAnchor, paleRecovery) * pigmentGrain;
+			let baseChroma = max(baseCol.r, max(baseCol.g, baseCol.b))
+				- min(baseCol.r, min(baseCol.g, baseCol.b));
+			let chromaticAnchor = palette7(
+				surfacePalette + 0.34 + anatomicalNoise * 0.18 + skinCurrent * 0.01
+			) * (0.34 + broadPigment * 0.12);
+			baseCol = mix(
+				baseCol,
+				chromaticAnchor,
+				(1.0 - smoothstep(0.08, 0.24, baseChroma)) * (0.34 + paleRecovery * 0.32)
+			);
 			// Cap diffuse pigment luminance before any light touches it. Specular and
 			// rim highlights can still flare, but a pale palette stop can no longer
 			// turn the entire close-study body into a white/grey shell.
@@ -1111,19 +1253,25 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			// sprout is wet, winding is taut chitin, bloom is crystalline, and
 			// shedding is dry/porous. The weights crossfade, so the same organism
 			// actually matures rather than swapping arbitrary effects.
-			let waxRaw = u.seedForm + u.dormancyForm * 0.45;
-			let wetRaw = u.sproutForm;
-			let tautRaw = u.windingForm;
-			let crystalRaw = u.bloomForm;
-			let porousRaw = u.sheddingForm + u.dormancyForm * 0.55;
+			let membraneDNA = pow(max(u.materialMembrane, 0.0), 1.65);
+			let mineralDNA = pow(max(u.materialMineral, 0.0), 1.65);
+			let velvetDNA = pow(max(u.materialVelvet, 0.0), 1.65);
+			let crystalDNA = pow(max(u.materialCrystal, 0.0), 1.65);
+			let waxRaw = membraneDNA * (0.72 + u.seedForm * 0.38)
+				+ velvetDNA * 0.18 + u.dormancyForm * 0.12;
+			let wetRaw = membraneDNA * (0.32 + u.sproutForm * 0.46);
+			let tautRaw = mineralDNA * (0.72 + u.windingForm * 0.42);
+			let crystalRaw = crystalDNA * (0.76 + u.bloomForm * 0.38);
+			let porousRaw = velvetDNA * (0.84 + u.sheddingForm * 0.42)
+				+ mineralDNA * u.materialErosion * 0.16;
 			let materialWeight = max(waxRaw + wetRaw + tautRaw + crystalRaw + porousRaw, 0.0001);
 			let wax = waxRaw / materialWeight;
 			let wet = wetRaw / materialWeight;
 			let taut = tautRaw / materialWeight;
 			let crystal = crystalRaw / materialWeight;
 			let porous = porousRaw / materialWeight;
-			let ridgeRelief = (surfaceNoise - 0.5) * (0.18 + u.surfaceRidges * 0.22)
-				+ (microNoise - 0.5) * (0.11 + u.surfaceRidges * 0.16)
+			let ridgeRelief = (surfaceNoise - 0.5) * (0.24 + u.surfaceRidges * 0.24)
+				+ (microNoise - 0.5) * (0.055 + u.surfaceRidges * 0.08)
 				+ skinCurrent * u.surfaceRidges * 0.015;
 			let iridescentShift = u.materialIridescence * (1.0 - cosNV)
 				* (0.10 + surfaceNoise * 0.045)
@@ -1136,8 +1284,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				0.09,
 				0.92
 			);
-			let specStrength = wax * 0.16 + wet * 0.52 + taut * 0.34
-				+ crystal * 0.56 + porous * 0.08;
+			let specStrength = wax * 0.14 + wet * 0.42 + taut * 0.28
+				+ crystal * 0.44 + porous * 0.06;
 			let diffuseStrength = wax * 0.92 + wet * 0.66 + taut * 0.72
 				+ crystal * 0.66 + porous * 0.90;
 			let detailShade = clamp(
@@ -1181,7 +1329,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let diffuse = baseCol * (direct + fill + ambient)
 				* bodyAo * detailShade * diffuseStrength * mix(0.90, 1.06, density);
 
-			let specPow = mix(144.0, 12.0, roughness);
+			let specPow = mix(72.0, 11.0, roughness);
 			let specular = pow(cosNH, specPow);
 			let fresnel = 0.04 + 0.96 * pow(1.0 - cosNV, 5.0);
 			let reflected = reflect(-view, n);
@@ -1212,7 +1360,25 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
 			let bodyFill = deepPigment * (0.028 + density * 0.070)
 				* (0.34 + cosNV * 0.46) * (0.48 + bodyAo * 0.52);
-			let surfaceCol = (diffuse + specularCol + rim + bodyFill) * impactGain + crevice;
+			var surfaceCol = (diffuse + specularCol + rim + bodyFill) * impactGain + crevice;
+			// A chroma-preserving shoulder keeps the many tiny fractal facets from
+			// becoming white pixel confetti while leaving true rim highlights alive.
+			let surfaceLuma = max(
+				dot(surfaceCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
+				0.0001
+			);
+			let lightingShoulder = 0.17 + crystal * 0.025 + wet * 0.018;
+			let compressedLuma = lightingShoulder * (1.0 - exp(-surfaceLuma / lightingShoulder));
+			surfaceCol = surfaceCol * (compressedLuma / surfaceLuma);
+			let shoulderChroma = max(surfaceCol.r, max(surfaceCol.g, surfaceCol.b))
+				- min(surfaceCol.r, min(surfaceCol.g, surfaceCol.b));
+			let lowChromaRecovery = (1.0 - smoothstep(0.055, 0.18, shoulderChroma))
+				* smoothstep(0.055, 0.18, compressedLuma);
+			surfaceCol = mix(
+				surfaceCol,
+				chromaticAnchor * (0.58 + density * 0.16),
+				lowChromaRecovery * 0.62
+			) + specularCol * 0.014 + rim * 0.009;
 			scattered = scattered + surfaceCol * transmittance;
 			transmittance = 0.0;
 			break;
@@ -1547,7 +1713,31 @@ fn ign(pixel: vec2<f32>) -> f32 {
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let res = vec2<f32>(u.resolutionX, u.resolutionY);
 	let uv = frag.xy / res;
-	var col = textureSample(compositeTex, samp, uv).rgb;
+	let texel = vec2<f32>(1.0 / res.x, 1.0 / res.y);
+	let center = textureSample(compositeTex, samp, uv).rgb;
+	let north = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, -texel.y)).rgb;
+	let south = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, texel.y)).rgb;
+	let east = textureSample(compositeTex, samp, uv + vec2<f32>(texel.x, 0.0)).rgb;
+	let west = textureSample(compositeTex, samp, uv + vec2<f32>(-texel.x, 0.0)).rgb;
+	let lumaWeights = vec3<f32>(0.2126, 0.7152, 0.0722);
+	let centerLuma = dot(center, lumaWeights);
+	let northLuma = dot(north, lumaWeights);
+	let southLuma = dot(south, lumaWeights);
+	let eastLuma = dot(east, lumaWeights);
+	let westLuma = dot(west, lumaWeights);
+	let minLuma = min(centerLuma, min(min(northLuma, southLuma), min(eastLuma, westLuma)));
+	let maxLuma = max(centerLuma, max(max(northLuma, southLuma), max(eastLuma, westLuma)));
+	let contrast = maxLuma - minLuma;
+	let localAverage = (north + south + east + west) * 0.25;
+	let localLuma = dot(localAverage, lumaWeights);
+	let threshold = 0.006 + maxLuma * 0.075;
+	let isolatedEdge = clamp(
+		abs(centerLuma - localLuma) / max(contrast, 0.0001),
+		0.0,
+		1.0
+	);
+	let edgeBlend = smoothstep(threshold, threshold * 2.6, contrast) * isolatedEdge * 0.34;
+	var col = mix(center, localAverage, edgeBlend);
 
 	col = agx(col);
 	// Black-point lift + micro-contrast so the deep volumetric blacks don't
@@ -2102,14 +2292,34 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const growth = journey.growth;
 		const tension = journey.tension;
 		const mandelbulbPower = Math.max(
-			5.9,
-			Math.min(8.8, 7.15 + journey.topologyBias + smoothed.mid * 0.12)
+			6.15,
+			Math.min(
+				8.45,
+				7.05 +
+					journey.topologyBias * 1.15 +
+					journey.styleLowHighTilt * 0.38 +
+					(journey.materialMineral - journey.materialMembrane) * 0.22 +
+					smoothed.mid * 0.16
+			)
 		);
 		const baseHue = directed.palette.baseHue;
 		const hueDelta = ((directed.palette.accentHue - baseHue + 1.5) % 1) - 0.5;
 		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
 		const paletteOffset =
 			baseHue + hueDelta * tonnetzBlend + (smoothed.centroidSlow - 0.5) * 0.055;
+		const paletteFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
+		const harmonicFamilyStep = 2 + Math.floor((((signalJourney.key % 1) + 1) % 1) * 5);
+		const paletteFamilyB = (paletteFamily + harmonicFamilyStep) % 8;
+		const paletteFamilyBlend = Math.max(
+			0.04,
+			Math.min(
+				0.3,
+				0.055 +
+					Math.abs(hueDelta) * 0.16 +
+					journey.materialIridescence * 0.12 +
+					directed.context.keyConfidence * 0.055
+			)
+		);
 		const responseMotion = smoothed.responseMotion;
 		const responseImpact = smoothed.responseImpact;
 		const fogDensity = Math.max(
@@ -2121,25 +2331,65 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			Math.min(0.8, journey.shaftIntensity * smoothed.responseShafts)
 		);
 		const responseShotZoom = 1 + (journey.shotZoom - 1) * responseMotion;
-		const shotZoom = Math.max(0.9, Math.min(1.85, responseShotZoom));
+		const shotZoom = Math.max(0.9, Math.min(1.72, responseShotZoom));
 		const closeStudy = Math.max(0, Math.min(1, journey.closeStudy * responseMotion));
 		const detailFocus = Math.max(0, Math.min(1, journey.detailFocus * responseMotion));
 		const zoomDelta = shotZoom - 1;
+		let cameraOrbit = Math.pow(Math.max(0, journey.cameraOrbit), 1.75);
+		let cameraProfile = Math.pow(Math.max(0, journey.cameraProfile), 1.75);
+		let cameraOverhead = Math.pow(Math.max(0, journey.cameraOverhead), 1.75);
+		let cameraLow = Math.pow(Math.max(0, journey.cameraLow), 1.75);
+		let cameraMacro = Math.pow(Math.max(0, journey.cameraMacro), 1.75);
+		const cameraWeightSum = Math.max(
+			0.0001,
+			cameraOrbit + cameraProfile + cameraOverhead + cameraLow + cameraMacro
+		);
+		cameraOrbit /= cameraWeightSum;
+		cameraProfile /= cameraWeightSum;
+		cameraOverhead /= cameraWeightSum;
+		cameraLow /= cameraWeightSum;
+		cameraMacro /= cameraWeightSum;
+		const macroStudyRamp = Math.max(0, Math.min(1, (closeStudy - 0.34) / 0.5));
+		const intentionalMacro = Math.max(
+			0,
+			Math.min(1, cameraMacro * macroStudyRamp * (0.74 + detailFocus * 0.26))
+		);
+		const effectiveZoomDelta = zoomDelta * (0.5 + intentionalMacro * 0.5);
 		// Combine a safe dolly with a mild optical push. Even at the closest
 		// elected study the camera remains outside the organism's scene bound.
-		const dollyScale = 1 / (1 + zoomDelta * 0.47);
+		const dollyScale = 1 / (1 + effectiveZoomDelta * 0.32);
+		const shotLens =
+			cameraOrbit * 1.52 +
+			cameraProfile * 1.62 +
+			cameraOverhead * 1.5 +
+			cameraLow * 1.46 +
+			cameraMacro * 1.72;
+		const requestedFovScale =
+			(shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
+		const subjectExtent =
+			1 + journey.axialStretch * 0.28 + journey.filamentReach * 0.09 + journey.lobeSplit * 0.07;
 		const fovScale =
-			(1.54 + mk2SongSeed * 0.12) * (1 + zoomDelta * 0.14);
+			requestedFovScale /
+			(1 + (subjectExtent - 1) * (1 - intentionalMacro * 0.72));
 
 		// The camera follows a continuous path at the conductor's physical rate.
 		// Harmony can gently reframe the target, but phrases and drops never add
 		// accumulated offsets and impacts never shake the camera.
-		const sessionTargetY = -0.05 + (mk2SongSeed - 0.5) * 0.1;
+		const sessionTargetY =
+			-0.08 +
+			(mk2SongSeed - 0.5) * 0.1 +
+			journey.axialStretch * 0.14 -
+			journey.lobeSplit * 0.025;
 		const sessionRoll = (mk2SongSeed - 0.5) * 0.14;
 		const camPosRaw = getCameraPos(
 			journey.cameraPhase,
 			journey.perspectiveAzimuth,
-			journey.perspectiveElevation
+			journey.perspectiveElevation,
+			cameraOrbit,
+			cameraProfile,
+			cameraOverhead,
+			cameraLow,
+			cameraMacro
 		);
 		const cameraScale = journey.cameraDistance * dollyScale;
 		const camPos: [number, number, number] = [
@@ -2153,10 +2403,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const horizontalLength = Math.hypot(camPos[0], camPos[2]) || 1;
 		const framingRightX = camPos[2] / horizontalLength;
 		const framingRightZ = -camPos[0] / horizontalLength;
+		const framingScale = 1 - closeStudy * 0.34;
 		const camTarget: [number, number, number] = [
-			framingRightX * journey.shotFramingX,
-			sessionTargetY + journey.shotFramingY,
-			framingRightZ * journey.shotFramingX
+			framingRightX * journey.shotFramingX * framingScale,
+			sessionTargetY + journey.shotFramingY * framingScale,
+			framingRightZ * journey.shotFramingX * framingScale
 		];
 		const fwd: [number, number, number] = [
 			camTarget[0] - camPos[0],
@@ -2231,7 +2482,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[31] = tension;
 		// Per-track palette family stays stable; harmonic analysis moves within
 		// it, so the track develops without looking like a preset roulette.
-		u[32] = Math.floor(mk2SongSeed * 6);
+		u[32] = paletteFamily;
 		u[33] = Math.min(1, smoothed.staccato * responseImpact);
 		u[34] = smoothed.sustain;
 		u[35] = journey.rotationPhase;
@@ -2271,6 +2522,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[69] = journey.shotFramingX;
 		u[70] = journey.shotFramingY;
 		u[71] = qualityProfile.raymarchSteps;
+		u[72] = journey.environmentVoid;
+		u[73] = journey.environmentCurrent;
+		u[74] = journey.environmentCavern;
+		u[75] = journey.environmentHorizon;
+		u[76] = journey.environmentCellular;
+		u[77] = journey.materialMembrane;
+		u[78] = journey.materialMineral;
+		u[79] = journey.materialVelvet;
+		u[80] = journey.materialCrystal;
+		u[81] = paletteFamilyB;
+		u[82] = paletteFamilyBlend;
+		u[83] = 0;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
 
 		// Upload decoded, baseline-relative detail. Static hiss and compressed
