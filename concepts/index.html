@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>visualizer concepts</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden}canvas{display:block;width:100vw;height:100vh}</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+const canvas = document.getElementById('c');
+const params = new URLSearchParams(location.search);
+const CONCEPT = params.get('concept') || 'terrain';
+const STATE = params.get('state') || 'calm';
+
+const STATES = {
+  calm: { bass: 0.30, mid: 0.28, high: 0.20, beat: 0.12, energy: 0.30, time: 14.0 },
+  drop: { bass: 0.95, mid: 0.75, high: 0.65, beat: 0.90, energy: 0.92, time: 14.0 },
+};
+const S = STATES[STATE] || STATES.calm;
+
+const VERT = `#version 300 es
+void main(){
+  vec2 v = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(v * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const COMMON = `#version 300 es
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime, uBass, uMid, uHigh, uBeat, uEnergy;
+out vec4 O;
+
+float hash21(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }
+float noise2(vec2 x){
+  vec2 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i), b = hash21(i + vec2(1, 0)), c = hash21(i + vec2(0, 1)), d = hash21(i + vec2(1, 1));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+float fbm(vec2 p){
+  float a = 0.5, s = 0.0;
+  mat2 R = mat2(0.8, -0.6, 0.6, 0.8);
+  for (int i = 0; i < 5; i++){ s += a * noise2(p); p = R * p * 2.02 + 11.7; a *= 0.5; }
+  return s;
+}
+vec3 aces(vec3 x){ return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0); }
+vec2 uvof(){ return (gl_FragCoord.xy * 2.0 - uRes) / uRes.y; }
+float grain(){ return (hash21(gl_FragCoord.xy + fract(uTime) * 61.7) - 0.5) * 0.028; }
+float vign(vec2 uv){ return 1.0 - 0.32 * dot(uv * 0.72, uv * 0.72); }
+`;
+
+const FRAG_TERRAIN = COMMON + `
+float bandAt(float b, float z){
+  float zc = z * 0.45;
+  float i = floor(zc), fr = smoothstep(0.0, 1.0, fract(zc));
+  float g = mix(hash21(vec2(b * 1.7, i)), hash21(vec2(b * 1.7, i + 1.0)), fr);
+  return 0.20 + 2.6 * g * g;
+}
+float bandEnv(float x, float z){
+  float u = (x + 8.0) / 2.0;
+  float i0 = floor(u), f = fract(u);
+  return mix(bandAt(i0, z), bandAt(min(i0 + 1.0, 8.0), z), smoothstep(0.25, 0.75, f));
+}
+float terrH(float x, float z){
+  float n = fbm(vec2(x * 0.30, z * 0.22)) + fbm(vec2(x * 0.95, z * 0.75)) * 0.28;
+  return (n * 1.35 + 0.15) * bandEnv(x, z) * (0.45 + 0.95 * uBass);
+}
+vec3 skyCol(vec3 rd){
+  float h = clamp(rd.y, -0.1, 1.0);
+  vec3 sky = mix(vec3(0.014, 0.008, 0.030), vec3(0.002, 0.002, 0.010), smoothstep(0.0, 0.6, h));
+  vec3 sunDir = normalize(vec3(0.25, 0.16, 0.95));
+  float g = max(dot(rd, sunDir), 0.0);
+  sky += vec3(1.30, 0.42, 0.12) * pow(g, 42.0) * (0.40 + 0.60 * uBass + 1.3 * uBeat);
+  sky += vec3(0.55, 0.10, 0.35) * pow(g, 4.0) * 0.12;
+  vec2 sp = rd.xz / max(rd.y + 0.25, 0.08) * 26.0;
+  vec2 id = floor(sp);
+  float sh = hash21(id);
+  float star = smoothstep(0.10, 0.0, length(fract(sp) - 0.5)) * step(0.965, sh);
+  sky += vec3(0.7, 0.8, 1.0) * star * (0.20 + 1.2 * uHigh) * smoothstep(0.03, 0.25, rd.y);
+  return sky;
+}
+void main(){
+  vec2 uv = uvof();
+  vec3 ro = vec3(0.0, 3.6 + 0.5 * uBass, uTime * 1.5);
+  vec3 fwd = normalize(vec3(0.0, -0.30, 1.0));
+  vec3 rgt = normalize(cross(fwd, vec3(0, 1, 0)));
+  vec3 up = cross(rgt, fwd);
+  vec3 rd = normalize(fwd * 1.35 + rgt * uv.x + up * uv.y);
+
+  float t = 0.0; bool hit = false; vec3 p = ro;
+  for (int i = 0; i < 160; i++){
+    p = ro + rd * t;
+    float h = terrH(p.x, p.z);
+    float d = p.y - h;
+    if (d < 0.015){ hit = true; break; }
+    t += clamp(d * 0.42, 0.03, 2.5);
+    if (t > 90.0) break;
+  }
+
+  vec3 sky = skyCol(rd);
+  vec3 col;
+  if (hit){
+    float e = 0.05;
+    float h0 = terrH(p.x, p.z);
+    vec3 n = normalize(vec3(terrH(p.x - e, p.z) - terrH(p.x + e, p.z), 2.0 * e, terrH(p.x, p.z - e) - terrH(p.x, p.z + e)));
+    vec3 sunDir = normalize(vec3(0.25, 0.35, 0.9));
+    float dif = max(dot(n, sunDir), 0.0);
+    vec3 rock = mix(vec3(0.004, 0.006, 0.020), vec3(0.022, 0.048, 0.078), clamp(h0 * 0.45, 0.0, 1.0));
+    float peak = smoothstep(0.95, 2.6, h0) * (0.50 + 0.50 * uEnergy);
+    vec3 peakCol = mix(vec3(1.50, 0.60, 0.10), vec3(0.05, 0.60, 0.90), smoothstep(2.0, 4.2, p.x + 8.0));
+    col = rock * (0.12 + 0.90 * dif) + peakCol * peak * (0.30 + 0.70 * dif);
+    float ct = 1.0 - abs(fract(h0 * 2.2) - 0.5) * 2.0;
+    float contour = smoothstep(0.93, 0.995, ct);
+    col += peakCol * contour * 0.55 * (0.25 + 0.75 * uEnergy);
+    col += vec3(0.30, 0.10, 0.42) * max(dot(n, normalize(vec3(-0.6, 0.25, -0.4))), 0.0) * 0.12;
+    float fog = 1.0 - exp(-t * 0.020);
+    col = mix(col, sky, fog);
+  } else {
+    col = sky;
+  }
+  col *= vign(uv);
+  col = aces(col * 1.05);
+  O = vec4(pow(col, vec3(0.4545)) + grain(), 1.0);
+}`;
+
+const FRAG_NEBULA = COMMON + `
+void main(){
+  vec2 uv = uvof();
+  float r0 = length(uv);
+  float ang = 1.15 / (0.35 + r0) * (0.30 + 0.70 * uEnergy) + uTime * 0.035;
+  float ca = cos(ang), sa = sin(ang);
+  vec2 p = mat2(ca, -sa, sa, ca) * uv * 2.60;
+
+  float t = uTime * 0.06;
+  vec2 q = vec2(fbm(p + vec2(0.0, t)), fbm(p + vec2(5.2, 1.3) - t));
+  vec2 r = vec2(fbm(p + 2.1 * q + vec2(1.7, 9.2) + 0.20 * t), fbm(p + 2.1 * q + vec2(8.3, 2.8) - 0.15 * t));
+  float f = pow(fbm(p + 2.4 * r), 1.5);
+  float fr = pow(1.0 - abs(2.0 * fbm(p * 1.7 + 3.1 * r) - 1.0), 3.0);
+
+  vec3 col = vec3(0.002, 0.003, 0.010);
+  col = mix(col, vec3(0.030, 0.040, 0.150), clamp(f * f * 2.6, 0.0, 1.0));
+  col = mix(col, vec3(0.30, 0.03, 0.42), clamp(dot(q, q) * 0.60, 0.0, 1.0) * f * (0.40 + 0.90 * uMid));
+  col = mix(col, vec3(0.02, 0.38, 0.60), clamp(r.x * r.x * 1.6, 0.0, 1.0) * 0.40 * (0.30 + 1.00 * uHigh));
+  col += vec3(0.10, 0.35, 0.65) * fr * (0.25 + 0.95 * uHigh);
+
+  float d = length(uv);
+  float core = exp(-d * 9.0) * (0.25 + 0.75 * uBass) * 0.60 + exp(-d * 30.0) * (0.50 + 3.5 * uBeat);
+  col += vec3(1.20, 0.75, 0.35) * core;
+  col += vec3(0.90, 0.30, 0.50) * exp(-abs(d - 0.28) * 16.0) * 0.10 * (0.40 + 0.60 * uEnergy);
+  col += vec3(0.45, 0.20, 0.70) * exp(-d * 1.5) * 0.10;
+
+  vec2 sp = uv * 34.0;
+  vec2 id = floor(sp);
+  float sh = hash21(id);
+  vec2 offs = vec2(hash21(id + 7.1), hash21(id + 13.7)) - 0.5;
+  float star = smoothstep(0.09, 0.0, length(fract(sp) - 0.5 - offs * 0.55)) * step(0.90, sh);
+  star *= 0.35 + 0.65 * sin(uTime * (1.5 + sh * 3.0) + sh * 40.0) * 0.5 + 0.5;
+  col += vec3(0.75, 0.85, 1.0) * star * (0.10 + 1.2 * uHigh);
+
+  col *= vign(uv);
+  col = aces(col * (0.75 + 0.65 * uEnergy));
+  O = vec4(pow(col, vec3(0.4545)) + grain(), 1.0);
+}`;
+
+const FRAG_SCULPTURE = COMMON + `
+float hash31(vec3 p){ p = fract(p * 0.3183099 + vec3(0.1, 0.17, 0.13)); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float noise3(vec3 x){
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash31(i), hash31(i + vec3(1, 0, 0)), f.x), mix(hash31(i + vec3(0, 1, 0)), hash31(i + vec3(1, 1, 0)), f.x), f.y),
+    mix(mix(hash31(i + vec3(0, 0, 1)), hash31(i + vec3(1, 0, 1)), f.x), mix(hash31(i + vec3(0, 1, 1)), hash31(i + vec3(1, 1, 1)), f.x), f.y),
+    f.z);
+}
+float fbm3(vec3 p){
+  float a = 0.5, s = 0.0;
+  for (int i = 0; i < 4; i++){ s += a * noise3(p); p *= 2.03; a *= 0.5; }
+  return s;
+}
+float sdOct(vec3 p, float s){ return (abs(p.x) + abs(p.y) + abs(p.z) - s) * 0.57735027; }
+float map(vec3 p){
+  float sc = 1.0 + 0.10 * uBeat;
+  vec3 q = p / sc;
+  float ry = uTime * 0.22;
+  float ca = cos(ry), sa = sin(ry);
+  q.xz = mat2(ca, -sa, sa, ca) * q.xz;
+  float d = sdOct(q, 1.15);
+  d -= fbm3(q * 3.4 + vec3(0.0, uTime * 0.10, 0.0)) * 0.12 * (0.45 + 0.75 * uMid);
+  return d * 0.75 * sc;
+}
+vec3 calcN(vec3 p){
+  const vec2 e = vec2(0.002, -0.002);
+  return normalize(e.xyy * map(p + e.xyy) + e.yyx * map(p + e.yyx) + e.yxy * map(p + e.yxy) + e.xxx * map(p + e.xxx));
+}
+float calcAO(vec3 p, vec3 n){
+  float occ = 0.0;
+  for (int i = 1; i <= 5; i++){
+    float h = 0.02 + 0.11 * float(i);
+    occ += max(h - map(p + n * h), 0.0) * (1.0 / float(i));
+  }
+  return clamp(1.0 - 1.6 * occ, 0.0, 1.0);
+}
+void main(){
+  vec2 uv = uvof();
+  float camA = 0.65;
+  vec3 ro = vec3(sin(camA), 0.42, cos(camA)) * 3.4;
+  vec3 ta = vec3(0.0);
+  vec3 fwd = normalize(ta - ro);
+  vec3 rgt = normalize(cross(fwd, vec3(0, 1, 0)));
+  vec3 up = cross(rgt, fwd);
+  vec3 rd = normalize(fwd * 1.6 + rgt * uv.x + up * uv.y);
+
+  float d0 = length(uv);
+  vec3 bg = mix(vec3(0.008, 0.010, 0.022), vec3(0.002, 0.002, 0.008), clamp(d0 * 0.9, 0.0, 1.0));
+  bg += vec3(0.03, 0.12, 0.20) * exp(-d0 * 2.0) * (0.25 + 0.70 * uBass + 1.0 * uBeat);
+  vec2 sp = uv * 30.0;
+  vec2 id = floor(sp);
+  float sh = hash21(id);
+  float star = smoothstep(0.08, 0.0, length(fract(sp) - 0.5)) * step(0.975, sh);
+  bg += vec3(0.6, 0.7, 0.9) * star * (0.08 + 0.8 * uHigh);
+
+  float t = 0.0; bool hit = false; vec3 p = ro;
+  for (int i = 0; i < 128; i++){
+    p = ro + rd * t;
+    float d = map(p);
+    if (d < 0.0015){ hit = true; break; }
+    t += d;
+    if (t > 16.0) break;
+  }
+
+  vec3 col = bg;
+  if (hit){
+    vec3 n = calcN(p);
+    float ao = calcAO(p, n);
+    vec3 key = normalize(vec3(0.6, 0.75, 0.45));
+    float dif = max(dot(n, key), 0.0);
+    float fres = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+    vec3 albedo = vec3(0.008, 0.010, 0.016);
+    vec3 lin = albedo * (0.06 + 0.85 * dif) * ao;
+    vec3 hlf = normalize(key - rd);
+    lin += vec3(0.9, 0.95, 1.0) * pow(max(dot(n, hlf), 0.0), 60.0) * 0.55 * ao;
+    lin += vec3(0.12, 0.75, 1.15) * fres * (0.25 + 1.4 * uEnergy) * ao;
+    float ry = uTime * 0.22;
+    vec3 q = p; q.xz = mat2(cos(ry), -sin(ry), sin(ry), cos(ry)) * q.xz;
+    float vn = 1.0 - abs(2.0 * fbm3(q * 4.2 + vec3(0.0, uTime * 0.05, 0.0)) - 1.0);
+    float crack = smoothstep(0.90, 0.975, vn);
+    lin += vec3(1.60, 0.55, 0.12) * crack * (0.15 + 1.8 * uEnergy + 1.2 * uBeat) * ao;
+    col = lin;
+  }
+
+  col *= vign(uv);
+  col = aces(col * 1.15);
+  O = vec4(pow(col, vec3(0.4545)) + grain(), 1.0);
+}`;
+
+const FRAGS = { terrain: FRAG_TERRAIN, nebula: FRAG_NEBULA, sculpture: FRAG_SCULPTURE };
+
+function fail(msg){ window.__error = String(msg); console.error(msg); }
+
+const gl = canvas.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false });
+if (!gl) fail('no webgl2');
+
+function compile(type, src){
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)){
+    fail('shader compile: ' + gl.getShaderInfoLog(sh));
+    return null;
+  }
+  return sh;
+}
+
+if (gl){
+  const vs = compile(gl.VERTEX_SHADER, VERT);
+  const fs = compile(gl.FRAGMENT_SHADER, FRAGS[CONCEPT] || FRAGS.terrain);
+  if (vs && fs){
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) fail('link: ' + gl.getProgramInfoLog(prog));
+    gl.useProgram(prog);
+    const U = {};
+    for (const n of ['uRes', 'uTime', 'uBass', 'uMid', 'uHigh', 'uBeat', 'uEnergy']) U[n] = gl.getUniformLocation(prog, n);
+    const dpr = 1;
+    const w = canvas.clientWidth * dpr || innerWidth, h = canvas.clientHeight * dpr || innerHeight;
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+    let frames = 0;
+    function draw(){
+      gl.uniform2f(U.uRes, w, h);
+      gl.uniform1f(U.uTime, S.time);
+      gl.uniform1f(U.uBass, S.bass);
+      gl.uniform1f(U.uMid, S.mid);
+      gl.uniform1f(U.uHigh, S.high);
+      gl.uniform1f(U.uBeat, S.beat);
+      gl.uniform1f(U.uEnergy, S.energy);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      frames++;
+      if (frames < 3) requestAnimationFrame(draw);
+      else {
+        const px = new Uint8Array(4 * 64);
+        gl.readPixels(w >> 1, h >> 1, 8, 8, gl.RGBA, gl.UNSIGNED_BYTE, px);
+        let luma = 0;
+        for (let i = 0; i < 64; i++) luma += 0.299 * px[i * 4] + 0.587 * px[i * 4 + 1] + 0.114 * px[i * 4 + 2];
+        window.__luma = luma / 64;
+        window.__ready = true;
+      }
+    }
+    requestAnimationFrame(draw);
+  }
+}
+</script>
+</body>
+</html>

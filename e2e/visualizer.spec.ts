@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 
 async function expectProductionEngine(
 	page: import('@playwright/test').Page,
-	engine: 'mk1' | 'mk2' | 'signal'
+	engine: 'mk1' | 'mk2' | 'signal' | 'loom'
 ) {
 	await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
 		'data-render-engine',
@@ -30,6 +30,17 @@ async function expectVisualizerChrome(
 		.toEqual({ host: expected, player: expected });
 }
 
+async function hasUsableWebGpu(page: import('@playwright/test').Page) {
+	return page.evaluate(async () => {
+		if (!navigator.gpu) return false;
+		try {
+			return Boolean(await navigator.gpu.requestAdapter());
+		} catch {
+			return false;
+		}
+	});
+}
+
 test.describe('visualizer engine roster', () => {
 	test('lab exposes only the supported engines and keyboard routes', async ({ page }) => {
 		await page.goto('/visualizer-test');
@@ -40,6 +51,7 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByRole('button', { name: 'Prism · mk1', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Soma · mk2', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Signal', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Loom', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'mk3', exact: true })).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'runtime', exact: true })).toHaveCount(0);
 		// Lab engines are embedded canvases, not fake full-screen buttons.
@@ -60,6 +72,8 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByText(/Soma · mk2/).last()).toBeVisible();
 		await page.keyboard.press('q');
 		await expect(page.getByText(/Prism · mk1/).last()).toBeVisible();
+		await page.keyboard.press('r');
+		await expect(page.getByText(/Loom · harmonic weave/).last()).toBeVisible();
 	});
 
 	test('named production rail uses arrows, retires V, persists response, and Escape closes', async ({ page }) => {
@@ -87,7 +101,7 @@ test.describe('visualizer engine roster', () => {
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'288'
+			'384'
 		);
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',
@@ -97,7 +111,24 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'signal');
 		await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
 		await page.keyboard.press('ArrowRight');
+		await expectProductionEngine(page, 'loom');
+		const loomCanvas = page.getByLabel('Loom audio visualizer');
+		await expect(loomCanvas).toHaveAttribute(
+			'data-loom-render-passes',
+			'2'
+		);
+		await expect(loomCanvas).toHaveAttribute(
+			'data-loom-topology',
+			/torus|helix|saddle|knot|cage/
+		);
+		if (await hasUsableWebGpu(page)) {
+			await expect(loomCanvas).toHaveAttribute('data-loom-ready', 'true', { timeout: 15_000 });
+			await expect(page.getByText('Loom unavailable', { exact: true })).toHaveCount(0);
+		}
+		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk1');
+		await page.keyboard.press('ArrowLeft');
+		await expectProductionEngine(page, 'loom');
 		await page.keyboard.press('ArrowLeft');
 		await expectProductionEngine(page, 'signal');
 		await page.getByRole('button', { name: /Signal: Phosphor score\. Show details/ }).click();
@@ -121,6 +152,10 @@ test.describe('visualizer engine roster', () => {
 		await opener.click();
 		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
 		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
+		// The opener can leave the synthetic browser pointer sitting over the
+		// player bar, which correctly holds chrome open. Move onto the stage so
+		// this assertion measures the idle clock instead of pointer-hover state.
+		await page.mouse.move(160, 280);
 		await expectVisualizerChrome(page, true);
 		await expectVisualizerChrome(page, false);
 
@@ -246,6 +281,7 @@ test.describe('visualizer engine roster', () => {
 			stroke: 1,
 			saturation: 1
 		});
+		expect(profiles.loom.flow).toEqual({ motion: 1, impact: 1, width: 1, glow: 1 });
 
 		for (const rail of ['motion', 'impact'] as const) {
 			expect(profiles.mk1.still[rail]).toBeLessThan(profiles.mk1.flow[rail]);
@@ -254,6 +290,8 @@ test.describe('visualizer engine roster', () => {
 			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
 			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
 			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
+			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
+			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
 		}
 		for (const rail of ['fog', 'shafts'] as const) {
 			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
@@ -262,6 +300,10 @@ test.describe('visualizer engine roster', () => {
 		for (const rail of ['persistenceOffset', 'stroke', 'saturation'] as const) {
 			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
 			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
+		}
+		for (const rail of ['width', 'glow'] as const) {
+			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
+			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
 		}
 		expect(profiles.mk1.still.feedbackFadeOffset).toBeLessThan(
 			profiles.mk1.flow.feedbackFadeOffset
@@ -364,6 +406,75 @@ test.describe('visualizer musical analysis', () => {
 
 		expect(slopes.rising).toBeGreaterThan(0);
 		expect(slopes.falling).toBeLessThan(0);
+	});
+
+	test('drop forecasts always land on the nearest supported phrase boundary', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/director/drop.ts';
+			const { projectBuildBars } = await import(modulePath);
+			return [0, 5, 13, 29, 31].map((bar) => {
+				const wait = projectBuildBars(bar);
+				const landing = bar + wait;
+				return { bar, wait, landing, supported: [8, 16, 32].some((p) => landing % p === 0) };
+			});
+		});
+
+		expect(result).toEqual([
+			{ bar: 0, wait: 8, landing: 8, supported: true },
+			{ bar: 5, wait: 11, landing: 16, supported: true },
+			{ bar: 13, wait: 11, landing: 24, supported: true },
+			{ bar: 29, wait: 11, landing: 40, supported: true },
+			{ bar: 31, wait: 9, landing: 40, supported: true }
+		]);
+	});
+
+	test('sustained novelty produces one onset impulse instead of one per frame', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/director/index.ts';
+			const { createVisualDirector } = await import(modulePath);
+			const director = createVisualDirector();
+			const features = {
+				bins: new Array(64).fill(0.08),
+				rms: 0.04,
+				peak: 0.08,
+				bass: 0.04,
+				mid: 0.04,
+				treble: 0.04,
+				centroid: 0.4,
+				onset: false,
+				bpm: 120,
+				beat_phase: 0.5,
+				chroma_key: 0,
+				chroma_strength: 0,
+				sample_rate: 48_000
+			};
+			const spectrum = {
+				bass: 0.04,
+				mid: 0.04,
+				treble: 0.04,
+				centroid: 0.4,
+				flatness: 0.5,
+				novelty: 0.9,
+				levels: { sub: 0.04, kick: 0.04 }
+			};
+			let first = director.update(features, 0, spectrum as any);
+			let held = first;
+			for (let frame = 1; frame <= 90; frame += 1) {
+				held = director.update(features, frame / 60, spectrum as any);
+			}
+			(spectrum as any).novelty = 0;
+			for (let frame = 91; frame <= 120; frame += 1) {
+				director.update(features, frame / 60, spectrum as any);
+			}
+			(spectrum as any).novelty = 0.9;
+			const retriggered = director.update(features, 121 / 60, spectrum as any);
+			return { firstDensity: first.density, heldDensity: held.density, retriggeredDensity: retriggered.density };
+		});
+
+		expect(result.heldDensity).toBeLessThan(0.12);
+		expect(result.retriggeredDensity).toBeGreaterThan(result.heldDensity);
 	});
 
 	test('drop detector preserves a build through its bass-and-energy landing', async ({ page }) => {

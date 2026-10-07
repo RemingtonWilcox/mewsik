@@ -57,6 +57,8 @@ export type SignalSpectrumProfile = {
 	crestRatio: number;
 	/** Compressed perceptual crest factor, 0..1. */
 	crestFactor: number;
+	/** Wiener spectral flatness from inverse-log-decoded magnitudes, 0..1. */
+	flatness: number;
 	/** Corrected composites made from real musical frequency ranges. */
 	bass: number;
 	mid: number;
@@ -303,6 +305,7 @@ export class SignalSpectrumTracker {
 	private spectralMotion = 0;
 	private spectralDirection = 0;
 	private crestFactor = 0;
+	private flatness = 0;
 	private primed = false;
 
 	private readonly profile: SignalSpectrumProfile = {
@@ -320,6 +323,7 @@ export class SignalSpectrumTracker {
 		centroidVelocity: 0,
 		crestRatio: 0,
 		crestFactor: 0,
+		flatness: 0,
 		bass: 0,
 		mid: 0,
 		treble: 0
@@ -352,6 +356,7 @@ export class SignalSpectrumTracker {
 		this.spectralMotion = 0;
 		this.spectralDirection = 0;
 		this.crestFactor = 0;
+		this.flatness = 0;
 		this.primed = false;
 		this.syncProfile(0);
 	}
@@ -365,6 +370,21 @@ export class SignalSpectrumTracker {
 		}
 
 		const decodedPeak = decodeSignalBins(features?.bins ?? EMPTY_BINS, this.decodedBins);
+		let decodedSum = 0;
+		let decodedLogSum = 0;
+		for (let bin = 0; bin < SIGNAL_SPECTRUM_BIN_COUNT; bin += 1) {
+			const magnitude = this.decodedBins[bin];
+			decodedSum += magnitude;
+			decodedLogSum += Math.log(Math.max(magnitude, 1e-8));
+		}
+		const flatnessTarget =
+			decodedSum > 1e-6
+				? clamp01(
+						Math.exp(decodedLogSum / SIGNAL_SPECTRUM_BIN_COUNT) /
+							(decodedSum / SIGNAL_SPECTRUM_BIN_COUNT)
+					)
+				: 0;
+		this.flatness = approach(this.flatness, flatnessTarget, 0.12, dt);
 		reduceDecodedSignalBands(this.decodedBins, this.weights, this.raw);
 		let motionInstant = 0;
 		let noveltyInstant = 0;
@@ -520,6 +540,7 @@ export class SignalSpectrumTracker {
 		this.profile.centroidVelocity = this.centroidVelocity;
 		this.profile.crestRatio = crestRatio;
 		this.profile.crestFactor = this.crestFactor;
+		this.profile.flatness = this.flatness;
 		this.profile.bass = clamp01(
 			this.levels[0] * 0.32 + this.levels[1] * 0.48 + this.levels[2] * 0.2
 		);

@@ -1,4 +1,4 @@
-export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal'] as const;
+export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal', 'loom'] as const;
 
 export type VisualizerEngine = (typeof VISUALIZER_ENGINES)[number];
 
@@ -39,6 +39,14 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		description: 'A continuous instrument trace that draws spectrum, rhythm, harmony, and song structure.',
 		accent: '#a7f3d0',
 		accentMuted: 'rgba(52, 211, 153, 0.46)'
+	},
+	loom: {
+		name: 'Loom',
+		subtitle: 'Harmonic weave',
+		role: 'Harmony',
+		description: 'A lit ribbon manifold that reweaves its topology as harmony, phrases, and releases unfold.',
+		accent: '#bfdbfe',
+		accentMuted: 'rgba(96, 165, 250, 0.46)'
 	}
 };
 
@@ -66,6 +74,11 @@ export const VISUALIZER_RESPONSE_PROFILES = {
 		still: { motion: 0.76, impact: 0.62, persistenceOffset: -0.018, stroke: 0.82, saturation: 0.88 },
 		flow: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
 		surge: { motion: 1.12, impact: 1.18, persistenceOffset: 0.01, stroke: 1.1, saturation: 1.06 }
+	},
+	loom: {
+		still: { motion: 0.68, impact: 0.62, width: 0.88, glow: 0.76 },
+		flow: { motion: 1, impact: 1, width: 1, glow: 1 },
+		surge: { motion: 1.16, impact: 1.2, width: 1.08, glow: 1.14 }
 	}
 } as const satisfies Record<VisualizerEngine, Record<VisualizerResponse, Record<string, number>>>;
 

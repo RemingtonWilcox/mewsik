@@ -88,8 +88,8 @@ struct Uniforms {
 	songSeed: f32,   // 0..1, shared deterministic journey seed
 	palJump: f32,    // brief palette T jump from onset roulette
 	sceneWeight: f32, // 0..1, scales scene output for top-2 blend rendering
-	_pad3: f32,
-	_pad4: f32,
+	longPhase: f32,  // shared song-scale phase; survives renderer remounts
+	sectionEnergy: f32,
 };
 
 fn fullscreenVS(idx: u32) -> vec4<f32> {
@@ -257,8 +257,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	// Kaleidoscope fold count — audio sets the *target*, but a slow noise drift
 	// wanders ±2 around it so the symmetry isn't deterministically tied to the
 	// current audio frame. The visual evolves on its own timescale.
-	let driftSlow = snoise(u.time * 0.07 + u.songSeed * 31.0);
-	let kalSidesRaw = 4.0 + floor(u.centroid * 6.0 + u.bpmNorm * 2.0 + (driftSlow - 0.5) * 4.0) * 2.0;
+	let driftSlow = snoise(u.longPhase * 0.42 + u.songSeed * 31.0);
+	let kalSidesRaw = 4.0 + floor(
+		u.centroid * 5.0 + u.bpmNorm * 1.5 + u.sectionEnergy * 1.5
+			+ (driftSlow - 0.5) * 4.0
+	) * 2.0;
 	let kalSides = clamp(kalSidesRaw, 4.0, 18.0);
 	let kal = kaleidoscope(p, kalSides);
 
@@ -269,15 +272,16 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	let beatPulse = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 4.0);
 
 	// Tile scale evolves organically — audio target plus slow noise drift.
-	let scaleDrift = snoise(u.time * 0.05 + u.songSeed * 71.0);
-	let tileScale = 2.5 + u.bpmNorm * 0.9 - u.chromaStrength * 0.4 + u.bass * 0.2 + scaleDrift * 0.8;
+	let scaleDrift = snoise(u.longPhase * 0.31 + u.songSeed * 71.0);
+	let tileScale = 2.5 + u.bpmNorm * 0.72 - u.chromaStrength * 0.34
+		+ u.bass * 0.2 + u.sectionEnergy * 0.38 + scaleDrift * 0.8;
 	let scalePunch = 1.0 - beatPulse * 0.12;
 	// Per-song seed shifts the tile-grid origin. Continuous variant morphing:
 	// we pick a "current" and "next" variant and BLEND between them over time
 	// (variantPhase oscillates 0→1→0 with ~12s period, modulated by noise).
 	// Result: same kaleidoscope framework but textures continuously mutate
 	// across (arcs / cross / diag / rings) rather than locking to one per song.
-	let variantClock = u.time * 0.08 + u.songSeed * 23.0;
+	let variantClock = u.longPhase * 0.64 + u.songSeed * 23.0;
 	let variantA = i32(floor(variantClock)) - i32(floor(variantClock / 4.0)) * 4;
 	let variantB = (variantA + 1) - ((variantA + 1) / 4) * 4;
 	let variantPhase = smoothstep(0.0, 1.0, variantClock - floor(variantClock));
@@ -305,10 +309,11 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	// Palette rotation — chroma + centroid + song seed + slow noise drift, so
 	// the palette wanders organically across the cycle instead of sitting in a
 	// fixed zone.
-	let palDrift = snoise(u.time * 0.03 + u.songSeed * 113.0);
+	let palDrift = snoise(u.longPhase * 0.24 + u.songSeed * 113.0);
 	let keyBias = u.chromaKey * u.chromaStrength;
 	let timbreBias = u.centroid * 0.7 * (1.0 - u.chromaStrength * 0.6);
-	let palT = keyBias + timbreBias + kalR * 0.15 + u.time * 0.012 + u.songSeed * 0.5 + palDrift * 0.35 + u.palJump;
+	let palT = keyBias + timbreBias + kalR * 0.15 + u.longPhase * 0.032
+		+ u.songSeed * 0.5 + palDrift * 0.35 + u.palJump;
 	let colA = iridescent(palT);
 	let colB = iridescent(palT + 0.5); // complementary stripe for the outer haze
 
@@ -938,7 +943,6 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	};
 
 	let gpu: GPU | null = null;
-	const t0 = performance.now();
 
 	function createTarget(device: GPUDevice, w: number, h: number, format: GPUTextureFormat) {
 		return device.createTexture({
@@ -1215,12 +1219,17 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			const tt = target > smoothed.bins[i] ? attack : release;
 			smoothed.bins[i] = lerp(smoothed.bins[i], target, tt);
 		}
-		smoothed.bass = lerp(smoothed.bass, feat?.bass ?? 0, 0.28);
-		smoothed.mid = lerp(smoothed.mid, feat?.mid ?? 0, 0.22);
-		smoothed.treble = lerp(smoothed.treble, feat?.treble ?? 0, 0.42);
-		smoothed.centroid = lerp(smoothed.centroid, feat?.centroid ?? 0.5, 0.04);
+		const spectrum = journey.spectrum;
+		const directed = journey.director;
+		smoothed.bass = lerp(smoothed.bass, feat ? spectrum.bass : 0, 0.28);
+		smoothed.mid = lerp(smoothed.mid, feat ? spectrum.mid : 0, 0.22);
+		smoothed.treble = lerp(smoothed.treble, feat ? spectrum.treble : 0, 0.42);
+		smoothed.centroid = lerp(smoothed.centroid, spectrum.centroid, 0.04);
 		smoothed.rms = lerp(smoothed.rms, feat?.rms ?? 0, 0.22);
-		if (feat?.onset && !onsetLatched) {
+		const onsetNow =
+			feat !== null &&
+			(feat.onset || spectrum.novelty > 0.58 || journey.signal.impact > 0.78);
+		if (onsetNow && !onsetLatched) {
 			smoothed.flash = responseImpact;
 			// Onset roulette: each onset rolls for one of N organic events.
 			// 30% chance: trail clear (feedback fade momentarily drops).
@@ -1234,33 +1243,46 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			}
 			onsetEventIndex += 1;
 		}
-		onsetLatched = feat?.onset ?? false;
+		onsetLatched = onsetNow;
 		smoothed.flash *= 0.9;
 		onsetEventStrip *= 0.85;
 		onsetEventPalJump *= 0.92;
 
 		// Circular chroma smoothing — atan2-recover so key changes glide rather
 		// than snap from index 11 → 0.
-		const chromaAngle = (feat?.chroma_key ?? 0) * 2 * Math.PI;
+		const directedKey =
+			directed.context.keyConfidence > 0.1
+				? directed.context.keyPitchClass
+				: journey.signal.key;
+		const chromaAngle = directedKey * 2 * Math.PI;
 		smoothed.chromaX = lerp(smoothed.chromaX, Math.cos(chromaAngle), 0.05);
 		smoothed.chromaY = lerp(smoothed.chromaY, Math.sin(chromaAngle), 0.05);
-		smoothed.chromaStrength = lerp(smoothed.chromaStrength, feat?.chroma_strength ?? 0, 0.06);
+		smoothed.chromaStrength = lerp(
+			smoothed.chromaStrength,
+			Math.max(feat?.chroma_strength ?? 0, directed.context.keyConfidence),
+			0.06
+		);
 		const chromaKeySmoothed =
 			(Math.atan2(smoothed.chromaY, smoothed.chromaX) / (2 * Math.PI) + 1) % 1;
 
 		// BPM normalized to 0..1 across 60..180 BPM, slowly smoothed.
-		const bpmRaw = feat?.bpm ?? 0;
+		const bpmRaw = directed.clock.tempoBpm;
 		const bpmNormTarget = bpmRaw > 0 ? Math.max(0, Math.min(1, (bpmRaw - 60) / 120)) : 0;
 		smoothed.bpmNorm = lerp(smoothed.bpmNorm, bpmNormTarget, 0.02);
 
 		// Rotation rate is non-monotonic — a slow oscillator on top of the audio
 		// rate. Direction reverses ~1×/min, speed varies, sometimes pauses.
 		// This kills the "always clockwise loop" feel and reads as alive.
-		const tSec = (frameNow - t0) / 1000;
+		// The source timeline belongs to the shared journey, so every slow Prism
+		// oscillator resumes at the same posture after switching engines.
+		const tSec = journey.timelineSeconds;
 		const rotOsc = Math.sin(tSec * 0.07 + songSeed * 6.28) * 0.7 + Math.sin(tSec * 0.023 + songSeed * 11.0) * 0.5;
-		const rotRate =
-			(0.04 + smoothed.mid * 0.55 + smoothed.bpmNorm * 0.15) * rotOsc * responseMotion;
-		smoothed.rotation += rotRate * Math.min(frameDt, 0.1);
+		// Rotation now belongs to the shared song journey rather than this mounted
+		// component's lifetime. Switching engines and returning to Prism resumes the
+		// same choreography instead of visibly restarting its clockwise loop.
+		smoothed.rotation =
+			journey.signal.tracePhase * 0.12 * responseMotion +
+			rotOsc * (0.18 + smoothed.mid * 0.2) * responseMotion;
 
 		// Audio-conditional post params. Tuned for clarity over smear — feedback
 		// punctuates, doesn't blanket; bloom only bites the brightest edges.
@@ -1277,7 +1299,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const feedbackZoom = 1 - (0.003 + smoothed.bass * 0.005) * responseMotion;
 
 		// Beat phase taken raw — we want the snap, not a smoothed drift.
-		const beatPhase = feat?.beat_phase ?? 0;
+		const beatPhase = directed.clock.beatPhase;
 
 		// Prism's production identity stays on its refined hyperbolic scene.
 		// The lab can still inspect the other generators, with a clamped index and
@@ -1311,8 +1333,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		u[20] = onsetEventPalJump * responseImpact;
 		// u[21] = sceneWeight — set per scene pass below.
 		u[21] = 1;
-		u[22] = 0;
-		u[23] = 0;
+		u[22] = journey.signal.tracePhase;
+		u[23] = directed.context.sectionEnergy;
 
 		// ── Single dominant preset (no top-2 blend). Cross-fading two distinct
 		// generators produced visible overlay/competition instead of evolution.

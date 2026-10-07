@@ -17,6 +17,24 @@ const HIST_LEN = 8 * 60;
 const SLOPE_WINDOW = 90; // ~1.5s at 60 Hz
 const BUILD_BAR_TARGETS = [8, 16, 32];
 
+/**
+ * Pick the nearest supported phrase boundary with enough runway for a build.
+ * When an immediate boundary is under four bars away, advance that same phrase
+ * family once instead of falling through to an unrelated absolute offset.
+ */
+export function projectBuildBars(barIndex: number, minimumRunway = 4): number {
+	const safeBar = Number.isFinite(barIndex) ? Math.floor(barIndex) : 0;
+	const runway = Math.max(0, Number.isFinite(minimumRunway) ? minimumRunway : 4);
+	let nearest = Number.POSITIVE_INFINITY;
+	for (const period of BUILD_BAR_TARGETS) {
+		const completed = ((safeBar % period) + period) % period;
+		let barsUntilBoundary = period - completed;
+		if (barsUntilBoundary < runway) barsUntilBoundary += period;
+		nearest = Math.min(nearest, barsUntilBoundary);
+	}
+	return Number.isFinite(nearest) ? nearest : BUILD_BAR_TARGETS[0];
+}
+
 type Phase = 'idle' | 'building' | 'dropped' | 'decaying';
 
 export class DropDetector {
@@ -122,19 +140,13 @@ export class DropDetector {
 	}
 
 	private projectBarTarget(clock: MusicalClock) {
-		// Pick the nearest build target (8/16/32 bars) and project drop time
-		// from current bar progress + tempo. Default to 16 bars when tempo is
-		// unknown (Yadati's median build length).
+		// Land on the nearest useful 8/16/32-bar phrase boundary with at least four
+		// bars of runway. Each family projects its own *next* boundary when the
+		// immediate one is too close, so the result always remains on-grid.
 		const beatsPerSec = clock.tempoBpm / 60;
 		const beatsPerBar = 4;
 		const barTime = beatsPerBar / Math.max(0.5, beatsPerSec);
-		let pick = 16;
-		for (const t of BUILD_BAR_TARGETS) {
-			if (t >= 4) {
-				pick = t;
-				break;
-			}
-		}
+		const pick = projectBuildBars(clock.barIndex);
 		this.projectedDropBar = clock.barIndex + pick;
 		this.projectedDropTime = this.buildStartTime + pick * barTime;
 	}

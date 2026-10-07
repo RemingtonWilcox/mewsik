@@ -1,6 +1,44 @@
 import { expect, test } from '@playwright/test';
 
 test.describe('shared visualizer journey runtime', () => {
+	test('source timeline and renderer phase stay monotonic beyond a full turn', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/journey.ts';
+			const { VisualizerJourneyRuntime } = await import(modulePath);
+			const runtime = new VisualizerJourneyRuntime(0.42, 0);
+			runtime.resetSource('monotonic-phase', 1_000);
+			const features = {
+				bins: Array.from({ length: 64 }, (_, index) => 0.72 + Math.sin(index * 0.4) * 0.12),
+				rms: 0.72,
+				peak: 0.9,
+				centroid: 0.46,
+				onset: false,
+				bass: 0.72,
+				mid: 0.68,
+				treble: 0.55,
+				sample_rate: 48_000,
+				bpm: 128,
+				beat_phase: 0.4,
+				chroma_key: 0.35,
+				chroma_strength: 0.8
+			};
+			let snapshot = runtime.advance(features, 1_000);
+			for (let step = 1; step <= 480; step += 1) {
+				snapshot = runtime.advance(features, 1_000 + step * 250);
+			}
+			return {
+				timelineSeconds: snapshot.timelineSeconds,
+				tracePhase: snapshot.signal.tracePhase,
+				cachedTimeline: runtime.cachedSnapshot?.timelineSeconds
+			};
+		});
+
+		expect(result.timelineSeconds).toBe(120);
+		expect(result.cachedTimeline).toBe(120);
+		expect(result.tracePhase).toBeGreaterThan(Math.PI * 2);
+	});
+
 	test('cached getters are idempotent and analyzer events advance every engine while Mk1 is selected', async ({
 		page
 	}) => {
@@ -37,7 +75,9 @@ test.describe('shared visualizer journey runtime', () => {
 				trace: first.signal.tracePhase,
 				camera: first.mk2.cameraPhase,
 				background: first.mk2.backgroundFlowPhase,
-				rotation: first.mk2.rotationPhase
+				rotation: first.mk2.rotationPhase,
+				loomWeave: first.loom.weavePhase,
+				loomLong: first.loom.longPhase
 			};
 			const repeated = vis.getJourney(base + 16);
 			const directorOnly = vis.getPerformance(base + 16);
@@ -55,7 +95,9 @@ test.describe('shared visualizer journey runtime', () => {
 					trace: progressed.signal.tracePhase,
 					camera: progressed.mk2.cameraPhase,
 					background: progressed.mk2.backgroundFlowPhase,
-					rotation: progressed.mk2.rotationPhase
+					rotation: progressed.mk2.rotationPhase,
+					loomWeave: progressed.loom.weavePhase,
+					loomLong: progressed.loom.longPhase
 				}
 			};
 		});
@@ -69,6 +111,8 @@ test.describe('shared visualizer journey runtime', () => {
 		expect(result.after.camera).toBeGreaterThan(result.before.camera);
 		expect(result.after.background).toBeGreaterThan(result.before.background);
 		expect(result.after.rotation).not.toBe(result.before.rotation);
+		expect(result.after.loomWeave).toBeGreaterThan(result.before.loomWeave);
+		expect(result.after.loomLong).toBeGreaterThan(result.before.loomLong);
 	});
 
 	test('Signal and Mk2 remount against the same continuously advancing source epoch', async ({
@@ -86,7 +130,9 @@ test.describe('shared visualizer journey runtime', () => {
 					travel: snapshot.signal.spectrumTravel,
 					trace: snapshot.signal.tracePhase,
 					camera: snapshot.mk2.cameraPhase,
-					background: snapshot.mk2.backgroundFlowPhase
+					background: snapshot.mk2.backgroundFlowPhase,
+					loomWeave: snapshot.loom.weavePhase,
+					loomLong: snapshot.loom.longPhase
 				};
 			});
 
@@ -102,9 +148,14 @@ test.describe('shared visualizer journey runtime', () => {
 		expect(after.epoch).toBe(before.epoch);
 		expect(duringMk2.travel).toBeGreaterThan(before.travel);
 		expect(after.travel).toBeGreaterThan(duringMk2.travel);
-		expect(after.trace).toBeGreaterThan(before.trace);
+		// Trace motion intentionally holds at zero whenever the shared director
+		// classifies the lab frame as silence; the tempo-driven spectrum journey
+		// above is the continuity rail that must always advance.
+		expect(after.trace).toBeGreaterThanOrEqual(before.trace);
 		expect(after.camera).toBeGreaterThan(duringMk2.camera);
 		expect(after.background).toBeGreaterThan(duringMk2.background);
+		expect(duringMk2.loomWeave).toBeGreaterThan(before.loomWeave);
+		expect(after.loomLong).toBeGreaterThan(duringMk2.loomLong);
 	});
 
 	test('A to B to A creates clean monotonic epochs without synthesizing an initial impact', async ({
@@ -127,6 +178,8 @@ test.describe('shared visualizer journey runtime', () => {
 					trace: snapshot.signal.tracePhase,
 					camera: snapshot.mk2.cameraPhase,
 					background: snapshot.mk2.backgroundFlowPhase,
+					loomWeave: snapshot.loom.weavePhase,
+					loomImpact: snapshot.loom.impact,
 					detailMagnitude: Array.from(snapshot.spectrum.detailBins).reduce(
 						(sum, value) => sum + Math.abs(value),
 						0
@@ -147,10 +200,14 @@ test.describe('shared visualizer journey runtime', () => {
 		expect(result.b.seed).not.toBe(result.a.seed);
 		expect(result.aAgain.camera).toBeCloseTo(result.a.camera, 8);
 		expect(result.aAgain.background).toBeCloseTo(result.a.background, 8);
+		expect(result.aAgain.loomWeave).toBeCloseTo(result.a.loomWeave, 8);
+		expect(result.b.loomWeave).not.toBeCloseTo(result.a.loomWeave, 8);
 		for (const snapshot of [result.a, result.b, result.aAgain]) {
 			expect(snapshot.signalImpact).toBe(0);
 			expect(snapshot.mk2Impact).toBe(0);
 			expect(snapshot.trace).toBe(0);
+			expect(Number.isFinite(snapshot.loomWeave)).toBe(true);
+			expect(snapshot.loomImpact).toBe(0);
 			expect(snapshot.detailMagnitude).toBe(0);
 		}
 	});
