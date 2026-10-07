@@ -327,10 +327,12 @@ fn vs_main(
 	var role = 0.0;
 	var family = instanceIndex;
 	var radius = params.style.x * 1.2;
+	var hero = 0.0;
 	if (instanceIndex < ${LOOM_PRIMARY_RAILS}u) {
 		kind = 0.0;
 		family = min(instanceIndex * 2u, 5u);
-		radius = params.style.x * (1.9 + bandEnergy(family) * 0.7);
+		hero = select(0.0, 1.0, instanceIndex == 1u);
+		radius = params.style.x * (1.5 + hero * 0.9 + bandEnergy(family) * 0.7);
 	} else if (instanceIndex < ${LOOM_PRIMARY_RAILS + LOOM_SECONDARY_RAILS}u) {
 		kind = 1.0;
 		let sub = instanceIndex - ${LOOM_PRIMARY_RAILS}u;
@@ -362,7 +364,7 @@ fn vs_main(
 	let packet = exp(-pow(s - fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + role * 0.13), 2.0) * 95.0);
 	var emission = 0.06 + band * 0.18 + packet * params.pulse.x * 0.5;
 	if (kind == 0.0) {
-		emission = 0.55 + band * 1.1 + packet * params.pulse.x * 5.0 + params.pulse.w * 0.35;
+		emission = (0.45 + hero * 0.35) + band * (0.8 + hero * 0.5) + packet * params.pulse.x * 5.0 + params.pulse.w * 0.35;
 	}
 	emission = emission * params.style.z * (1.0 - params.style.w * 0.8);
 	// Beats read as a colour event, not only a brightness event: the packet
@@ -372,10 +374,10 @@ fn vs_main(
 	var hue = mixHueShortest(params.palette.x, params.palette.y, familyUnit * 0.72);
 	hue = mixHueShortest(hue, params.palette.z, rails.y * 0.35 + max(0.0, -params.harmony.w) * 0.12);
 	var saturation = clamp(params.palette.w * (0.9 + band * 0.3), 0.6, 0.95);
-	var value = 0.42 + band * 0.34 + params.macroRails.x * 0.12;
+	var value = 0.38 + hero * 0.1 + band * 0.34 + params.macroRails.x * 0.12;
 	if (kind == 1.0) {
-		saturation = saturation * 0.8;
-		value = value * (0.55 + rails.w * 0.15);
+		saturation = saturation * 0.85;
+		value = value * (0.68 + rails.w * 0.15);
 	}
 	if (kind == 2.0) {
 		hue = mixHueShortest(params.palette.y, params.palette.z, 0.62 + params.harmony.z * 0.12);
