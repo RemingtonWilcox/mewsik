@@ -258,6 +258,17 @@ async function cleanRuntimeOutputs() {
 }
 
 async function main() {
+  // Mobile builds get no bundled runtimes: iOS and Android cannot spawn the
+  // Node sidecar or FFmpeg, so leave resources/bin empty instead of shipping
+  // the host's binaries inside the app.
+  const targetPlatform = process.env.TAURI_ENV_PLATFORM;
+  if (targetPlatform === 'ios' || targetPlatform === 'android') {
+    await mkdir(resourcesDir, { recursive: true });
+    await cleanRuntimeOutputs();
+    console.log(`Skipped bundled runtimes for ${targetPlatform}: desktop-only resources`);
+    return;
+  }
+
   const target = resolveRuntimeTarget();
   await mkdir(resourcesDir, { recursive: true });
   await cleanRuntimeOutputs();
