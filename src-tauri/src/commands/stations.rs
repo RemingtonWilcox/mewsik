@@ -10,6 +10,9 @@ use crate::stations::health::{
 };
 use crate::stations::network::{parse_public_http_url, validate_public_http_url};
 use crate::stations::probe::{probe_station_stream, url_looks_like_playlist};
+use crate::stations::scenes::{
+    self, SceneInfo, SceneRefreshSummary, StationDiscoveryFeed, StationPick,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
@@ -545,6 +548,43 @@ pub async fn play_station_search_result(
         let _ = radio_browser_get(&path).await;
     });
     Ok(station.id)
+}
+
+// ── Station discovery (scenes) ──
+
+/// The cached discovery feed. Never blocks on the network: an empty cache
+/// answers `status: "empty"` and starts one background refresh.
+#[tauri::command]
+pub async fn get_station_discovery(db: State<'_, DbPool>) -> Result<StationDiscoveryFeed, String> {
+    let db = db.inner().clone();
+    scenes::build_discovery_feed(&db)
+}
+
+/// Pull stale scenes (all of them when `force`) from radio-browser.
+#[tauri::command]
+pub async fn refresh_station_scenes(
+    db: State<'_, DbPool>,
+    force: Option<bool>,
+) -> Result<SceneRefreshSummary, String> {
+    let db = db.inner().clone();
+    scenes::refresh_station_scenes(&db, force.unwrap_or(false)).await
+}
+
+#[tauri::command]
+pub fn get_station_scenes() -> Vec<SceneInfo> {
+    scenes::scene_catalog()
+}
+
+/// Ranked stations of one scene without the daily shuffle, for "See all".
+#[tauri::command]
+pub async fn get_scene_stations(
+    db: State<'_, DbPool>,
+    scene_id: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<StationPick>, String> {
+    let db = db.inner().clone();
+    scenes::scene_stations_page(&db, &scene_id, limit, offset)
 }
 
 #[cfg(test)]

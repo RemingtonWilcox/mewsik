@@ -115,6 +115,8 @@ pub fn run() {
         .setup(move |app| {
             external_tools::configure_runtime_resource_dir(app.path().resource_dir()?)?;
             stations::health::spawn_favorite_station_health_check(startup_db.clone());
+            stations::scenes::spawn_startup_refresh(startup_db.clone());
+            stations::scenes::spawn_daily_cache_health_sweep(startup_db.clone());
             engine_for_setup.set_app_handle(app.handle().clone());
             Ok(())
         })
@@ -222,6 +224,10 @@ pub fn run() {
             commands::stations::play_station,
             commands::stations::play_station_search_result,
             commands::stations::seed_favorite_stations_from_bundle,
+            commands::stations::get_station_discovery,
+            commands::stations::refresh_station_scenes,
+            commands::stations::get_station_scenes,
+            commands::stations::get_scene_stations,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

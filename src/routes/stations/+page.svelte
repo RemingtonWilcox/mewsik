@@ -5,23 +5,32 @@
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import StationMetrics from '$lib/components/stations/station-metrics.svelte';
 	import * as api from '$lib/api/tauri';
-	import type { RadioBrowserStation, RadioStationSort } from '$lib/api/tauri';
+	import type {
+		RadioBrowserStation,
+		RadioStationSort,
+		SceneInfo,
+		StationDiscoveryFeed,
+		StationPick,
+		StationShelf
+	} from '$lib/api/tauri';
 	import type { Station, StationHealthResult } from '$lib/types';
 	import {
 		curatedCollections,
 		curatedStations,
-		type CuratedCollection,
-		type CuratedStation
+		type CuratedCollection
 	} from '$lib/radio/curated';
+	import { SCENE_CATALOG } from '$lib/radio/scenes';
 	import {
 		DIRECTORY_SORT_OPTIONS,
 		sortRadioStations
 	} from '$lib/radio/signals';
 	import { usePlayer } from '$lib/state/player.svelte';
 	import { toast } from 'svelte-sonner';
+	import { tick, untrack } from 'svelte';
 	import {
 		ArrowRight,
 		Check,
+		ChevronDown,
 		Globe,
 		Guitar,
 		Headphones,
@@ -65,10 +74,29 @@
 	let stationPlayRequest = 0;
 	let verifyingStations = $state(false);
 	let searchHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
-	let curatedHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
+	let discoverHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
+	let probedUrls = $state<Set<string>>(new Set());
+	let failedFavicons = $state<Set<string>>(new Set());
+	let loadedFavicons = $state<Set<string>>(new Set());
 	let selectedCollectionId = $state<CuratedCollection['id']>('night-drive');
+	let editorPicksOpen = $state(false);
 	let stationView = $state<'discover' | 'favorites' | 'directory'>('discover');
-	let curatedHealthRequest = 0;
+	let feed = $state<StationDiscoveryFeed>({
+		generatedAt: '',
+		status: 'empty',
+		cacheAgeSeconds: null,
+		shelves: [],
+		scenes: []
+	});
+	let feedLoading = $state(true);
+	let feedRefreshing = $state(false);
+	let feedError = $state('');
+	let feedFetchedAt = $state(0);
+	let feedRequest = 0;
+	let feedPollDeadline = 0;
+	let clock = $state(Date.now());
+	type SceneExpansion = { status: 'loading' | 'ready' | 'error'; items: StationPick[] };
+	let sceneExpansions = $state<Record<string, SceneExpansion>>({});
 	let directorySort = $state<RadioStationSort>('smart');
 	let resultContext = $state<'browse' | 'search'>('browse');
 	let loadingMore = $state(false);
@@ -90,14 +118,222 @@
 	);
 	const displayedResults = $derived(results);
 
+	// Scene catalog: the backend's list when the feed carries one, otherwise the
+	// frontend copy so chips render without a cache (or without a backend).
+	const scenes = $derived<SceneInfo[]>(feed.scenes.length > 0 ? feed.scenes : SCENE_CATALOG);
+	const sceneById = $derived(new Map(scenes.map((scene) => [scene.id, scene] as const)));
+	const feedSceneIds = $derived(
+		new Set(feed.shelves.flatMap((shelf) => (shelf.sceneId ? [shelf.sceneId] : [])))
+	);
+	const standaloneScenes = $derived(
+		scenes.filter((scene) => sceneExpansions[scene.id] && !feedSceneIds.has(scene.id))
+	);
+	const heroShelf = $derived<StationShelf | null>(feed.shelves[0] ?? null);
+	const heroPick = $derived<StationPick>(
+		heroShelf?.items[0] ?? {
+			station: curatedStations[0],
+			sceneId: null,
+			reason: 'Editor pick while the live feed fills',
+			score: 0,
+			bailRate: 0,
+			plays: 0
+		}
+	);
+	// Health probes are limited to the first 12 picks on screen, in feed order.
+	const probeTargetStations = $derived.by(() => {
+		const seen = new Set<string>();
+		const stations: RadioBrowserStation[] = [];
+		for (const shelf of feed.shelves) {
+			for (const pick of shelf.items) {
+				if (seen.has(pick.station.url)) continue;
+				seen.add(pick.station.url);
+				stations.push(pick.station);
+				if (stations.length >= MAX_LOCAL_DIRECTORY_PROBES) return stations;
+			}
+		}
+		return stations;
+	});
+	const showFeedSkeleton = $derived(
+		feedLoading || (feed.status === 'refreshing' && feed.shelves.length === 0)
+	);
+	const cacheAgeLabel = $derived.by(() => {
+		if (feed.cacheAgeSeconds === null) {
+			return feed.shelves.length === 0 ? 'Nothing cached yet' : 'Updated just now';
+		}
+		const elapsed = feedFetchedAt > 0 ? Math.max(0, Math.floor((clock - feedFetchedAt) / 1000)) : 0;
+		const seconds = feed.cacheAgeSeconds + elapsed;
+		if (seconds < 60) return 'Updated just now';
+		const minutes = Math.floor(seconds / 60);
+		if (minutes < 60) return `Updated ${minutes} min ago`;
+		const hours = Math.floor(minutes / 60);
+		if (hours < 24) return `Updated ${hours} h ago`;
+		return `Updated ${Math.floor(hours / 24)} d ago`;
+	});
+
 	$effect(() => {
 		void loadFavorites();
+		void loadFeed();
+	});
+
+	$effect(() => {
+		const timer = setInterval(() => {
+			clock = Date.now();
+		}, 30_000);
+		return () => clearInterval(timer);
+	});
+
+	// While the backend is still building the cache, re-query every 2 s for up
+	// to 60 s. `get_station_discovery` spawns a background refresh when the
+	// cache is empty, so an empty feed is polled too until it reports ready.
+	$effect(() => {
+		const status = feed.status;
+		const view = stationView;
+		if (feedLoading || view !== 'discover' || status === 'ready') {
+			feedPollDeadline = 0;
+			return;
+		}
+		if (feedPollDeadline === 0) feedPollDeadline = Date.now() + 60_000;
+		if (Date.now() >= feedPollDeadline) return;
+		const timer = setTimeout(() => void loadFeed(), 2_000);
+		return () => clearTimeout(timer);
 	});
 
 	$effect(() => {
 		if (stationView !== 'discover') return;
-		void verifyCuratedPicks(selectedCollection.stations);
+		const stations = probeTargetStations;
+		if (stations.length === 0) return;
+		untrack(() => void verifyDiscoverPicks(stations.map((station) => station.url)));
 	});
+
+	$effect(() => {
+		if (stationView !== 'discover' || !editorPicksOpen) return;
+		const stations = selectedCollection.stations;
+		untrack(() => void verifyDiscoverPicks(stations.map((station) => station.url)));
+	});
+
+	async function loadFeed() {
+		const requestId = ++feedRequest;
+		try {
+			const next = await api.getStationDiscovery();
+			if (requestId !== feedRequest) return;
+			feed = next;
+			feedFetchedAt = Date.now();
+			feedError = '';
+		} catch (error) {
+			if (requestId !== feedRequest) return;
+			feedError = `Station picks are unavailable${error ? `: ${error}` : ''}`;
+		} finally {
+			if (requestId === feedRequest) feedLoading = false;
+		}
+	}
+
+	async function refreshFeed() {
+		if (feedRefreshing) return;
+		feedRefreshing = true;
+		try {
+			const summary = await api.refreshStationScenes(true);
+			await loadFeed();
+			if (summary.stations > 0) {
+				toast.success(`Refreshed ${summary.scenes} scenes · ${summary.stations} stations`);
+			} else {
+				toast.warning('Refresh returned no stations. Nothing new was cached.');
+			}
+		} catch (error) {
+			toast.error(`Could not refresh station picks: ${error}`);
+		} finally {
+			feedRefreshing = false;
+		}
+	}
+
+	async function openScene(sceneId: string) {
+		if (sceneExpansions[sceneId]) return;
+		sceneExpansions = { ...sceneExpansions, [sceneId]: { status: 'loading', items: [] } };
+		try {
+			const items = await api.getSceneStations(sceneId, 40, 0);
+			if (!sceneExpansions[sceneId]) return;
+			sceneExpansions = { ...sceneExpansions, [sceneId]: { status: 'ready', items } };
+		} catch {
+			if (!sceneExpansions[sceneId]) return;
+			sceneExpansions = { ...sceneExpansions, [sceneId]: { status: 'error', items: [] } };
+		}
+	}
+
+	function closeScene(sceneId: string) {
+		const { [sceneId]: _closed, ...rest } = sceneExpansions;
+		sceneExpansions = rest;
+	}
+
+	function scrollToElement(id: string) {
+		document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+	}
+
+	// A scene chip scrolls to its shelf when the feed has one, otherwise it
+	// opens the ranked "See all" list for that scene in place.
+	async function focusScene(sceneId: string) {
+		if (feedSceneIds.has(sceneId)) {
+			scrollToElement(`shelf-scene:${sceneId}`);
+			return;
+		}
+		if (sceneExpansions[sceneId]) {
+			scrollToElement(`scene-${sceneId}`);
+			return;
+		}
+		void openScene(sceneId);
+		await tick();
+		scrollToElement(`scene-${sceneId}`);
+	}
+
+	function toggleSceneExpansion(sceneId: string) {
+		if (sceneExpansions[sceneId]) {
+			closeScene(sceneId);
+		} else {
+			void openScene(sceneId);
+		}
+	}
+
+	function sceneTitle(sceneId: string | null): string {
+		return sceneId ? (sceneById.get(sceneId)?.title ?? sceneId) : '';
+	}
+
+	function sceneAccent(sceneId: string | null): string {
+		return (
+			(sceneId ? sceneById.get(sceneId)?.accent : null) ??
+			'from-primary/20 via-primary/5 to-transparent'
+		);
+	}
+
+	function shelfEyebrow(shelf: StationShelf): string {
+		if (shelf.kind === 'for_you') return 'Made for you';
+		if (shelf.kind === 'fresh') return 'New today';
+		return (shelf.sceneId ? sceneById.get(shelf.sceneId)?.eyebrow : null) ?? 'Scene';
+	}
+
+	function stationMeta(station: RadioBrowserStation): string {
+		const stream = [station.codec, station.bitrate ? `${station.bitrate} kbps` : null]
+			.filter(Boolean)
+			.join(' ');
+		return [station.country, stream].filter(Boolean).join(' · ');
+	}
+
+	function stationMonogram(station: RadioBrowserStation): string {
+		const letter = station.name.trim().replace(/^[^a-z0-9]+/i, '').charAt(0);
+		return (letter || station.name.charAt(0) || '?').toUpperCase();
+	}
+
+	function stationFavicon(station: RadioBrowserStation): string | null {
+		const favicon = station.favicon?.trim();
+		if (!favicon || !favicon.startsWith('https://') || failedFavicons.has(favicon)) return null;
+		return favicon;
+	}
+
+	function markFaviconFailed(favicon: string) {
+		failedFavicons = new Set([...failedFavicons, favicon]);
+	}
+
+	function markFaviconLoaded(favicon: string) {
+		if (loadedFavicons.has(favicon)) return;
+		loadedFavicons = new Set([...loadedFavicons, favicon]);
+	}
 
 	function mergeDirectoryStats(stations: RadioBrowserStation[]) {
 		const updates = Object.fromEntries(
@@ -159,13 +395,15 @@
 		}
 	}
 
-	async function verifyCuratedPicks(stations: CuratedStation[]) {
-		const requestId = ++curatedHealthRequest;
+	async function verifyDiscoverPicks(urls: string[]) {
+		const pending = [...new Set(urls)].slice(0, MAX_LOCAL_DIRECTORY_PROBES);
+		if (pending.length === 0) return;
+		probedUrls = new Set([...probedUrls, ...pending]);
 		try {
-			const verified = await api.verifyStationUrls(stations.map((station) => station.url));
-			if (requestId !== curatedHealthRequest) return;
-			curatedHealthByUrl = {
-				...curatedHealthByUrl,
+			const verified = await api.verifyStationUrls(pending);
+			// Results are keyed by URL, so a late batch can only add information.
+			discoverHealthByUrl = {
+				...discoverHealthByUrl,
 				...Object.fromEntries(verified.map((result) => [result.url, result.status] as const))
 			};
 		} catch {
@@ -410,8 +648,41 @@
 		}
 	}
 
-	function pickHealth(station: CuratedStation): StationHealthResult['status'] | null {
-		return curatedHealthByUrl[station.url] ?? null;
+	type PickHealth = StationHealthResult['status'] | 'checking' | 'unknown';
+
+	function pickHealth(station: RadioBrowserStation): PickHealth {
+		const status = discoverHealthByUrl[station.url];
+		if (status) return status;
+		return probedUrls.has(station.url) ? 'checking' : 'unknown';
+	}
+
+	function pickHealthLabel(health: PickHealth): string {
+		switch (health) {
+			case 'ok': return 'Stream checked';
+			case 'stale': return 'Connection issue';
+			case 'dead': return 'Couldn’t connect';
+			case 'checking': return 'Checking stream';
+			default: return 'Not tested locally';
+		}
+	}
+
+	function pickHealthDotClass(health: PickHealth): string {
+		switch (health) {
+			case 'ok': return 'bg-emerald-400';
+			case 'stale': return 'bg-amber-400';
+			case 'dead': return 'bg-zinc-500';
+			case 'checking': return 'bg-white/40 animate-pulse';
+			default: return 'bg-white/25';
+		}
+	}
+
+	function pickHealthPillClass(health: PickHealth): string {
+		switch (health) {
+			case 'ok': return 'border-emerald-400/20 bg-emerald-400/10 text-emerald-300';
+			case 'stale': return 'border-amber-400/25 bg-amber-400/10 text-amber-300';
+			case 'dead': return 'border-zinc-500/25 bg-zinc-500/10 text-zinc-400';
+			default: return 'border-white/10 bg-white/5 text-white/45';
+		}
 	}
 
 	function searchStationHealth(url: string): StationHealthResult['status'] | null {
@@ -494,7 +765,9 @@
 		if (verifyingStations) return;
 		const healthRequestId = ++stationHealthRequest;
 		const scanView = stationView;
-		const visiblePicks = scanView === 'discover' ? selectedCollection.stations : [];
+		const visiblePicks: RadioBrowserStation[] = scanView === 'discover'
+			? [...probeTargetStations, ...(editorPicksOpen ? selectedCollection.stations : [])]
+			: [];
 		const visibleDirectoryStations = scanView === 'directory'
 			? results.slice(0, MAX_LOCAL_DIRECTORY_PROBES)
 			: [];
@@ -544,8 +817,9 @@
 			const visibleResultsAreCurrent = healthRequestId === stationHealthRequest;
 			if (visibleResultsAreCurrent) {
 				if (scanView === 'discover') {
-					curatedHealthByUrl = {
-						...curatedHealthByUrl,
+					probedUrls = new Set([...probedUrls, ...visibleUrls]);
+					discoverHealthByUrl = {
+						...discoverHealthByUrl,
 						...savedVisibleHealthByUrl,
 						...Object.fromEntries(visibleResults.map((result) => [result.url, result.status] as const))
 					};
@@ -666,29 +940,138 @@
 
 	{#if stationView === 'discover'}
 
-	<section class="relative isolate overflow-hidden rounded-2xl border border-white/10 bg-[#101817] px-5 py-5 shadow-xl shadow-black/20 sm:px-7 sm:py-6">
+	{#snippet stationArt(station: RadioBrowserStation, accent: string, sizeClass: string)}
+		{@const favicon = stationFavicon(station)}
+		<div class={`${sizeClass} relative flex shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/30 font-semibold text-white/85`} aria-hidden="true">
+			<div class={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accent}`}></div>
+			<span class="relative">{stationMonogram(station)}</span>
+			{#if favicon}
+				<img
+					src={favicon}
+					alt=""
+					class={`absolute inset-0 size-full object-cover transition-opacity ${loadedFavicons.has(favicon) ? 'opacity-100' : 'opacity-0'}`}
+					loading="lazy"
+					decoding="async"
+					onload={() => markFaviconLoaded(favicon)}
+					onerror={() => markFaviconFailed(favicon)}
+				/>
+			{/if}
+		</div>
+	{/snippet}
+
+	{#snippet pickCard(pick: StationPick, accent: string, railCard: boolean)}
+		{@const station = pick.station}
+		{@const health = pickHealth(station)}
+		<article
+			class={`group relative flex min-w-0 flex-col overflow-hidden rounded-xl border border-border/70 bg-background/70 p-3.5 transition duration-300 hover:-translate-y-0.5 hover:border-white/20 hover:shadow-xl hover:shadow-black/15 ${railCard ? 'w-[72vw] max-w-[300px] shrink-0 snap-start lg:w-auto lg:max-w-none' : ''}`}
+		>
+			<div class={`pointer-events-none absolute inset-x-0 top-0 h-16 bg-gradient-to-b ${accent}`}></div>
+			<div class="relative flex items-start gap-3">
+				{@render stationArt(station, accent, 'size-12 text-lg')}
+				<div class="min-w-0 flex-1">
+					<div class="flex min-w-0 items-center gap-2">
+						<p class="truncate text-sm font-semibold text-white">{station.name}</p>
+						<span class={`size-2 shrink-0 rounded-full ${pickHealthDotClass(health)}`} title={pickHealthLabel(health)}></span>
+					</div>
+					<p class="mt-0.5 truncate text-[11px] text-white/45">{stationMeta(station)}</p>
+				</div>
+			</div>
+			<p class="relative mt-3 line-clamp-2 min-h-8 text-xs leading-4 text-muted-foreground">{pick.reason}</p>
+			<div class="relative mt-3 flex items-center justify-between gap-2 border-t border-white/[0.07] pt-3">
+				<p class={`truncate text-[10px] ${health === 'ok' ? 'text-emerald-400/80' : health === 'stale' ? 'text-amber-400/80' : health === 'dead' ? 'text-zinc-400' : 'text-white/35'}`}>
+					{health === 'unknown' ? (pick.plays > 0 ? `${pick.plays} ${pick.plays === 1 ? 'play' : 'plays'}` : sceneTitle(pick.sceneId)) : pickHealthLabel(health)}
+				</p>
+				<div class="flex shrink-0 items-center gap-1.5">
+					{#if isStationSaved(station)}
+						<span class="flex size-8 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary" title="Saved to favorites" aria-label={`${station.name} is saved`}>
+							<Check class="size-3.5" />
+						</span>
+					{:else}
+						<button
+							class="flex size-8 items-center justify-center rounded-full border border-white/10 bg-black/15 text-white/55 transition hover:border-primary/30 hover:text-primary"
+							onclick={() => saveToFavorites(station)}
+							title="Save to favorites"
+							aria-label={`Save ${station.name}`}
+						>
+							<Heart class="size-3.5" />
+						</button>
+					{/if}
+					<button
+						class="flex size-9 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/10 transition hover:scale-105 hover:bg-primary/90 active:scale-95"
+						onclick={() => playSearchResult(station)}
+						aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}
+					>
+						{#if isSearchStationActive(station)}
+							{#if player.state.is_buffering}
+								<LoaderCircle class="size-4 animate-spin" />
+							{:else}
+								<Square class="size-3.5 fill-current" />
+							{/if}
+						{:else}
+							<Play class="size-3.5 fill-current pl-0.5" />
+						{/if}
+					</button>
+				</div>
+			</div>
+		</article>
+	{/snippet}
+
+	{#snippet sceneExpansionPanel(sceneId: string)}
+		{@const expansion = sceneExpansions[sceneId]}
+		{@const scene = sceneById.get(sceneId)}
+		{#if expansion}
+			<div class="mt-3 rounded-2xl border border-border/60 bg-card/30 p-3 sm:p-4" aria-live="polite">
+				{#if expansion.status === 'loading'}
+					<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+						{#each Array(8) as _}<Skeleton class="h-36 w-full rounded-xl" />{/each}
+					</div>
+				{:else if expansion.status === 'error'}
+					<p class="px-1 py-4 text-sm text-destructive">Couldn’t load the full {scene?.title ?? sceneId} list.</p>
+				{:else if expansion.items.length === 0}
+					<p class="px-1 py-4 text-sm text-muted-foreground">No cached stations for {scene?.title ?? sceneId} yet. Refresh picks once the desktop app can reach radio-browser.info.</p>
+				{:else}
+					<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+						{#each expansion.items as pick (pick.station.stationuuid || pick.station.url)}
+							{@render pickCard(pick, sceneAccent(sceneId), false)}
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{/snippet}
+
+	{@const heroHealth = pickHealth(heroPick.station)}
+	<section class="relative isolate overflow-hidden rounded-2xl border border-white/10 bg-[#101817] px-5 py-5 shadow-xl shadow-black/20 sm:px-7 sm:py-6" aria-labelledby="hero-heading">
 		<div class="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_78%_22%,rgba(74,222,128,0.17),transparent_31%),radial-gradient(circle_at_16%_110%,rgba(34,211,238,0.12),transparent_40%)]"></div>
 		<div class="pointer-events-none absolute -right-8 -top-16 size-64 rounded-full border border-primary/10"></div>
 		<div class="pointer-events-none absolute right-10 top-2 size-40 rounded-full border border-white/5"></div>
-		<div class="relative grid items-end gap-5 lg:grid-cols-[minmax(0,1fr)_280px]">
+		<div class="relative grid items-end gap-5 lg:grid-cols-[minmax(0,1fr)_300px]">
 			<div class="max-w-2xl">
 				<div class="mb-3 inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary">
 					<Sparkles class="size-3.5" />
-					Mewsik Picks · {curatedStations.length} researched streams
+					{heroShelf ? heroShelf.title : 'Live radio'} · {cacheAgeLabel}
 				</div>
-				<h2 class="text-balance text-2xl font-semibold leading-tight tracking-[-0.025em] text-white sm:text-3xl">
-					Radio with a point of view.
+				<h2 id="hero-heading" class="text-balance text-2xl font-semibold leading-tight tracking-[-0.025em] text-white sm:text-3xl">
+					{heroPick.station.name}
 				</h2>
-				<p class="mt-2 max-w-xl text-sm leading-6 text-white/62">
-					Independent, public, and listener-supported stations chosen for flow, identity, and a working stream.
-				</p>
+				<p class="mt-2 max-w-xl text-sm leading-6 text-white/62">{heroPick.reason}</p>
+				<p class="mt-1 text-xs text-white/40">{stationMeta(heroPick.station)}</p>
 				<div class="mt-4 flex flex-col gap-2 min-[420px]:flex-row">
 					<Button
 						class="h-11 rounded-full px-5"
-						onclick={() => playSearchResult(selectedCollection.stations[0])}
+						onclick={() => playSearchResult(heroPick.station)}
 					>
-						<Play class="mr-2 size-4 fill-current" />
-						Play {selectedCollection.stations[0].name}
+						{#if isSearchStationActive(heroPick.station)}
+							{#if player.state.is_buffering}
+								<LoaderCircle class="mr-2 size-4 animate-spin" />
+							{:else}
+								<Square class="mr-2 size-4 fill-current" />
+							{/if}
+							Stop {heroPick.station.name}
+						{:else}
+							<Play class="mr-2 size-4 fill-current" />
+							Play {heroPick.station.name}
+						{/if}
 					</Button>
 					<Button
 						variant="outline"
@@ -704,15 +1087,18 @@
 			<div class="hidden rounded-xl border border-white/10 bg-black/20 p-4 backdrop-blur-sm lg:block">
 				<div class="flex items-center justify-between text-xs text-white/50">
 					<span>Currently featured</span>
-					<span class="inline-flex items-center gap-1.5 text-primary"><span class="size-1.5 animate-pulse rounded-full bg-primary"></span>Live</span>
+					<span class={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-medium ${pickHealthPillClass(heroHealth)}`}>
+						<span class={`size-1.5 rounded-full ${pickHealthDotClass(heroHealth)}`}></span>
+						{pickHealthLabel(heroHealth)}
+					</span>
 				</div>
 				<div class="mt-5 flex items-center gap-4">
-					<div class="flex size-12 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-[0_0_30px_rgba(74,222,128,0.2)]">
-						<Headphones class="size-5" />
-					</div>
+					{@render stationArt(heroPick.station, sceneAccent(heroPick.sceneId), 'size-12 text-xl')}
 					<div class="min-w-0">
-						<p class="truncate font-medium text-white">{selectedCollection.stations[0].name}</p>
-						<p class="mt-1 truncate text-xs text-white/45">{selectedCollection.stations[0].quality}</p>
+						<p class="truncate font-medium text-white">{heroPick.station.name}</p>
+						<p class="mt-1 truncate text-xs text-white/45">
+							{heroPick.sceneId ? sceneTitle(heroPick.sceneId) : (heroShelf?.subtitle ?? 'Editor pick')}
+						</p>
 					</div>
 				</div>
 				<div class="mt-5 flex h-8 items-end gap-1" aria-hidden="true">
@@ -724,127 +1110,247 @@
 		</div>
 	</section>
 
-	<section aria-labelledby="collections-heading">
+	<section aria-labelledby="scenes-heading">
 		<div class="mb-3 flex items-end justify-between gap-4">
 			<div>
-				<p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">Start with a feeling</p>
-				<h2 id="collections-heading" class="mt-1 text-lg font-semibold sm:text-xl">Curated collections</h2>
+				<p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">Pick a lane</p>
+				<h2 id="scenes-heading" class="mt-1 text-lg font-semibold sm:text-xl">Scenes</h2>
 			</div>
-			<p class="hidden text-xs text-muted-foreground sm:block">Updated as better stations surface</p>
-		</div>
-
-		<div class="collection-rail -mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-2 sm:mx-0 sm:grid sm:grid-cols-2 sm:overflow-visible sm:px-0 lg:grid-cols-4">
-			{#each curatedCollections as collection}
-				<button
-					class={`group relative min-h-28 min-w-[68vw] snap-center overflow-hidden rounded-xl border p-4 text-left transition duration-300 sm:min-w-0 ${selectedCollectionId === collection.id ? 'border-primary/45 bg-primary/[0.07] shadow-[0_0_0_1px_rgba(74,222,128,0.08)]' : 'border-border/70 bg-card hover:-translate-y-0.5 hover:border-white/20'}`}
-					onclick={() => selectedCollectionId = collection.id}
-					aria-pressed={selectedCollectionId === collection.id}
+			<div class="flex shrink-0 items-center gap-3">
+				<span class="hidden text-[11px] text-muted-foreground sm:block">{cacheAgeLabel}</span>
+				<Button
+					variant="outline"
+					size="sm"
+					class="h-9 rounded-full border-border/70 bg-card/60 px-3"
+					disabled={feedRefreshing}
+					onclick={refreshFeed}
+					title="Pull fresh stations for every scene"
+					aria-label="Refresh picks"
 				>
-					<div class={`pointer-events-none absolute inset-0 bg-gradient-to-br ${collection.accent}`}></div>
-					<div class="relative flex h-full flex-col">
-						<div class="flex items-start justify-between">
-							<div class={`flex size-9 items-center justify-center rounded-lg border ${selectedCollectionId === collection.id ? 'border-primary/25 bg-primary/15 text-primary' : 'border-white/10 bg-black/15 text-white/70'}`}>
-								{#if collection.id === 'night-drive'}
-									<MoonStar class="size-4" />
-								{:else if collection.id === 'deep-focus'}
-									<Waves class="size-4" />
-								{:else if collection.id === 'after-hours'}
-									<Signal class="size-4" />
-								{:else if collection.id === 'global-dial'}
-									<Globe class="size-4" />
-								{:else if collection.id === 'jazz-soul' || collection.id === 'human-radio'}
-									<Headphones class="size-4" />
-								{:else}
-									<Guitar class="size-4" />
-								{/if}
-							</div>
-							<span class="text-[11px] font-medium text-white/45">{collection.stations.length} picks</span>
-						</div>
-						<p class="mt-2 text-[10px] font-semibold uppercase tracking-[0.16em] text-white/45">{collection.eyebrow}</p>
-						<h3 class="mt-1 text-base font-semibold text-white">{collection.title}</h3>
-					</div>
+					{#if feedRefreshing}
+						<LoaderCircle class="size-4 shrink-0 animate-spin text-primary" />
+					{:else}
+						<RefreshCw class="size-4 shrink-0" />
+					{/if}
+					<span class="ml-2">{feedRefreshing ? 'Refreshing…' : 'Refresh'}</span>
+				</Button>
+			</div>
+		</div>
+		<div class="station-rail -mx-4 flex gap-2 overflow-x-auto px-4 pb-1 lg:mx-0 lg:flex-wrap lg:overflow-visible lg:px-0">
+			{#each scenes as scene (scene.id)}
+				{@const active = feedSceneIds.has(scene.id) || Boolean(sceneExpansions[scene.id])}
+				<button
+					class={`shrink-0 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${active ? 'border-primary/40 bg-primary/10 text-primary hover:bg-primary/15' : 'border-border bg-card text-muted-foreground hover:border-primary/40 hover:bg-primary/10 hover:text-primary'}`}
+					onclick={() => focusScene(scene.id)}
+					aria-pressed={Boolean(sceneExpansions[scene.id])}
+					title={scene.description}
+				>
+					{scene.title}
 				</button>
 			{/each}
 		</div>
 	</section>
 
-	<section class="rounded-2xl border border-border/70 bg-card/35 p-3 sm:p-5" aria-live="polite">
-		<div class="mb-4 flex flex-col gap-3 px-1 sm:flex-row sm:items-end sm:justify-between">
-			<div class="max-w-2xl">
-				<p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">{selectedCollection.eyebrow}</p>
-				<h2 class="mt-1 text-xl font-semibold">{selectedCollection.title}</h2>
-				<p class="mt-1 text-sm leading-5 text-muted-foreground">{selectedCollection.description}</p>
-			</div>
-			<Button variant="ghost" size="sm" class="w-fit shrink-0 text-xs text-muted-foreground hover:text-primary" onclick={() => searchGenre(selectedCollection.tag)}>
-				More like this <ArrowRight class="ml-1.5 size-3.5" />
-			</Button>
-		</div>
-
-		<div class="grid gap-3 lg:grid-cols-3">
-			{#each selectedCollection.stations as station, index}
-				{@const health = pickHealth(station)}
-				<article class="group relative min-w-0 overflow-hidden rounded-xl border border-border/70 bg-background/70 p-4 transition duration-300 hover:-translate-y-0.5 hover:border-white/20 hover:shadow-xl hover:shadow-black/15">
-					<div class={`pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b ${selectedCollection.accent}`}></div>
-					<div class="relative flex items-start justify-between gap-3">
-						<div class="flex items-center gap-2">
-							<span class="font-mono text-[10px] text-white/30">0{index + 1}</span>
-							<span class={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium ${health === 'dead' ? 'border-zinc-500/25 bg-zinc-500/10 text-zinc-400' : health === 'stale' ? 'border-amber-400/25 bg-amber-400/10 text-amber-300' : health === 'ok' ? 'border-emerald-400/20 bg-emerald-400/10 text-emerald-300' : 'border-white/10 bg-white/5 text-white/45'}`}>
-								<span class={`size-1.5 rounded-full ${health === 'dead' ? 'bg-zinc-500' : health === 'stale' ? 'bg-amber-400' : health === 'ok' ? 'bg-emerald-400' : 'bg-white/30'}`}></span>
-								{health === 'dead' ? 'Couldn’t connect' : health === 'stale' ? 'Connection issue' : health === 'ok' ? 'Stream checked' : 'Checking stream'}
-							</span>
-						</div>
-						{#if isStationSaved(station)}
-							<span
-								class="flex size-9 shrink-0 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary"
-								title="Saved to favorites"
-								aria-label={`${station.name} is saved`}
-							>
-								<Check class="size-4" />
-							</span>
-						{:else}
-							<button
-								class="flex size-9 shrink-0 items-center justify-center rounded-full border border-white/10 bg-black/15 text-white/55 transition hover:border-primary/30 hover:text-primary"
-								onclick={() => saveToFavorites(station)}
-								title="Save to favorites"
-								aria-label={`Save ${station.name}`}
-							>
-								<Heart class="size-4" />
-							</button>
-						{/if}
+	{#if feedError}
+		<Card class="border-dashed">
+			<CardContent class="py-6 text-sm text-destructive">{feedError}</CardContent>
+		</Card>
+	{:else if showFeedSkeleton}
+		<div class="flex flex-col gap-8" aria-busy="true" aria-label="Loading station picks">
+			{#each Array(2) as _}
+				<section>
+					<Skeleton class="mb-3 h-6 w-48 rounded-md" />
+					<div class="station-rail -mx-4 flex gap-3 overflow-x-auto px-4 pb-2 lg:mx-0 lg:grid lg:grid-cols-4 lg:overflow-visible lg:px-0">
+						{#each Array(4) as _}
+							<Skeleton class="h-36 w-[72vw] max-w-[300px] shrink-0 rounded-xl lg:w-auto lg:max-w-none" />
+						{/each}
 					</div>
-
-					<div class="relative mt-7">
-						<p class="truncate text-base font-semibold text-white">{station.name}</p>
-						<p class="mt-2 min-h-10 text-sm leading-5 text-muted-foreground">{station.editorial}</p>
-					</div>
-
-					<div class="relative mt-5 flex items-end justify-between gap-3 border-t border-white/[0.07] pt-3">
-						<div class="min-w-0">
-							<p class="truncate text-[11px] font-medium text-white/70">{station.quality}</p>
-							<p class="mt-1 truncate text-[10px] text-primary/65">Station profile · {station.adLabel}</p>
-							<p class="mt-1 truncate text-[10px] text-white/35">
-								{station.country} · {station.codec} {station.bitrate ? `· ${station.bitrate} kbps` : ''}
-							</p>
-						</div>
-						<button
-							class="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/10 transition hover:scale-105 hover:bg-primary/90 active:scale-95"
-							onclick={() => playSearchResult(station)}
-							aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}
-						>
-							{#if isSearchStationActive(station)}
-								{#if player.state.is_buffering}
-									<LoaderCircle class="size-4 animate-spin" />
-								{:else}
-									<Square class="size-4 fill-current" />
-								{/if}
-							{:else}
-								<Play class="size-4 fill-current pl-0.5" />
-							{/if}
-						</button>
-					</div>
-				</article>
+				</section>
 			{/each}
 		</div>
+	{:else if feed.shelves.length === 0}
+		<Card class="border-dashed">
+			<CardContent class="flex flex-col items-center gap-4 py-12 text-center">
+				<div class="flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+					<Radio class="size-5" />
+				</div>
+				<div class="max-w-md">
+					<h2 class="font-semibold">No station picks yet</h2>
+					<p class="mt-1 text-sm text-muted-foreground">
+						The feed is built by the desktop app from radio-browser.info and nothing has been cached on this device. Refresh to pull the first batch, or start with a scene above or the Editor picks below.
+					</p>
+				</div>
+				<Button variant="outline" class="rounded-full" disabled={feedRefreshing} onclick={refreshFeed}>
+					{#if feedRefreshing}<LoaderCircle class="mr-2 size-4 animate-spin" />{/if}
+					Refresh picks now
+				</Button>
+			</CardContent>
+		</Card>
+	{:else}
+		{#each feed.shelves as shelf (shelf.id)}
+			{@const accent = sceneAccent(shelf.sceneId)}
+			<section id={`shelf-${shelf.id}`} class="scroll-mt-28" aria-labelledby={`shelf-${shelf.id}-heading`}>
+				<div class="mb-3 flex items-end justify-between gap-4">
+					<div class="min-w-0">
+						<p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-primary">{shelfEyebrow(shelf)}</p>
+						<h2 id={`shelf-${shelf.id}-heading`} class="mt-1 truncate text-lg font-semibold sm:text-xl">{shelf.title}</h2>
+						<p class="mt-0.5 truncate text-xs text-muted-foreground">{shelf.subtitle}</p>
+					</div>
+					{#if shelf.sceneId}
+						{@const sceneId = shelf.sceneId}
+						<Button variant="ghost" size="sm" class="shrink-0 text-xs text-muted-foreground hover:text-primary" onclick={() => toggleSceneExpansion(sceneId)} aria-expanded={Boolean(sceneExpansions[sceneId])}>
+							{sceneExpansions[sceneId] ? 'Show less' : 'See all'}
+							<ArrowRight class="ml-1.5 size-3.5" />
+						</Button>
+					{/if}
+				</div>
+				<div class="station-rail -mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-2 lg:mx-0 lg:grid lg:grid-cols-4 lg:overflow-visible lg:px-0">
+					{#each shelf.items as pick (pick.station.stationuuid || pick.station.url)}
+						{@render pickCard(pick, accent, true)}
+					{/each}
+				</div>
+				{#if shelf.sceneId}
+					{@render sceneExpansionPanel(shelf.sceneId)}
+				{/if}
+			</section>
+		{/each}
+	{/if}
+
+	{#each standaloneScenes as scene (scene.id)}
+		<section id={`scene-${scene.id}`} class="scroll-mt-28" aria-labelledby={`scene-${scene.id}-heading`}>
+			<div class="mb-1 flex items-end justify-between gap-4">
+				<div class="min-w-0">
+					<p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-primary">{scene.eyebrow}</p>
+					<h2 id={`scene-${scene.id}-heading`} class="mt-1 truncate text-lg font-semibold sm:text-xl">{scene.title}</h2>
+					<p class="mt-0.5 text-xs text-muted-foreground">{scene.description}</p>
+				</div>
+				<Button variant="ghost" size="sm" class="shrink-0 text-xs text-muted-foreground hover:text-primary" onclick={() => closeScene(scene.id)} aria-label={`Hide ${scene.title}`}>
+					<X class="size-4" />
+				</Button>
+			</div>
+			{@render sceneExpansionPanel(scene.id)}
+		</section>
+	{/each}
+
+	<section class="rounded-2xl border border-border/70 bg-card/35" aria-labelledby="editor-picks-heading">
+		<button
+			class="flex w-full items-center justify-between gap-4 rounded-2xl p-4 text-left transition hover:bg-white/[0.03] sm:p-5"
+			onclick={() => (editorPicksOpen = !editorPicksOpen)}
+			aria-expanded={editorPicksOpen}
+			aria-controls="editor-picks-panel"
+		>
+			<div class="min-w-0">
+				<p class="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">Hand-picked</p>
+				<h2 id="editor-picks-heading" class="mt-1 text-lg font-semibold sm:text-xl">Editor picks</h2>
+				<p class="mt-0.5 text-xs text-muted-foreground">{curatedStations.length} researched streams in {curatedCollections.length} collections</p>
+			</div>
+			<ChevronDown class={`size-5 shrink-0 text-muted-foreground transition-transform ${editorPicksOpen ? 'rotate-180' : ''}`} />
+		</button>
+
+		{#if editorPicksOpen}
+			<div id="editor-picks-panel" class="border-t border-border/60 p-3 sm:p-5">
+				<div class="station-rail -mx-3 flex gap-2 overflow-x-auto px-3 pb-3 sm:mx-0 sm:flex-wrap sm:overflow-visible sm:px-0">
+					{#each curatedCollections as collection (collection.id)}
+						<button
+							class={`inline-flex shrink-0 items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${selectedCollectionId === collection.id ? 'border-primary/45 bg-primary/10 text-primary' : 'border-border bg-card text-muted-foreground hover:border-primary/40 hover:text-primary'}`}
+							onclick={() => (selectedCollectionId = collection.id)}
+							aria-pressed={selectedCollectionId === collection.id}
+						>
+							{#if collection.id === 'night-drive'}
+								<MoonStar class="size-3.5" />
+							{:else if collection.id === 'deep-focus'}
+								<Waves class="size-3.5" />
+							{:else if collection.id === 'after-hours'}
+								<Signal class="size-3.5" />
+							{:else if collection.id === 'global-dial'}
+								<Globe class="size-3.5" />
+							{:else if collection.id === 'jazz-soul' || collection.id === 'human-radio'}
+								<Headphones class="size-3.5" />
+							{:else}
+								<Guitar class="size-3.5" />
+							{/if}
+							{collection.title}
+							<span class="text-[10px] opacity-60">{collection.stations.length}</span>
+						</button>
+					{/each}
+				</div>
+
+				<div class="mb-4 flex flex-col gap-3 px-1 sm:flex-row sm:items-end sm:justify-between">
+					<div class="max-w-2xl">
+						<p class="text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">{selectedCollection.eyebrow}</p>
+						<h3 class="mt-1 text-lg font-semibold">{selectedCollection.title}</h3>
+						<p class="mt-1 text-sm leading-5 text-muted-foreground">{selectedCollection.description}</p>
+					</div>
+					<Button variant="ghost" size="sm" class="w-fit shrink-0 text-xs text-muted-foreground hover:text-primary" onclick={() => searchGenre(selectedCollection.tag)}>
+						More like this <ArrowRight class="ml-1.5 size-3.5" />
+					</Button>
+				</div>
+
+				<div class="grid gap-3 lg:grid-cols-3">
+					{#each selectedCollection.stations as station, index (station.stationuuid)}
+						{@const health = pickHealth(station)}
+						<article class="group relative min-w-0 overflow-hidden rounded-xl border border-border/70 bg-background/70 p-4 transition duration-300 hover:-translate-y-0.5 hover:border-white/20 hover:shadow-xl hover:shadow-black/15">
+							<div class={`pointer-events-none absolute inset-x-0 top-0 h-20 bg-gradient-to-b ${selectedCollection.accent}`}></div>
+							<div class="relative flex items-start justify-between gap-3">
+								<div class="flex items-center gap-2">
+									<span class="font-mono text-[10px] text-white/30">0{index + 1}</span>
+									<span class={`inline-flex items-center gap-1.5 rounded-full border px-2 py-1 text-[10px] font-medium ${pickHealthPillClass(health)}`}>
+										<span class={`size-1.5 rounded-full ${pickHealthDotClass(health)}`}></span>
+										{pickHealthLabel(health)}
+									</span>
+								</div>
+								{#if isStationSaved(station)}
+									<span
+										class="flex size-9 shrink-0 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary"
+										title="Saved to favorites"
+										aria-label={`${station.name} is saved`}
+									>
+										<Check class="size-4" />
+									</span>
+								{:else}
+									<button
+										class="flex size-9 shrink-0 items-center justify-center rounded-full border border-white/10 bg-black/15 text-white/55 transition hover:border-primary/30 hover:text-primary"
+										onclick={() => saveToFavorites(station)}
+										title="Save to favorites"
+										aria-label={`Save ${station.name}`}
+									>
+										<Heart class="size-4" />
+									</button>
+								{/if}
+							</div>
+
+							<div class="relative mt-7">
+								<p class="truncate text-base font-semibold text-white">{station.name}</p>
+								<p class="mt-2 min-h-10 text-sm leading-5 text-muted-foreground">{station.editorial}</p>
+							</div>
+
+							<div class="relative mt-5 flex items-end justify-between gap-3 border-t border-white/[0.07] pt-3">
+								<div class="min-w-0">
+									<p class="truncate text-[11px] font-medium text-white/70">{station.quality}</p>
+									<p class="mt-1 truncate text-[10px] text-primary/65">Station profile · {station.adLabel}</p>
+									<p class="mt-1 truncate text-[10px] text-white/35">{stationMeta(station)}</p>
+								</div>
+								<button
+									class="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/10 transition hover:scale-105 hover:bg-primary/90 active:scale-95"
+									onclick={() => playSearchResult(station)}
+									aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}
+								>
+									{#if isSearchStationActive(station)}
+										{#if player.state.is_buffering}
+											<LoaderCircle class="size-4 animate-spin" />
+										{:else}
+											<Square class="size-4 fill-current" />
+										{/if}
+									{:else}
+										<Play class="size-4 fill-current pl-0.5" />
+									{/if}
+								</button>
+							</div>
+						</article>
+					{/each}
+				</div>
+			</div>
+		{/if}
 	</section>
 
 	{:else if stationView === 'favorites'}
@@ -1036,11 +1542,11 @@
 		animation: signal-pulse 1.6s ease-in-out infinite alternate;
 	}
 
-	.collection-rail {
+	.station-rail {
 		scrollbar-width: none;
 	}
 
-	.collection-rail::-webkit-scrollbar {
+	.station-rail::-webkit-scrollbar {
 		display: none;
 	}
 

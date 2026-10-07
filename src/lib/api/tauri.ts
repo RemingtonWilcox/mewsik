@@ -676,6 +676,83 @@ export const playStationSearchResult = (station: RadioBrowserStation) =>
 		stationuuid: station.stationuuid
 	});
 
+// Station discovery (see docs/station-discovery-contract-2026-10-07.md)
+export type SceneFamily =
+	| 'workout'
+	| 'hiphop'
+	| 'rock'
+	| 'electronic'
+	| 'chill'
+	| 'soul'
+	| 'world'
+	| 'pop'
+	| 'classic';
+
+export interface SceneInfo {
+	id: string;
+	title: string;
+	eyebrow: string;
+	description: string;
+	family: SceneFamily;
+	accent: string;
+}
+
+export interface StationPick {
+	station: RadioBrowserStation;
+	sceneId: string | null;
+	reason: string;
+	score: number;
+	bailRate: number;
+	plays: number;
+}
+
+export interface StationShelf {
+	id: string;
+	kind: 'for_you' | 'fresh' | 'scene';
+	title: string;
+	subtitle: string;
+	sceneId: string | null;
+	items: StationPick[];
+}
+
+export interface StationDiscoveryFeed {
+	generatedAt: string;
+	status: 'ready' | 'empty' | 'refreshing';
+	cacheAgeSeconds: number | null;
+	shelves: StationShelf[];
+	scenes: SceneInfo[];
+}
+
+export interface SceneRefreshSummary {
+	scenes: number;
+	stations: number;
+	pruned: number;
+	tookMs: number;
+}
+
+const emptyStationDiscoveryFeed = (): StationDiscoveryFeed => ({
+	generatedAt: '',
+	status: 'empty',
+	cacheAgeSeconds: null,
+	shelves: [],
+	scenes: []
+});
+
+export const getStationDiscovery = () =>
+	safeInvoke<StationDiscoveryFeed>('get_station_discovery', undefined, emptyStationDiscoveryFeed);
+
+export const refreshStationScenes = (force = false) =>
+	safeInvoke<SceneRefreshSummary>(
+		'refresh_station_scenes',
+		{ force },
+		{ scenes: 0, stations: 0, pruned: 0, tookMs: 0 }
+	);
+
+export const getStationScenes = () => safeInvoke<SceneInfo[]>('get_station_scenes', undefined, []);
+
+export const getSceneStations = (sceneId: string, limit?: number, offset?: number) =>
+	safeInvoke<StationPick[]>('get_scene_stations', { sceneId, limit, offset }, []);
+
 // ---- Visual score (offline track analysis) ----
 
 import type { TrackScore } from '$lib/visualizer/director/score';
