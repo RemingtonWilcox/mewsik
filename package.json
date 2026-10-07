@@ -57,8 +57,8 @@
   "pnpm": {
     "overrides": {
       "cookie@<0.7.0": "0.7.2",
-      "postcss@<8.5.10": "8.5.18",
-      "undici": "7.28.0"
+      "postcss@<8.5.23": "8.5.29",
+      "undici": "7.29.1"
     },
     "onlyBuiltDependencies": [
       "esbuild"
