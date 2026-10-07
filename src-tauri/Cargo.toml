@@ -1,11 +1,11 @@
 [package]
 name = "mewsik"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal music streaming & discovery app"
 authors = ["Remington Wilcox"]
 license = "MIT"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.88"
 
 [lib]
 name = "mewsik_lib"
@@ -18,12 +18,11 @@ tauri-build = { version = "2.5.6", features = [] }
 tauri = { version = "2.10.3", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
-tauri-plugin-shell = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 log = "0.4"
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+rusqlite = { version = "0.31", features = ["backup", "bundled", "vtab"] }
 symphonia = { version = "0.5", features = ["all"] }
 rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
 cpal = "0.15"
@@ -33,7 +32,6 @@ ulid = "1.1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-security-framework = "3"
 sha2 = "0.10"
 ebur128 = "0.1"
 parking_lot = "0.12"
@@ -45,9 +43,20 @@ rand = "0.8"
 fuzzy-matcher = "0.3"
 async-trait = "0.1"
 urlencoding = "2"
+realfft = "3"
+quick-xml = "0.41"
+dunce = "1"
 
-# Desktop-only deps (tray-icon pulls in desktop-only crates; drag plugin is
-# desktop-only).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
+# Desktop-only deps. tray-icon pulls in desktop-only crates, and the drag,
+# process and updater plugins have no mobile implementation.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 tauri = { version = "2.10.3", features = ["tray-icon"] }
 tauri-plugin-drag = "2.1.0"
+tauri-plugin-process = "=2.3.1"
+tauri-plugin-updater = "=2.10.1"
+
+[dev-dependencies]
+minisign-verify = "=0.2.5"

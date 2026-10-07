@@ -1,0 +1,3124 @@
+<script lang="ts">
+	// Mark II visualizer — "Drift Through a Fractal Atmosphere"
+	//
+	// Architecture per research findings:
+	//   • Mandelbulb SDF raymarched as the hero — a genuine fractal architecture,
+	//     not a smoothed primitive. Forms read as alien geology, not "blob."
+	//   • Volumetric participating medium — fog accumulates with transmittance
+	//     and phase-weighted key light, while the hero retains real soft shadow.
+	//     Atmosphere stays dimensional without nesting a shadow raymarch inside
+	//     every fog sample.
+	//   • Phrase-held seeded camera compositions with render-rate interpolation.
+	//     The organism evolves inside the shot; the camera never runs a turntable.
+	//   • Photographic 7-stop palette interpolated smoothly — golden hour /
+	//     dusk / deep space stops, never cosine RGB.
+	//   • AgX filmic tone map + stable dither for a clean post-processing
+	//     signature without pasted-on lens overlays.
+	//
+	// Audio routing (multiple timescales):
+	//   • sub/kick            → localized root pigment/material response
+	//   • body/mids           → axial growth, lobe splitting, winding and folds
+	//   • presence/air        → ridges, filaments, erosion and surface emission
+	//   • spectral direction  → fine surface/environment travel, never rigid-body lean
+	//   • section/phrase      → lifecycle plus reach / coil / divide / hollow / stillness
+	//   • harmony/key         → continuous palette and material development
+	//   • bpmNorm (slow)     → long-form tissue development rate
+	//   • rms (slow)         → light shaft intensity
+	//   • onset (impulse)    → restrained root/surface impact only
+	//
+	// Future iterations: real circle-of-confusion DOF and Mandelbox / hybrid IFS
+	// variants per song seed.
+
+	import { onMount, onDestroy } from 'svelte';
+	import {
+		VISUALIZER_RESPONSE_PROFILES,
+		useVisualizer,
+		type VisualizerJourneySnapshot
+	} from '$lib/state/visualizer.svelte';
+	import {
+		mk2ContinuousPaletteBlend,
+		type Mk2ConductorFrame
+	} from '$lib/visualizer/mk2/conductor';
+	import {
+		SOMA_QUALITY_PROFILES,
+		SomaAutoQualityController,
+		selectSomaQuality,
+		somaBackingSize,
+		somaFrameStride,
+		type SomaQualityProfile,
+		type SomaQualityTier
+	} from '$lib/visualizer/mk2/runtime';
+
+	const vis = useVisualizer();
+	const t0 = performance.now();
+
+	let canvas = $state<HTMLCanvasElement | null>(null);
+	let errorMsg = $state<string | null>(null);
+	let gpuReady = $state(false);
+	let raf = 0;
+	let unsub: (() => void) | null = null;
+	let initGeneration = 0;
+	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
+	// returns instead of touching destroyed GPU resources mid-frame.
+	let running = false;
+	// Per-TRACK identity seed (Lomas principle): hashed from the recording id,
+	// so the same song always grows the same organism — palette family, camera
+	// identity, FOV, roll — and every different song gets a different world.
+	// Falls back to a random session seed when nothing identifiable plays.
+	let mk2SongSeed = 0.5;
+	let mk2SecondaryPaletteFamily = 2;
+	let rendererSourceEpoch = -1;
+	let rendererSyncRequested = true;
+	let poseSyncRequested = true;
+
+	// Mk2 borrows Signal's persistent song journey, then moves on deliberately
+	// slower rails. Only root punch and a restrained surface impact react quickly.
+	let temporalResetRequested = true;
+	let currentSection = $state('intro');
+	let currentForm = $state('seed');
+	let currentGesture = $state('reach');
+	let qualityTier = $state<SomaQualityTier>('ultra');
+	let renderPixels = $state(0);
+	let renderStride = $state(1);
+	let measuredRefreshRate = $state(60);
+
+	function dominantLifecycleForm(journey: VisualizerJourneySnapshot['mk2']): string {
+		const forms = [
+			['seed', journey.seedForm],
+			['sprout', journey.sproutForm],
+			['winding', journey.windingForm],
+			['bloom', journey.bloomForm],
+			['shedding', journey.sheddingForm],
+			['dormancy', journey.dormancyForm]
+		] as const;
+		let dominant: (typeof forms)[number] = forms[0];
+		for (const form of forms) if (form[1] > dominant[1]) dominant = form;
+		return dominant[0];
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Audio smoothing — multiple timescales per research recommendation.
+	// Fast-attack/release for transient-driven params; slow for mood-driven.
+	// ──────────────────────────────────────────────────────────────────────────
+	const smoothed = {
+		bass: 0,
+		mid: 0,
+		treble: 0,
+		centroidSlow: 0.5,
+		chromaXSlow: 1,
+		chromaYSlow: 0,
+		rmsSlow: 0,
+		bpmNormSlow: 0.4,
+		flash: 0,
+		staccato: 0,
+		sustain: 0,
+		paletteXSlow: 1,
+		paletteYSlow: 0,
+		responseMotion: 1,
+		responseImpact: 1,
+		responseFog: 1,
+		responseShafts: 1
+	};
+
+	function lerp(a: number, b: number, t: number) {
+		return a + (b - a) * t;
+	}
+
+	// Analyzer events arrive at roughly 60 Hz and are not phase-locked to the
+	// display. Using their already-slow conductor values raw still creates a
+	// hold/jump/hold cadence on a 143/144 Hz panel. Interpolate every macro rail
+	// at render cadence, while advancing unbounded surface phases continuously.
+	const RENDER_POSE_KEYS = [
+		'growth',
+		'tension',
+		'openness',
+		'suspense',
+		'postureYaw',
+		'posturePitch',
+		'seedForm',
+		'sproutForm',
+		'windingForm',
+		'bloomForm',
+		'sheddingForm',
+		'dormancyForm',
+		'rootMass',
+		'axialStretch',
+		'lobeSplit',
+		'foldDepth',
+		'cavityOpen',
+		'surfaceRidges',
+		'filamentReach',
+		'spectralLean',
+		'morphRate',
+		'spectralTravelRate',
+		'backgroundFlow',
+		'palettePhase',
+		'paletteWarmth',
+		'materialDensity',
+		'materialIridescence',
+		'materialErosion',
+		'shotZoom',
+		'closeStudy',
+		'detailFocus',
+		'perspectiveAzimuth',
+		'perspectiveElevation',
+		'shotFramingX',
+		'shotFramingY',
+		'cameraDistance',
+		'fogDensity',
+		'shaftIntensity',
+		'environmentVoid',
+		'environmentCurrent',
+		'environmentCavern',
+		'environmentHorizon',
+		'environmentCellular',
+		'materialMembrane',
+		'materialMineral',
+		'materialVelvet',
+		'materialCrystal',
+		'topologyCocoon',
+		'topologySpire',
+		'topologyBilateral',
+		'topologyTorus',
+		'topologyCoral',
+		'topologyShell',
+		'cameraOrbit',
+		'cameraProfile',
+		'cameraOverhead',
+		'cameraLow',
+		'cameraMacro',
+		'gestureReach',
+		'gestureCoil',
+		'gestureDivide',
+		'gestureHollow',
+		'gestureStillness',
+		'styleRhythmicDensity',
+		'topologyBias',
+		'styleLowHighTilt',
+		'styleTonality'
+	] as const satisfies readonly (keyof Mk2ConductorFrame)[];
+	type RenderPoseKey = (typeof RENDER_POSE_KEYS)[number];
+	const renderPose = Object.fromEntries(RENDER_POSE_KEYS.map((key) => [key, 0])) as Record<
+		RenderPoseKey,
+		number
+	>;
+	const CAMERA_POSE_KEYS = new Set<RenderPoseKey>([
+		'shotZoom',
+		'closeStudy',
+		'detailFocus',
+		'perspectiveAzimuth',
+		'perspectiveElevation',
+		'shotFramingX',
+		'shotFramingY',
+		'cameraDistance',
+		'cameraOrbit',
+		'cameraProfile',
+		'cameraOverhead',
+		'cameraLow',
+		'cameraMacro'
+	]);
+	const renderPhases = {
+		backgroundFlowPhase: 0,
+		morphPhase: 0,
+		spectralTravelPhase: 0
+	};
+
+	function updateRenderPose(journey: Readonly<Mk2ConductorFrame>, dt: number) {
+		if (poseSyncRequested) {
+			for (const key of RENDER_POSE_KEYS) renderPose[key] = journey[key];
+			renderPhases.backgroundFlowPhase = journey.backgroundFlowPhase;
+			renderPhases.morphPhase = journey.morphPhase;
+			renderPhases.spectralTravelPhase = journey.spectralTravelPhase;
+			poseSyncRequested = false;
+			return renderPose;
+		}
+		for (const key of RENDER_POSE_KEYS) {
+			const tau = CAMERA_POSE_KEYS.has(key) ? 0.2 : 0.13;
+			const smoothing = 1 - Math.exp(-dt / tau);
+			renderPose[key] = lerp(renderPose[key], journey[key], smoothing);
+		}
+		renderPhases.backgroundFlowPhase += renderPose.backgroundFlow * dt;
+		renderPhases.morphPhase += renderPose.morphRate * dt;
+		renderPhases.spectralTravelPhase += renderPose.spectralTravelRate * dt;
+		return renderPose;
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Camera placement is a held musical shot. Phrase rails interpolate between
+	// compositions; elapsed time never orbits, breathes, or nudges the camera.
+	// This is intentionally boring at the frame level: Soma itself can evolve
+	// without a perpetual handheld wobble being mistaken for audio reactivity.
+	// ──────────────────────────────────────────────────────────────────────────
+	function getCameraPos(
+		perspectiveAzimuth: number,
+		perspectiveElevation: number,
+		cameraOrbit: number,
+		cameraProfile: number,
+		cameraOverhead: number,
+		cameraLow: number,
+		cameraMacro: number
+	): [number, number, number] {
+		const seedAngle = mk2SongSeed * Math.PI * 2;
+		const azimuth =
+			seedAngle +
+			perspectiveAzimuth +
+			cameraProfile * 0.22 -
+			cameraLow * 0.08;
+		const baseRadius =
+			(3.48 + (mk2SongSeed - 0.5) * 0.24) *
+			(1 + cameraOrbit * 0.035 + cameraOverhead * 0.055 - cameraMacro * 0.025);
+		const radius = baseRadius * Math.cos(perspectiveElevation * 0.82);
+		const sideDrift =
+			(mk2SongSeed - 0.5) * 2 * (0.1 + cameraOrbit * 0.06 + cameraProfile * 0.05);
+		const altitudeBias =
+			cameraOverhead * 0.72 - cameraLow * 0.48 + cameraProfile * 0.1 - cameraMacro * 0.08;
+		return [
+			Math.cos(azimuth) * radius + Math.cos(azimuth * 0.37 + seedAngle) * sideDrift,
+			1.12 +
+				Math.sin(perspectiveElevation) * baseRadius * 0.86 +
+				altitudeBias,
+			Math.sin(azimuth) * radius + Math.sin(azimuth * 0.41 - seedAngle) * sideDrift
+		];
+	}
+
+	function dominantGesture(journey: VisualizerJourneySnapshot['mk2']): string {
+		const gestures = [
+			['reach', journey.gestureReach],
+			['coil', journey.gestureCoil],
+			['divide', journey.gestureDivide],
+			['hollow', journey.gestureHollow],
+			['stillness', journey.gestureStillness]
+		] as const;
+		let dominant: (typeof gestures)[number] = gestures[0];
+		for (const gesture of gestures) if (gesture[1] > dominant[1]) dominant = gesture;
+		return dominant[0];
+	}
+
+	function syncRendererToJourney(snapshot: VisualizerJourneySnapshot) {
+		if (snapshot.sourceEpoch === rendererSourceEpoch) return;
+		rendererSourceEpoch = snapshot.sourceEpoch;
+		mk2SongSeed = snapshot.seed;
+		const primaryFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
+		const stableKey =
+			snapshot.director.context.keyConfidence > 0.35
+				? snapshot.director.context.keyPitchClass
+				: snapshot.signal.key;
+		const familyStep = 2 + Math.floor((((stableKey % 1) + 1) % 1) * 5);
+		mk2SecondaryPaletteFamily = (primaryFamily + familyStep) % 8;
+		currentSection = snapshot.director.section;
+		rendererSyncRequested = true;
+		poseSyncRequested = true;
+		temporalResetRequested = true;
+		resetFrameScheduler();
+	}
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Uniform layout — 96 f32s = 384 bytes (multiple of 16 ✓)
+	// 0-1  resolution
+	// 2    time
+	// 3-7  audio: bass, mid, treble, centroid, rms
+	// 8    flash (onset)
+	// 9    bpmNorm
+	// 10-11 chromaKey x/y (unit-circle smoothed)
+	// 12   chromaStrength
+	// 13-15 camera position
+	// 16-18 camera forward
+	// 19-21 camera right
+	// 22-24 camera up
+	// 25   fovScale
+	// 26   mandelbulbPower (audio + time modulated)
+	// 27   paletteOffset (smoothed centroid + chroma → palette T)
+	// 28   fogDensity
+	// 29   lightShaftIntensity
+	// 30-31 growth / tension
+	// 32-35 palette family / surface impact / openness / rotation phase
+	// 36-39 background phase / posture yaw / posture pitch / suspense
+	// 40-45 lifecycle form weights: seed / sprout / winding / bloom / shedding / dormancy
+	// 46-47 unwrapped morph phase / rate
+	// 48-55 root mass / root pulse / axial stretch / lobe split / folds / cavity / ridges / filaments
+	// 56-58 signed spectral lean / unwrapped spectral travel / travel rate
+	// 59-63 palette phase / warmth / density / iridescence / erosion
+	// 64-70 shot zoom / close study / detail / azimuth / elevation / framing x/y
+	// 71    quality raymarch steps
+	// 72-76 environment DNA: void / current / cavern / horizon / cellular
+	// 77-80 material DNA: membrane / mineral / velvet / crystal
+	// 81-82 secondary palette family / continuous family blend
+	// 83    alignment
+	// 84-89 topology grammar: cocoon / spire / bilateral / torus / coral / shell
+	// 90-94 phrase gesture: reach / coil / divide / hollow / stillness
+	// 95    long-horizon rhythmic density
+	const UNIFORM_FLOATS = 96;
+	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
+
+	const SCENE_WGSL = /* wgsl */ `
+struct Uniforms {
+	resolutionX: f32,
+	resolutionY: f32,
+	time: f32,
+	bass: f32,
+	mid: f32,
+	treble: f32,
+	centroid: f32,
+	rms: f32,
+	flash: f32,
+	bpmNorm: f32,
+	chromaX: f32,
+	chromaY: f32,
+	chromaStrength: f32,
+	camPosX: f32,
+	camPosY: f32,
+	camPosZ: f32,
+	camFwdX: f32,
+	camFwdY: f32,
+	camFwdZ: f32,
+	camRightX: f32,
+	camRightY: f32,
+	camRightZ: f32,
+	camUpX: f32,
+	camUpY: f32,
+	camUpZ: f32,
+	fovScale: f32,
+	mandelbulbPower: f32,
+	paletteOffset: f32,
+	fogDensity: f32,
+	lightShaftIntensity: f32,
+	_pad0: f32,
+	_pad1: f32,
+	paletteFamily: f32,
+	surfaceImpact: f32,
+	openness: f32,
+	journeyPhase: f32,
+	backgroundPhase: f32,
+	postureYaw: f32,
+	posturePitch: f32,
+	suspense: f32,
+	seedForm: f32,
+	sproutForm: f32,
+	windingForm: f32,
+	bloomForm: f32,
+	sheddingForm: f32,
+	dormancyForm: f32,
+	morphPhase: f32,
+	morphRate: f32,
+	rootMass: f32,
+	rootPulse: f32,
+	axialStretch: f32,
+	lobeSplit: f32,
+	foldDepth: f32,
+	cavityOpen: f32,
+	surfaceRidges: f32,
+	filamentReach: f32,
+	spectralLean: f32,
+	spectralTravelPhase: f32,
+	spectralTravelRate: f32,
+	palettePhase: f32,
+	paletteWarmth: f32,
+	materialDensity: f32,
+	materialIridescence: f32,
+	materialErosion: f32,
+	shotZoom: f32,
+	closeStudy: f32,
+	detailFocus: f32,
+	perspectiveAzimuth: f32,
+	perspectiveElevation: f32,
+	shotFramingX: f32,
+	shotFramingY: f32,
+	qualitySteps: f32,
+	environmentVoid: f32,
+	environmentCurrent: f32,
+	environmentCavern: f32,
+	environmentHorizon: f32,
+	environmentCellular: f32,
+	materialMembrane: f32,
+	materialMineral: f32,
+	materialVelvet: f32,
+	materialCrystal: f32,
+	paletteFamilyB: f32,
+	paletteFamilyBlend: f32,
+	_pad2: f32,
+	topologyCocoon: f32,
+	topologySpire: f32,
+	topologyBilateral: f32,
+	topologyTorus: f32,
+	topologyCoral: f32,
+	topologyShell: f32,
+	gestureReach: f32,
+	gestureCoil: f32,
+	gestureDivide: f32,
+	gestureHollow: f32,
+	gestureStillness: f32,
+	styleRhythmicDensity: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> bins: array<f32, 64>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	var pos = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+	);
+	return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 7-stop palette LUT — eight coordinated colour worlds. A track keeps a
+// stable primary family and slowly borrows pigment from a harmonically chosen
+// secondary family, so colour develops without flashing between presets.
+// Each family is a totally distinct visual world rather than a rotation
+// through the same hues. Picked by song seed so every track lands a
+// different colour world.
+//   0 dusk        photographic — deep navy → plum → burnt orange → cream → teal
+//   1 aurora      cool — blacks → indigos → cyans → mint → bright magenta cap
+//   2 synthwave   neon — black → hot magenta → cyan → electric purple
+//   3 volcanic    warm — black → ember red → orange → bright yellow → bone white
+//   4 bioluminous UV → cyan → green → chartreuse on near-black field
+//   5 oil-on-water iridescent — petrol blues → magenta → gold → mint shifts
+// ═══════════════════════════════════════════════════════════════════════════
+fn paletteFamily(t: f32, family: i32) -> vec3<f32> {
+	let s = fract(t);
+	let x = s * 7.0;
+	let i = i32(floor(x));
+	let f = smoothstep(0.0, 1.0, x - floor(x));
+	var stops = array<vec3<f32>, 7>(
+		vec3<f32>(0.020, 0.025, 0.080),
+		vec3<f32>(0.090, 0.045, 0.150),
+		vec3<f32>(0.380, 0.120, 0.105),
+		vec3<f32>(0.880, 0.420, 0.150),
+		vec3<f32>(0.950, 0.820, 0.620),
+		vec3<f32>(0.460, 0.580, 0.700),
+		vec3<f32>(0.090, 0.300, 0.380)
+	);
+	if (family == 1) {
+		// aurora
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.010, 0.015, 0.045),
+			vec3<f32>(0.040, 0.025, 0.180),
+			vec3<f32>(0.060, 0.160, 0.420),
+			vec3<f32>(0.180, 0.580, 0.640),
+			vec3<f32>(0.520, 0.880, 0.640),
+			vec3<f32>(0.900, 0.500, 0.880),
+			vec3<f32>(0.310, 0.080, 0.380)
+		);
+	} else if (family == 2) {
+		// synthwave neon
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.020, 0.010, 0.040),
+			vec3<f32>(0.260, 0.020, 0.180),
+			vec3<f32>(0.980, 0.140, 0.520),
+			vec3<f32>(0.620, 0.080, 0.860),
+			vec3<f32>(0.060, 0.780, 0.940),
+			vec3<f32>(0.180, 0.220, 0.640),
+			vec3<f32>(0.880, 0.300, 0.760)
+		);
+	} else if (family == 3) {
+		// volcanic
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.018, 0.008, 0.005),
+			vec3<f32>(0.220, 0.030, 0.020),
+			vec3<f32>(0.640, 0.080, 0.040),
+			vec3<f32>(0.940, 0.380, 0.070),
+			vec3<f32>(0.980, 0.760, 0.180),
+			vec3<f32>(0.980, 0.940, 0.760),
+			vec3<f32>(0.400, 0.100, 0.030)
+		);
+	} else if (family == 4) {
+		// bioluminous
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.005, 0.020, 0.030),
+			vec3<f32>(0.020, 0.060, 0.260),
+			vec3<f32>(0.040, 0.420, 0.580),
+			vec3<f32>(0.180, 0.880, 0.620),
+			vec3<f32>(0.720, 0.980, 0.220),
+			vec3<f32>(0.080, 0.640, 0.480),
+			vec3<f32>(0.040, 0.180, 0.220)
+		);
+	} else if (family == 5) {
+		// oil-on-water iridescent
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.030, 0.060, 0.140),
+			vec3<f32>(0.140, 0.080, 0.420),
+			vec3<f32>(0.060, 0.640, 0.720),
+			vec3<f32>(0.880, 0.380, 0.620),
+			vec3<f32>(0.980, 0.840, 0.300),
+			vec3<f32>(0.580, 0.940, 0.640),
+			vec3<f32>(0.380, 0.120, 0.520)
+		);
+	} else if (family == 6) {
+		// obsidian mineral
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.008, 0.010, 0.014),
+			vec3<f32>(0.055, 0.065, 0.072),
+			vec3<f32>(0.060, 0.250, 0.235),
+			vec3<f32>(0.520, 0.290, 0.110),
+			vec3<f32>(0.840, 0.650, 0.270),
+			vec3<f32>(0.740, 0.710, 0.610),
+			vec3<f32>(0.120, 0.150, 0.160)
+		);
+	} else if (family == 7) {
+		// verdant deep sea
+		stops = array<vec3<f32>, 7>(
+			vec3<f32>(0.005, 0.018, 0.016),
+			vec3<f32>(0.018, 0.095, 0.070),
+			vec3<f32>(0.120, 0.360, 0.160),
+			vec3<f32>(0.680, 0.320, 0.180),
+			vec3<f32>(0.940, 0.620, 0.360),
+			vec3<f32>(0.500, 0.800, 0.700),
+			vec3<f32>(0.050, 0.210, 0.250)
+		);
+	}
+	let a = stops[(i % 7 + 7) % 7];
+	let b = stops[((i + 1) % 7 + 7) % 7];
+	return mix(a, b, f);
+}
+
+fn palette7(t: f32) -> vec3<f32> {
+	let primary = paletteFamily(t, i32(u.paletteFamily));
+	let secondary = paletteFamily(t + u.paletteWarmth * 0.035, i32(u.paletteFamilyB));
+	let familyBlend = clamp(u.paletteFamilyBlend, 0.0, 0.36);
+	let blended = mix(primary, secondary, familyBlend);
+	let luma = dot(blended, vec3<f32>(0.2126, 0.7152, 0.0722));
+	return clamp(
+		mix(vec3<f32>(luma), blended, 1.08 + familyBlend * 0.18),
+		vec3<f32>(0.0),
+		vec3<f32>(1.0)
+	);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mandelbulb distance estimator. Iterates the formula z = z^n + c where
+// raising to power n is done in spherical coordinates. Returns a distance
+// approximation via the derivative magnitude — accurate enough to raymarch
+// without overshooting the genuine fractal boundary.
+// ═══════════════════════════════════════════════════════════════════════════
+// iters now passed in — audio-driven from caller so the fractal literally
+// reveals more detail during high-energy sections. 4 = smooth blob (calm),
+// 11 = full fractal detail (drop/chorus). This is the actual "evolution"
+// the user wants: the geometry has more or less complexity, not just a
+// pulsing version of the same shape.
+fn mandelbulbDE(p: vec3<f32>, power: f32, iters: i32) -> f32 {
+	var z = p;
+	var dr = 1.0;
+	var r = 0.0;
+	for (var i: i32 = 0; i < iters; i = i + 1) {
+		r = length(z);
+		if (r > 2.0) { break; }
+		let safeR = max(r, 1e-5);
+		let theta = acos(clamp(z.z / safeR, -1.0, 1.0));
+		let phi = atan2(z.y, z.x);
+		dr = pow(safeR, power - 1.0) * power * dr + 1.0;
+		let zr = pow(safeR, power);
+		let nTheta = theta * power;
+		let nPhi = phi * power;
+		z = zr * vec3<f32>(
+			sin(nTheta) * cos(nPhi),
+			sin(nPhi) * sin(nTheta),
+			cos(nTheta)
+		);
+		z = z + p;
+	}
+	let safeR = max(r, 1e-5);
+	return 0.5 * log(safeR) * safeR / max(dr, 1e-5);
+}
+
+fn rot2(v: vec2<f32>, a: f32) -> vec2<f32> {
+	let c = cos(a);
+	let s = sin(a);
+	return vec2<f32>(c * v.x - s * v.y, s * v.x + c * v.y);
+}
+
+fn smin(a: f32, b: f32, k: f32) -> f32 {
+	let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+	return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+fn smax(a: f32, b: f32, k: f32) -> f32 {
+	return -smin(-a, -b, k);
+}
+
+fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
+	let lenV = length(v);
+	if (!(lenV > 1e-5 && lenV < 1e10)) {
+		return fallback;
+	}
+	return v / lenV;
+}
+
+fn sdCapsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, radius: f32) -> f32 {
+	let pa = p - a;
+	let ba = b - a;
+	let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-5), 0.0, 1.0);
+	return length(pa - ba * h) - radius;
+}
+
+fn sdEllipsoid(p: vec3<f32>, radii: vec3<f32>) -> f32 {
+	let safeRadii = max(radii, vec3<f32>(0.025));
+	let k0 = length(p / safeRadii);
+	let k1 = max(length(p / (safeRadii * safeRadii)), 1e-5);
+	return k0 * (k0 - 1.0) / k1;
+}
+
+fn sproutDirection(i: i32) -> vec3<f32> {
+	if (i == 0) { return safeNormalize(vec3<f32>(0.48, 0.86, 0.12), vec3<f32>(0.0, 1.0, 0.0)); }
+	if (i == 1) { return safeNormalize(vec3<f32>(-0.72, 0.52, 0.34), vec3<f32>(-1.0, 0.0, 0.0)); }
+	if (i == 2) { return safeNormalize(vec3<f32>(0.30, -0.12, 0.94), vec3<f32>(0.0, 0.0, 1.0)); }
+	return safeNormalize(vec3<f32>(-0.24, -0.34, -0.91), vec3<f32>(0.0, 0.0, -1.0));
+}
+
+fn windingDirection(i: i32) -> vec3<f32> {
+	if (i == 0) { return safeNormalize(vec3<f32>(0.30, 0.94, 0.16), vec3<f32>(0.0, 1.0, 0.0)); }
+	if (i == 1) { return safeNormalize(vec3<f32>(-0.34, 0.88, -0.32), vec3<f32>(0.0, 1.0, 0.0)); }
+	if (i == 2) { return safeNormalize(vec3<f32>(0.42, -0.74, 0.52), vec3<f32>(0.0, -1.0, 0.0)); }
+	return safeNormalize(vec3<f32>(-0.48, -0.72, -0.50), vec3<f32>(0.0, -1.0, 0.0));
+}
+
+fn bloomDirection(i: i32) -> vec3<f32> {
+	if (i == 0) { return safeNormalize(vec3<f32>(0.94, 0.25, 0.12), vec3<f32>(1.0, 0.0, 0.0)); }
+	if (i == 1) { return safeNormalize(vec3<f32>(-0.86, 0.20, 0.46), vec3<f32>(-1.0, 0.0, 0.0)); }
+	if (i == 2) { return safeNormalize(vec3<f32>(0.08, 0.58, 0.81), vec3<f32>(0.0, 0.0, 1.0)); }
+	return safeNormalize(vec3<f32>(0.18, -0.78, -0.60), vec3<f32>(0.0, -1.0, 0.0));
+}
+
+fn organismWarp(p: vec3<f32>) -> vec3<f32> {
+	let growth = u._pad0;
+	let tension = u._pad1;
+	let openness = clamp(u.openness, 0.0, 1.0);
+	let spire = pow(max(u.topologySpire, 0.0), 1.25);
+	let bilateral = pow(max(u.topologyBilateral, 0.0), 1.25);
+	let torus = pow(max(u.topologyTorus, 0.0), 1.25);
+	let coral = pow(max(u.topologyCoral, 0.0), 1.25);
+	let shell = pow(max(u.topologyShell, 0.0), 1.25);
+	let reach = pow(max(u.gestureReach, 0.0), 1.15);
+	let coil = pow(max(u.gestureCoil, 0.0), 1.15);
+	let divide = pow(max(u.gestureDivide, 0.0), 1.15);
+	let hollow = pow(max(u.gestureHollow, 0.0), 1.15);
+	let stillness = pow(max(u.gestureStillness, 0.0), 1.15);
+	// Whole-body breathing is deliberately restrained. Sub and kick now own a
+	// localized material change below. Phrase gestures own silhouette scale.
+	let breath = 1.0
+		+ growth * 0.045
+		+ openness * 0.028
+		+ u.bloomForm * 0.045
+		+ divide * 0.055
+		+ reach * 0.025
+		- u.seedForm * 0.035
+		- u.dormancyForm * 0.085
+		- stillness * 0.055
+		- hollow * 0.018;
+	var q = p / breath;
+
+	// Whole-body orientation is a held compositional decision. No clock, FFT
+	// delta, spectral lean, kick, or impact is allowed to twist the entire subject.
+	// Perspective changes come from patient camera grammar and phrase posture.
+	let globalYaw = u.postureYaw * 0.62
+		+ (coil - divide) * 0.065 + (shell - bilateral) * 0.035;
+	let yawed = rot2(q.xz, globalYaw);
+	q.x = yawed.x;
+	q.z = yawed.y;
+	let pitched = rot2(
+		q.yz,
+		u.posturePitch * 0.70 + (reach - hollow) * 0.045 - stillness * 0.018
+	);
+	q.y = pitched.x;
+	q.z = pitched.y;
+
+	// Spatial asymmetry gives the tissue a living bias, but it is a held pose.
+	// No elapsed-time phase may deform the whole coordinate field: even a very
+	// slow sine eventually reads as the same canned inhale-and-twist loop.
+	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
+		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
+		+ (coil - divide) * 0.42 + (reach - hollow) * 0.31;
+	// A long-form local deformation clock changes anatomy from within. Its
+	// incommensurate, very low rates never rotate, translate, or scale the rigid
+	// subject; they only let different tissue regions grow and relax over minutes.
+	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
+	let drift = vec3<f32>(
+		sin(q.y * 1.05 + poseIdentity + evolutionPhase * 0.37) * 0.045
+			+ cos(q.z * 0.73 - poseIdentity * 0.61 - evolutionPhase * 0.19) * 0.030,
+		sin(q.x * 0.82 - poseIdentity * 0.43 + evolutionPhase * 0.23) * 0.032,
+		cos(q.x * 0.92 + poseIdentity * 0.79 + evolutionPhase * 0.31) * 0.045
+			+ sin(q.y * 0.71 + poseIdentity * 0.53 - evolutionPhase * 0.17) * 0.030
+	);
+	q = q + drift * (
+		0.22 + growth * 0.22 + u.sproutForm * 0.18 + u.sheddingForm * 0.15
+			+ coral * 0.28 + reach * 0.16 + hollow * 0.1 - stillness * 0.14
+	);
+
+	// Body/mids own large silhouette changes: long sprout, wound build, wide
+	// bloom, and contracted dormancy are genuinely different coordinate fields.
+	let stretchY = max(0.52,
+		0.82 + u.axialStretch * 0.70 + u.sproutForm * 0.14 + u.windingForm * 0.08
+		+ spire * 0.58 + reach * 0.42 - torus * 0.20 - shell * 0.16
+		- u.bloomForm * 0.14 - u.dormancyForm * 0.28 - stillness * 0.16);
+	let stretchX = max(0.64,
+		0.80 + u.lobeSplit * 0.24 + u.bloomForm * 0.18 + u.dormancyForm * 0.12
+		+ bilateral * 0.22 + torus * 0.18 + divide * 0.24 - spire * 0.14);
+	let stretchZ = max(0.64,
+		0.82 + u.lobeSplit * 0.27 + u.bloomForm * 0.20 + u.rootMass * 0.08
+		+ u.dormancyForm * 0.14 + torus * 0.32 + shell * 0.25 + divide * 0.24);
+	q.x = q.x / stretchX;
+	q.y = q.y / stretchY;
+	q.z = q.z / stretchZ;
+
+	// Tissue migrates between upper/lower and near/far regions instead of the
+	// entire organism breathing as one sphere. This produces obvious growth over
+	// a musical passage while keeping the centroid and total scale essentially
+	// stable—expansion in one anatomical region is balanced by contraction in another.
+	let migration = sin(q.y * 1.36 + evolutionPhase * 0.73 + poseIdentity * 0.31);
+	let migrationStrength = (0.035 + growth * 0.038 + reach * 0.025 + divide * 0.03)
+		* (1.0 - stillness * 0.68);
+	q.x = q.x / max(0.82, 1.0 + migration * migrationStrength);
+	q.z = q.z / max(0.84, 1.0 - migration * migrationStrength * 0.78);
+	q.y = q.y + sin(q.x * 1.24 - evolutionPhase * 0.39 + poseIdentity)
+		* migrationStrength * 0.18;
+
+	// Sprout grows as one visibly biased shoot instead of a uniformly stretched
+	// orb. Winding then pulls the cross-section inward before applying its twist;
+	// bloom releases that stored pressure laterally, while dormancy settles flat.
+	let sproutBend = (u.sproutForm + reach * 0.72 + spire * 0.30)
+		* (0.07 + u.axialStretch * 0.075);
+	let growthIdentity = poseIdentity;
+	let growthLeanX = sin(growthIdentity);
+	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
+	let sproutCurve = sin(q.y * 1.18 + poseIdentity * 0.23 + evolutionPhase * 0.29) * sproutBend
+		+ q.y * q.y * u.sproutForm * 0.045;
+	q.x = q.x - sproutCurve * growthLeanX;
+	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
+	let windingCompression = 1.0
+		+ (u.windingForm + coil * 0.82 + shell * 0.46) * (0.08 + u.foldDepth * 0.16);
+	q.x = q.x * windingCompression;
+	q.z = q.z * windingCompression;
+
+	// Signed filter motion leans the organism through space instead of changing a
+	// fullscreen overlay. Root energy expands only the lower anatomy.
+	q.x = q.x - q.y * u.spectralLean * (0.10 + u.axialStretch * 0.13);
+	let rootZone = 1.0 - smoothstep(-0.58, 0.34, q.y);
+	let rootExpansionX = 1.0 + rootZone * u.rootMass * 0.18;
+	let rootExpansionZ = 1.0 + rootZone * u.rootMass * 0.15;
+	q.x = q.x / rootExpansionX;
+	q.z = q.z / rootExpansionZ;
+
+	// Use the circular key vector directly. Unlike atan2(), these controls remain
+	// continuous when pitch class crosses the 0/1 boundary.
+	let chromaPull = clamp(u.chromaStrength, 0.0, 1.0);
+	let chromaTilt = u.chromaY * chromaPull * 0.055;
+	let rChroma = rot2(q.xy, chromaTilt);
+	q.x = rChroma.x;
+	q.y = rChroma.y;
+
+	// Builds physically wind inward; mids determine fold depth. Bloom releases
+	// that stored twist into separated lobes rather than a uniform scale pulse.
+	let twist = q.y * (
+		0.16 + tension * 0.32 + u.windingForm * 1.08 + u.foldDepth * 0.62
+			+ coil * 1.24 + shell * 0.74
+	)
+		+ sin(q.z * 1.52 + poseIdentity * 1.09 + evolutionPhase * 0.41)
+			* (0.045 + u.foldDepth * 0.16)
+		+ u.chromaX * chromaPull * 0.045;
+	let rxz = rot2(q.xz, twist);
+	q.x = rxz.x;
+	q.z = rxz.y;
+	let rxy = rot2(
+		q.xy,
+		sin(q.z * 0.96 + poseIdentity * 0.67 - evolutionPhase * 0.27)
+			* (0.035 + u.foldDepth * 0.14)
+	);
+	q.x = rxy.x;
+	q.y = rxy.y;
+	q.y = q.y + sin(q.x * 1.75 + poseIdentity * 0.59 + evolutionPhase * 0.21)
+		* (0.022 + u.foldDepth * 0.075);
+	return q;
+}
+
+fn map(p: vec3<f32>) -> f32 {
+	let growth = u._pad0;
+	let tension = u._pad1;
+	let cocoonDNA = pow(max(u.topologyCocoon, 0.0), 1.25);
+	let spireDNA = pow(max(u.topologySpire, 0.0), 1.25);
+	let bilateralDNA = pow(max(u.topologyBilateral, 0.0), 1.25);
+	let torusDNA = pow(max(u.topologyTorus, 0.0), 1.25);
+	let coralDNA = pow(max(u.topologyCoral, 0.0), 1.25);
+	let shellDNA = pow(max(u.topologyShell, 0.0), 1.25);
+	let reachGesture = pow(max(u.gestureReach, 0.0), 1.15);
+	let coilGesture = pow(max(u.gestureCoil, 0.0), 1.15);
+	let divideGesture = pow(max(u.gestureDivide, 0.0), 1.15);
+	let hollowGesture = pow(max(u.gestureHollow, 0.0), 1.15);
+	let stillGesture = pow(max(u.gestureStillness, 0.0), 1.15);
+	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
+		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
+		+ (coilGesture - divideGesture) * 0.42
+		+ (reachGesture - hollowGesture) * 0.31;
+	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
+	// Cheap conservative scene bound. All lifecycle appendages and shed fragments
+	// remain within this envelope, so empty screen rays avoid the fractal entirely.
+	let outerBound = length(p) - 1.95;
+	if (outerBound > 0.35) {
+		return outerBound * 0.76;
+	}
+	let q = organismWarp(p);
+	let bilateralMorph = clamp(bilateralDNA * (0.26 + divideGesture * 0.48), 0.0, 0.68);
+	var coreQ = q;
+	// Fold one true fractal field into two coherent lobes. This preserves the
+	// organism's surface vocabulary instead of gluing smooth primitive balloons
+	// onto its sides.
+	coreQ.x = mix(
+		coreQ.x,
+		abs(coreQ.x) - (0.13 + divideGesture * 0.09),
+		bilateralMorph
+	);
+	let shellCurl = shellDNA * (0.18 + coilGesture * 0.42);
+	let shellTurn = rot2(coreQ.xy, shellCurl * (0.55 + coreQ.z * 0.35));
+	coreQ.x = shellTurn.x - shellDNA * 0.045;
+	coreQ.y = shellTurn.y + shellDNA * 0.025;
+
+	// A single expensive Mandelbulb remains the organic heart. Intro/outro blend
+	// toward a waxy cocoon; active sections reveal the fractal continuously.
+	let cocoonRadii = vec3<f32>(
+		0.60 + u.rootMass * 0.08 + u.bloomForm * 0.12 + u.dormancyForm * 0.10
+			+ cocoonDNA * 0.08 + divideGesture * 0.06,
+		0.68 + u.axialStretch * 0.18 + u.sproutForm * 0.12 - u.dormancyForm * 0.14
+			+ spireDNA * 0.12 + reachGesture * 0.08 - stillGesture * 0.08,
+		0.58 + u.lobeSplit * 0.12 + u.bloomForm * 0.10 + u.dormancyForm * 0.12
+			+ shellDNA * 0.08 + torusDNA * 0.06
+	);
+	let cocoon = sdEllipsoid(coreQ, cocoonRadii);
+	// A lifecycle-owned core scale keeps the expensive fractal itself from reading
+	// as the same ball in every section. Larger coordinate scale means a smaller,
+	// denser core; bloom deliberately moves in the opposite direction.
+	let bodyScale = 1.04 + growth * 0.025 + u.seedForm * 0.12
+		+ u.windingForm * 0.08 + u.sheddingForm * 0.04 + u.dormancyForm * 0.18
+		- u.sproutForm * 0.04 - u.bloomForm * 0.12;
+	// Macro studies earn extra true fractal iterations. Both gates are uniform
+	// across the frame and require an elected close study, so an intricate normal
+	// hero shot never pays the macro cost by accident.
+	var fractalIterations = 6;
+	if (u.closeStudy > 0.55 && u.detailFocus > 0.58) { fractalIterations = 7; }
+	if (u.closeStudy > 0.84 && u.detailFocus > 0.90) { fractalIterations = 8; }
+	let fractal = mandelbulbDE(
+		coreQ * bodyScale,
+		u.mandelbulbPower + tension * 0.28 + u.foldDepth * 0.24 - u.bloomForm * 0.16,
+		fractalIterations
+	) * (1.01 - growth * 0.045);
+	let fractalReveal = clamp(
+		0.34 + u.sproutForm * 0.32 + u.windingForm * 0.46 + u.bloomForm * 0.52
+		+ u.sheddingForm * 0.40 + coralDNA * 0.18 + bilateralDNA * 0.10
+		- cocoonDNA * 0.18 - u.seedForm * 0.08 - u.dormancyForm * 0.12,
+		0.16,
+		0.86
+	);
+	var body = mix(cocoon, fractal, fractalReveal);
+
+	// Torus DNA is expressed as a tunnel through the existing living tissue, not
+	// as a replacement primitive. It can open the silhouette and expose the inner
+	// fractal, but it can never inflate Soma into a giant smooth rubber ring.
+	var torusQ = q;
+	let torusTurn = rot2(torusQ.yz, 0.28 + coilGesture * 0.72 + shellDNA * 0.35);
+	torusQ.y = torusTurn.x;
+	torusQ.z = torusTurn.y;
+	let tunnelRadius = 0.10 + torusDNA * 0.11 + hollowGesture * 0.08;
+	let hollowTunnel = max(
+		length(torusQ.xy) - tunnelRadius,
+		abs(torusQ.z) - (0.46 + divideGesture * 0.10)
+	);
+	let hollowMorph = clamp(torusDNA * (0.18 + hollowGesture * 0.62), 0.0, 0.76);
+	body = mix(body, max(body, -hollowTunnel), hollowMorph);
+
+	// Sub energy grows a rooted lower lobe. This is spatially localized, so a
+	// kick reads as weight entering the organism rather than a fullscreen pulse.
+	let rootCenter = vec3<f32>(u.spectralLean * 0.08, -0.48, 0.02);
+	let rootLobe = sdEllipsoid(
+		q - rootCenter,
+		vec3<f32>(
+			0.31 + u.rootMass * 0.20,
+			0.25 + u.rootMass * 0.13,
+			0.30 + u.rootMass * 0.18
+		)
+	);
+	body = smin(body, rootLobe, 0.085 + u.rootMass * 0.035);
+
+	// Four thick anatomical limbs replace the old hair-thin helixes that lived
+	// inside the core. Their directions, reach, buds, and visibility crossfade
+	// from asymmetric sprout to wound cocoon to open bloom.
+	for (var i: i32 = 0; i < 4; i = i + 1) {
+		var sproutGate = 0.04;
+		var windingGate = 0.50;
+		var bloomGate = 0.88;
+		var lanePolarity = -1.0;
+		if (i == 0) {
+			sproutGate = 1.0;
+			windingGate = 0.82;
+			bloomGate = 1.0;
+			lanePolarity = 1.0;
+		} else if (i == 1) {
+			sproutGate = 0.48;
+			windingGate = 0.74;
+			bloomGate = 0.96;
+		} else if (i == 2) {
+			sproutGate = 0.12;
+			windingGate = 0.58;
+			bloomGate = 0.92;
+			lanePolarity = 1.0;
+		}
+
+		let activeForms = max(u.sproutForm + u.windingForm + u.bloomForm, 1e-4);
+		let bloomMix = clamp(u.bloomForm / activeForms, 0.0, 1.0);
+		let windingMix = clamp(u.windingForm / activeForms, 0.0, 1.0);
+		var direction = safeNormalize(
+			mix(sproutDirection(i), bloomDirection(i), bloomMix),
+			sproutDirection(i)
+		);
+		direction = safeNormalize(
+			mix(direction, windingDirection(i), windingMix * 0.82),
+			direction
+		);
+		let travelTurn = u.postureYaw * (0.92 + f32(i) * 0.08)
+			+ u.posturePitch * 0.54 * lanePolarity
+			+ (coilGesture - divideGesture) * (0.22 + f32(i) * 0.025)
+			+ u.paletteFamily * 0.17 * lanePolarity
+			+ evolutionPhase * (0.085 + f32(i) * 0.009) * lanePolarity;
+		let turned = rot2(direction.xz, travelTurn);
+		direction.x = turned.x;
+		direction.z = turned.y;
+		direction.x = direction.x + u.spectralLean * (0.10 + f32(i) * 0.018) * lanePolarity;
+		direction = safeNormalize(direction, sproutDirection(i));
+
+		let presence = clamp(
+			u.sproutForm * sproutGate + u.windingForm * windingGate
+			+ u.bloomForm * bloomGate + u.sheddingForm * 0.14
+			+ coralDNA * (0.42 + bloomGate * 0.34)
+			+ reachGesture * sproutGate * 0.38
+			+ divideGesture * bloomGate * 0.24
+			- stillGesture * 0.24,
+			0.0,
+			1.0
+		);
+		let laneVariation = 0.90 + f32(i) * 0.055 + lanePolarity * u.spectralLean * 0.08;
+		let reach = (
+			0.46 + u.axialStretch * 0.22 + u.lobeSplit * 0.24
+			+ u.bloomForm * 0.25 + u.filamentReach * 0.10 - u.windingForm * 0.10
+			+ coralDNA * 0.25 + reachGesture * 0.26 + divideGesture * 0.12
+		) * laneVariation;
+		let a = direction * (0.14 + u.windingForm * 0.13);
+		var b = direction * reach;
+		b.y = b.y + sin(poseIdentity * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
+		b.x = b.x + u.spectralLean * lanePolarity * (0.035 + u.lobeSplit * 0.055);
+		let branchRadius = 0.050 + u.rootMass * 0.020 + u.lobeSplit * 0.025
+			+ u.bloomForm * 0.030 + u.filamentReach * 0.015;
+		let branch = sdCapsule(q, a, b, branchRadius);
+		let budRadius = 0.075 + u.lobeSplit * 0.040 + u.bloomForm * 0.055
+			+ divideGesture * 0.020 + coralDNA * 0.015;
+		let bud = sdEllipsoid(
+			q - b,
+			vec3<f32>(budRadius * (1.12 + u.lobeSplit * 0.18), budRadius * 0.86, budRadius)
+		);
+		let appendage = min(branch, bud) + (1.0 - presence) * 0.34;
+		body = smin(body, appendage, 0.035 + presence * 0.030);
+	}
+
+	// Bridge/breakdown opens a real exterior-intersecting tunnel. Unlike the old
+	// tiny internal spheres, this negative space reaches the silhouette from most
+	// camera angles and makes shedding unmistakably different from bloom.
+	var cavityQ = q;
+	let cavityTurn = u.posturePitch * 1.24 + u.postureYaw * 0.46
+		+ shellDNA * 0.54 + coilGesture * 0.62;
+	let cavityYZ = rot2(cavityQ.yz, cavityTurn);
+	cavityQ.y = cavityYZ.x;
+	cavityQ.z = cavityYZ.y;
+	let tunnel = sdCapsule(
+		cavityQ,
+		vec3<f32>(-1.35, 0.0, 0.0),
+		vec3<f32>(1.35, 0.0, 0.0),
+		0.070 + u.cavityOpen * 0.30 + hollowGesture * 0.24 + torusDNA * 0.13
+	);
+	let cavityGate = smoothstep(
+		0.08,
+		0.74,
+		u.cavityOpen + hollowGesture * 0.58 + torusDNA * 0.28 + shellDNA * 0.12
+	);
+	body = smax(body, -tunnel - (1.0 - cavityGate) * 0.46, 0.052);
+	let pocket = length(cavityQ - vec3<f32>(0.34, 0.29, 0.18))
+		- (0.11 + u.cavityOpen * 0.21);
+	body = smax(
+		body,
+		-pocket - (1.0 - max(u.sheddingForm, hollowGesture * 0.8)) * 0.36,
+		0.044
+	);
+
+	// Two coherent shed fragments drift away during bridge/breakdown. They remain
+	// part of this one world-space SDF—no translucent texture layer is involved.
+	let shedGate = clamp(u.sheddingForm * 1.12 + hollowGesture * 0.34 + shellDNA * 0.12, 0.0, 1.0);
+	let fragmentDrift = 0.72 + shedGate * 0.43;
+	let fragmentAOffset = vec3<f32>(
+		fragmentDrift + sin(poseIdentity * 0.61) * 0.12,
+		0.30 + shedGate * 0.18 + cos(poseIdentity * 0.47) * 0.13,
+		-0.20 - shedGate * 0.10 + sin(poseIdentity * 0.39) * 0.10
+	);
+	let fragmentBOffset = vec3<f32>(
+		-fragmentDrift * 0.88 + cos(poseIdentity * 0.53) * 0.15,
+		-0.36 - shedGate * 0.16 + sin(poseIdentity * 0.43) * 0.12,
+		0.43 + shedGate * 0.20 + cos(poseIdentity * 0.31) * 0.11
+	);
+	let fragmentRadius = 0.15 + u.filamentReach * 0.060 + u.materialErosion * 0.050;
+	let fragmentA = sdEllipsoid(
+		q - fragmentAOffset,
+		vec3<f32>(fragmentRadius * 1.35, fragmentRadius * 0.78, fragmentRadius)
+	);
+	let fragmentB = sdEllipsoid(
+		q - fragmentBOffset,
+		vec3<f32>(fragmentRadius, fragmentRadius * 1.28, fragmentRadius * 0.82)
+	);
+	let fragments = min(fragmentA, fragmentB) + (1.0 - shedGate) * 0.34;
+	body = smin(body, fragments, 0.045 + shedGate * 0.025);
+
+	// True Mandelbulb detail, lifecycle anatomy, and hit-time pore material now
+	// provide all fine structure. Removing procedural SDF corrugation prevents
+	// bright grazing light from turning tiny ridges into another stripe pattern
+	// and saves several trigonometric operations on every map evaluation.
+	return body * 0.76;
+}
+
+// 4-tap tetrahedral normal estimation.
+fn calcNormal(p: vec3<f32>) -> vec3<f32> {
+	let macroFocus = clamp(u.closeStudy * u.detailFocus, 0.0, 1.0);
+	let normalEpsilon = mix(0.0015, 0.00072, macroFocus);
+	let e = vec2<f32>(normalEpsilon, -normalEpsilon);
+	let m1 = map(p + e.xyy);
+	let m2 = map(p + e.yyx);
+	let m3 = map(p + e.yxy);
+	let m4 = map(p + e.xxx);
+	// Black-square guard — NaN comparisons all return false in WGSL, so a NaN
+	// distance fails (x < 1e10) and we fall back to the up vector. Without
+	// this, NaN propagates through normal/lighting and produces the tile-
+	// shaped black artifacts characteristic of fragment-shader SDF failures.
+	let allFinite = (abs(m1) < 1e10) && (abs(m2) < 1e10)
+		&& (abs(m3) < 1e10) && (abs(m4) < 1e10);
+	if (!allFinite) {
+		return vec3<f32>(0.0, 1.0, 0.0);
+	}
+	return safeNormalize(
+		e.xyy * m1 + e.yyx * m2 + e.yxy * m3 + e.xxx * m4,
+		vec3<f32>(0.0, 1.0, 0.0)
+	);
+}
+
+// Short march toward the key light for the hero's soft surface shadow.
+fn lightVisibility(ro: vec3<f32>, rd: vec3<f32>, maxt: f32) -> f32 {
+	var res = 1.0;
+	var t = 0.02;
+	for (var i: i32 = 0; i < 5; i = i + 1) {
+		var h = map(ro + rd * t);
+		if (!(abs(h) < 1e10)) { h = 0.5; }
+		if (h < 0.001) { return 0.0; }
+		res = min(res, 12.0 * h / t);
+		t = t + clamp(h, 0.05, 0.4);
+		if (t > maxt) { break; }
+	}
+	return clamp(res, 0.0, 1.0);
+}
+
+// Cheap dither — Bayer 4x4 thresholds for breaking up volumetric stepping
+// banding without proper blue noise textures.
+fn dither(p: vec2<f32>) -> f32 {
+	let bayer = mat4x4<f32>(
+		0.0/16.0, 8.0/16.0, 2.0/16.0,10.0/16.0,
+		12.0/16.0, 4.0/16.0,14.0/16.0, 6.0/16.0,
+		3.0/16.0,11.0/16.0, 1.0/16.0, 9.0/16.0,
+		15.0/16.0, 7.0/16.0,13.0/16.0, 5.0/16.0
+	);
+	let ix = i32(p.x) % 4;
+	let iy = i32(p.y) % 4;
+	return bayer[iy][ix];
+}
+
+// Hash primitive used by the single-sample atmospheric current warp.
+fn h31(p: vec3<f32>) -> f32 {
+	var q = fract(p * vec3<f32>(443.897, 441.423, 437.195));
+	q = q + dot(q, q.yzx + 19.19);
+	return fract((q.x + q.y) * q.z);
+}
+
+// 3D value noise — one sample gives the world-space current a soft, organic
+// bend without another raymarch, texture, or stacked fullscreen layer.
+fn vn3(p: vec3<f32>) -> f32 {
+	let i = floor(p);
+	let f = fract(p);
+	let u = f * f * (3.0 - 2.0 * f);
+	let c000 = h31(i);
+	let c100 = h31(i + vec3<f32>(1.0, 0.0, 0.0));
+	let c010 = h31(i + vec3<f32>(0.0, 1.0, 0.0));
+	let c110 = h31(i + vec3<f32>(1.0, 1.0, 0.0));
+	let c001 = h31(i + vec3<f32>(0.0, 0.0, 1.0));
+	let c101 = h31(i + vec3<f32>(1.0, 0.0, 1.0));
+	let c011 = h31(i + vec3<f32>(0.0, 1.0, 1.0));
+	let c111 = h31(i + vec3<f32>(1.0, 1.0, 1.0));
+	let x00 = mix(c000, c100, u.x);
+	let x10 = mix(c010, c110, u.x);
+	let x01 = mix(c001, c101, u.x);
+	let x11 = mix(c011, c111, u.x);
+	let y0 = mix(x00, x10, u.y);
+	let y1 = mix(x01, x11, u.y);
+	return mix(y0, y1, u.z);
+}
+
+// One coherent world-space atmospheric current. It is sampled at a distant
+// point along the camera ray, so camera translation creates real parallax
+// instead of sliding a screen-space texture over the hero. Growth/tension and
+// the slow audio rails continuously reshape the same field; there are no stars,
+// sprites, flashes, or independent visual layers competing with the organism.
+fn sky(rd: vec3<f32>) -> vec3<f32> {
+	let upT = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
+	let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
+		+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
+	let baseT = u.paletteOffset + u.palettePhase * 0.16
+		+ u.paletteWarmth * 0.04 + lifecycleHue;
+	let growth = clamp(u._pad0, 0.0, 1.0);
+	let tension = clamp(u._pad1, 0.0, 1.0);
+	let voidRaw = pow(max(u.environmentVoid, 0.0), 1.8);
+	let currentRaw = pow(max(u.environmentCurrent, 0.0), 1.8);
+	let cavernRaw = pow(max(u.environmentCavern, 0.0), 1.8);
+	let horizonRaw = pow(max(u.environmentHorizon, 0.0), 1.8);
+	let cellularRaw = pow(max(u.environmentCellular, 0.0), 1.8);
+	let environmentWeight = max(
+		voidRaw + currentRaw + cavernRaw + horizonRaw + cellularRaw,
+		0.0001
+	);
+	let voidW = voidRaw / environmentWeight;
+	let currentW = currentRaw / environmentWeight;
+	let cavernW = cavernRaw / environmentWeight;
+	let horizonW = horizonRaw / environmentWeight;
+	let cellularW = cellularRaw / environmentWeight;
+	let horizon = palette7(baseT + 0.03) * (
+		0.010 + currentW * 0.015 + horizonW * 0.014 + cellularW * 0.011
+			+ growth * 0.005 - voidW * 0.004
+	);
+	let zenith = palette7(baseT + 0.70 + u.materialErosion * 0.08)
+		* (0.003 + cavernW * 0.004 + cellularW * 0.003);
+	var bg = mix(horizon, zenith, smoothstep(0.0, 1.0, upT));
+
+	let camPos = vec3<f32>(u.camPosX, u.camPosY, u.camPosZ);
+	let camFwd = safeNormalize(
+		vec3<f32>(u.camFwdX, u.camFwdY, u.camFwdZ),
+		vec3<f32>(0.0, 0.0, -1.0)
+	);
+	let worldP = camPos + rd * 8.0;
+
+	// These are alternate structures inside one coherent 3D atmosphere. They are
+	// sampled in world space, so camera movement reveals parallax instead of
+	// sliding a transparent texture across the screen.
+	let cavernNoise = vn3(
+		worldP * vec3<f32>(0.18, 0.28, 0.18)
+			+ vec3<f32>(u.backgroundPhase * 0.018, 0.0, 0.0)
+	);
+	let cavernStrata = smoothstep(
+		0.50,
+		0.86,
+		0.5 + 0.5 * cos(length(worldP.xz) * 0.72 + worldP.y * 0.34 + cavernNoise * 2.1)
+	);
+	let horizonBand = exp(-abs(rd.y + 0.08 + u.perspectiveElevation * 0.08) * 12.0);
+	let cellularPhase = sin(worldP.x * 0.72 + u.backgroundPhase * 0.11)
+		* sin(worldP.y * 0.61 - u.morphPhase * 0.07)
+		* sin(worldP.z * 0.67 + u.spectralTravelPhase * 0.09);
+	let cellularMembrane = smoothstep(0.22, 0.76, abs(cellularPhase));
+	let depthNoise = vn3(
+		worldP * 0.105 + vec3<f32>(u.backgroundPhase * 0.012, u.morphPhase * 0.006, 0.0)
+	);
+	let parallaxVein = smoothstep(
+		0.54,
+		0.82,
+		vn3(worldP * 0.31 + vec3<f32>(0.0, u.backgroundPhase * 0.022, u.morphPhase * 0.01))
+	);
+	let depthPresence = clamp(cavernW * 0.82 + cellularW * 0.48 + currentW * 0.28, 0.0, 0.78);
+	bg = bg * mix(1.0, mix(0.62, 1.34, depthNoise), depthPresence);
+	bg = bg
+		+ palette7(baseT + 0.58) * cavernStrata * cavernW * 0.15
+		+ palette7(baseT + 0.19) * horizonBand * horizonW * (0.14 + growth * 0.018)
+		+ palette7(baseT + 0.62) * cellularMembrane * cellularW * 0.105
+		+ palette7(baseT + 0.79) * parallaxVein * (cavernW + cellularW * 0.72) * 0.052;
+	bg = bg * (
+		1.0 - cavernW * (1.0 - cavernStrata) * 0.42
+			- cellularW * (1.0 - cellularMembrane) * 0.22
+			- voidW * 0.22
+	);
+	let familyPhase = u.paletteFamily * 1.04719755 + baseT * 1.7
+		+ u.spectralTravelPhase * 0.16;
+	let currentAxis = safeNormalize(
+		vec3<f32>(cos(familyPhase), 0.22 + tension * 0.16, sin(familyPhase)),
+		vec3<f32>(0.7, 0.25, 0.6)
+	);
+	let sideAxis = safeNormalize(
+		cross(currentAxis, vec3<f32>(0.0, 1.0, 0.0)),
+		vec3<f32>(1.0, 0.0, 0.0)
+	);
+	let liftAxis = safeNormalize(cross(sideAxis, currentAxis), vec3<f32>(0.0, 1.0, 0.0));
+	let along = dot(worldP, currentAxis);
+	let across = dot(worldP, sideAxis);
+	let lift = dot(worldP, liftAxis);
+
+	// The CPU integrates this phase from the shared song journey. Persistent
+	// rhythmic identity and tension bend the current; no transient rail touches
+	// background luminance or geometry.
+	// Suspense accelerates the CPU-integrated phase instead of offsetting it here,
+	// so the foreshadowing current can never rewind when anticipation releases.
+	let flowPhase = u.backgroundPhase + familyPhase + u.morphPhase * 0.21;
+	let warpP = worldP * 0.24 + currentAxis * flowPhase * 0.20;
+	let warp = vn3(warpP) - 0.5;
+	let bend = sin(along * 0.54 + flowPhase + warp * 2.0)
+		* (0.30 + u.styleRhythmicDensity * 0.16)
+		+ sin(lift * 0.31 - flowPhase * 0.47 + familyPhase) * (0.10 + tension * 0.10);
+	let currentCoord = across * 0.30 + bend;
+	let currentWidth = 0.32 + u.rootMass * 0.08 + growth * 0.05 + u.openness * 0.05
+		+ u.sproutForm * 0.07 + u.bloomForm * 0.24 + u.sheddingForm * 0.10
+		+ u.dormancyForm * 0.18 - u.windingForm * 0.15 - tension * 0.10
+		- u.suspense * 0.08;
+	let normalizedDistance = currentCoord / max(currentWidth, 0.20);
+	var currentBody = exp(-normalizedDistance * normalizedDistance);
+	// The same atmospheric river divides during bloom and frays during shedding.
+	// This is one world-space field, but its arrangement now follows the lifeform.
+	let splitAmount = clamp(
+		u.bloomForm * 0.98 + u.sheddingForm * 0.68 + u.suspense * 0.30,
+		0.0,
+		0.92
+	);
+	let splitOffset = 0.24 + u.lobeSplit * 0.28 + u.filamentReach * 0.12;
+	let splitA = (currentCoord - splitOffset) / max(currentWidth * 0.72, 0.16);
+	let splitB = (currentCoord + splitOffset) / max(currentWidth * 0.72, 0.16);
+	let splitBody = (exp(-splitA * splitA) + exp(-splitB * splitB)) * 0.58;
+	currentBody = mix(currentBody, splitBody, splitAmount);
+	let filament = 0.72 + 0.28 * (0.5 + 0.5 * sin(along * 1.63 - flowPhase * 0.61 + warp * 2.4));
+	let erosionBreaks = mix(
+		1.0,
+		0.42 + 0.58 * smoothstep(-0.25, 0.55, sin(along * 2.3 + flowPhase * 0.44 + warp * 3.1)),
+		clamp(u.materialErosion + u.suspense * 0.10, 0.0, 1.0)
+	);
+	let current = currentBody * filament * erosionBreaks;
+	let currentCol = mix(
+		palette7(baseT + 0.28 + warp * 0.05),
+		palette7(baseT + 0.55),
+		clamp(0.35 + tension * 0.35 + upT * 0.15, 0.0, 1.0)
+	);
+	let atmosphereTransfer = clamp(
+		(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
+			+ u.cavityOpen * 0.22,
+		0.0,
+		1.0
+	);
+	bg = bg * (1.0 - current * currentW * (0.045 + tension * 0.02));
+	bg = bg + currentCol * current * (0.42 + currentW * 0.72 + cellularW * 0.16) * (
+		0.030 + u.rms * 0.004 + growth * 0.019 + u.sproutForm * 0.006
+			+ u.bloomForm * 0.036 + u.sheddingForm * 0.018
+			+ atmosphereTransfer * 0.015 + u.suspense * 0.008
+	);
+
+	// Preserve a quiet pocket behind the subject. The current remains visible at
+	// the periphery and through negative-space openings without becoming a halo.
+	let heroFocus = pow(clamp(dot(rd, camFwd), 0.0, 1.0), 18.0);
+	bg = bg * (1.0 - heroFocus * (0.24 + tension * 0.05 + u.dormancyForm * 0.08));
+	let backgroundLuma = max(dot(bg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
+	let backgroundCeiling = 0.13 + horizonW * 0.035 + cellularW * 0.022;
+	bg = bg * min(1.0, backgroundCeiling / backgroundLuma);
+
+	return bg;
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let res = vec2<f32>(u.resolutionX, u.resolutionY);
+	let uv = (frag.xy - 0.5 * res) / res.y;
+
+	// Camera basis from the continuous CPU-side journey.
+	let camPos = vec3<f32>(u.camPosX, u.camPosY, u.camPosZ);
+	let fwd = vec3<f32>(u.camFwdX, u.camFwdY, u.camFwdZ);
+	let right = vec3<f32>(u.camRightX, u.camRightY, u.camRightZ);
+	let up = vec3<f32>(u.camUpX, u.camUpY, u.camUpZ);
+	let rd = normalize(uv.x * right + uv.y * up + fwd * u.fovScale);
+
+	// Lifecycle-directed lighting rigs. Each form has a different photographic
+	// read (soft top light, side light, grazing contrast, back rim, or quiet
+	// overhead light), while harmony only nudges the rig instead of spinning it.
+	let cChroma = u.chromaX;
+	let sChroma = u.chromaY;
+	let lifecycleWeight = max(
+		u.seedForm + u.sproutForm + u.windingForm + u.bloomForm
+			+ u.sheddingForm + u.dormancyForm,
+		0.0001
+	);
+	let lifecycleLight = (
+		vec3<f32>(0.12, 0.97, 0.20) * u.seedForm
+		+ vec3<f32>(0.78, 0.46, 0.30) * u.sproutForm
+		+ vec3<f32>(-0.66, 0.14, 0.74) * u.windingForm
+		+ vec3<f32>(-0.48, 0.54, -0.70) * u.bloomForm
+		+ vec3<f32>(0.64, -0.12, -0.76) * u.sheddingForm
+		+ vec3<f32>(-0.10, 0.98, -0.16) * u.dormancyForm
+	) / lifecycleWeight;
+	let lightDir = safeNormalize(
+		lifecycleLight + vec3<f32>(
+			cChroma * 0.08 + sChroma * 0.04,
+			0.0,
+			cChroma * 0.05 - sChroma * 0.07
+		) * u.chromaStrength,
+		vec3<f32>(0.25, 0.82, 0.50)
+	);
+
+	// ── Volumetric raymarch.
+	// At every step we accumulate fog scattering, attenuated by transmittance.
+	// If a step hits the surface (distance < EPS) we shade it physically and
+	// premultiply the surface contribution by the remaining transmittance,
+	// then return — naturally compositing fog over surface over background.
+	let MAX_STEPS = 56;
+	let MAX_DIST = 10.0;
+	let macroFocus = clamp(u.closeStudy * u.detailFocus, 0.0, 1.0);
+	let EPS_NEAR = mix(0.0014, 0.00062, macroFocus);
+	let EPS_FAR  = mix(0.0070, 0.0036, macroFocus);
+
+	var transmittance = 1.0;
+	var scattered = vec3<f32>(0.0);
+	var t = 0.05 + dither(frag.xy) * 0.04; // dither breaks fog banding
+
+	for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
+		if (i >= i32(clamp(u.qualitySteps, 1.0, f32(MAX_STEPS)))) { break; }
+		if (i >= 48 && (u.closeStudy < 0.55 || u.detailFocus < 0.55)) { break; }
+		if (t > MAX_DIST) { break; }
+		let p = camPos + rd * t;
+		var d = map(p);
+		// Black-square guard — if SDF returns NaN/Inf from a degenerate iteration,
+		// treat as max distance so the marcher skips and the pixel falls through
+		// to sky instead of stamping a NaN tile.
+		if (!(abs(d) < 1e10)) { d = 0.5; }
+		// Distance-adaptive hit threshold — far surfaces use looser EPS so we
+		// don't waste precision; close surfaces tighten so detail reads sharp.
+		// Eliminates the "spamming a close-up that's scaled up" degradation.
+		let EPS = mix(EPS_NEAR, EPS_FAR, smoothstep(0.5, 6.0, t));
+
+		// ── Surface hit
+		if (d < EPS) {
+			let geometryNormal = calcNormal(p);
+			let view = -rd;
+			let shadow = lightVisibility(p + geometryNormal * 0.005, lightDir, 4.0);
+
+			// Two short ambient-occlusion probes preserve crevice depth. The lifecycle
+			// primitives are funded by removing the third probe and two shadow steps,
+			// rather than adding an unbounded second fractal evaluation.
+			var ao = 0.0;
+			var aoW = 0.0;
+			for (var k: i32 = 1; k <= 2; k = k + 1) {
+				let ko = f32(k) * 0.065;
+				var aoSample = map(p + geometryNormal * ko);
+				if (!(abs(aoSample) < 1e10)) { aoSample = ko; }
+				let occ = ko - aoSample;
+				ao = ao + occ * pow(0.6, f32(k));
+				aoW = aoW + pow(0.6, f32(k));
+			}
+			ao = clamp(1.0 - ao / aoW * 5.0, 0.0, 1.0);
+
+			// One geometry-bound detail field replaces every projected stripe,
+			// triplanar sine, and direct FFT-to-albedo band. It changes material
+			// response under real light, never adds an unlit texture over the form.
+			let surfQ = organismWarp(p);
+			let regionBin = i32(clamp((surfQ.y + 1.90) * 16.58, 0.0, 63.0));
+			let bandDetail = clamp(abs(bins[regionBin]), 0.0, 1.0);
+			let familyOffset = vec3<f32>(
+				u.paletteFamily * 7.13 + 2.7,
+				u.paletteFamily * 3.71 + 11.9,
+				u.paletteFamily * 5.37 + 19.1
+			);
+			let surfaceNoise = vn3(
+				surfQ * (5.4 + u.materialErosion * 4.8 + u.detailFocus * 3.2)
+					+ familyOffset + vec3<f32>(u.morphPhase * 0.012)
+			);
+			let anatomicalNoise = vn3(
+				surfQ * (1.75 + u.materialMineral * 0.55 + u.materialVelvet * 0.22)
+					+ familyOffset * 0.31 - vec3<f32>(u.morphPhase * 0.004)
+			);
+			// One hit-time octave gives broad cocoon lobes actual skin. Its spatial
+			// scale stays fixed while audio changes contrast/roughness, so pores breathe
+			// without crawling or rescaling. This never runs inside the raymarch, SDF
+			// normal, shadow, or AO loops.
+			let microScale = 19.0;
+			let microP = surfQ * microScale + familyOffset * 1.71
+				- vec3<f32>(u.morphPhase * 0.019);
+			let microNoise = vn3(microP);
+			// Keep lighting in the SDF/world frame. The material octave affects pigment
+			// and roughness only, avoiding a detached bump layer on a heavily warped body.
+			let n = geometryNormal;
+			let cosNL = clamp(dot(n, lightDir), 0.0, 1.0);
+			let halfDir = safeNormalize(lightDir + view, lightDir);
+			let cosNH = clamp(dot(n, halfDir), 0.0, 1.0);
+			let cosNV = clamp(dot(n, view), 0.0, 1.0);
+			let pore = smoothstep(0.72, 0.94, 1.0 - surfaceNoise);
+
+			let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
+				+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
+			let surfacePalette = u.paletteOffset + u.palettePhase * 0.34
+				+ u.paletteWarmth * 0.075 + lifecycleHue;
+			// The same world-space river that crosses the sky passes through Soma's
+			// skin as a material current. It only bends pigment/roughness; it never
+			// adds unlit brightness, so it cannot become a pasted-on stripe layer.
+			let skinFamilyPhase = u.paletteFamily * 1.04719755 + surfacePalette * 1.7
+				+ u.spectralTravelPhase * 0.16;
+			let skinCurrentAxis = safeNormalize(
+				vec3<f32>(cos(skinFamilyPhase), 0.22 + u._pad1 * 0.16, sin(skinFamilyPhase)),
+				vec3<f32>(0.7, 0.25, 0.6)
+			);
+			let skinFlowPhase = u.backgroundPhase + skinFamilyPhase + u.morphPhase * 0.21;
+			let skinCurrent = sin(
+				dot(p, skinCurrentAxis) * 1.45 - skinFlowPhase * 0.61
+					+ surfaceNoise * 3.1 + microNoise * 0.65
+			);
+			let palT = surfacePalette
+				+ length(surfQ) * 0.12
+				+ n.x * 0.045 + n.y * 0.055
+				+ (surfaceNoise - 0.5) * (0.12 + u.materialErosion * 0.06)
+				+ (microNoise - 0.5) * (0.035 + u.surfaceRidges * 0.055)
+				+ bandDetail * 0.022
+				+ skinCurrent * (0.005 + u.materialIridescence * 0.012);
+			let density = clamp(u.materialDensity, 0.30, 1.0);
+			let rawBaseCol = palette7(palT);
+			let rawBaseLuma = dot(rawBaseCol, vec3<f32>(0.2126, 0.7152, 0.0722));
+			let rawBaseChroma = max(rawBaseCol.r, max(rawBaseCol.g, rawBaseCol.b))
+				- min(rawBaseCol.r, min(rawBaseCol.g, rawBaseCol.b));
+			let pigmentAnchorRaw = palette7(
+				surfacePalette + 0.40
+					+ (surfaceNoise - 0.5) * 0.14
+					+ (microNoise - 0.5) * (0.08 + u.surfaceRidges * 0.05)
+					+ skinCurrent * 0.010
+			);
+			let pigmentAnchorLuma = dot(
+				pigmentAnchorRaw,
+				vec3<f32>(0.2126, 0.7152, 0.0722)
+			);
+			let pigmentAnchor = clamp(
+				mix(vec3<f32>(pigmentAnchorLuma), pigmentAnchorRaw, 1.18),
+				vec3<f32>(0.0),
+				vec3<f32>(1.0)
+			) * 0.55;
+			let washedRecovery = max(
+				smoothstep(0.40, 0.70, rawBaseLuma),
+				(1.0 - smoothstep(0.08, 0.30, rawBaseChroma))
+					* smoothstep(0.22, 0.52, rawBaseLuma)
+			);
+			let paleRecovery = clamp(
+				washedRecovery * (0.50 + density * 0.56)
+					+ u.sproutForm * washedRecovery * 0.08
+					+ u.sheddingForm * washedRecovery * 0.10,
+				0.0,
+				0.94
+			);
+			let broadPigment = smoothstep(0.16, 0.84, anatomicalNoise * 0.68 + surfaceNoise * 0.32);
+			let pigmentGrain = clamp(
+				0.70 + broadPigment * 0.54
+					+ (surfaceNoise - 0.5) * 0.12
+					+ (microNoise - 0.5) * (0.07 + u.surfaceRidges * 0.045),
+				0.58,
+				1.26
+			);
+			// Pale palette stops retain their hue, but are pulled back into a deeper
+			// lifecycle pigment before lighting. White can remain a highlight, not a body.
+			var baseCol = mix(rawBaseCol, pigmentAnchor, paleRecovery) * pigmentGrain;
+			let baseChroma = max(baseCol.r, max(baseCol.g, baseCol.b))
+				- min(baseCol.r, min(baseCol.g, baseCol.b));
+			let chromaticAnchor = palette7(
+				surfacePalette + 0.34 + anatomicalNoise * 0.18 + skinCurrent * 0.01
+			) * (0.34 + broadPigment * 0.12);
+			baseCol = mix(
+				baseCol,
+				chromaticAnchor,
+				(1.0 - smoothstep(0.08, 0.24, baseChroma)) * (0.34 + paleRecovery * 0.32)
+			);
+			// Cap diffuse pigment luminance before any light touches it. Specular and
+			// rim highlights can still flare, but a pale palette stop can no longer
+			// turn the entire close-study body into a white/grey shell.
+			let baseColLuma = max(
+				dot(baseCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
+				0.0001
+			);
+			let pigmentCeiling = 0.44 + density * 0.12 + u.materialIridescence * 0.025;
+			baseCol = baseCol * min(1.0, pigmentCeiling / baseColLuma);
+
+			// Continuous lifecycle material vocabulary: seed/dormancy are waxy,
+			// sprout is wet, winding is taut chitin, bloom is crystalline, and
+			// shedding is dry/porous. The weights crossfade, so the same organism
+			// actually matures rather than swapping arbitrary effects.
+			let membraneDNA = pow(max(u.materialMembrane, 0.0), 1.65);
+			let mineralDNA = pow(max(u.materialMineral, 0.0), 1.65);
+			let velvetDNA = pow(max(u.materialVelvet, 0.0), 1.65);
+			let crystalDNA = pow(max(u.materialCrystal, 0.0), 1.65);
+			let waxRaw = membraneDNA * (0.72 + u.seedForm * 0.38)
+				+ velvetDNA * 0.18 + u.dormancyForm * 0.12;
+			let wetRaw = membraneDNA * (0.32 + u.sproutForm * 0.46);
+			let tautRaw = mineralDNA * (0.72 + u.windingForm * 0.42);
+			let crystalRaw = crystalDNA * (0.76 + u.bloomForm * 0.38);
+			let porousRaw = velvetDNA * (0.84 + u.sheddingForm * 0.42)
+				+ mineralDNA * u.materialErosion * 0.16;
+			let materialWeight = max(waxRaw + wetRaw + tautRaw + crystalRaw + porousRaw, 0.0001);
+			let wax = waxRaw / materialWeight;
+			let wet = wetRaw / materialWeight;
+			let taut = tautRaw / materialWeight;
+			let crystal = crystalRaw / materialWeight;
+			let porous = porousRaw / materialWeight;
+			let ridgeRelief = (surfaceNoise - 0.5) * (0.24 + u.surfaceRidges * 0.24)
+				+ (microNoise - 0.5) * (0.055 + u.surfaceRidges * 0.08)
+				+ skinCurrent * u.surfaceRidges * 0.015;
+			let iridescentShift = u.materialIridescence * (1.0 - cosNV)
+				* (0.10 + surfaceNoise * 0.045)
+				+ skinCurrent * u.materialIridescence * 0.009;
+
+			let roughness = clamp(
+				wax * 0.56 + wet * 0.24 + taut * 0.35 + crystal * 0.22 + porous * 0.80
+					+ pore * porous * 0.08 - bandDetail * (wet + crystal) * 0.035
+					- u.treble * (wet + crystal) * 0.025 - ridgeRelief * 0.12,
+				0.09,
+				0.92
+			);
+			let specStrength = wax * 0.14 + wet * 0.42 + taut * 0.28
+				+ crystal * 0.44 + porous * 0.06;
+			let diffuseStrength = wax * 0.92 + wet * 0.66 + taut * 0.72
+				+ crystal * 0.66 + porous * 0.90;
+			let detailShade = clamp(
+				0.96 + ridgeRelief - pore * porous * 0.22
+					+ (bandDetail - 0.5) * u.mid * 0.035,
+				0.60,
+				1.18
+			);
+
+			// Lighting arrangement and contrast evolve with the lifecycle. All
+			// tints come from the song's palette and stay energy-bounded so bloom
+			// cannot bleach them into white decals.
+			let keyStrength = wax * 0.86 + wet * 1.00 + taut * 1.18
+				+ crystal * 0.95 + porous * 0.90;
+			let fillStrength = wax * 0.42 + wet * 0.32 + taut * 0.14
+				+ crystal * 0.28 + porous * 0.20;
+			let rimStrength = wax * 0.08 + wet * 0.22 + taut * 0.48
+				+ crystal * 0.52 + porous * 0.42;
+			let keyTint = palette7(surfacePalette + 0.16 + iridescentShift * 0.16) * 1.10;
+			let fillTint = palette7(surfacePalette + 0.54) * 0.68;
+			let rimTint = palette7(surfacePalette + 0.79 + iridescentShift * 1.12) * 1.04;
+			let ambientTint = palette7(surfacePalette + 0.66) * 0.42;
+
+			let fillDir = safeNormalize(
+				-lightDir + vec3<f32>(-0.18, -0.36, 0.14),
+				vec3<f32>(-0.25, -0.55, -0.35)
+			);
+			let rimDir = safeNormalize(
+				-lightDir + vec3<f32>(0.08, 0.20, -0.06),
+				-lightDir
+			);
+			let cosNF = clamp(dot(n, fillDir), 0.0, 1.0);
+			let cosNR = clamp(dot(n, rimDir), 0.0, 1.0);
+			let rimFresnel = pow(1.0 - cosNV, 3.8);
+			let direct = keyTint * cosNL * shadow * keyStrength;
+			let fill = fillTint * cosNF * fillStrength;
+			let ambient = ambientTint * (0.16 + max(n.y, 0.0) * 0.16) * (0.78 + ao * 0.22);
+			// AO still carves the fractal, but it can no longer erase all pigment and
+			// leave only a pale rim/specular shell behind.
+			let bodyAo = 0.24 + ao * 0.76;
+			let diffuse = baseCol * (direct + fill + ambient)
+				* bodyAo * detailShade * diffuseStrength * mix(0.90, 1.06, density);
+
+			let specPow = mix(72.0, 11.0, roughness);
+			let specular = pow(cosNH, specPow);
+			let fresnel = 0.04 + 0.96 * pow(1.0 - cosNV, 5.0);
+			let reflected = reflect(-view, n);
+			let envLow = palette7(
+				surfacePalette + 0.48 + reflected.x * 0.035 + iridescentShift * 0.82
+			);
+			let envHigh = palette7(
+				surfacePalette + 0.82 + reflected.z * 0.035 + iridescentShift * 1.18
+			);
+			let environment = mix(
+				envLow,
+				envHigh,
+				smoothstep(-0.60, 0.82, reflected.y)
+			);
+			let reflectionStrength = wet * 0.28 + taut * 0.10 + crystal * 0.36 + wax * 0.04;
+			let specularCol = keyTint * specular * specStrength * shadow
+				+ environment * fresnel * reflectionStrength;
+			let rim = rimTint * cosNR * rimFresnel * rimStrength
+				* (0.78 + u.openness * 0.18);
+
+			// Hits illuminate one small anatomical patch instead of brightening the
+			// whole lower half. This preserves percussion detail without creating the
+			// optical illusion that Soma scales or punches as one object on every kick.
+			let hitCenter = vec3<f32>(
+				u.spectralLean * 0.24,
+				-0.48,
+				sin(u.paletteFamily * 1.71 + u.postureYaw * 0.8) * 0.22
+			);
+			let hitMask = 1.0 - smoothstep(0.10, 0.31, length(surfQ - hitCenter));
+			let impactGain = 1.0 + hitMask * (u.rootPulse * 0.075 + u.surfaceImpact * 0.04);
+			let crevice = palette7(surfacePalette + 0.34) * pow(1.0 - ao, 2.0)
+				* (porous * 0.026 + crystal * 0.014);
+			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
+			let bodyFill = deepPigment * (0.028 + density * 0.070)
+				* (0.34 + cosNV * 0.46) * (0.48 + bodyAo * 0.52);
+			var surfaceCol = (diffuse + specularCol + rim + bodyFill) * impactGain + crevice;
+			// A chroma-preserving shoulder keeps the many tiny fractal facets from
+			// becoming white pixel confetti while leaving true rim highlights alive.
+			let surfaceLuma = max(
+				dot(surfaceCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
+				0.0001
+			);
+			let lightingShoulder = 0.17 + crystal * 0.025 + wet * 0.018;
+			let compressedLuma = lightingShoulder * (1.0 - exp(-surfaceLuma / lightingShoulder));
+			surfaceCol = surfaceCol * (compressedLuma / surfaceLuma);
+			let shoulderChroma = max(surfaceCol.r, max(surfaceCol.g, surfaceCol.b))
+				- min(surfaceCol.r, min(surfaceCol.g, surfaceCol.b));
+			let lowChromaRecovery = (1.0 - smoothstep(0.055, 0.18, shoulderChroma))
+				* smoothstep(0.055, 0.18, compressedLuma);
+			surfaceCol = mix(
+				surfaceCol,
+				chromaticAnchor * (0.58 + density * 0.16),
+				lowChromaRecovery * 0.62
+			) + specularCol * 0.014 + rim * 0.009;
+			scattered = scattered + surfaceCol * transmittance;
+			transmittance = 0.0;
+			break;
+		}
+
+		// ── In-medium fog scattering.
+		// Density mildly increases in concavities near the fractal (proxied by
+		// the SDF value), so fog hugs the form like incense smoke.
+		let proxim = exp(-d * 1.4);
+		// Dense tissue pushes the medium away from its silhouette; shedding and
+		// cavities invite it back in. Body and atmosphere now trade substance
+		// instead of a universal near-surface veil washing every form equally.
+		let atmosphereTransfer = clamp(
+			(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
+				+ u.cavityOpen * 0.22,
+			0.0,
+			1.0
+		);
+		let proximityFog = mix(0.30, 1.10, atmosphereTransfer);
+		let localDensity = u.fogDensity * (0.88 + proxim * proximityFog);
+		// A phase/clearance approximation replaces a nested shadow raymarch at
+		// every fog step. Surface hits still receive a real soft shadow above;
+		// atmosphere keeps directional depth at a tiny fraction of the cost.
+		let lightPhase = pow(max(dot(rd, lightDir), 0.0), 4.0);
+		let clearance = smoothstep(0.015, 0.45, d);
+		let lightV = mix(0.32, 1.0, clearance) * (0.58 + lightPhase * 0.42);
+		// Atmospheric tint — dramatically reduced from earlier attempt. The
+		// per-step contribution gets multiplied by stepDensity and then
+		// summed across ~30 fog steps, so what looks like a "tiny constant"
+		// adds up to a bright central blob when camera points toward the
+		// key light. Baseline 0.12 (was 0.6) and inscatter 0.0028 (was 0.012)
+		// together make fog readable as atmosphere without dominating.
+		let fogLifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
+			+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
+		let lightTint = palette7(
+			u.paletteOffset + u.palettePhase * 0.34 + u.paletteWarmth * 0.075
+			+ fogLifecycleHue + 0.18
+		) * (0.12 + u.lightShaftIntensity * 0.08);
+		let scatterIn = lightTint * lightV * 0.0028;
+		// organismBloom — disabled. The colored halo around the organism
+		// read as a detached glow overlay. Direct surface lighting carries
+		// the silhouette now; no volumetric helper needed.
+		let organismBloom = vec3<f32>(0.0);
+		let stepDensity = localDensity * 0.08;
+		scattered = scattered + (scatterIn + organismBloom) * stepDensity * transmittance;
+		transmittance = transmittance * exp(-stepDensity);
+
+		// March step. Smaller in dense areas (near surface), larger in open space.
+		let stepSize = max(d * 0.92, 0.065);
+		t = t + stepSize;
+		if (transmittance < 0.025) { break; }
+	}
+
+	// Composite remaining transmittance with the current field. An explicit
+	// branch lets opaque hero pixels skip all background noise/math.
+	var col = scattered;
+	if (transmittance > 0.001) {
+		col = col + sky(rd) * transmittance;
+	}
+
+	// Gentle distance vignette (matches the eye's expectation of dimmer edges).
+	let centered = (frag.xy - 0.5 * res) / res.y;
+	let vig = smoothstep(1.2, 0.35, length(centered) * 1.3);
+	col = col * (0.78 + 0.22 * vig);
+
+	return vec4<f32>(col, 1.0);
+}
+`;
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Kawase bloom — diagonal 4-tap downsample with optional HDR threshold for
+	// the first level (so only bright pixels actually bloom). Subsequent levels
+	// use threshold = 0 so the already-bright glow propagates evenly.
+	// ──────────────────────────────────────────────────────────────────────────
+	const BLOOM_DOWN_WGSL = /* wgsl */ `
+struct BloomParams {
+	srcResX: f32,
+	srcResY: f32,
+	dstResX: f32,
+	dstResY: f32,
+	threshold: f32,
+	_pad0: f32,
+	_pad1: f32,
+	_pad2: f32,
+};
+
+@group(0) @binding(0) var<uniform> p: BloomParams;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var srcTex: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	var pos = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+	);
+	return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let dstRes = vec2<f32>(p.dstResX, p.dstResY);
+	let uv = frag.xy / dstRes;
+	let texel = vec2<f32>(1.0 / p.srcResX, 1.0 / p.srcResY);
+	// Diagonal 4-tap (Kawase-style)
+	var c = textureSample(srcTex, samp, uv + vec2<f32>(-1.0, -1.0) * texel).rgb;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0, -1.0) * texel).rgb;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  1.0) * texel).rgb;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  1.0) * texel).rgb;
+	c = c * 0.25;
+	// Soft HDR threshold — only triggers on first level (threshold > 0).
+	if (p.threshold > 0.0) {
+		let bright = max(c.r, max(c.g, c.b));
+		let knee = max(0.0, bright - p.threshold);
+		let factor = knee / max(1e-4, bright);
+		c = c * factor;
+	}
+	return vec4<f32>(c, 1.0);
+}
+`;
+
+	// Upsample with Kawase 4-tap and ADDITIVELY blend into destination so the
+	// smaller bloom mip contributions accumulate cleanly into the parent mip.
+	const BLOOM_UP_WGSL = /* wgsl */ `
+struct BloomParams {
+	srcResX: f32,
+	srcResY: f32,
+	dstResX: f32,
+	dstResY: f32,
+	threshold: f32,
+	intensity: f32,
+	_pad1: f32,
+	_pad2: f32,
+};
+
+@group(0) @binding(0) var<uniform> p: BloomParams;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var srcTex: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	var pos = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+	);
+	return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let dstRes = vec2<f32>(p.dstResX, p.dstResY);
+	let uv = frag.xy / dstRes;
+	let texel = vec2<f32>(1.0 / p.srcResX, 1.0 / p.srcResY);
+	// Five-tap tent blur. The scene's temporal accumulation supplies the soft
+	// tail, so four diagonal reads per mip were redundant bandwidth.
+	var c = textureSample(srcTex, samp, uv).rgb * 0.4;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  0.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  0.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0, -1.0) * texel).rgb * 0.15;
+	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0,  1.0) * texel).rgb * 0.15;
+	return vec4<f32>(c * p.intensity, 1.0);
+}
+`;
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// HDR composite — merges scene + bloom with previous frame's composite for
+	// temporal motion blur. Stays in linear HDR; tone-map happens later in the
+	// present pass so we don't double-ACES.
+	// ──────────────────────────────────────────────────────────────────────────
+	const COMPOSITE_WGSL = /* wgsl */ `
+struct Uniforms {
+	resolutionX: f32,
+	resolutionY: f32,
+	time: f32,
+	bass: f32,
+	mid: f32,
+	treble: f32,
+	centroid: f32,
+	rms: f32,
+	flash: f32,
+	bpmNorm: f32,
+	chromaX: f32,
+	chromaY: f32,
+	chromaStrength: f32,
+	camPosX: f32,
+	camPosY: f32,
+	camPosZ: f32,
+	camFwdX: f32,
+	camFwdY: f32,
+	camFwdZ: f32,
+	camRightX: f32,
+	camRightY: f32,
+	camRightZ: f32,
+	camUpX: f32,
+	camUpY: f32,
+	camUpZ: f32,
+	fovScale: f32,
+	mandelbulbPower: f32,
+	paletteOffset: f32,
+	fogDensity: f32,
+	lightShaftIntensity: f32,
+	_pad0: f32,
+	_pad1: f32,
+	paletteFamily: f32,
+	surfaceImpact: f32,
+	openness: f32,
+	journeyPhase: f32,
+	backgroundPhase: f32,
+	postureYaw: f32,
+	posturePitch: f32,
+	suspense: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var sceneTex: texture_2d<f32>;
+@group(0) @binding(3) var bloomTex: texture_2d<f32>;
+@group(0) @binding(4) var prevTex: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	var pos = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+	);
+	return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let res = vec2<f32>(u.resolutionX, u.resolutionY);
+	let uv = frag.xy / res;
+	// Linear-domain merge: scene + bloom + prev frame for temporal motion blur.
+	let scene = textureSample(sceneTex, samp, uv).rgb;
+	let bloom = textureSample(bloomTex, samp, uv).rgb;
+	let prev = textureSample(prevTex, samp, uv).rgb;
+	let current = scene + bloom * 0.55;
+	// Five percent continuity softens raymarch shimmer without holding an old
+	// lighting arrangement over a new perspective.
+	let blended = mix(current, prev, 0.05);
+	return vec4<f32>(blended, 1.0);
+}
+`;
+
+	// ──────────────────────────────────────────────────────────────────────────
+	// Present pass — tone-map + stable dither.
+	// Reads the temporally-blended HDR composite and outputs sRGB to the swap
+	// chain. Doing tone-map here (not in composite) keeps temporal blend linear.
+	// ──────────────────────────────────────────────────────────────────────────
+	const PRESENT_WGSL = /* wgsl */ `
+struct Uniforms {
+	resolutionX: f32,
+	resolutionY: f32,
+	time: f32,
+	bass: f32,
+	mid: f32,
+	treble: f32,
+	centroid: f32,
+	rms: f32,
+	flash: f32,
+	bpmNorm: f32,
+	chromaX: f32,
+	chromaY: f32,
+	chromaStrength: f32,
+	camPosX: f32,
+	camPosY: f32,
+	camPosZ: f32,
+	camFwdX: f32,
+	camFwdY: f32,
+	camFwdZ: f32,
+	camRightX: f32,
+	camRightY: f32,
+	camRightZ: f32,
+	camUpX: f32,
+	camUpY: f32,
+	camUpZ: f32,
+	fovScale: f32,
+	mandelbulbPower: f32,
+	paletteOffset: f32,
+	fogDensity: f32,
+	lightShaftIntensity: f32,
+	_pad0: f32,
+	_pad1: f32,
+	paletteFamily: f32,
+	surfaceImpact: f32,
+	openness: f32,
+	journeyPhase: f32,
+	backgroundPhase: f32,
+	postureYaw: f32,
+	posturePitch: f32,
+	suspense: f32,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var compositeTex: texture_2d<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	var pos = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+	);
+	return vec4<f32>(pos[idx], 0.0, 1.0);
+}
+
+// AgX tone-map (Troy Sobotka). Preserves saturation in bright hues better
+// than the cheap ACES approximation — gold cores stay gold instead of
+// bleaching to white.
+fn agx(c: vec3<f32>) -> vec3<f32> {
+	let m = mat3x3<f32>(
+		0.842479062253094, 0.0423282422610123, 0.0423756549057051,
+		0.0784335999999992, 0.878468636469772, 0.0784336,
+		0.0792237451477643, 0.0791661274605434, 0.879142973793104
+	);
+	let x = m * c;
+	let lo = vec3<f32>(0.0001);
+	let mapped = clamp((log2(max(x, lo)) + 12.47393) / (12.47393 + 4.026069), vec3<f32>(0.0), vec3<f32>(1.0));
+	let m2 = mapped * mapped;
+	let m4 = m2 * m2;
+	return -17.86 * m4 * m2 + 78.01 * m4 * mapped - 126.7 * m4 + 92.06 * m2 * mapped - 28.72 * m2 + 4.361 * mapped - vec3<f32>(0.1718);
+}
+
+// IGN — Jorge Jimenez interleaved gradient noise, used only as stable
+// pre-quantization dither. It no longer changes every frame like film static.
+fn ign(pixel: vec2<f32>) -> f32 {
+	let m = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
+	return fract(m.z * fract(dot(pixel, m.xy)));
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let res = vec2<f32>(u.resolutionX, u.resolutionY);
+	let uv = frag.xy / res;
+	let texel = vec2<f32>(1.0 / res.x, 1.0 / res.y);
+	let center = textureSample(compositeTex, samp, uv).rgb;
+	let north = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, -texel.y)).rgb;
+	let south = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, texel.y)).rgb;
+	let east = textureSample(compositeTex, samp, uv + vec2<f32>(texel.x, 0.0)).rgb;
+	let west = textureSample(compositeTex, samp, uv + vec2<f32>(-texel.x, 0.0)).rgb;
+	let lumaWeights = vec3<f32>(0.2126, 0.7152, 0.0722);
+	let centerLuma = dot(center, lumaWeights);
+	let northLuma = dot(north, lumaWeights);
+	let southLuma = dot(south, lumaWeights);
+	let eastLuma = dot(east, lumaWeights);
+	let westLuma = dot(west, lumaWeights);
+	let minLuma = min(centerLuma, min(min(northLuma, southLuma), min(eastLuma, westLuma)));
+	let maxLuma = max(centerLuma, max(max(northLuma, southLuma), max(eastLuma, westLuma)));
+	let contrast = maxLuma - minLuma;
+	let localAverage = (north + south + east + west) * 0.25;
+	let localLuma = dot(localAverage, lumaWeights);
+	let threshold = 0.006 + maxLuma * 0.075;
+	let isolatedEdge = clamp(
+		abs(centerLuma - localLuma) / max(contrast, 0.0001),
+		0.0,
+		1.0
+	);
+	let edgeBlend = smoothstep(threshold, threshold * 2.6, contrast) * isolatedEdge * 0.34;
+	var col = mix(center, localAverage, edgeBlend);
+
+	col = agx(col);
+	// Black-point lift + micro-contrast so the deep volumetric blacks don't
+	// read as flat. AgX is gentler than ACES so blacks need a little help.
+	col = max(col - vec3<f32>(0.018), vec3<f32>(0.0));
+	col = pow(col, vec3<f32>(1.06));
+
+	// Pre-quantization dither — kills 8-bit banding in volumetric gradients.
+	col = col + vec3<f32>((ign(frag.xy + vec2<f32>(33.0, 71.0)) - 0.5) / 255.0);
+
+	return vec4<f32>(col, 1.0);
+}
+`;
+
+	// Bloom param uniform layout — 8 f32s = 32 bytes (×3 mips, down + up).
+	const BLOOM_PARAM_FLOATS = 8;
+	const BLOOM_PARAM_BYTES = BLOOM_PARAM_FLOATS * 4;
+	const BLOOM_LEVELS = 3;
+
+	const BIN_COUNT = 64;
+	const BINS_BYTES = BIN_COUNT * 4;
+
+	type GPU = {
+		device: GPUDevice;
+		context: GPUCanvasContext;
+		format: GPUTextureFormat;
+		sampler: GPUSampler;
+		uniformBuf: GPUBuffer;
+		uniformData: Float32Array;
+		bloomParamBuf: GPUBuffer;
+		bloomParamData: Float32Array;
+		// Spectrum storage sampled directly by the raymarched surface.
+		binsBuf: GPUBuffer;
+		binsData: Float32Array;
+		pipelines: {
+			scene: GPURenderPipeline;
+			bloomDown: GPURenderPipeline;
+			bloomUp: GPURenderPipeline;
+			composite: GPURenderPipeline;
+			present: GPURenderPipeline;
+		};
+		targets: {
+			scene: GPUTexture;
+			sceneView: GPUTextureView;
+			bloomMips: GPUTexture[];
+			bloomViews: GPUTextureView[];
+			bloomSizes: { w: number; h: number }[];
+			compositeAB: [GPUTexture, GPUTexture];
+			compositeViewsAB: [GPUTextureView, GPUTextureView];
+			width: number;
+			height: number;
+		} | null;
+		bindGroups: {
+			scene: GPUBindGroup;
+			composite: [GPUBindGroup, GPUBindGroup];
+			present: [GPUBindGroup, GPUBindGroup];
+			bloomDownBGs: GPUBindGroup[];
+			bloomUpBGs: GPUBindGroup[];
+		} | null;
+		frame: number;
+	};
+
+	let gpu: GPU | null = null;
+	let qualityProfile: SomaQualityProfile = SOMA_QUALITY_PROFILES.ultra;
+	const autoQuality = new SomaAutoQualityController(qualityProfile.tier);
+	let autoQualityCeiling: SomaQualityTier | null = null;
+	let schedulerTickAt = 0;
+	let refreshIntervalMs = 1000 / 60;
+	let activeFrameStride = 1;
+	let framesUntilRender = 0;
+	let lastRenderedAt = 0;
+
+	function resetFrameScheduler() {
+		schedulerTickAt = 0;
+		framesUntilRender = 0;
+		lastRenderedAt = 0;
+	}
+
+	function observeDisplayCadence(tickElapsedMs: number) {
+		if (tickElapsedMs < 1000 / 360 || tickElapsedMs > 1000 / 24) return;
+		// Converge quickly downward when discovering a high-refresh panel, then
+		// ignore obvious multi-vsync hitches so one missed RAF cannot halve the
+		// estimated refresh rate and reshuffle the presentation cadence.
+		if (tickElapsedMs < refreshIntervalMs * 0.8) {
+			refreshIntervalMs = lerp(refreshIntervalMs, tickElapsedMs, 0.38);
+		} else if (tickElapsedMs <= refreshIntervalMs * 1.35) {
+			refreshIntervalMs = lerp(refreshIntervalMs, tickElapsedMs, 0.08);
+		}
+		const nextRefreshRate = Math.round(1000 / refreshIntervalMs);
+		if (nextRefreshRate !== measuredRefreshRate) measuredRefreshRate = nextRefreshRate;
+	}
+
+	function updateQualityProfile(elapsedMs: number | null): SomaQualityProfile {
+		if (!canvas) return qualityProfile;
+		const deviceMemory = (navigator as Navigator & { deviceMemory?: number }).deviceMemory;
+		const initial = selectSomaQuality(
+			canvas.clientWidth,
+			canvas.clientHeight,
+			window.devicePixelRatio || 1,
+			navigator.hardwareConcurrency,
+			deviceMemory
+		);
+		let sampleMs = elapsedMs;
+		if (autoQualityCeiling === null) {
+			autoQuality.reset(initial.tier);
+			autoQualityCeiling = initial.tier;
+			sampleMs = null;
+		} else if (initial.tier !== autoQualityCeiling) {
+			autoQuality.setCeiling(initial.tier);
+			autoQualityCeiling = initial.tier;
+			// A viewport workload change is not a performance sample. In particular,
+			// resizing must not combine with an almost-finished downgrade vote.
+			sampleMs = null;
+		}
+		if (sampleMs !== null && document.visibilityState === 'visible') {
+			autoQuality.observeFrame(sampleMs);
+		}
+
+		const active = autoQuality.profile;
+		if (active.tier !== qualityProfile.tier) {
+			qualityProfile = active;
+			qualityTier = active.tier;
+			resetFrameScheduler();
+			temporalResetRequested = true;
+		}
+		return qualityProfile;
+	}
+
+	function buildTargets(device: GPUDevice, w: number, h: number) {
+		const hdr: GPUTextureFormat = 'rgba16float';
+		const scene = device.createTexture({
+			size: { width: Math.max(1, w), height: Math.max(1, h) },
+			format: hdr,
+			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
+		});
+		// Bloom mip chain — start at 1/2, halve each level.
+		const bloomMips: GPUTexture[] = [];
+		const bloomViews: GPUTextureView[] = [];
+		const bloomSizes: { w: number; h: number }[] = [];
+		let mw = Math.max(1, Math.floor(w / 2));
+		let mh = Math.max(1, Math.floor(h / 2));
+		for (let i = 0; i < BLOOM_LEVELS; i++) {
+			const tex = device.createTexture({
+				size: { width: mw, height: mh },
+				format: hdr,
+				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
+			});
+			bloomMips.push(tex);
+			bloomViews.push(tex.createView());
+			bloomSizes.push({ w: mw, h: mh });
+			mw = Math.max(1, Math.floor(mw / 2));
+			mh = Math.max(1, Math.floor(mh / 2));
+		}
+		// Ping-pong composite textures (full res HDR) for temporal motion blur.
+		const cA = device.createTexture({
+			size: { width: Math.max(1, w), height: Math.max(1, h) },
+			format: hdr,
+			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
+		});
+		const cB = device.createTexture({
+			size: { width: Math.max(1, w), height: Math.max(1, h) },
+			format: hdr,
+			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
+		});
+		return {
+			scene,
+			sceneView: scene.createView(),
+			bloomMips,
+			bloomViews,
+			bloomSizes,
+			compositeAB: [cA, cB] as [GPUTexture, GPUTexture],
+			compositeViewsAB: [cA.createView(), cB.createView()] as [GPUTextureView, GPUTextureView],
+			width: w,
+			height: h
+		};
+	}
+
+	function buildBindGroups(g: GPU) {
+		if (!g.targets) return null;
+		const { device, pipelines, uniformBuf, bloomParamBuf, sampler, targets, binsBuf } = g;
+		const scene = device.createBindGroup({
+			layout: pipelines.scene.getBindGroupLayout(0),
+			entries: [
+				{ binding: 0, resource: { buffer: uniformBuf } },
+				{ binding: 1, resource: { buffer: binsBuf } }
+			]
+		});
+		// Composite has 2 bind groups — each reads a different prevTex (the
+		// other ping-pong texture). Output target alternates each frame.
+		const composite: [GPUBindGroup, GPUBindGroup] = [0, 1].map((i) =>
+			device.createBindGroup({
+				layout: pipelines.composite.getBindGroupLayout(0),
+				entries: [
+					{ binding: 0, resource: { buffer: uniformBuf } },
+					{ binding: 1, resource: sampler },
+					{ binding: 2, resource: targets.sceneView },
+					{ binding: 3, resource: targets.bloomViews[0] },
+					{ binding: 4, resource: targets.compositeViewsAB[i] }
+				]
+			})
+		) as [GPUBindGroup, GPUBindGroup];
+		// Present has 2 bind groups so it can read the current composite ping-pong
+		// slot without any separate screen-space overlay textures.
+		const present: [GPUBindGroup, GPUBindGroup] = [0, 1].map((i) =>
+			device.createBindGroup({
+				layout: pipelines.present.getBindGroupLayout(0),
+				entries: [
+					{ binding: 0, resource: { buffer: uniformBuf } },
+					{ binding: 1, resource: sampler },
+					{ binding: 2, resource: targets.compositeViewsAB[i] }
+				]
+			})
+		) as [GPUBindGroup, GPUBindGroup];
+		// Bloom downsample bind groups: source for level i is sceneTex (i=0) or
+		// bloomMip[i-1]. Each has a dedicated uniform-buffer slice for params.
+		const bloomDownBGs: GPUBindGroup[] = [];
+		for (let i = 0; i < BLOOM_LEVELS; i++) {
+			const src = i === 0 ? targets.sceneView : targets.bloomViews[i - 1];
+			bloomDownBGs.push(
+				device.createBindGroup({
+					layout: pipelines.bloomDown.getBindGroupLayout(0),
+					entries: [
+						{
+							binding: 0,
+							resource: { buffer: bloomParamBuf, offset: i * 256, size: BLOOM_PARAM_BYTES }
+						},
+						{ binding: 1, resource: sampler },
+						{ binding: 2, resource: src }
+					]
+				})
+			);
+		}
+		// Bloom upsample bind groups: src=mip[i+1], dst=mip[i]. Param slices
+		// begin immediately after the three downsample slices.
+		const bloomUpBGs: GPUBindGroup[] = [];
+		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
+			const srcLevel = BLOOM_LEVELS - 1 - i;
+			bloomUpBGs.push(
+				device.createBindGroup({
+					layout: pipelines.bloomUp.getBindGroupLayout(0),
+					entries: [
+						{
+							binding: 0,
+							resource: {
+								buffer: bloomParamBuf,
+								offset: (BLOOM_LEVELS + i) * 256,
+								size: BLOOM_PARAM_BYTES
+							}
+						},
+						{ binding: 1, resource: sampler },
+						{ binding: 2, resource: targets.bloomViews[srcLevel] }
+					]
+				})
+			);
+		}
+		return { scene, composite, present, bloomDownBGs, bloomUpBGs };
+	}
+
+	async function initGpu(c: HTMLCanvasElement): Promise<GPU | null> {
+		const gpuApi = navigator.gpu;
+		if (!gpuApi) {
+			errorMsg = 'WebGPU not available.';
+			return null;
+		}
+		const adapter = await gpuApi.requestAdapter();
+		if (!adapter) {
+			errorMsg = 'No WebGPU adapter found.';
+			return null;
+		}
+		const device = (await adapter.requestDevice()) as GPUDevice;
+
+		const context = c.getContext('webgpu') as unknown as GPUCanvasContext;
+		if (!context) {
+			device.destroy?.();
+			errorMsg = 'WebGPU canvas context unavailable.';
+			return null;
+		}
+		const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
+		context.configure({ device, format, alphaMode: 'opaque' });
+
+		const hdr: GPUTextureFormat = 'rgba16float';
+
+		const shaderModule = async (label: string, code: string) => {
+			const module = device.createShaderModule({ label, code });
+			const info = await module.getCompilationInfo?.();
+			const errors =
+				info?.messages.filter((message) => message.type === 'error').slice(0, 4) ?? [];
+			if (errors.length > 0) {
+				const details = errors
+					.map((message) => {
+						const line = message.lineNum ? `:${message.lineNum}:${message.linePos}` : '';
+						return `${label}${line} ${message.message}`;
+					})
+					.join(' | ');
+				throw new Error(`Soma shader failed to compile: ${details}`);
+			}
+			return module;
+		};
+
+		const mkPipeline = async (label: string, code: string, target: GPUTextureFormat) => {
+			const module = await shaderModule(label, code);
+			return device.createRenderPipeline({
+				layout: 'auto',
+				vertex: { module, entryPoint: 'vs_main' },
+				fragment: { module, entryPoint: 'fs_main', targets: [{ format: target }] },
+				primitive: { topology: 'triangle-list' }
+			});
+		};
+
+		// Bloom upsample uses additive blend so each mip's contribution accumulates
+		// cleanly into the parent. Downsample uses replace.
+		const mkUpsamplePipeline = async (label: string, code: string) => {
+			const module = await shaderModule(label, code);
+			return device.createRenderPipeline({
+				layout: 'auto',
+				vertex: { module, entryPoint: 'vs_main' },
+				fragment: {
+					module,
+					entryPoint: 'fs_main',
+					targets: [
+						{
+							format: hdr,
+							blend: {
+								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
+							}
+						}
+					]
+				},
+				primitive: { topology: 'triangle-list' }
+			});
+		};
+
+		const pipelines = {
+			scene: await mkPipeline('Soma scene shader', SCENE_WGSL, hdr),
+			bloomDown: await mkPipeline('Soma bloom-down shader', BLOOM_DOWN_WGSL, hdr),
+			bloomUp: await mkUpsamplePipeline('Soma bloom-up shader', BLOOM_UP_WGSL),
+			composite: await mkPipeline('Soma composite shader', COMPOSITE_WGSL, hdr),
+			present: await mkPipeline('Soma present shader', PRESENT_WGSL, format)
+		};
+
+		const sampler = device.createSampler({
+			magFilter: 'linear',
+			minFilter: 'linear',
+			addressModeU: 'clamp-to-edge',
+			addressModeV: 'clamp-to-edge'
+		});
+
+		const uniformBuf = device.createBuffer({
+			size: UNIFORM_BYTES,
+			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+		});
+
+		const bloomParamBuf = device.createBuffer({
+			size: 256 * (BLOOM_LEVELS * 2 - 1),
+			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+		});
+
+		// Spectrum storage remains part of the scene pipeline: the raymarched
+		// surface maps vertical regions to individual FFT bins.
+		const binsBuf = device.createBuffer({
+			size: BINS_BYTES,
+			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+		});
+
+		return {
+			device,
+			context,
+			format,
+			sampler,
+			uniformBuf,
+			uniformData: new Float32Array(UNIFORM_FLOATS),
+			bloomParamBuf,
+			bloomParamData: new Float32Array(BLOOM_PARAM_FLOATS),
+			binsBuf,
+			binsData: new Float32Array(BIN_COUNT),
+			pipelines,
+			targets: null,
+			bindGroups: null,
+			frame: 0
+		};
+	}
+
+	function discardTargets(g: GPU) {
+		if (g.targets) {
+			g.targets.scene.destroy();
+			for (const t of g.targets.bloomMips) t.destroy();
+			g.targets.compositeAB[0].destroy();
+			g.targets.compositeAB[1].destroy();
+		}
+		g.targets = null;
+		g.bindGroups = null;
+		g.frame = 0;
+	}
+
+	function ensureTargets(g: GPU, w: number, h: number) {
+		if (g.targets && g.targets.width === w && g.targets.height === h) return;
+		discardTargets(g);
+		g.targets = buildTargets(g.device, w, h);
+		g.bindGroups = buildBindGroups(g);
+	}
+
+	function destroyGpuResources(g: GPU) {
+		try {
+			discardTargets(g);
+			g.uniformBuf.destroy();
+			g.bloomParamBuf.destroy();
+			g.binsBuf.destroy();
+			g.device.destroy?.();
+		} catch {}
+	}
+
+	function failGpuDevice(g: GPU, generation: number, message: string) {
+		// An old device may resolve `lost` after a normal engine switch. Identity
+		// and generation checks ensure it cannot tear down a newer replacement.
+		if (gpu !== g || generation !== initGeneration) return;
+		initGeneration++;
+		gpu = null;
+		gpuReady = false;
+		resetFrameScheduler();
+		temporalResetRequested = true;
+		errorMsg = message;
+		destroyGpuResources(g);
+	}
+
+	function teardownGpu() {
+		initGeneration++;
+		gpuReady = false;
+		resetFrameScheduler();
+		temporalResetRequested = true;
+		if (!gpu) return;
+		const doomed = gpu;
+		gpu = null;
+		destroyGpuResources(doomed);
+	}
+
+	function loop(frameNow = performance.now()) {
+		if (!running) return;
+		raf = requestAnimationFrame(loop);
+		if (!canvas || !gpu) return;
+
+		if (!schedulerTickAt) {
+			schedulerTickAt = frameNow;
+		} else {
+			const tickElapsed = Math.max(0, frameNow - schedulerTickAt);
+			schedulerTickAt = frameNow;
+			observeDisplayCadence(tickElapsed);
+		}
+		const nextFrameStride = somaFrameStride(refreshIntervalMs, qualityProfile.frameRate);
+		if (nextFrameStride !== activeFrameStride) {
+			activeFrameStride = nextFrameStride;
+			renderStride = nextFrameStride;
+			framesUntilRender = 0;
+		}
+		if (framesUntilRender > 0) {
+			framesUntilRender--;
+			return;
+		}
+		framesUntilRender = activeFrameStride - 1;
+
+		// This is the actual time between rendered frames, independent of the
+		// scheduler's fractional budget, so smoothing remains time-correct on
+		// 60/75/90/120/144 Hz displays and after an occasional missed frame.
+		const hadPreviousRender = lastRenderedAt !== 0;
+		const elapsedMs = hadPreviousRender
+			? Math.max(0, frameNow - lastRenderedAt)
+			: refreshIntervalMs * activeFrameStride;
+		lastRenderedAt = frameNow;
+		const frameDt = Math.min(1, Math.max(0.001, elapsedMs / 1000));
+
+		const activeQuality = updateQualityProfile(hadPreviousRender ? elapsedMs : null);
+		const { width: w, height: h } = somaBackingSize(
+			canvas.clientWidth,
+			canvas.clientHeight,
+			window.devicePixelRatio || 1,
+			activeQuality
+		);
+		const nextRenderPixels = w * h;
+		if (renderPixels !== nextRenderPixels) renderPixels = nextRenderPixels;
+		if (canvas.width !== w || canvas.height !== h) {
+			canvas.width = w;
+			canvas.height = h;
+		}
+
+		// Bind the current source epoch before preserving or recreating temporal
+		// targets. A track switch must never present one frame of the previous
+		// source's composite history.
+		const time = (performance.now() - t0) / 1000;
+		const feat = vis.getLatest(frameNow);
+		const shared = vis.getJourney(frameNow);
+		syncRendererToJourney(shared);
+		const targetGpu = gpu;
+		const targetGeneration = initGeneration;
+		try {
+			if (temporalResetRequested) {
+				discardTargets(targetGpu);
+				temporalResetRequested = false;
+			}
+			ensureTargets(targetGpu, w, h);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			failGpuDevice(
+				targetGpu,
+				targetGeneration,
+				`Mk2 could not prepare its WebGPU render targets: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+			);
+			return;
+		}
+		if (!gpu.bindGroups || !gpu.targets) {
+			return;
+		}
+
+		const directed = shared.director;
+		const spectrum = shared.spectrum;
+		const signalJourney = shared.signal;
+		const journey = shared.mk2;
+		const pose = updateRenderPose(journey, frameDt);
+		currentSection = directed.section;
+		currentForm = dominantLifecycleForm(journey);
+		currentGesture = dominantGesture(journey);
+
+		// Time-correct renderer-side polish. The musical controller already owns
+		// the longer envelopes; this final smoothing only keeps GPU uniforms calm.
+		const frameScale = frameDt * 60;
+		const alpha = (at60Hz: number) => 1 - Math.pow(1 - at60Hz, frameScale);
+		const chromaAngle = signalJourney.key * Math.PI * 2;
+		const response = VISUALIZER_RESPONSE_PROFILES.mk2[vis.response];
+		const responseMotionTarget = response.motion;
+		const responseImpactTarget = response.impact;
+		const responseFogTarget = response.fog;
+		const responseShaftsTarget = response.shafts;
+		const baseHue = directed.palette.baseHue;
+		const hueDelta = ((directed.palette.accentHue - baseHue + 1.5) % 1) - 0.5;
+		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
+		const paletteTarget =
+			baseHue + hueDelta * tonnetzBlend + (spectrum.centroid - 0.5) * 0.055;
+		const paletteTargetAngle = paletteTarget * Math.PI * 2;
+		const paletteXTarget = Math.cos(paletteTargetAngle);
+		const paletteYTarget = Math.sin(paletteTargetAngle);
+		if (rendererSyncRequested) {
+			smoothed.bass = spectrum.bass;
+			smoothed.mid = spectrum.mid;
+			smoothed.treble = spectrum.treble;
+			smoothed.centroidSlow = spectrum.centroid;
+			smoothed.rmsSlow = journey.macroEnergy;
+			smoothed.bpmNormSlow = signalJourney.tempo;
+			smoothed.flash = 0;
+			smoothed.staccato = 0;
+			smoothed.sustain = pose.openness;
+			smoothed.chromaXSlow = Math.cos(chromaAngle);
+			smoothed.chromaYSlow = Math.sin(chromaAngle);
+			smoothed.paletteXSlow = paletteXTarget;
+			smoothed.paletteYSlow = paletteYTarget;
+			smoothed.responseMotion = responseMotionTarget;
+			smoothed.responseImpact = responseImpactTarget;
+			smoothed.responseFog = responseFogTarget;
+			smoothed.responseShafts = responseShaftsTarget;
+			rendererSyncRequested = false;
+		} else {
+			smoothed.bass = lerp(smoothed.bass, spectrum.bass, alpha(0.12));
+			smoothed.mid = lerp(smoothed.mid, spectrum.mid, alpha(0.09));
+			smoothed.treble = lerp(smoothed.treble, spectrum.treble, alpha(0.15));
+			smoothed.centroidSlow = lerp(smoothed.centroidSlow, spectrum.centroid, alpha(0.025));
+			smoothed.rmsSlow = lerp(smoothed.rmsSlow, journey.macroEnergy, alpha(0.012));
+			smoothed.bpmNormSlow = lerp(smoothed.bpmNormSlow, signalJourney.tempo, alpha(0.02));
+			smoothed.flash = lerp(smoothed.flash, journey.impact, alpha(0.32));
+			smoothed.staccato = lerp(smoothed.staccato, journey.impact, alpha(0.38));
+			smoothed.sustain = lerp(smoothed.sustain, pose.openness, alpha(0.035));
+			smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.025));
+			smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.025));
+			const paletteX = lerp(smoothed.paletteXSlow, paletteXTarget, alpha(0.0045));
+			const paletteY = lerp(smoothed.paletteYSlow, paletteYTarget, alpha(0.0045));
+			const paletteLength = Math.hypot(paletteX, paletteY);
+			if (paletteLength > 0.001) {
+				smoothed.paletteXSlow = paletteX / paletteLength;
+				smoothed.paletteYSlow = paletteY / paletteLength;
+			} else {
+				smoothed.paletteXSlow = paletteXTarget;
+				smoothed.paletteYSlow = paletteYTarget;
+			}
+			// Response changes are instrument gestures, not edits to the camera cut.
+			// Glide them onto the renderer so changing modes cannot dolly-jump Soma.
+			smoothed.responseMotion = lerp(smoothed.responseMotion, responseMotionTarget, alpha(0.045));
+			smoothed.responseImpact = lerp(smoothed.responseImpact, responseImpactTarget, alpha(0.07));
+			smoothed.responseFog = lerp(smoothed.responseFog, responseFogTarget, alpha(0.04));
+			smoothed.responseShafts = lerp(smoothed.responseShafts, responseShaftsTarget, alpha(0.04));
+		}
+
+		const growth = pose.growth;
+		const tension = pose.tension;
+		const mandelbulbPower = Math.max(
+			6.15,
+			Math.min(
+				8.45,
+				7.05 +
+					pose.topologyBias * 1.15 +
+					pose.styleLowHighTilt * 0.38 +
+					(pose.styleTonality - 0.5) * 0.24 +
+					(pose.materialMineral - pose.materialMembrane) * 0.22 +
+					(pose.gestureCoil - pose.gestureDivide) * 0.18
+			)
+		);
+		const paletteOffset =
+			((Math.atan2(smoothed.paletteYSlow, smoothed.paletteXSlow) / (Math.PI * 2)) % 1 + 1) % 1;
+		const paletteFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
+		const paletteFamilyB = mk2SecondaryPaletteFamily;
+		const paletteFamilyBlend = Math.max(
+			0.04,
+			Math.min(
+				0.3,
+				0.055 +
+					Math.abs(hueDelta) * 0.16 +
+					pose.materialIridescence * 0.12 +
+					directed.context.keyConfidence * 0.055
+			)
+		);
+		const responseMotion = smoothed.responseMotion;
+		const responseImpact = smoothed.responseImpact;
+		const fogDensity = Math.max(
+			0.032,
+			Math.min(0.088, pose.fogDensity * smoothed.responseFog)
+		);
+		const lightShaftIntensity = Math.max(
+			0.18,
+			Math.min(0.8, pose.shaftIntensity * smoothed.responseShafts)
+		);
+		const responseShotZoom = 1 + (pose.shotZoom - 1) * responseMotion;
+		const shotZoom = Math.max(0.9, Math.min(1.72, responseShotZoom));
+		const closeStudy = Math.max(0, Math.min(1, pose.closeStudy * responseMotion));
+		const detailFocus = Math.max(0, Math.min(1, pose.detailFocus * responseMotion));
+		const zoomDelta = shotZoom - 1;
+		let cameraOrbit = Math.pow(Math.max(0, pose.cameraOrbit), 1.75);
+		let cameraProfile = Math.pow(Math.max(0, pose.cameraProfile), 1.75);
+		let cameraOverhead = Math.pow(Math.max(0, pose.cameraOverhead), 1.75);
+		let cameraLow = Math.pow(Math.max(0, pose.cameraLow), 1.75);
+		let cameraMacro = Math.pow(Math.max(0, pose.cameraMacro), 1.75);
+		const cameraWeightSum = Math.max(
+			0.0001,
+			cameraOrbit + cameraProfile + cameraOverhead + cameraLow + cameraMacro
+		);
+		cameraOrbit /= cameraWeightSum;
+		cameraProfile /= cameraWeightSum;
+		cameraOverhead /= cameraWeightSum;
+		cameraLow /= cameraWeightSum;
+		cameraMacro /= cameraWeightSum;
+		const macroStudyRamp = Math.max(0, Math.min(1, (closeStudy - 0.34) / 0.5));
+		const intentionalMacro = Math.max(
+			0,
+			Math.min(1, cameraMacro * macroStudyRamp * (0.74 + detailFocus * 0.26))
+		);
+		const effectiveZoomDelta = zoomDelta * (0.5 + intentionalMacro * 0.5);
+		// Combine a safe dolly with a mild optical push. Even at the closest
+		// elected study the camera remains outside the organism's scene bound.
+		const dollyScale = 1 / (1 + effectiveZoomDelta * 0.32);
+		const shotLens =
+			cameraOrbit * 0.86 +
+			cameraProfile * 0.96 +
+			cameraOverhead * 0.88 +
+			cameraLow * 0.82 +
+			cameraMacro * 1.24;
+		const requestedFovScale =
+			(shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
+		const subjectExtent =
+			1 + pose.axialStretch * 0.28 + pose.filamentReach * 0.09 + pose.lobeSplit * 0.07;
+		const fovScale =
+			requestedFovScale /
+			(1 + (subjectExtent - 1) * (1 - intentionalMacro * 0.72));
+
+		// Camera composition moves only when the phrase-held shot rails change.
+		// Impacts, FFT deltas, and autonomous clocks never move the camera.
+		const sessionTargetY =
+			-0.08 +
+			(mk2SongSeed - 0.5) * 0.1 +
+			pose.axialStretch * 0.14 -
+			pose.lobeSplit * 0.025;
+		const sessionRoll = (mk2SongSeed - 0.5) * 0.14;
+		const camPosRaw = getCameraPos(
+			pose.perspectiveAzimuth,
+			pose.perspectiveElevation,
+			cameraOrbit,
+			cameraProfile,
+			cameraOverhead,
+			cameraLow,
+			cameraMacro
+		);
+		const cameraScale = pose.cameraDistance * dollyScale;
+		const camPos: [number, number, number] = [
+			camPosRaw[0] * cameraScale,
+			camPosRaw[1] * cameraScale,
+			camPosRaw[2] * cameraScale
+		];
+		// Phrase/key posture now belongs to the organism only. Applying it to the
+		// body, camera path, and camera target at once amplified tiny analysis
+		// reversals into the old ten-degree twitch-and-return motion.
+		const horizontalLength = Math.hypot(camPos[0], camPos[2]) || 1;
+		const framingRightX = camPos[2] / horizontalLength;
+		const framingRightZ = -camPos[0] / horizontalLength;
+		const framingScale = 1 - closeStudy * 0.34;
+		const camTarget: [number, number, number] = [
+			framingRightX * pose.shotFramingX * framingScale,
+			sessionTargetY + pose.shotFramingY * framingScale,
+			framingRightZ * pose.shotFramingX * framingScale
+		];
+		const fwd: [number, number, number] = [
+			camTarget[0] - camPos[0],
+			camTarget[1] - camPos[1],
+			camTarget[2] - camPos[2]
+		];
+		const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1;
+		fwd[0] /= fwdLen;
+		fwd[1] /= fwdLen;
+		fwd[2] /= fwdLen;
+		// cross(fwd, worldUp=(0,1,0)) = (fwd.z, 0, -fwd.x)
+		const right: [number, number, number] = [fwd[2], 0, -fwd[0]];
+		const rLen = Math.hypot(right[0], right[1], right[2]) || 1;
+		right[0] /= rLen;
+		right[1] /= rLen;
+		right[2] /= rLen;
+		// up = cross(right, fwd) — then roll around fwd by sessionRoll so the
+		// horizon line is tilted per session. Adds Dutch-angle camera identity.
+		const baseUp: [number, number, number] = [
+			right[1] * fwd[2] - right[2] * fwd[1],
+			right[2] * fwd[0] - right[0] * fwd[2],
+			right[0] * fwd[1] - right[1] * fwd[0]
+		];
+		const cr = Math.cos(sessionRoll);
+		const sr = Math.sin(sessionRoll);
+		const camUp: [number, number, number] = [
+			baseUp[0] * cr + right[0] * sr,
+			baseUp[1] * cr + right[1] * sr,
+			baseUp[2] * cr + right[2] * sr
+		];
+		const rolledRight: [number, number, number] = [
+			right[0] * cr - baseUp[0] * sr,
+			right[1] * cr - baseUp[1] * sr,
+			right[2] * cr - baseUp[2] * sr
+		];
+		right[0] = rolledRight[0];
+		right[1] = rolledRight[1];
+		right[2] = rolledRight[2];
+
+		const u = gpu.uniformData;
+		u[0] = w;
+		u[1] = h;
+		u[2] = time;
+		u[3] = smoothed.bass;
+		u[4] = smoothed.mid;
+		u[5] = smoothed.treble;
+		u[6] = smoothed.centroidSlow;
+		u[7] = smoothed.rmsSlow;
+		u[8] = smoothed.flash;
+		u[9] = smoothed.bpmNormSlow;
+		u[10] = smoothed.chromaXSlow;
+		u[11] = smoothed.chromaYSlow;
+		u[12] = Math.max(feat?.chroma_strength ?? 0, directed.context.keyConfidence);
+		u[13] = camPos[0];
+		u[14] = camPos[1];
+		u[15] = camPos[2];
+		u[16] = fwd[0];
+		u[17] = fwd[1];
+		u[18] = fwd[2];
+		u[19] = right[0];
+		u[20] = right[1];
+		u[21] = right[2];
+		u[22] = camUp[0];
+		u[23] = camUp[1];
+		u[24] = camUp[2];
+		u[25] = fovScale;
+		u[26] = mandelbulbPower;
+		u[27] = paletteOffset;
+		u[28] = fogDensity;
+		u[29] = lightShaftIntensity;
+		u[30] = growth;
+		u[31] = tension;
+		// Per-track palette family stays stable; harmonic analysis moves within
+		// it, so the track develops without looking like a preset roulette.
+		u[32] = paletteFamily;
+		u[33] = Math.min(1, smoothed.staccato * responseImpact * 0.4);
+		u[34] = smoothed.sustain;
+		// Reserved legacy slot. Whole-subject clock rotation is intentionally disabled.
+		u[35] = 0;
+		u[36] = renderPhases.backgroundFlowPhase;
+		u[37] = pose.postureYaw;
+		u[38] = pose.posturePitch;
+		u[39] = pose.suspense;
+		u[40] = pose.seedForm;
+		u[41] = pose.sproutForm;
+		u[42] = pose.windingForm;
+		u[43] = pose.bloomForm;
+		u[44] = pose.sheddingForm;
+		u[45] = pose.dormancyForm;
+		u[46] = renderPhases.morphPhase;
+		u[47] = pose.morphRate;
+		u[48] = pose.rootMass;
+		u[49] = Math.min(1, journey.rootPulse * responseImpact * 0.55);
+		u[50] = pose.axialStretch;
+		u[51] = pose.lobeSplit;
+		u[52] = pose.foldDepth;
+		u[53] = pose.cavityOpen;
+		u[54] = pose.surfaceRidges;
+		u[55] = pose.filamentReach;
+		u[56] = pose.spectralLean;
+		u[57] = renderPhases.spectralTravelPhase;
+		u[58] = pose.spectralTravelRate;
+		u[59] = pose.palettePhase;
+		u[60] = pose.paletteWarmth;
+		u[61] = pose.materialDensity;
+		u[62] = pose.materialIridescence;
+		u[63] = pose.materialErosion;
+		u[64] = shotZoom;
+		u[65] = closeStudy;
+		u[66] = detailFocus;
+		u[67] = pose.perspectiveAzimuth;
+		u[68] = pose.perspectiveElevation;
+		u[69] = pose.shotFramingX;
+		u[70] = pose.shotFramingY;
+		u[71] = qualityProfile.raymarchSteps;
+		u[72] = pose.environmentVoid;
+		u[73] = pose.environmentCurrent;
+		u[74] = pose.environmentCavern;
+		u[75] = pose.environmentHorizon;
+		u[76] = pose.environmentCellular;
+		u[77] = pose.materialMembrane;
+		u[78] = pose.materialMineral;
+		u[79] = pose.materialVelvet;
+		u[80] = pose.materialCrystal;
+		u[81] = paletteFamilyB;
+		u[82] = paletteFamilyBlend;
+		u[83] = 0;
+		u[84] = pose.topologyCocoon;
+		u[85] = pose.topologySpire;
+		u[86] = pose.topologyBilateral;
+		u[87] = pose.topologyTorus;
+		u[88] = pose.topologyCoral;
+		u[89] = pose.topologyShell;
+		u[90] = pose.gestureReach;
+		u[91] = pose.gestureCoil;
+		u[92] = pose.gestureDivide;
+		u[93] = pose.gestureHollow;
+		u[94] = pose.gestureStillness;
+		u[95] = pose.styleRhythmicDensity;
+		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
+
+		// Upload decoded, baseline-relative detail. Static hiss and compressed
+		// display-bin floor no longer shimmer across the entire surface.
+		gpu.binsData.set(spectrum.detailBins);
+		gpu.device.queue.writeBuffer(
+			gpu.binsBuf,
+			0,
+			gpu.binsData.buffer,
+			gpu.binsData.byteOffset,
+			gpu.binsData.byteLength
+		);
+
+		// ── Pack bloom params for five passes (3 down + 2 up).
+		// Each slice is 256-byte aligned (WebGPU minimum dynamic uniform alignment).
+		const bloomThreshold = 1.15; // HDR threshold for first downsample
+		const bloomIntensity = 0.3; // contribution scale for each upsample
+		const gpuRef = gpu;
+		const bp = gpuRef.bloomParamData;
+		// Helper to write a slice
+		const writeSlice = (passIdx: number, fields: number[]) => {
+			for (let k = 0; k < BLOOM_PARAM_FLOATS; k++) bp[k] = fields[k] ?? 0;
+			gpuRef.device.queue.writeBuffer(
+				gpuRef.bloomParamBuf,
+				passIdx * 256,
+				bp.buffer,
+				bp.byteOffset,
+				BLOOM_PARAM_BYTES
+			);
+		};
+		// Down passes: source resolution → destination (half each level)
+		const t = gpu.targets;
+		// Level 0 down: src = scene full res; dst = mip 0 (half)
+		writeSlice(0, [w, h, t.bloomSizes[0].w, t.bloomSizes[0].h, bloomThreshold, 0, 0, 0]);
+		for (let i = 1; i < BLOOM_LEVELS; i++) {
+			const src = t.bloomSizes[i - 1];
+			const dst = t.bloomSizes[i];
+			writeSlice(i, [src.w, src.h, dst.w, dst.h, 0, 0, 0, 0]);
+		}
+		// Up passes climb from the smallest mip back to mip 0.
+		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
+			const srcLevel = BLOOM_LEVELS - 1 - i;
+			const dstLevel = srcLevel - 1;
+			const src = t.bloomSizes[srcLevel];
+			const dst = t.bloomSizes[dstLevel];
+			writeSlice(BLOOM_LEVELS + i, [src.w, src.h, dst.w, dst.h, 0, bloomIntensity, 0, 0]);
+		}
+
+		const submittingGpu = gpuRef;
+		const submittingBindGroups = submittingGpu.bindGroups;
+		if (!submittingBindGroups) return;
+		const submittingGeneration = initGeneration;
+		try {
+			const encoder = submittingGpu.device.createCommandEncoder();
+
+		// Scene → sceneTex
+		{
+			const pass = encoder.beginRenderPass({
+				colorAttachments: [
+					{
+						view: t.sceneView,
+						clearValue: { r: 0, g: 0, b: 0, a: 1 },
+						loadOp: 'clear',
+						storeOp: 'store'
+					}
+				]
+			});
+			pass.setPipeline(submittingGpu.pipelines.scene);
+			pass.setBindGroup(0, submittingBindGroups.scene);
+			pass.draw(6);
+			pass.end();
+		}
+
+		// Bloom downsample chain (clear each mip, threshold on first only).
+		for (let i = 0; i < BLOOM_LEVELS; i++) {
+			const pass = encoder.beginRenderPass({
+				colorAttachments: [
+					{
+						view: t.bloomViews[i],
+						clearValue: { r: 0, g: 0, b: 0, a: 1 },
+						loadOp: 'clear',
+						storeOp: 'store'
+					}
+				]
+			});
+			pass.setPipeline(submittingGpu.pipelines.bloomDown);
+			pass.setBindGroup(0, submittingBindGroups.bloomDownBGs[i]);
+			pass.draw(6);
+			pass.end();
+		}
+
+		// Bloom upsample chain (additive blend into parent mip).
+		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
+			const dstLevel = BLOOM_LEVELS - 2 - i;
+			const pass = encoder.beginRenderPass({
+				colorAttachments: [
+					{ view: t.bloomViews[dstLevel], loadOp: 'load', storeOp: 'store' }
+				]
+			});
+			pass.setPipeline(submittingGpu.pipelines.bloomUp);
+			pass.setBindGroup(0, submittingBindGroups.bloomUpBGs[i]);
+			pass.draw(6);
+			pass.end();
+		}
+
+		const prevIdx = (submittingGpu.frame % 2) as 0 | 1;
+		const currIdx = (1 - prevIdx) as 0 | 1;
+
+		// Composite → compositeTex (current ping-pong slot). Reads prev slot for
+		// temporal motion blur via mix() in the shader.
+		{
+			const pass = encoder.beginRenderPass({
+				colorAttachments: [
+					{
+						view: t.compositeViewsAB[currIdx],
+						clearValue: { r: 0, g: 0, b: 0, a: 1 },
+						loadOp: 'clear',
+						storeOp: 'store'
+					}
+				]
+			});
+			pass.setPipeline(submittingGpu.pipelines.composite);
+			pass.setBindGroup(0, submittingBindGroups.composite[prevIdx]);
+			pass.draw(6);
+			pass.end();
+		}
+
+		// Present (tone-map + stable dither) → swap chain
+		{
+			const view = submittingGpu.context.getCurrentTexture().createView();
+			const pass = encoder.beginRenderPass({
+				colorAttachments: [
+					{
+						view,
+						clearValue: { r: 0, g: 0, b: 0, a: 1 },
+						loadOp: 'clear',
+						storeOp: 'store'
+					}
+				]
+			});
+			pass.setPipeline(submittingGpu.pipelines.present);
+			pass.setBindGroup(0, submittingBindGroups.present[currIdx]);
+			pass.draw(6);
+			pass.end();
+		}
+
+			submittingGpu.device.queue.submit([encoder.finish()]);
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			failGpuDevice(
+				submittingGpu,
+				submittingGeneration,
+				`Mk2 could not encode or submit WebGPU work: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+			);
+			return;
+		}
+		submittingGpu.frame++;
+		if (!gpuReady) gpuReady = true;
+	}
+
+	$effect(() => {
+		if (!canvas) {
+			teardownGpu();
+			return;
+		}
+		if (gpu) return;
+		errorMsg = null;
+		gpuReady = false;
+		const initFor = canvas;
+		const generation = ++initGeneration;
+		initGpu(initFor)
+			.then((g) => {
+				if (!g) return;
+				if (generation !== initGeneration || canvas !== initFor) {
+					destroyGpuResources(g);
+					return;
+				}
+				gpu = g;
+				resetFrameScheduler();
+				void g.device.lost.then((info) => {
+					const reason = info.reason === 'destroyed' ? 'destroyed unexpectedly' : 'lost';
+					const detail = info.message.trim();
+					failGpuDevice(
+						g,
+						generation,
+						`Mk2's WebGPU device was ${reason}${detail ? `: ${detail}` : ''}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+					);
+				});
+			})
+			.catch((e) => {
+				if (generation === initGeneration && canvas === initFor) {
+					errorMsg = e instanceof Error ? e.message : String(e);
+				}
+			});
+	});
+
+	onMount(() => {
+		running = true;
+		raf = requestAnimationFrame(loop);
+		void vis.subscribe().then((stop) => {
+			if (!running) {
+				stop();
+				return;
+			}
+			unsub = stop;
+		});
+	});
+
+	onDestroy(() => {
+		running = false;
+		cancelAnimationFrame(raf);
+		if (unsub) {
+			unsub();
+			unsub = null;
+		}
+		teardownGpu();
+	});
+</script>
+
+{#if vis.active}
+	<div class="fixed inset-0 z-[100] overflow-hidden bg-black">
+		<div
+			class="pointer-events-none absolute inset-0 transition-opacity duration-500"
+			class:opacity-0={gpuReady}
+			style="background: radial-gradient(circle at 50% 44%, #171029 0%, #070410 46%, #000 78%);"
+			aria-hidden="true"
+		></div>
+		<canvas
+			bind:this={canvas}
+			class="relative z-10 h-full w-full transition-opacity duration-300"
+			class:opacity-0={!gpuReady}
+			aria-label="Soma audio visualizer"
+			data-mk2-section={currentSection}
+			data-mk2-form={currentForm}
+			data-mk2-gesture={currentGesture}
+			data-mk2-uniform-bytes={UNIFORM_BYTES}
+			data-mk2-render-passes="8"
+			data-soma-quality={qualityTier}
+			data-soma-render-pixels={renderPixels}
+			data-soma-max-pixels={SOMA_QUALITY_PROFILES[qualityTier].maxPixels}
+			data-soma-frame-rate={SOMA_QUALITY_PROFILES[qualityTier].frameRate}
+			data-soma-frame-stride={renderStride}
+			data-soma-refresh-rate={measuredRefreshRate}
+			data-soma-raymarch-steps={SOMA_QUALITY_PROFILES[qualityTier].raymarchSteps}
+		></canvas>
+		{#if errorMsg}
+			<div class="pointer-events-none absolute left-6 top-16 z-30 max-w-md text-xs text-red-300/80">
+				Visualizer error: {errorMsg}
+			</div>
+		{/if}
+	</div>
+{/if}

@@ -4,7 +4,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { usePlayer, formatTime } from '$lib/state/player.svelte';
 	import { Music, ListMusic, Trash2, Play } from '@lucide/svelte';
-	import type { QueueItem } from '$lib/types';
+	import type { QueueSnapshot } from '$lib/types';
 	import { toast } from 'svelte-sonner';
 
 	interface Props {
@@ -15,11 +15,16 @@
 	let { open = $bindable(), onOpenChange }: Props = $props();
 
 	const player = usePlayer();
-	let queue = $state<QueueItem[]>([]);
+	let queue = $state<QueueSnapshot>({
+		session_id: '',
+		revision: 0,
+		now_playing: null,
+		upcoming: []
+	});
 	let loading = $state(false);
 	let queueError = $state('');
-	let currentItem = $derived(queue.find((item) => item.is_current) ?? null);
-	let upcoming = $derived(queue.filter((item) => !item.is_current));
+	let currentItem = $derived(queue.now_playing);
+	let upcoming = $derived(queue.upcoming);
 
 	$effect(() => {
 		if (!open) return;
@@ -44,9 +49,9 @@
 		}
 	}
 
-	async function removeItem(index: number) {
+	async function removeItem(entryId: string) {
 		try {
-			await player.removeFromQueue(index);
+			await player.removeQueueEntry(queue.session_id, entryId);
 			await loadQueue();
 		} catch (error) {
 			toast.error(`Failed to remove track: ${error}`);
@@ -62,9 +67,9 @@
 		}
 	}
 
-	async function playItem(index: number) {
+	async function playItem(entryId: string) {
 		try {
-			await player.playQueueIndex(index);
+			await player.playQueueEntry(queue.session_id, entryId);
 			await loadQueue();
 		} catch (error) {
 			toast.error(`Failed to play track: ${error}`);
@@ -81,7 +86,7 @@
 					Queue
 				</div>
 			</Sheet.Title>
-			{#if queue.length > 0}
+			{#if queue.now_playing || queue.upcoming.length > 0}
 				<div class="pt-2">
 					<Button variant="ghost" size="sm" onclick={clearAll}>Clear Upcoming</Button>
 				</div>
@@ -129,10 +134,24 @@
 									<p class="text-[11px] text-muted-foreground">{formatTime(item.duration_ms)}</p>
 								{/if}
 							</div>
-							<Button variant="ghost" size="icon" class="size-7" onclick={() => playItem(item.index)}>
+							<Button
+								variant="ghost"
+								size="icon"
+								class="size-7"
+								title={`Play ${item.title}`}
+								aria-label={`Play ${item.title}`}
+								onclick={() => playItem(item.entry_id)}
+							>
 								<Play class="size-3.5 pl-0.5" />
 							</Button>
-							<Button variant="ghost" size="icon" class="size-7" onclick={() => removeItem(item.index)}>
+							<Button
+								variant="ghost"
+								size="icon"
+								class="size-7"
+								title={`Remove ${item.title} from Up Next`}
+								aria-label={`Remove ${item.title} from Up Next`}
+								onclick={() => removeItem(item.entry_id)}
+							>
 								<Trash2 class="size-3.5" />
 							</Button>
 						</div>

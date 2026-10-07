@@ -1,0 +1,225 @@
+<script lang="ts">
+	import type { SearchDiscoveryFeed, SearchDiscoveryItem } from '$lib/api/tauri';
+	import { LoaderCircle, Radio, Sparkles } from '@lucide/svelte';
+	import SearchDiscoveryCard from './search-discovery-card.svelte';
+
+	let {
+		feed,
+		loading = false,
+		onselect
+	}: {
+		feed: SearchDiscoveryFeed | null;
+		loading?: boolean;
+		onselect: (item: SearchDiscoveryItem) => void;
+	} = $props();
+
+	let liveSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'live').length);
+	let cachedSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'cached').length);
+	let unavailableSourceCount = $derived((feed?.source_statuses ?? []).filter((source) => source.state === 'unavailable').length);
+	let hasPersonalizedShelves = $derived((feed?.sections ?? []).some((section) => section.personalized));
+	let sourceSummary = $derived(
+		liveSourceCount > 0
+			? `${liveSourceCount} live signal${liveSourceCount === 1 ? '' : 's'}${cachedSourceCount > 0 ? ` · ${cachedSourceCount} cached` : ''}`
+			: cachedSourceCount > 0
+				? `${cachedSourceCount} cached signal${cachedSourceCount === 1 ? '' : 's'}`
+				: feed?.source || 'Source status'
+	);
+	let sourceTooltip = $derived(
+		(feed?.source_statuses ?? [])
+			.map((source) => `${source.label}: ${source.state}${source.detail ? ` — ${source.detail}` : ''}`)
+			.join('\n') || feed?.source || ''
+	);
+	let elapsedSeconds = $state(0);
+	let loadingTitle = $derived(
+		elapsedSeconds < 2
+			? 'Checking saved discovery'
+			: elapsedSeconds < 15
+				? 'Loading discovery sources'
+				: elapsedSeconds < 45
+					? 'Discovery is taking longer than usual'
+					: 'Still loading discovery'
+	);
+	let loadingDetail = $derived(
+		elapsedSeconds < 2
+			? 'Looking for a recent snapshot before waiting on public feeds.'
+			: elapsedSeconds < 15
+				? 'Combining recent saved snapshots with any Apple Music, ListenBrainz, and Bandcamp updates that are due.'
+				: elapsedSeconds < 45
+					? 'One or more public sources is responding slowly. Usable results will still load.'
+					: 'Slow or unavailable feeds time out automatically; usable sources will still be shown.'
+	);
+
+	function formatElapsed(seconds: number): string {
+		if (seconds < 60) return `${seconds}s elapsed`;
+		const minutes = Math.floor(seconds / 60);
+		const remainder = seconds % 60;
+		return `${minutes}m ${remainder.toString().padStart(2, '0')}s elapsed`;
+	}
+
+	$effect(() => {
+		if (!loading) {
+			elapsedSeconds = 0;
+			return;
+		}
+
+		const startedAt = Date.now();
+		elapsedSeconds = 0;
+		const timer = window.setInterval(() => {
+			elapsedSeconds = Math.floor((Date.now() - startedAt) / 1_000);
+		}, 250);
+
+		return () => window.clearInterval(timer);
+	});
+</script>
+
+<section class="min-w-0 space-y-7 pb-6" aria-label="Search inspiration" data-testid="search-discovery-feed">
+	<div class="flex flex-wrap items-center justify-between gap-2 border-b border-border/60 pb-3">
+		<div>
+			<h2 class="flex items-center gap-2 text-sm font-semibold uppercase tracking-[0.16em] text-foreground/85">
+				<Sparkles class="size-3.5 text-primary" /> Find your next rabbit hole
+			</h2>
+			<p class="mt-1 text-xs text-muted-foreground">Charts, release feeds, and editorial signals{hasPersonalizedShelves ? ', shaped by your listening history' : ''}—every pick says why it is here.</p>
+		</div>
+		{#if loading}
+			<span class="inline-flex items-center gap-1.5 text-[11px] tabular-nums text-muted-foreground" data-testid="discovery-loading-elapsed">
+				<LoaderCircle class="size-3 animate-spin motion-reduce:animate-none" /> {formatElapsed(elapsedSeconds)}
+			</span>
+		{:else if feed && feed.source_statuses.length > 0}
+			<details class="group/source relative max-w-full">
+				<summary
+					class="inline-flex max-w-full cursor-pointer list-none items-center gap-1.5 rounded-full border border-border/70 bg-muted/25 px-2.5 py-1 text-[10px] text-muted-foreground marker:hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+					aria-label={`Discovery sources. ${sourceTooltip}`}
+				>
+					<Radio class="size-2.5 {feed.is_fallback || liveSourceCount === 0 ? '' : 'text-primary'}" />
+					<span class="truncate">
+						{feed.is_stale ? `Stale snapshot · ${sourceSummary}` : `${sourceSummary}${feed.has_history ? ' · movement on' : ''}`}
+					</span>
+				</summary>
+				<div class="absolute right-0 z-20 mt-1.5 w-72 max-w-[80vw] rounded-lg border border-border bg-popover p-2.5 text-[10px] text-popover-foreground shadow-xl">
+					{#each feed.source_statuses as source (source.id)}
+						<p class="flex gap-2 py-0.5">
+							<span class="w-14 shrink-0 font-semibold uppercase tracking-wide text-muted-foreground">{source.state}</span>
+							<span><strong>{source.label}</strong>{source.detail ? ` — ${source.detail}` : ''}</span>
+						</p>
+					{/each}
+					{#if cachedSourceCount > 0}
+						<p class="mt-1 border-t border-border pt-1 text-muted-foreground">Cached means a recent saved source snapshot is still inside its refresh window—not broken or guessed.</p>
+					{/if}
+					{#if unavailableSourceCount > 0}
+						<p class="mt-1 border-t border-border pt-1 text-muted-foreground">Unavailable optional sources do not weaken the usable ones above.</p>
+					{/if}
+				</div>
+			</details>
+		{:else if feed}
+			<span class="inline-flex max-w-full items-center gap-1.5 rounded-full border border-border/70 bg-muted/25 px-2.5 py-1 text-[10px] text-muted-foreground">
+				<Radio class="size-2.5" /> <span class="truncate">{feed.source}</span>
+			</span>
+		{/if}
+	</div>
+
+	{#if feed}
+		{#each feed.sections as section (section.id)}
+			<section aria-labelledby={`discovery-${section.id}`} data-testid={`discovery-section-${section.id}`}>
+				<div class="mb-3 flex items-end justify-between gap-4">
+					<div class="min-w-0">
+						<h3 id={`discovery-${section.id}`} class="text-lg font-semibold tracking-tight">{section.title}</h3>
+						<p class="truncate text-xs text-muted-foreground">{section.subtitle}</p>
+					</div>
+					<span class="shrink-0 text-[10px] uppercase tracking-[0.14em] text-muted-foreground/55">Click to search</span>
+				</div>
+				<div class="discovery-rail flex gap-3 overflow-x-auto pb-2">
+					{#each section.items as item (`${section.id}-${item.id}`)}
+						<SearchDiscoveryCard
+							{item}
+							sectionId={section.id}
+							snapshotId={feed.snapshot_id || String(feed.generated_at)}
+							{onselect}
+						/>
+					{/each}
+				</div>
+			</section>
+		{/each}
+	{:else if loading}
+		<div
+			class="rounded-xl border border-primary/20 bg-primary/[0.04] p-4"
+			role="status"
+			aria-live="polite"
+			data-testid="discovery-loading-status"
+		>
+			<div class="flex items-start gap-3">
+				<div class="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+					<LoaderCircle class="size-4 animate-spin motion-reduce:animate-none" />
+				</div>
+				<div class="min-w-0 flex-1">
+					<p class="text-sm font-medium text-foreground">{loadingTitle}</p>
+					<p class="mt-0.5 text-xs leading-5 text-muted-foreground">{loadingDetail}</p>
+				</div>
+			</div>
+
+			<div
+				class="discovery-progress mt-3 h-1.5 overflow-hidden rounded-full bg-primary/10"
+				role="progressbar"
+				aria-label="Loading discovery sources"
+			>
+				<div class="discovery-progress__bar h-full w-1/3 rounded-full bg-primary"></div>
+			</div>
+
+			<div class="mt-3 flex flex-wrap gap-1.5 text-[10px] text-muted-foreground" aria-label="Discovery loading steps">
+				<span class="rounded-full border border-border/70 bg-background/60 px-2 py-1">Saved snapshot</span>
+				<span class="rounded-full border border-border/70 bg-background/60 px-2 py-1">Apple Music charts</span>
+				<span class="rounded-full border border-border/70 bg-background/60 px-2 py-1">ListenBrainz releases</span>
+				<span class="rounded-full border border-border/70 bg-background/60 px-2 py-1">Bandcamp Daily</span>
+			</div>
+		</div>
+
+		{#each Array(3) as _, sectionIndex}
+			<div aria-hidden="true">
+				<div class="mb-3 h-5 w-32 animate-pulse rounded bg-muted"></div>
+				<div class="flex gap-3 overflow-hidden">
+					{#each Array(6) as _, itemIndex}
+						<div class="w-[9.75rem] shrink-0" data-skeleton={`${sectionIndex}-${itemIndex}`}>
+							<div class="aspect-square animate-pulse rounded-xl bg-muted"></div>
+							<div class="mt-2 h-3.5 w-4/5 animate-pulse rounded bg-muted"></div>
+							<div class="mt-1.5 h-2.5 w-3/5 animate-pulse rounded bg-muted/70"></div>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/each}
+	{:else}
+		<p class="py-10 text-center text-sm text-muted-foreground">Discovery picks are taking a break. Search above to keep exploring.</p>
+	{/if}
+</section>
+
+<style>
+	.discovery-rail {
+		scrollbar-width: thin;
+		scrollbar-color: color-mix(in oklab, var(--muted-foreground) 25%, transparent) transparent;
+		scroll-snap-type: x proximity;
+	}
+
+	.discovery-rail :global(> *) {
+		scroll-snap-align: start;
+	}
+
+	.discovery-progress__bar {
+		animation: discovery-progress 1.35s ease-in-out infinite;
+	}
+
+	@keyframes discovery-progress {
+		0% {
+			transform: translateX(-110%);
+		}
+		100% {
+			transform: translateX(310%);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.discovery-progress__bar {
+			animation: none;
+			width: 100%;
+			opacity: 0.55;
+		}
+	}
+</style>

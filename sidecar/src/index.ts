@@ -1,6 +1,5 @@
 import http from 'node:http';
-import net from 'node:net';
-import fs from 'node:fs';
+import readline from 'node:readline';
 
 // Set up the youtubei.js JavaScript evaluator BEFORE any provider instantiation.
 // The default node.js shim ships a no-op evaluator that throws; we replace it with
@@ -96,68 +95,58 @@ async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> 
   }
 }
 
-// Socket path from argv or default
-const socketPath = process.argv[2] || '/tmp/mewsik-sidecar.sock';
+function writeResponse(response: JsonRpcResponse): void {
+  process.stdout.write(JSON.stringify(response) + '\n');
+}
 
-// Clean up old socket
-try {
-  fs.unlinkSync(socketPath);
-} catch {}
-
-const server = net.createServer((socket) => {
-  let buffer = '';
-
-  socket.on('data', async (data) => {
-    buffer += data.toString();
-
-    // Process complete JSON-RPC messages (newline-delimited)
-    let newlineIdx: number;
-    while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
-      const line = buffer.slice(0, newlineIdx).trim();
-      buffer = buffer.slice(newlineIdx + 1);
-
-      if (!line) continue;
-
-      try {
-        const request: JsonRpcRequest = JSON.parse(line);
-        const response = await handleRequest(request);
-        socket.write(JSON.stringify(response) + '\n');
-      } catch (err) {
-        const errorResponse: JsonRpcResponse = {
-          jsonrpc: '2.0',
-          id: null,
-          error: { code: -32700, message: 'Parse error' },
-        };
-        socket.write(JSON.stringify(errorResponse) + '\n');
-      }
-    }
-  });
-
-  socket.on('error', (err) => {
-    console.error('Socket error:', err.message);
-  });
-});
-
+// stdout carries the JSON-RPC frames; everything diagnostic must go to stderr.
 proxyServer.listen(0, '127.0.0.1', () => {
   const address = proxyServer.address();
   if (address && typeof address === 'object') {
     providers.soundcloud.setProxyBaseUrl(`http://127.0.0.1:${address.port}`);
   }
 
-  server.listen(socketPath, () => {
-    console.log(`Sidecar listening on ${socketPath}`);
-  });
+  const port = address && typeof address === 'object' ? address.port : 'unknown';
+  process.stderr.write(`Sidecar ready (proxy on 127.0.0.1:${port})\n`);
 });
 
-// Graceful shutdown
+const rl = readline.createInterface({
+  input: process.stdin,
+  crlfDelay: Infinity,
+});
+
+rl.on('line', async (line) => {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+
+  let request: JsonRpcRequest;
+  try {
+    request = JSON.parse(trimmed);
+  } catch {
+    writeResponse({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: 'Parse error' },
+    });
+    return;
+  }
+
+  const response = await handleRequest(request);
+  writeResponse(response);
+});
+
+// When the parent (Rust) closes our stdin, treat it as shutdown.
+rl.on('close', () => {
+  proxyServer.close();
+  process.exit(0);
+});
+
 process.on('SIGTERM', () => {
   proxyServer.close();
-  server.close();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   proxyServer.close();
-  server.close();
   process.exit(0);
 });

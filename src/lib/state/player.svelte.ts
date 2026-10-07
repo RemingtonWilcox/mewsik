@@ -1,5 +1,8 @@
 import type { PlaybackState, RepeatMode } from '$lib/types';
 import * as api from '$lib/api/tauri';
+import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
+import { useVisualizer } from '$lib/state/visualizer.svelte';
+import { visualizerPerformanceIdentity } from '$lib/visualizer/identity';
 
 const defaultState: PlaybackState = {
 	is_playing: false,
@@ -10,6 +13,7 @@ const defaultState: PlaybackState = {
 	current_artist: null,
 	current_album_art: null,
 	current_source_url: null,
+	current_station_id: null,
 	position_ms: 0,
 	duration_ms: 0,
 	volume: 1.0,
@@ -34,7 +38,67 @@ function clearPendingSeek() {
 	pendingSeek = null;
 }
 
+// ---- Visual score lifecycle ----
+// On every state merge the director's playback anchor is refreshed; when the
+// playing recording changes, the cached offline analysis is fetched (or
+// kicked off) and handed to the director. Null score = live-FSM fallback.
+let scoreRecordingId: string | null = null;
+let analysisListenerStarted = false;
+
+function clearVisualizerAudio() {
+	useVisualizer().clearLatest();
+}
+
+function playbackSourceChanged(previous: PlaybackState, next: PlaybackState): boolean {
+	return (
+		previous.source !== next.source ||
+		previous.current_recording_id !== next.current_recording_id ||
+		previous.current_source_url !== next.current_source_url ||
+		previous.current_station_id !== next.current_station_id
+	);
+}
+
+function syncVisualScore(next: PlaybackState) {
+	setScorePlayback(next.position_ms, next.is_playing);
+
+	const id = next.source === 'radio' ? null : next.current_recording_id;
+	if (id === scoreRecordingId) return;
+	scoreRecordingId = id;
+	setActiveScore(null);
+	if (!id) return;
+
+	if (!analysisListenerStarted) {
+		analysisListenerStarted = true;
+		void api.listenAnalysisComplete((payload) => {
+			if (payload.recording_id !== scoreRecordingId) return;
+			void api.getTrackAnalysis(payload.recording_id).then((score) => {
+				if (payload.recording_id === scoreRecordingId) setActiveScore(score);
+			});
+		});
+	}
+
+	void api.requestTrackAnalysis(id).then(async (status) => {
+		if (status === 'cached' && id === scoreRecordingId) {
+			const score = await api.getTrackAnalysis(id);
+			// The user may have switched tracks while the cached score was loading.
+			// Recheck after the await so A can never overwrite B's active journey.
+			if (id === scoreRecordingId) setActiveScore(score);
+		}
+		// 'started' resolves via the analysis:complete listener;
+		// 'unavailable' stays on the live fallback.
+	});
+}
+
 function mergePlaybackState(nextState: PlaybackState) {
+	// Clear immediately when playback is no longer producing trustworthy audio.
+	// The store's 250 ms freshness timeout remains a backstop for missed polls or
+	// native analyzer stalls, while source identity protects fast track switches.
+	const sourceChanged = playbackSourceChanged(state, nextState);
+	if (sourceChanged) {
+		useVisualizer().resetPerformance(visualizerPerformanceIdentity(nextState));
+	} else if (!nextState.is_playing || nextState.is_buffering) {
+		clearVisualizerAudio();
+	}
 	if (pendingSeek) {
 		const sameTarget =
 			pendingSeek.recordingId === nextState.current_recording_id &&
@@ -50,6 +114,7 @@ function mergePlaybackState(nextState: PlaybackState) {
 	}
 
 	state = nextState;
+	syncVisualScore(nextState);
 }
 
 async function refreshState() {
@@ -97,24 +162,28 @@ export function usePlayer() {
 
 		async play(recordingId: string) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playRecording(recordingId);
 			scheduleRefresh();
 		},
 
 		async playAll(ids: string[], startIndex: number) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playTracksFrom(ids, startIndex);
 			scheduleRefresh();
 		},
 
 		async pause() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.pause();
 			scheduleRefresh([0, 50]);
 		},
 
 		async stop() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.stopPlayback();
 			scheduleRefresh([0, 50]);
 		},
@@ -128,8 +197,10 @@ export function usePlayer() {
 		async togglePlay() {
 			clearPendingSeek();
 			if (state.is_buffering) {
+				clearVisualizerAudio();
 				await api.stopPlayback();
 			} else if (state.is_playing) {
+				clearVisualizerAudio();
 				await api.pause();
 			} else {
 				if (!state.current_recording_id && !state.current_source_url && !state.current_title) {
@@ -165,12 +236,14 @@ export function usePlayer() {
 
 		async next() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.nextTrack();
 			scheduleRefresh();
 		},
 
 		async prev() {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.prevTrack();
 			scheduleRefresh();
 		},
@@ -204,12 +277,25 @@ export function usePlayer() {
 
 		async playQueueIndex(index: number) {
 			clearPendingSeek();
+			clearVisualizerAudio();
 			await api.playQueueIndex(index);
+			scheduleRefresh();
+		},
+
+		async playQueueEntry(sessionId: string, entryId: string) {
+			clearPendingSeek();
+			clearVisualizerAudio();
+			await api.playQueueEntry(sessionId, entryId);
 			scheduleRefresh();
 		},
 
 		async removeFromQueue(index: number) {
 			await api.removeFromQueue(index);
+			scheduleRefresh([0, 50]);
+		},
+
+		async removeQueueEntry(sessionId: string, entryId: string) {
+			await api.removeQueueEntry(sessionId, entryId);
 			scheduleRefresh([0, 50]);
 		},
 

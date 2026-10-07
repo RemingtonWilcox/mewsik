@@ -1,3 +1,4 @@
+pub mod analyzer;
 pub mod engine;
 pub mod http_stream;
 #[cfg(target_os = "ios")]

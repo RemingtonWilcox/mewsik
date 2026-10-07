@@ -117,7 +117,13 @@ pub struct PlayHistory {
     pub station_id: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
+    /// Length of the media item, when known.
     pub duration_ms: Option<i64>,
+    /// Time that audio was actually playing for this history entry.
+    pub listened_ms: Option<i64>,
+    /// Why playback ended. `None` means the play is still active.
+    pub end_reason: Option<String>,
+    /// True only when the source reached its natural end.
     pub completed: bool,
 }
 
@@ -176,6 +182,7 @@ pub struct PlaybackState {
     pub is_buffering: bool,
     pub can_seek: bool,
     pub current_recording_id: Option<String>,
+    pub current_station_id: Option<String>,
     pub current_title: Option<String>,
     pub current_artist: Option<String>,
     pub current_album_art: Option<String>,
@@ -195,6 +202,7 @@ impl Default for PlaybackState {
             is_buffering: false,
             can_seek: false,
             current_recording_id: None,
+            current_station_id: None,
             current_title: None,
             current_artist: None,
             current_album_art: None,
@@ -211,6 +219,10 @@ impl Default for PlaybackState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueItem {
+    /// Stable identity for this occurrence. Two queue rows that reference the
+    /// same recording deliberately have different entry IDs.
+    pub entry_id: String,
+    /// Legacy upcoming index. New callers should mutate by session + entry ID.
     pub index: usize,
     pub recording_id: String,
     pub title: String,
@@ -218,4 +230,15 @@ pub struct QueueItem {
     pub duration_ms: Option<i64>,
     pub cover_art_url: Option<String>,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QueueSnapshot {
+    /// Changes whenever a new playback context replaces the queue.
+    pub session_id: String,
+    /// Monotonically increases for observable mutations within the session.
+    pub revision: u64,
+    pub now_playing: Option<QueueItem>,
+    /// Literal future playback order. History is never included.
+    pub upcoming: Vec<QueueItem>,
 }

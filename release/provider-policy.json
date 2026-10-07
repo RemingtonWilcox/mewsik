@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "distribution_approved": false,
+  "approved_release_version": null,
+  "reviewed_at": null,
+  "approval_reference": null,
+  "blockers": [
+    "Replace or disable unofficial YouTube search, audio extraction, background playback, and downloads for distributed builds.",
+    "Obtain written SoundCloud approval for the multi-provider product or disable SoundCloud for distributed builds; never persist its streams.",
+    "Replace Bandcamp scraping with approved link-outs or a licensed integration.",
+    "Publish reviewed user Terms and Privacy Policy covering the final provider and data behavior."
+  ]
+}

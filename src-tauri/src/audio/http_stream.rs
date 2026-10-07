@@ -1,6 +1,5 @@
 use crate::audio::engine::AudioEvent;
 use crate::config::AppConfig;
-#[cfg(not(target_os = "ios"))]
 use crate::external_tools::{find_binary, format_ffmpeg_headers};
 use crossbeam_channel::Sender;
 use parking_lot::{Condvar, Mutex};
@@ -8,14 +7,80 @@ use rodio::{Decoder, Source};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-#[cfg(not(target_os = "ios"))]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
 const GOOGLEVIDEO_RANGE_CHUNK_BYTES: u64 = 1024 * 1024;
+
+#[derive(Default)]
+struct FfmpegTracker {
+    quiescing: bool,
+    next_id: u64,
+    children: HashMap<u64, Arc<Mutex<Child>>>,
+}
+
+static FFMPEG_TRACKER: OnceLock<Mutex<FfmpegTracker>> = OnceLock::new();
+
+fn ffmpeg_tracker() -> &'static Mutex<FfmpegTracker> {
+    FFMPEG_TRACKER.get_or_init(|| Mutex::new(FfmpegTracker::default()))
+}
+
+struct TrackedFfmpeg {
+    id: u64,
+}
+
+impl Drop for TrackedFfmpeg {
+    fn drop(&mut self) {
+        ffmpeg_tracker().lock().children.remove(&self.id);
+    }
+}
+
+fn spawn_tracked_ffmpeg(
+    command: &mut Command,
+) -> Result<(Arc<Mutex<Child>>, TrackedFfmpeg), String> {
+    // Hold the same lock used by quiesce across spawn + registration. That
+    // makes it impossible for updater shutdown to miss a just-created child.
+    let mut tracker = ffmpeg_tracker().lock();
+    if tracker.quiescing {
+        return Err("Audio transcoding is shutting down for app exit".to_string());
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("Failed to start ffmpeg: {error}"))?;
+    tracker.next_id = tracker.next_id.saturating_add(1);
+    let id = tracker.next_id;
+    let child = Arc::new(Mutex::new(child));
+    tracker.children.insert(id, Arc::clone(&child));
+    Ok((child, TrackedFfmpeg { id }))
+}
+
+fn stop_ffmpeg_child(child: &Arc<Mutex<Child>>) {
+    let mut child = child.lock();
+    match child.try_wait() {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(_) => {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
+}
+
+/// Permanently prevents new transcoders in this process, then kills and waits
+/// for every active ffmpeg child. This is intentionally terminal-only: updater
+/// installation can bypass Tauri's normal managed-state teardown on Windows.
+pub fn quiesce_and_stop_ffmpeg() {
+    let children = {
+        let mut tracker = ffmpeg_tracker().lock();
+        tracker.quiescing = true;
+        tracker.children.values().cloned().collect::<Vec<_>>()
+    };
+    for child in children {
+        stop_ffmpeg_child(&child);
+    }
+}
 
 struct BufferedFileState {
     available_bytes: u64,
@@ -225,7 +290,9 @@ fn build_request(
     headers: &HashMap<String, String>,
     is_live: bool,
 ) -> reqwest::blocking::RequestBuilder {
-    let mut request = client.get(url).header("User-Agent", "mewsik/0.1");
+    let mut request = client
+        .get(url)
+        .header("User-Agent", concat!("mewsik/", env!("CARGO_PKG_VERSION")));
     if is_live {
         request = request.header("Icy-MetaData", "0");
     }
@@ -272,21 +339,24 @@ fn spawn_download_worker(
         .spawn(move || {
             use std::io::Read as _;
 
-            let mut builder =
-                reqwest::blocking::Client::builder().connect_timeout(Duration::from_secs(10));
-            if !is_live {
-                builder = builder.timeout(Duration::from_secs(120));
-            }
-
-            let client = match builder.build() {
-                Ok(client) => client,
-                Err(err) => {
-                    shared.fail(format!("Failed to build streaming client: {}", err));
-                    let _ = event_tx.send(AudioEvent::Error(format!(
-                        "{} failed before playback: {}",
-                        label, err
-                    )));
-                    return;
+            let client = if is_live {
+                None
+            } else {
+                match reqwest::blocking::Client::builder()
+                    .connect_timeout(Duration::from_secs(10))
+                    .timeout(Duration::from_secs(120))
+                    .build()
+                    .map_err(|err| format!("Failed to build streaming client: {err}"))
+                {
+                    Ok(client) => Some(client),
+                    Err(err) => {
+                        shared.fail(err.clone());
+                        let _ = event_tx.send(AudioEvent::Error(format!(
+                            "{} failed before playback: {}",
+                            label, err
+                        )));
+                        return;
+                    }
                 }
             };
 
@@ -318,8 +388,21 @@ fn spawn_download_worker(
                 };
 
                 let requested_bytes = range.map(|(start, end)| end.saturating_sub(start) + 1);
-                let mut response = match open_http_response(&client, &url, &headers, is_live, range)
-                {
+                let response_result = if is_live {
+                    // Resolve, classify and pin every hop in the actual radio
+                    // connection. Ordinary direct streams therefore do not
+                    // need a separate throwaway content probe first.
+                    crate::stations::network::open_blocking_public_stream(&url, &headers)
+                } else {
+                    open_http_response(
+                        client.as_ref().expect("non-live client exists"),
+                        &url,
+                        &headers,
+                        false,
+                        range,
+                    )
+                };
+                let mut response = match response_result {
                     Ok(response) => response,
                     Err(err) => {
                         shared.fail(err.clone());
@@ -400,7 +483,6 @@ fn spawn_download_worker(
     Ok(())
 }
 
-#[cfg(not(target_os = "ios"))]
 fn spawn_ffmpeg_transcode_worker(
     url: String,
     headers: HashMap<String, String>,
@@ -412,6 +494,9 @@ fn spawn_ffmpeg_transcode_worker(
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<(), String> {
+    if ffmpeg_tracker().lock().quiescing {
+        return Err("Audio transcoding is shutting down for app exit".to_string());
+    }
     let ffmpeg = find_binary("ffmpeg").ok_or_else(|| {
         "ffmpeg is required for progressive YouTube playback but was not found".to_string()
     })?;
@@ -420,6 +505,12 @@ fn spawn_ffmpeg_transcode_worker(
         .name("ffmpeg-stream-transcode".to_string())
         .spawn(move || {
             let mut command = Command::new(ffmpeg);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                command.creation_flags(CREATE_NO_WINDOW);
+            }
             command
                 .arg("-hide_banner")
                 .arg("-loglevel")
@@ -456,10 +547,10 @@ fn spawn_ffmpeg_transcode_worker(
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
-            let mut child = match command.spawn() {
-                Ok(child) => child,
+            let (child, _tracked_child) = match spawn_tracked_ffmpeg(&mut command) {
+                Ok(tracked) => tracked,
                 Err(err) => {
-                    let message = format!("Failed to start ffmpeg: {}", err);
+                    let message = err.to_string();
                     shared.fail(message.clone());
                     let _ = event_tx.send(AudioEvent::Error(format!(
                         "{} failed before playback: {}",
@@ -469,16 +560,15 @@ fn spawn_ffmpeg_transcode_worker(
                 }
             };
 
-            let Some(mut stdout) = child.stdout.take() else {
-                let _ = child.kill();
-                let _ = child.wait();
+            let Some(mut stdout) = child.lock().stdout.take() else {
+                stop_ffmpeg_child(&child);
                 let message = "Failed to capture ffmpeg audio output".to_string();
                 shared.fail(message.clone());
                 let _ = event_tx.send(AudioEvent::Error(format!("{} failed: {}", label, message)));
                 return;
             };
 
-            let stderr_reader = child.stderr.take().map(|mut stderr| {
+            let stderr_reader = child.lock().stderr.take().map(|mut stderr| {
                 std::thread::spawn(move || {
                     let mut output = String::new();
                     let _ = stderr.read_to_string(&mut output);
@@ -489,8 +579,7 @@ fn spawn_ffmpeg_transcode_worker(
             let mut chunk = [0u8; 64 * 1024];
             loop {
                 if playback_session.load(Ordering::SeqCst) != session_id {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop_ffmpeg_child(&child);
                     shared.cancel();
                     return;
                 }
@@ -499,8 +588,7 @@ fn spawn_ffmpeg_transcode_worker(
                     Ok(0) => break,
                     Ok(bytes_read) => {
                         if let Err(err) = writer.write_all(&chunk[..bytes_read]) {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            stop_ffmpeg_child(&child);
                             let message = format!("Failed to write ffmpeg stream buffer: {}", err);
                             shared.fail(message.clone());
                             let _ = event_tx
@@ -510,8 +598,7 @@ fn spawn_ffmpeg_transcode_worker(
                         shared.append_bytes(bytes_read as u64);
                     }
                     Err(err) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        stop_ffmpeg_child(&child);
                         let message = format!("Failed to read ffmpeg audio output: {}", err);
                         shared.fail(message.clone());
                         let _ = event_tx
@@ -521,7 +608,7 @@ fn spawn_ffmpeg_transcode_worker(
                 }
             }
 
-            let status = child.wait();
+            let status = child.lock().wait();
             let stderr_output = stderr_reader
                 .and_then(|handle| handle.join().ok())
                 .unwrap_or_default();
@@ -676,20 +763,11 @@ pub fn prepare_http_audio_source(
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
-    // Some Radio Browser entries store an .m3u/.pls playlist URL instead of the
-    // direct stream URL. Resolve playlists to the actual stream so the audio
-    // decoder gets MP3/AAC bytes, not playlist text.
-    let resolved_url = if is_live {
-        resolve_playlist_url_blocking(&url).unwrap_or(url)
-    } else {
-        url
-    };
-
     let (writer, reader) = create_unlinked_stream_file()?;
     let shared = Arc::new(SharedBufferedFile::new(reader));
 
     spawn_download_worker(
-        resolved_url,
+        url,
         headers,
         writer,
         Arc::clone(&shared),
@@ -703,78 +781,6 @@ pub fn prepare_http_audio_source(
     prepare_buffered_decoder(shared, initial_buffer_bytes, is_live)
 }
 
-/// If `url` points to a playlist (.m3u, .m3u8, .pls), fetch it, parse the first
-/// stream URL, and return that. Returns `None` if the URL is already a direct
-/// stream or playlist parsing fails. Blocking — call from the prepare thread.
-fn resolve_playlist_url_blocking(url: &str) -> Option<String> {
-    let lower = url.to_ascii_lowercase();
-    let looks_like_playlist = lower.ends_with(".m3u")
-        || lower.ends_with(".m3u8")
-        || lower.ends_with(".pls")
-        || lower.ends_with(".asx");
-
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .ok()?;
-
-    let response = client
-        .get(url)
-        .header("User-Agent", "mewsik/0.1")
-        .send()
-        .ok()?;
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    let is_playlist_response = content_type.contains("mpegurl")
-        || content_type.contains("scpls")
-        || content_type.contains("x-mpegurl")
-        || content_type.contains("application/pls")
-        || content_type.starts_with("text/")
-        || content_type.starts_with("application/xml");
-
-    if !looks_like_playlist && !is_playlist_response {
-        return None;
-    }
-
-    let text = response.text().ok()?;
-    parse_first_stream_url(&text)
-}
-
-/// Parses an M3U / M3U8 / PLS playlist body and returns the first non-comment
-/// URL found. Skips `#EXT...` directives and `[playlist]` headers.
-fn parse_first_stream_url(playlist_text: &str) -> Option<String> {
-    for raw_line in playlist_text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
-            continue;
-        }
-
-        // .pls format: `File1=http://...` — extract the value after `=`.
-        let candidate = if let Some((key, value)) = line.split_once('=') {
-            if key.trim().to_ascii_lowercase().starts_with("file") {
-                value.trim()
-            } else {
-                continue;
-            }
-        } else {
-            line
-        };
-
-        if candidate.starts_with("http://") || candidate.starts_with("https://") {
-            return Some(candidate.to_string());
-        }
-    }
-    None
-}
-
-#[cfg(not(target_os = "ios"))]
 pub fn prepare_ffmpeg_audio_source(
     url: String,
     headers: HashMap<String, String>,

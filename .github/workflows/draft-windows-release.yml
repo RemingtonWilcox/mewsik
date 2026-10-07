@@ -1,0 +1,155 @@
+name: Draft signed Windows release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: New stable X.Y.Z version already present in all four app manifests
+        required: true
+        type: string
+      confirmation:
+        description: Type CREATE DRAFT vX.Y.Z exactly
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: mewsik-windows-release
+  cancel-in-progress: false
+
+jobs:
+  draft-windows-release:
+    name: Validate, sign, and create draft
+    runs-on: windows-2025
+    environment: release
+    permissions:
+      contents: write
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out the selected release commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 10.11.0
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Install locked JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Verify release contract without writing config
+        run: pnpm release:preflight
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          MEWSIK_UPDATER_PUBLIC_KEY: ${{ vars.MEWSIK_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+
+      - name: Reject an existing release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: v${{ inputs.version }}
+        run: |
+          git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release tag $env:RELEASE_TAG already exists. Versions are immutable."
+          }
+          if ($LASTEXITCODE -ne 2) {
+            throw "Could not verify whether release tag $env:RELEASE_TAG exists."
+          }
+
+      - name: Prove updater public and private keys match
+        run: pnpm release:verify-keypair
+        env:
+          MEWSIK_UPDATER_PUBLIC_KEY: ${{ vars.MEWSIK_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Run application quality gates
+        run: |
+          pnpm version:check
+          pnpm check
+          cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install chromium
+
+      - name: Run browser end-to-end tests
+        run: pnpm test:e2e
+
+      - name: Install pinned Azure Artifact Signing client
+        run: cargo install artifact-signing-cli --version 0.11.0 --locked
+
+      - name: Generate credential-free Tauri release overlay
+        run: pnpm release:config
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          MEWSIK_UPDATER_PUBLIC_KEY: ${{ vars.MEWSIK_UPDATER_PUBLIC_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.AZURE_ARTIFACT_SIGNING_ENDPOINT }}
+          AZURE_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.AZURE_ARTIFACT_SIGNING_ACCOUNT }}
+          AZURE_ARTIFACT_SIGNING_PROFILE: ${{ vars.AZURE_ARTIFACT_SIGNING_PROFILE }}
+
+      - name: Build signed updater artifacts and create a GitHub draft
+        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # action-v1.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MEWSIK_UPDATE_CHANNEL: stable
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        with:
+          tauriScript: pnpm tauri
+          tagName: v__VERSION__
+          releaseName: mewsik v__VERSION__
+          releaseBody: |
+            Windows x64 release candidate. Keep this draft until the signed installer,
+            updater signature, latest.json, upgrade safety, and clean-machine behavior
+            have all been manually reviewed.
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --bundles nsis --config src-tauri/tauri.release.generated.conf.json

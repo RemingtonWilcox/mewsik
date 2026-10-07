@@ -76,8 +76,10 @@
 		return () => clearTimeout(debounceTimer);
 	});
 
-	function handleSelect(recordingId: string) {
-		player.play(recordingId);
+	function handleSelect(index: number) {
+		const ids = results.map((result) => result.recording_id);
+		if (index < 0 || index >= ids.length) return;
+		void player.playAll(ids, index);
 		open = false;
 		query = '';
 	}
@@ -99,10 +101,10 @@
 		<Command.Empty>No results found.</Command.Empty>
 		{#if results.length > 0}
 			<Command.Group heading="Songs">
-				{#each results as result}
+				{#each results as result, index}
 					<Command.Item
 						value={result.title}
-						onSelect={() => handleSelect(result.recording_id)}
+						onSelect={() => handleSelect(index)}
 					>
 						<Music class="mr-2 size-4" />
 						<div class="flex flex-col">

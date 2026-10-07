@@ -1,11 +1,11 @@
+pub mod analysis;
 pub mod discovery;
-#[cfg(not(target_os = "ios"))]
 pub mod downloads;
-#[cfg(not(target_os = "ios"))]
 pub mod external_search;
 pub mod library;
 pub mod playback;
 pub mod playlists;
+pub mod release;
 pub mod search;
 pub mod settings;
 pub mod smart_playlists;

@@ -5,34 +5,94 @@
 	import PlayerBar from '$lib/components/player/player-bar.svelte';
 	import CommandSearch from '$lib/components/search/command-search.svelte';
 	import MobileLayout from '$lib/components/mobile/mobile-layout.svelte';
-	import { SidebarProvider, SidebarInset } from '$lib/components/ui/sidebar';
-	import { ModeWatcher } from 'mode-watcher';
+	import UpdateNotice from '$lib/components/update/update-notice.svelte';
+	import VisualizerHost from '$lib/components/visualizer/visualizer-host.svelte';
+	import { useAppUpdater } from '$lib/state/app-updater.svelte';
+	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+	import { page } from '$app/state';
+	import {
+		SidebarProvider,
+		SidebarInset
+	} from '$lib/components/ui/sidebar';
+	import { ModeWatcher } from 'mode-watcher';
+	import { onMount } from 'svelte';
 
 	let { children } = $props();
+	const visualizer = useVisualizer();
+	const updater = useAppUpdater();
 
-	// Mobile breakpoint matches Tailwind's `md` (768px). iOS phones always
-	// match this; iPad portrait does too.
+	// Mobile breakpoint matches Tailwind's `md` (768px). Phones always match
+	// this; iPad portrait does too.
 	const isMobile = new IsMobile();
+
+	onMount(() => {
+		updater.startLaunchCheck();
+	});
+
+	const isVisualizerLab = $derived(page.url.pathname.startsWith('/visualizer-test'));
+
+	const interactiveKeyboardTarget = [
+		'a[href]',
+		'button',
+		'input',
+		'textarea',
+		'select',
+		'summary',
+		'audio[controls]',
+		'video[controls]',
+		'[contenteditable]:not([contenteditable="false"])',
+		'[tabindex]:not([tabindex="-1"])',
+		'[role="button"]',
+		'[role="link"]',
+		'[role="checkbox"]',
+		'[role="radio"]',
+		'[role="switch"]',
+		'[role="slider"]',
+		'[role="spinbutton"]',
+		'[role="scrollbar"]',
+		'[role="textbox"]',
+		'[role="searchbox"]',
+		'[role="combobox"]',
+		'[role="listbox"]',
+		'[role="option"]',
+		'[role="menuitem"]',
+		'[role="menuitemcheckbox"]',
+		'[role="menuitemradio"]',
+		'[role="tab"]',
+		'[role="treeitem"]',
+		'[role="gridcell"]',
+		'[role="row"]',
+		'[role="rowheader"]',
+		'[role="columnheader"]'
+	].join(',');
+
+	function isInteractiveKeyboardTarget(event: KeyboardEvent): boolean {
+		return event
+			.composedPath()
+			.some((node) => node instanceof Element && node.matches(interactiveKeyboardTarget));
+	}
 </script>
 
 <ModeWatcher />
 
 <svelte:window
 	onkeydown={(e) => {
-		const target = e.target as HTMLElement;
-		const isInput =
-			target.tagName === 'INPUT' ||
-			target.tagName === 'TEXTAREA' ||
-			target.isContentEditable;
-
 		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
 			e.preventDefault();
+			if (visualizer.active) return;
 			const event = new CustomEvent('toggle-command', { bubbles: true });
 			window.dispatchEvent(event);
+			return;
 		}
 
-		if (!isInput && e.key === ' ') {
+		if (
+			e.key === ' ' &&
+			!e.altKey &&
+			!e.ctrlKey &&
+			!e.metaKey &&
+			!isInteractiveKeyboardTarget(e)
+		) {
 			e.preventDefault();
 			const event = new CustomEvent('toggle-playback', { bubbles: true });
 			window.dispatchEvent(event);
@@ -40,13 +100,22 @@
 	}}
 />
 
-{#if isMobile.current}
+{#if isVisualizerLab}
+	{@render children()}
+{:else if isMobile.current}
 	<MobileLayout>
 		{@render children()}
 	</MobileLayout>
+	<Toaster />
 {:else}
 	<div class="flex h-screen flex-col">
-		<div class="flex flex-1 overflow-hidden">
+		<div
+			data-app-content
+			class="flex flex-1 overflow-hidden"
+			inert={visualizer.active}
+			aria-hidden={visualizer.active ? 'true' : undefined}
+		>
+			<UpdateNotice />
 			<SidebarProvider>
 				<AppSidebar />
 				<SidebarInset>
@@ -58,7 +127,8 @@
 		</div>
 		<PlayerBar />
 	</div>
-{/if}
 
-<CommandSearch />
-<Toaster />
+	<CommandSearch />
+	<VisualizerHost />
+	<Toaster />
+{/if}

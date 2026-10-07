@@ -5,50 +5,60 @@
 <h1 align="center">mewsik</h1>
 
 <p align="center">
-  A free, open-source desktop music player that searches and plays music from YouTube, SoundCloud, and Bandcamp in one place. Built with Tauri, Svelte, and Rust.
+  An open-source desktop music player and visualizer prototype built with Tauri, Svelte, and Rust.
 </p>
 
 <p align="center">
-  <a href="https://github.com/RemingtonWilcox/mewsik/releases/latest">Download for macOS</a>
+  <a href="https://github.com/RemingtonWilcox/mewsik/releases">Release history and signing status</a>
 </p>
 
 ---
 
-## Features
+## Prototype features
 
-- **Search everything at once** - YouTube, SoundCloud, and Bandcamp results in a single search
-- **Stream instantly** - Click a song and it plays, no account needed
-- **Build your library** - Save songs to your library, download for offline playback
+- **Experimental provider search** - Local development builds aggregate YouTube, SoundCloud, and Bandcamp, but those unofficial integrations are not approved for distribution and are blocked by the release gate
+- **Local music library** - Scan and play user-owned files with playlists and listening history
 - **Radio stations** - Browse 30,000+ internet radio stations by genre
 - **Discover** - Listening stats, recently played, and personalized recommendations
 - **Playlists** - Create and manage playlists from any source
+- **Audio-reactive visuals** - Prism, Soma, and Signal engines with shared musical analysis
 - **Keyboard shortcuts** - `Cmd+K` for quick search, `Space` for play/pause
 
 ## Screenshot
 
 <img src="docs/screenshot.png" alt="mewsik screenshot" width="800">
 
-## Install
+## Install (early beta)
 
-### macOS (Apple Silicon)
+There is not yet a current signed public installer. The existing `v0.1.0` release is a legacy Mac artifact, not the reviewed Windows/macOS bootstrap described below. The release workflow is fail-closed while the prototype's unofficial YouTube, SoundCloud, and Bandcamp search/playback/download paths are replaced, licensed, or disabled for distributed builds. This repository builds native Windows and macOS applications, but the public release process is still being hardened. Check each GitHub release for its exact supported platforms and signing status. Version 0.1 cannot update itself, so moving to the first signed updater-capable release is a one-time manual install. Signed stable Windows releases built by the protected release workflow can then check for newer signed releases and offer an opt-in update in Settings. Local, source-built, unsigned, and current macOS builds keep the updater disabled and are updated manually.
 
-Download the latest `.dmg` from the [Releases page](https://github.com/RemingtonWilcox/mewsik/releases/latest):
+### Windows 10/11 (x64)
 
-**[mewsik_0.1.0_aarch64.dmg](https://github.com/RemingtonWilcox/mewsik/releases/download/v0.1.0/mewsik_0.1.0_aarch64.dmg)**
+Use the `*_x64-setup.exe` NSIS installer when one is attached to a release. It uses a normal setup wizard, installs for the signed-in Windows user under `%LOCALAPPDATA%`, and does not require an administrator account. The app chooses that user's Windows Music folder for downloads by default; no username or machine-specific path is hard-coded.
+
+Current local Windows builds are unsigned. Windows SmartScreen will normally show an unknown-publisher warning until the release is Authenticode-signed and has established reputation. Do not represent an unsigned friend build as a trusted public release.
+
+### macOS 13.5+
+
+Use the signed and notarized `.dmg` for the Mac's processor when one is attached to the [Releases page](https://github.com/RemingtonWilcox/mewsik/releases/latest):
+
+- `aarch64` for Apple Silicon
+- `x64` for Intel
 
 1. Download the `.dmg`
 2. Open it and drag **mewsik** to your Applications folder
-3. On first launch, macOS may block it - right-click the app and select **Open**, then click **Open** in the dialog
+3. Launch **mewsik** from Applications
 
-> **Note:** This release is for Apple Silicon Macs (M1/M2/M3/M4). Intel Mac and Windows support coming soon.
+If macOS says it cannot verify the developer, that artifact did not pass the current release process. Verify the release notes rather than bypassing Gatekeeper for a general public install.
 
 ### Build from Source
 
 #### Prerequisites
 
-- [Node.js](https://nodejs.org/) v20+
-- [pnpm](https://pnpm.io/) v9+
-- [Rust](https://rustup.rs/) (latest stable)
+- [Node.js](https://nodejs.org/) 24.15.0 (also pinned in `.node-version`)
+- [pnpm](https://pnpm.io/) 10.11.0
+- [Rust](https://rustup.rs/) (`rust-toolchain.toml` installs the pinned toolchain)
+- Windows: Microsoft C++ Build Tools and WebView2 development prerequisites
 - macOS: Xcode Command Line Tools (`xcode-select --install`)
 
 #### Steps
@@ -59,7 +69,7 @@ git clone https://github.com/RemingtonWilcox/mewsik.git
 cd mewsik
 
 # Install dependencies
-pnpm install
+pnpm install --frozen-lockfile
 
 # Run in development mode
 pnpm tauri:dev
@@ -68,7 +78,15 @@ pnpm tauri:dev
 pnpm tauri:build
 ```
 
-The built app will be at `src-tauri/target/release/bundle/macos/mewsik.app` and the installer DMG at `src-tauri/target/release/bundle/dmg/`.
+Windows installers are written to `src-tauri/target/release/bundle/nsis/` and `src-tauri/target/release/bundle/msi/`. Native macOS app bundles and DMGs are written to `src-tauri/target/release/bundle/macos/` and `src-tauri/target/release/bundle/dmg/`. The self-contained runtime packaging step intentionally rejects cross-platform and cross-architecture builds.
+
+For the complete signing, notarization, versioning, upgrade-safety, and release checklist, see [docs/releasing.md](docs/releasing.md).
+
+## User data and downloads
+
+mewsik resolves folders for the currently signed-in operating-system user. On Windows, private library data is under `%APPDATA%\mewsik\mewsik\data`; on macOS it is under `~/Library/Application Support/app.mewsik.mewsik`. New downloads default to the user's `Music/Mewsik` folder (or the operating system's Downloads folder if Music is unavailable), and the location can be changed in Settings.
+
+Installing a newer build does not intentionally remove the SQLite library, settings, or downloaded music. Before a database schema migration, the app now creates a consistent backup next to the database and retains the three newest migration backups.
 
 ## Tech Stack
 

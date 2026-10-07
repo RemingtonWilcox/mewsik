@@ -16,8 +16,12 @@
 		if (downloadingIds.has(track.id)) return;
 		downloadingIds = new Set([...downloadingIds, track.id]);
 		try {
-			await api.downloadRecording(track.id);
-			toast.success(`Download queued: ${track.title}`);
+			const started = await api.downloadRecording(track.id);
+			if (started.already_active || !started.directory) {
+				toast.message(`Download already queued: ${track.title}`);
+			} else {
+				toast.success(`Download queued: ${track.title} · Saving to ${started.directory}`);
+			}
 		} catch (e) {
 			toast.error(`Failed to download: ${e}`);
 		} finally {

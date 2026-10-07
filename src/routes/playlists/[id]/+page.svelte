@@ -167,16 +167,13 @@
 		}
 	}
 
-	function shuffleTracks(): string[] {
-		return [...tracks]
-			.sort(() => Math.random() - 0.5)
-			.map((track) => track.id);
-	}
-
 	async function playPlaylist(shuffle = false) {
 		if (tracks.length === 0) return;
-		const ids = shuffle ? shuffleTracks() : tracks.map((track) => track.id);
+		const ids = tracks.map((track) => track.id);
 		await player.playAll(ids, 0);
+		if (player.state.is_shuffle !== shuffle) {
+			await player.toggleShuffle();
+		}
 	}
 </script>
 
