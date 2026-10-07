@@ -1569,6 +1569,324 @@ pub fn get_local_file_for_recording(
     }
 }
 
+// ── Scene station cache (station discovery) ──
+
+/// One cached radio-browser row for a discovery scene.
+#[derive(Debug, Clone)]
+pub struct SceneStationRow {
+    pub scene_id: String,
+    pub station_uuid: String,
+    pub name: String,
+    pub url: String,
+    pub url_resolved: Option<String>,
+    pub homepage: Option<String>,
+    pub favicon: Option<String>,
+    pub country: Option<String>,
+    pub countrycode: Option<String>,
+    pub language: Option<String>,
+    pub tags: Option<String>,
+    pub codec: Option<String>,
+    pub bitrate: Option<i32>,
+    pub votes: i64,
+    pub clickcount: i64,
+    pub clicktrend: i64,
+    pub fetched_at: String,
+    pub fail_count: i32,
+    pub last_checked_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneRefreshRow {
+    pub scene_id: String,
+    pub refreshed_at: String,
+    pub station_count: i64,
+}
+
+/// One radio play joined to its saved station, for history signals.
+#[derive(Debug, Clone)]
+pub struct StationPlayRow {
+    pub station: Station,
+    pub listened_ms: i64,
+    pub end_reason: Option<String>,
+    pub started_at: String,
+}
+
+/// The `scene_refresh` row that stores the per-install shuffle salt. It is
+/// never a real scene id, so cadence queries filter it out.
+pub const INSTALL_SALT_SCENE_ID: &str = "_salt";
+
+const SCENE_STATION_COLUMNS: &str = "scene_id, station_uuid, name, url, url_resolved, homepage, favicon, country, countrycode, language, tags, codec, bitrate, votes, clickcount, clicktrend, fetched_at, fail_count, last_checked_at";
+
+fn scene_station_from_row(row: &rusqlite::Row<'_>) -> Result<SceneStationRow, rusqlite::Error> {
+    Ok(SceneStationRow {
+        scene_id: row.get(0)?,
+        station_uuid: row.get(1)?,
+        name: row.get(2)?,
+        url: row.get(3)?,
+        url_resolved: row.get(4)?,
+        homepage: row.get(5)?,
+        favicon: row.get(6)?,
+        country: row.get(7)?,
+        countrycode: row.get(8)?,
+        language: row.get(9)?,
+        tags: row.get(10)?,
+        codec: row.get(11)?,
+        bitrate: row.get(12)?,
+        votes: row.get(13)?,
+        clickcount: row.get(14)?,
+        clicktrend: row.get(15)?,
+        fetched_at: row.get(16)?,
+        fail_count: row.get(17)?,
+        last_checked_at: row.get(18)?,
+    })
+}
+
+/// Insert or refresh cached rows in one transaction. Directory metadata is
+/// replaced; the local health columns (`fail_count`, `last_checked_at`)
+/// survive so a known-bad stream is not silently rehabilitated by a refresh.
+pub fn upsert_scene_stations(db: &DbPool, rows: &[SceneStationRow]) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    let transaction = conn.unchecked_transaction()?;
+    {
+        let mut stmt = transaction.prepare(
+            "INSERT INTO scene_stations (scene_id, station_uuid, name, url, url_resolved, homepage, favicon, country, countrycode, language, tags, codec, bitrate, votes, clickcount, clicktrend, fetched_at, fail_count, last_checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, 0, NULL)
+             ON CONFLICT(scene_id, station_uuid) DO UPDATE SET
+               name = excluded.name,
+               url = excluded.url,
+               url_resolved = excluded.url_resolved,
+               homepage = excluded.homepage,
+               favicon = excluded.favicon,
+               country = excluded.country,
+               countrycode = excluded.countrycode,
+               language = excluded.language,
+               tags = excluded.tags,
+               codec = excluded.codec,
+               bitrate = excluded.bitrate,
+               votes = excluded.votes,
+               clickcount = excluded.clickcount,
+               clicktrend = excluded.clicktrend,
+               fetched_at = excluded.fetched_at",
+        )?;
+        for row in rows {
+            stmt.execute(params![
+                row.scene_id,
+                row.station_uuid,
+                row.name,
+                row.url,
+                row.url_resolved,
+                row.homepage,
+                row.favicon,
+                row.country,
+                row.countrycode,
+                row.language,
+                row.tags,
+                row.codec,
+                row.bitrate,
+                row.votes,
+                row.clickcount,
+                row.clicktrend,
+                row.fetched_at,
+            ])?;
+        }
+    }
+    transaction.commit()
+}
+
+/// Every station uuid currently in the cache, across all scenes.
+pub fn get_cached_scene_station_uuids(
+    db: &DbPool,
+) -> Result<std::collections::HashSet<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare("SELECT DISTINCT station_uuid FROM scene_stations")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect()
+}
+
+/// Delete rows of a scene that the directory no longer returned and that have
+/// already failed three checks. Returns the number of deleted rows.
+pub fn prune_scene_stations(
+    db: &DbPool,
+    scene_id: &str,
+    keep_uuids: &std::collections::HashSet<String>,
+) -> Result<usize, rusqlite::Error> {
+    let conn = db.lock();
+    let stale: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT station_uuid FROM scene_stations WHERE scene_id = ?1 AND fail_count >= 3",
+        )?;
+        let rows = stmt.query_map(params![scene_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut pruned = 0;
+    for uuid in stale {
+        if keep_uuids.contains(&uuid) {
+            continue;
+        }
+        pruned += conn.execute(
+            "DELETE FROM scene_stations WHERE scene_id = ?1 AND station_uuid = ?2",
+            params![scene_id, uuid],
+        )?;
+    }
+    Ok(pruned)
+}
+
+pub fn get_scene_stations_for_scene(
+    db: &DbPool,
+    scene_id: &str,
+) -> Result<Vec<SceneStationRow>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCENE_STATION_COLUMNS} FROM scene_stations WHERE scene_id = ?1 ORDER BY votes DESC, station_uuid"
+    ))?;
+    let rows = stmt.query_map(params![scene_id], scene_station_from_row)?;
+    rows.collect()
+}
+
+pub fn get_all_scene_stations(db: &DbPool) -> Result<Vec<SceneStationRow>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCENE_STATION_COLUMNS} FROM scene_stations ORDER BY scene_id, votes DESC, station_uuid"
+    ))?;
+    let rows = stmt.query_map([], scene_station_from_row)?;
+    rows.collect()
+}
+
+pub fn count_scene_stations(db: &DbPool) -> Result<i64, rusqlite::Error> {
+    let conn = db.lock();
+    conn.query_row("SELECT COUNT(*) FROM scene_stations", [], |row| row.get(0))
+}
+
+/// One row per distinct station, those never or least recently checked first.
+pub fn get_scene_stations_oldest_checked(
+    db: &DbPool,
+    limit: usize,
+) -> Result<Vec<SceneStationRow>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SCENE_STATION_COLUMNS} FROM scene_stations
+         WHERE rowid IN (SELECT MIN(rowid) FROM scene_stations GROUP BY station_uuid)
+         ORDER BY last_checked_at IS NOT NULL, last_checked_at ASC, station_uuid
+         LIMIT ?1"
+    ))?;
+    let rows = stmt.query_map(params![limit as i64], scene_station_from_row)?;
+    rows.collect()
+}
+
+/// Apply a probe outcome to every scene row that shares the station uuid.
+pub fn update_scene_station_health(
+    db: &DbPool,
+    station_uuid: &str,
+    fail_count: i32,
+    checked_at: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE scene_stations SET fail_count = ?1, last_checked_at = ?2 WHERE station_uuid = ?3",
+        params![fail_count, checked_at, station_uuid],
+    )?;
+    Ok(())
+}
+
+pub fn delete_scene_station_by_uuid(
+    db: &DbPool,
+    station_uuid: &str,
+) -> Result<usize, rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "DELETE FROM scene_stations WHERE station_uuid = ?1",
+        params![station_uuid],
+    )
+}
+
+/// Refresh bookkeeping for real scenes (the salt row is excluded).
+pub fn get_scene_refresh_rows(db: &DbPool) -> Result<Vec<SceneRefreshRow>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT scene_id, refreshed_at, station_count FROM scene_refresh WHERE scene_id <> ?1",
+    )?;
+    let rows = stmt.query_map(params![INSTALL_SALT_SCENE_ID], |row| {
+        Ok(SceneRefreshRow {
+            scene_id: row.get(0)?,
+            refreshed_at: row.get(1)?,
+            station_count: row.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn upsert_scene_refresh(
+    db: &DbPool,
+    scene_id: &str,
+    refreshed_at: &str,
+    station_count: i64,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "INSERT INTO scene_refresh (scene_id, refreshed_at, station_count)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(scene_id) DO UPDATE SET
+           refreshed_at = excluded.refreshed_at,
+           station_count = excluded.station_count",
+        params![scene_id, refreshed_at, station_count],
+    )?;
+    Ok(())
+}
+
+/// The per-install salt that seeds the daily shelf shuffle. There is no
+/// generic key/value store, so it lives in `scene_refresh` under a reserved
+/// scene id and is created on first use.
+pub fn get_or_create_install_salt(db: &DbPool) -> Result<String, rusqlite::Error> {
+    let conn = db.lock();
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT refreshed_at FROM scene_refresh WHERE scene_id = ?1",
+            params![INSTALL_SALT_SCENE_ID],
+            |row| row.get(0),
+        )
+        .ok();
+    if let Some(salt) = existing {
+        return Ok(salt);
+    }
+    let salt = new_id();
+    conn.execute(
+        "INSERT OR IGNORE INTO scene_refresh (scene_id, refreshed_at, station_count)
+         VALUES (?1, ?2, 0)",
+        params![INSTALL_SALT_SCENE_ID, salt],
+    )?;
+    conn.query_row(
+        "SELECT refreshed_at FROM scene_refresh WHERE scene_id = ?1",
+        params![INSTALL_SALT_SCENE_ID],
+        |row| row.get(0),
+    )
+}
+
+/// Radio plays started on or after `since` (RFC 3339), each joined to its
+/// saved station so callers can key signals by radio-browser uuid.
+pub fn get_station_play_rows_since(
+    db: &DbPool,
+    since: &str,
+) -> Result<Vec<StationPlayRow>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.name, s.url, s.homepage, s.favicon_url, s.favicon_path, s.country, s.language, s.tags, s.codec, s.bitrate, s.radio_browser_id, s.is_favorite, s.fail_count, s.last_played_at, s.last_checked_at, s.created_at,
+                COALESCE(ph.listened_ms, 0), ph.end_reason, ph.started_at
+         FROM play_history ph
+         JOIN stations s ON s.id = ph.station_id
+         WHERE ph.station_id IS NOT NULL AND ph.started_at >= ?1
+         ORDER BY ph.started_at DESC",
+    )?;
+    let rows = stmt.query_map(params![since], |row| {
+        Ok(StationPlayRow {
+            station: station_from_row(row)?,
+            listened_ms: row.get(17)?,
+            end_reason: row.get(18)?,
+            started_at: row.get(19)?,
+        })
+    })?;
+    rows.collect()
+}
+
 #[cfg(test)]
 mod play_history_tests {
     use super::{finalize_play, record_play};

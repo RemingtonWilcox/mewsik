@@ -1282,6 +1282,12 @@ impl AudioEngine {
         // Last radio station (id, url, name) so pause/resume can restart the
         // live stream and Next/Prev can cycle through favorites.
         let mut last_radio_station: Option<(String, String, String)> = None;
+        // Live streams drop on network changes and server hiccups. When one
+        // ends while the user still wants it, replay the station a few times
+        // with backoff before giving up; attempts reset after stable playback.
+        let mut radio_reconnect_attempts: u32 = 0;
+        let mut radio_reconnect_due: Option<Instant> = None;
+        let mut radio_started_at: Option<Instant> = None;
         let mut last_position_update = Instant::now();
         let mut playback_kind = PlaybackKind::Idle;
         let mut awaiting_source = false;
@@ -1540,6 +1546,8 @@ impl AudioEngine {
                     queue_owner_session.mark_ready(queue.session_id(), &entry.recording_id);
                 }
                 Ok(AudioCommand::PlayUrl(station_id, url, name)) => {
+                    radio_reconnect_due = None;
+                    radio_started_at = None;
                     last_radio_station = Some((station_id.clone(), url.clone(), name.clone()));
                     let session_id = Self::reset_playback_session(
                         &sink,
@@ -1659,9 +1667,11 @@ impl AudioEngine {
                         &mut awaiting_source,
                         desired_playing,
                     );
+                    radio_started_at = Some(Instant::now());
                 }
                 Ok(AudioCommand::Interrupted) => {
                     output_needs_reset = true;
+                    radio_reconnect_due = None;
                     if playback_kind == PlaybackKind::Idle {
                         continue;
                     }
@@ -1680,6 +1690,8 @@ impl AudioEngine {
                     emit_state_changed(&event_tx, s);
                 }
                 Ok(AudioCommand::Pause) => {
+                    radio_reconnect_due = None;
+                    radio_reconnect_attempts = 0;
                     if playback_kind == PlaybackKind::Radio {
                         // Radio is a live HTTP stream: pausing the sink only
                         // stalls the buffer, and resuming later plays stale
@@ -1776,6 +1788,8 @@ impl AudioEngine {
                         }
                         _ => PlayEndReason::Stopped,
                     };
+                    radio_reconnect_due = None;
+                    radio_reconnect_attempts = 0;
                     Self::reset_playback_session(
                         &sink,
                         &playback_session,
@@ -2292,7 +2306,16 @@ impl AudioEngine {
                     );
                     break;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if let Some(due) = radio_reconnect_due {
+                        if Instant::now() >= due {
+                            radio_reconnect_due = None;
+                            if let Some((id, url, name)) = last_radio_station.clone() {
+                                let _ = cmd_tx.send(AudioCommand::PlayUrl(id, url, name));
+                            }
+                        }
+                    }
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
 
@@ -2368,20 +2391,52 @@ impl AudioEngine {
                         && sink.empty()
                         && s.is_playing
                     {
-                        desired_playing = false;
-                        s.is_playing = false;
-                        s.is_buffering = false;
-                        let state_clone = s.clone();
-                        drop(s);
+                        let stable = radio_started_at
+                            .map(|started| started.elapsed() >= Duration::from_secs(15))
+                            .unwrap_or(false);
+                        if stable {
+                            radio_reconnect_attempts = 0;
+                        }
+                        let can_reconnect = desired_playing
+                            && last_radio_station.is_some()
+                            && radio_reconnect_attempts < 3
+                            && radio_reconnect_due.is_none();
+                        if can_reconnect {
+                            radio_reconnect_attempts += 1;
+                            let backoff =
+                                Duration::from_millis(900 * u64::from(radio_reconnect_attempts));
+                            radio_reconnect_due = Some(Instant::now() + backoff);
+                            awaiting_source = true;
+                            s.is_buffering = true;
+                            let state_clone = s.clone();
+                            drop(s);
+                            Self::finalize_active_play(
+                                &db,
+                                &mut active_play,
+                                PlayEndReason::StreamEnded,
+                            );
+                            log::info!(
+                                "radio stream dropped; reconnect attempt {} in {:?}",
+                                radio_reconnect_attempts,
+                                backoff
+                            );
+                            emit_state_changed(&event_tx, state_clone);
+                        } else {
+                            desired_playing = false;
+                            s.is_playing = false;
+                            s.is_buffering = false;
+                            let state_clone = s.clone();
+                            drop(s);
 
-                        Self::finalize_active_play(
-                            &db,
-                            &mut active_play,
-                            PlayEndReason::StreamEnded,
-                        );
+                            Self::finalize_active_play(
+                                &db,
+                                &mut active_play,
+                                PlayEndReason::StreamEnded,
+                            );
 
-                        playback_kind = PlaybackKind::Idle;
-                        emit_state_changed(&event_tx, state_clone);
+                            playback_kind = PlaybackKind::Idle;
+                            emit_state_changed(&event_tx, state_clone);
+                        }
                     }
                 }
                 last_position_update = Instant::now();

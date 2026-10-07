@@ -8,6 +8,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_005,
     MIGRATION_006,
     MIGRATION_007,
+    MIGRATION_008,
 ];
 
 const MIGRATION_001: &str = r#"
@@ -357,6 +358,40 @@ ALTER TABLE discovery_observations ADD COLUMN view_count INTEGER
     CHECK (view_count IS NULL OR view_count >= 0);
 "#;
 
+const MIGRATION_008: &str = r#"
+-- Station discovery cache: radio-browser rows pulled per scene (genre family
+-- or mood), refreshed daily and health-swept. Favorites live in `stations`;
+-- this table only ever holds the directory cache.
+CREATE TABLE IF NOT EXISTS scene_stations (
+    scene_id        TEXT NOT NULL,
+    station_uuid    TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    url             TEXT NOT NULL,
+    url_resolved    TEXT,
+    homepage        TEXT,
+    favicon         TEXT,
+    country         TEXT,
+    countrycode     TEXT,
+    language        TEXT,
+    tags            TEXT,
+    codec           TEXT,
+    bitrate         INTEGER,
+    votes           INTEGER NOT NULL DEFAULT 0,
+    clickcount      INTEGER NOT NULL DEFAULT 0,
+    clicktrend      INTEGER NOT NULL DEFAULT 0,
+    fetched_at      TEXT NOT NULL,
+    fail_count      INTEGER NOT NULL DEFAULT 0,
+    last_checked_at TEXT,
+    PRIMARY KEY (scene_id, station_uuid)
+);
+CREATE INDEX IF NOT EXISTS idx_scene_stations_uuid ON scene_stations(station_uuid);
+CREATE TABLE IF NOT EXISTS scene_refresh (
+    scene_id     TEXT PRIMARY KEY,
+    refreshed_at TEXT NOT NULL,
+    station_count INTEGER NOT NULL
+);
+"#;
+
 pub(crate) fn latest_version() -> i64 {
     MIGRATIONS.len() as i64
 }
@@ -504,7 +539,26 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
+    }
+
+    #[test]
+    fn scene_cache_tables_exist_after_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        for table in ["scene_stations", "scene_refresh"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1
+                     )",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{table} should exist");
+        }
     }
 
     #[test]
