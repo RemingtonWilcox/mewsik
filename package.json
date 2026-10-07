@@ -37,7 +37,7 @@
     "@sveltejs/kit": "^2.69.2",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@tailwindcss/vite": "^4.2.2",
-    "@tauri-apps/cli": "^2.10.1",
+    "@tauri-apps/cli": "^2.11.1",
     "@types/node": "^25.5.0",
     "@webgpu/types": "^0.1.70",
     "bits-ui": "^2.16.4",
@@ -67,7 +67,7 @@
   "dependencies": {
     "@crabnebula/tauri-plugin-drag": "2.1.0",
     "@lucide/svelte": "^1.7.0",
-    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.4.2",
     "@tauri-apps/plugin-process": "2.3.1",
     "@tauri-apps/plugin-updater": "2.10.1",
