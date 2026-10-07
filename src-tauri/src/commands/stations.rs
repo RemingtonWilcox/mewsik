@@ -10,7 +10,7 @@ use crate::stations::health::{
 };
 use crate::stations::network::{parse_public_http_url, validate_public_http_url};
 use crate::stations::probe::{probe_station_stream, url_looks_like_playlist};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::State;
 
@@ -703,4 +703,82 @@ mod tests {
         assert_eq!(raw_offset, 83);
         assert_eq!(next_offset, 83);
     }
+}
+
+/// One entry of `resources/seed_favorite_stations.json`, the favorites list
+/// bundled into mobile builds so a fresh install is not empty.
+#[derive(Debug, Deserialize)]
+struct SeedStation {
+    name: String,
+    url: String,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    favicon_url: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    codec: Option<String>,
+    #[serde(default)]
+    bitrate: Option<i32>,
+    #[serde(default)]
+    radio_browser_id: Option<String>,
+}
+
+/// Upserts the bundled seed stations as favorites. Skipped when the device
+/// already holds at least half as many favorites as the seed list, so a
+/// user's own list is never clobbered. Returns the number added.
+#[tauri::command]
+pub fn seed_favorite_stations_from_bundle(
+    app: tauri::AppHandle,
+    db: State<'_, DbPool>,
+) -> Result<usize, String> {
+    use tauri::Manager;
+    let resource_path = app
+        .path()
+        .resolve(
+            "seed_favorite_stations.json",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("seed file not bundled: {}", e))?;
+
+    let contents = std::fs::read_to_string(&resource_path)
+        .map_err(|e| format!("failed to read seed file: {}", e))?;
+    let stations: Vec<SeedStation> =
+        serde_json::from_str(&contents).map_err(|e| format!("invalid seed json: {}", e))?;
+
+    let existing = queries::get_favorite_stations(&db).map_err(|e| e.to_string())?;
+    if !existing.is_empty() && existing.len() >= stations.len() / 2 {
+        return Ok(0);
+    }
+    let existing_urls: std::collections::HashSet<String> =
+        existing.iter().map(|s| s.url.clone()).collect();
+
+    let mut added = 0;
+    for s in stations {
+        if existing_urls.contains(&s.url) {
+            continue;
+        }
+        upsert_station(
+            &db,
+            s.name,
+            s.url,
+            s.homepage,
+            s.favicon_url,
+            s.country,
+            s.language,
+            s.tags,
+            s.codec,
+            s.bitrate,
+            s.radio_browser_id,
+            true,
+            None,
+        )?;
+        added += 1;
+    }
+    Ok(added)
 }

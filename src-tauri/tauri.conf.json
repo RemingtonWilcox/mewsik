@@ -33,7 +33,8 @@
     "targets": "all",
     "resources": {
       "../sidecar/dist/index.cjs": "sidecar/dist/index.cjs",
-      "resources/bin/": "bin/"
+      "resources/bin/": "bin/",
+      "resources/seed_favorite_stations.json": "seed_favorite_stations.json"
     },
     "macOS": {
       "minimumSystemVersion": "13.5"

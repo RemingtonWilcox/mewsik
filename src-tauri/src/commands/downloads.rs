@@ -238,6 +238,10 @@ fn resolve_completed_download_path(db: &DbPool, download_id: &str) -> Result<Pat
     Ok(file_path)
 }
 
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows")),
+    allow(unused_variables)
+)]
 fn reveal_file(
     file_path: &std::path::Path,
     _containing_folder: &std::path::Path,

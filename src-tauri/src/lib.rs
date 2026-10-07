@@ -81,10 +81,9 @@ pub fn run() {
     ));
     let startup_db = db.clone();
 
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_drag::init())
-        .plugin(tauri_plugin_process::init())
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
@@ -92,15 +91,24 @@ pub fn run() {
                 .build(),
         );
 
-    // A local/source build intentionally has no updater key or endpoint. The
-    // updater plugin treats a missing config as an initialization error, so it
-    // must only be registered in the guarded release build that supplies both
-    // the generated config and this compile-time channel marker.
-    if option_env!("MEWSIK_UPDATE_CHANNEL")
-        .map(str::trim)
-        .is_some_and(|channel| !channel.is_empty())
+    // Drag, process restart and the updater have no mobile implementation.
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+        builder = builder
+            .plugin(tauri_plugin_drag::init())
+            .plugin(tauri_plugin_process::init());
+
+        // A local/source build intentionally has no updater key or endpoint.
+        // The updater plugin treats a missing config as an initialization
+        // error, so it must only be registered in the guarded release build
+        // that supplies both the generated config and this compile-time
+        // channel marker.
+        if option_env!("MEWSIK_UPDATE_CHANNEL")
+            .map(str::trim)
+            .is_some_and(|channel| !channel.is_empty())
+        {
+            builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+        }
     }
 
     let app = builder
@@ -213,6 +221,7 @@ pub fn run() {
             commands::stations::toggle_station_favorite,
             commands::stations::play_station,
             commands::stations::play_station_search_result,
+            commands::stations::seed_favorite_stations_from_bundle,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

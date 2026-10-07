@@ -4,10 +4,12 @@
 	import AppSidebar from '$lib/components/app-sidebar.svelte';
 	import PlayerBar from '$lib/components/player/player-bar.svelte';
 	import CommandSearch from '$lib/components/search/command-search.svelte';
+	import MobileLayout from '$lib/components/mobile/mobile-layout.svelte';
 	import UpdateNotice from '$lib/components/update/update-notice.svelte';
 	import VisualizerHost from '$lib/components/visualizer/visualizer-host.svelte';
 	import { useAppUpdater } from '$lib/state/app-updater.svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { page } from '$app/state';
 	import {
 		SidebarProvider,
@@ -19,6 +21,10 @@
 	let { children } = $props();
 	const visualizer = useVisualizer();
 	const updater = useAppUpdater();
+
+	// Mobile breakpoint matches Tailwind's `md` (768px). Phones always match
+	// this; iPad portrait does too.
+	const isMobile = new IsMobile();
 
 	onMount(() => {
 		updater.startLaunchCheck();
@@ -96,6 +102,11 @@
 
 {#if isVisualizerLab}
 	{@render children()}
+{:else if isMobile.current}
+	<MobileLayout>
+		{@render children()}
+	</MobileLayout>
+	<Toaster />
 {:else}
 	<div class="flex h-screen flex-col">
 		<div
