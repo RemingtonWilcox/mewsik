@@ -17,7 +17,8 @@ export const LOOM_UNIFORM_GROUPS = [
 	['camera', ['yaw', 'pitch', 'distance', 'roll']],
 	['cloth', ['beatConveyor', 'swayPhase', 'weftSparse', 'driftPhase']],
 	['style', ['warpRadius', 'weftRadius', 'glow', 'silence']],
-	['harmony', ['seedHi', 'seedLo', 'key', 'mode']]
+	['harmony', ['seedHi', 'seedLo', 'key', 'mode']],
+	['post', ['feedbackFade', 'feedbackZoom', 'bloomThreshold', 'aberration']]
 ] as const;
 
 export const LOOM_UNIFORM_FLOATS = LOOM_UNIFORM_GROUPS.length * 4;
@@ -27,7 +28,7 @@ export type LoomUniformGroupName = (typeof LOOM_UNIFORM_GROUPS)[number][0];
 export type LoomUniformSlot = (typeof LOOM_UNIFORM_GROUPS)[number][1][number];
 export type LoomUniformValues = Record<LoomUniformSlot, number>;
 
-/** Pack named values into the 52-float uniform block in contract order. */
+/** Pack named values into the 56-float uniform block in contract order. */
 export function packLoomUniforms(
 	out: Float32Array,
 	values: Readonly<LoomUniformValues>

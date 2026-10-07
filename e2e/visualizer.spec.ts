@@ -115,7 +115,7 @@ test.describe('visualizer engine roster', () => {
 		const loomCanvas = page.getByLabel('Loom audio visualizer');
 		await expect(loomCanvas).toHaveAttribute(
 			'data-loom-render-passes',
-			'2'
+			'8'
 		);
 		await expect(loomCanvas).toHaveAttribute(
 			'data-loom-topology',
@@ -281,7 +281,14 @@ test.describe('visualizer engine roster', () => {
 			stroke: 1,
 			saturation: 1
 		});
-		expect(profiles.loom.flow).toEqual({ motion: 1, impact: 1, width: 1, glow: 1 });
+		expect(profiles.loom.flow).toEqual({
+			motion: 1,
+			impact: 1,
+			width: 1,
+			glow: 1,
+			bloomThresholdOffset: 0,
+			feedbackFadeOffset: 0
+		});
 
 		for (const rail of ['motion', 'impact'] as const) {
 			expect(profiles.mk1.still[rail]).toBeLessThan(profiles.mk1.flow[rail]);
