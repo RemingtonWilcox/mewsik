@@ -54,7 +54,7 @@ test.describe('Loom uniform contract', () => {
 			};
 		});
 
-		expect(result.floats).toBe(52);
+		expect(result.floats).toBe(56);
 		expect(result.sceneFields).not.toBeNull();
 		expect(result.compositeFields).not.toBeNull();
 		expect(result.sceneFields).toEqual(result.layoutGroups);

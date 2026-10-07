@@ -43,6 +43,8 @@ struct Params {
 	style: vec4<f32>,
 	// seedHi, seedLo, key, mode
 	harmony: vec4<f32>,
+	// feedbackFade, feedbackZoom, bloomThreshold, aberration
+	post: vec4<f32>,
 };
 `;
 
@@ -114,8 +116,9 @@ struct LoomOut {
 	@location(2) color: vec3<f32>,
 	// x: curve position, y: instance kind, z: band energy, w: rail role
 	@location(3) dataA: vec4<f32>,
-	// x: signed detail, y: node glow, z: harmonic intersection, w: depth cue
+	// x: signed detail, y: emission, z: harmonic intersection, w: depth cue
 	@location(4) dataB: vec4<f32>,
+	@location(5) tangent: vec3<f32>,
 };
 
 fn smoothDetail(position: f32) -> f32 {
@@ -197,7 +200,7 @@ fn architecturePoint(s: f32, rail: f32, family: u32, role: f32) -> vec3<f32> {
 	p.y = p.y + osc * env * (0.045 + band * 0.09 + params.macroRails.y * 0.035) * params.view.w;
 	p.z = p.z + slow * env * (0.12 + rails.y * 0.34 + params.shapeB.y * 0.12);
 
-	let vaultLift = env * rails.y * (0.40 + params.shape.w * 0.28);
+	let vaultLift = env * rails.y * (0.22 + params.shape.w * 0.16);
 	p.y = p.y + vaultLift;
 	p.z = p.z + rails.y * (0.18 + abs(rail) * 0.16);
 
@@ -233,16 +236,45 @@ fn primaryRailPoint(s: f32, railIndex: u32) -> vec3<f32> {
 	return architecturePoint(s, rail, family, 0.0);
 }
 
+// One weft draft: how many times a filament crosses between its two rails in
+// a phrase, and where the crossing pattern starts. Hashed from the phrase so
+// every phrase re-drafts the weave; knot weight and energy densify it.
+fn weftDraft(phrase: f32, index: u32) -> vec2<f32> {
+	let h = hashUnit(u32(max(phrase, 0.0)) + 1u, index + 11u, 5u);
+	let h2 = hashUnit(u32(max(phrase, 0.0)) + 1u, index + 23u, 9u);
+	let crossings = 1.0 + floor(h * 3.0) + params.grammar.x * 2.0 + params.macroRails.x * 1.5;
+	return vec2<f32>(crossings, h2 * TAU);
+}
+
 fn secondaryRailPoint(s: f32, index: u32) -> vec3<f32> {
-	let pair = index % 6u;
-	let side = select(-1.0, 1.0, (index & 1u) == 1u);
-	let rail = ((f32(pair) + 0.5) / 6.0) * 1.5 - 0.75 + side * (0.05 + params.shapeB.z * 0.02);
-	var p = architecturePoint(s, rail, pair, 1.0);
+	// Filaments are the weft: each threads between two neighbouring rails,
+	// passing over and under them a phrase-chosen number of times. The draft
+	// changes at phrase boundaries with a short blend so nothing hard-cuts.
+	let phrase = floor(params.cloth.x / 32.0);
+	let phrasePos = fract(params.cloth.x / 32.0);
+	let pairA = select(0u, 1u, (index & 1u) == 1u);
+	let railA = (f32(pairA) - 1.0) * 0.72;
+	let railB = (f32(pairA + 1u) - 1.0) * 0.72;
+	let familyA = min(pairA * 2u, 5u);
+	let familyB = min((pairA + 1u) * 2u, 5u);
+	let a = architecturePoint(s, railA, familyA, 0.0);
+	let b = architecturePoint(s, railB, familyB, 0.0);
+
+	let draftNow = weftDraft(phrase, index);
+	let draftNext = weftDraft(phrase + 1.0, index);
+	let blend = smoothstep(0.92, 1.0, phrasePos);
+	let crossings = mix(draftNow.x, draftNext.x, blend);
+	let phase = mix(draftNow.y, draftNext.y, blend) + params.harmony.z * TAU * 0.5;
+	let angle = s * TAU * crossings + phase;
+	let t = 0.5 + 0.5 * sin(angle);
+	var p = mix(a, b, t);
+	// Thread around the rails rather than through them: lift toward the camera
+	// on the over-pass, dip behind on the under-pass.
+	let lift = cos(angle);
 	let q = s * 2.0 - 1.0;
-	let env = pow(max(0.0, 1.0 - q * q), 0.7);
-	p.x = p.x + side * env * (0.035 + params.shapeB.w * 0.025);
-	p.y = p.y * (0.75 + params.cloth.z * 0.15);
-	p.z = p.z - 0.08 + side * sin(q * TAU + params.cloth.w * 0.13) * env * 0.02;
+	let env = pow(max(0.0, 1.0 - q * q), 0.6);
+	p.z = p.z + lift * (0.055 + params.shapeB.z * 0.03) * env;
+	p.y = p.y + lift * 0.018 * env * select(-1.0, 1.0, (index & 2u) == 2u);
 	return p;
 }
 
@@ -275,13 +307,13 @@ fn loomPoint(s: f32, instanceIndex: u32) -> vec3<f32> {
 
 fn viewPoint(p0: vec3<f32>) -> vec3<f32> {
 	var p = p0;
-	p.x = p.x * 0.94;
-	p.y = p.y * 1.02;
+	p.x = p.x * 1.32;
+	p.y = p.y * 1.12;
 	p.z = p.z * 1.16;
 	p = rotateY(p, params.camera.x + 0.62);
 	p = rotateX(p, params.camera.y - 0.18);
 	p = rotateZ(p, params.camera.w);
-	p.x = p.x - 0.05;
+	p.x = p.x + 0.04;
 	p.y = p.y - 0.08;
 	p.z = p.z - 0.18;
 	return p;
@@ -324,16 +356,19 @@ fn vs_main(
 	var role = 0.0;
 	var family = instanceIndex;
 	var radius = params.style.x * 1.2;
+	var hero = 0.0;
 	if (instanceIndex < ${LOOM_PRIMARY_RAILS}u) {
 		kind = 0.0;
 		family = min(instanceIndex * 2u, 5u);
-		radius = params.style.x * (1.38 + bandEnergy(family) * 0.48);
+		hero = select(0.0, 1.0, instanceIndex == 1u);
+		role = hero;
+		radius = params.style.x * (1.5 + hero * 0.9 + bandEnergy(family) * 0.7);
 	} else if (instanceIndex < ${LOOM_PRIMARY_RAILS + LOOM_SECONDARY_RAILS}u) {
 		kind = 1.0;
 		let sub = instanceIndex - ${LOOM_PRIMARY_RAILS}u;
 		family = sub;
 		role = f32(sub & 1u);
-		radius = params.style.x * 0.16 * (0.42 + bandEnergy(family) * 0.15) * (1.0 - params.cloth.z * 0.7);
+		radius = params.style.x * 0.55 * (0.5 + bandEnergy(family) * 0.2) * (1.0 - params.cloth.z * 0.6);
 	} else {
 		kind = 2.0;
 		let sub = instanceIndex - ${LOOM_PRIMARY_RAILS + LOOM_SECONDARY_RAILS}u;
@@ -354,14 +389,28 @@ fn vs_main(
 	let rails = compositionRails();
 	let detail = select(bandDetail(family, s), smoothDetail(fract(s + role * 0.13)), kind > 1.5);
 	let intersection = exp(-pow(abs(s - fract(params.cloth.x * 0.03125 + familyUnit * 0.23)), 2.0) * 70.0);
+	// Phosphor core: primary rails carry an HDR emissive charge that bloom and
+	// the feedback trail pick up; each beat launches a light packet along it.
+	let packet = exp(-pow(s - fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + role * 0.13), 2.0) * 95.0);
+	var emission = 0.16 + band * 0.3 + packet * params.pulse.x * 0.9;
+	if (kind == 0.0) {
+		emission = (0.6 + hero * 0.4) + band * (0.8 + hero * 0.5) + packet * params.pulse.x * 5.0 + params.pulse.w * 0.35;
+	}
+	emission = emission * params.style.z * (1.0 - params.style.w * 0.8);
+	// Beats read as a colour event, not only a brightness event: the packet
+	// shifts toward the rim hue as it travels.
+	let packetMix = clamp(packet * params.pulse.x * 1.6, 0.0, 1.0) * select(0.5, 1.0, kind == 0.0);
 
-	var hue = mixHueShortest(params.palette.x, params.palette.y, familyUnit * 0.72);
-	hue = mixHueShortest(hue, params.palette.z, rails.y * 0.35 + max(0.0, -params.harmony.w) * 0.12);
-	var saturation = clamp(params.palette.w * (0.48 + band * 0.28), 0.28, 0.86);
-	var value = 0.42 + band * 0.34 + params.macroRails.x * 0.12;
+	// Three colour roles, not a sweep: hero rail = base hue, supporting rails =
+	// accent, weft = rim. Minor keys lean the whole set a little toward rim.
+	var hue = mixHueShortest(params.palette.y, params.palette.x, hero);
+	hue = mixHueShortest(hue, params.palette.z, max(0.0, -params.harmony.w) * 0.15);
+	var saturation = clamp(params.palette.w * (1.0 + band * 0.3), 0.7, 0.97);
+	var value = 0.38 + hero * 0.1 + band * 0.34 + params.macroRails.x * 0.12;
 	if (kind == 1.0) {
-		saturation = saturation * 0.58;
-		value = value * (0.22 + rails.w * 0.12);
+		hue = params.palette.z;
+		saturation = saturation * 0.9;
+		value = value * (0.9 + rails.w * 0.15);
 	}
 	if (kind == 2.0) {
 		hue = mixHueShortest(params.palette.y, params.palette.z, 0.62 + params.harmony.z * 0.12);
@@ -375,9 +424,11 @@ fn vs_main(
 	out.position = vec4<f32>(projected, clamp(depth / 8.0, 0.0, 1.0), 1.0);
 	out.worldNormal = radial;
 	out.viewDirection = normalize(cameraPoint - position);
-	out.color = hsvToRgb(vec3<f32>(hue, saturation, value));
+	let packetHue = mixHueShortest(hue, params.palette.z, packetMix);
+	out.color = hsvToRgb(vec3<f32>(packetHue, saturation, value));
 	out.dataA = vec4<f32>(s, kind, band, role);
-	out.dataB = vec4<f32>(detail, select(0.0, 1.0, kind == 2.0), intersection, depth);
+	out.dataB = vec4<f32>(detail, emission, intersection, depth);
+	out.tangent = tangent;
 	return out;
 }
 
@@ -391,21 +442,38 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let isNode = kind == 2.0;
 	let isSecondary = kind == 1.0;
 
-	let diffuse = 0.13 + max(dot(normal, keyLight), 0.0) * 0.58 + max(dot(normal, rimLight), 0.0) * 0.16;
+	let diffuseKey = max(dot(normal, keyLight), 0.0);
+	let diffuseFill = max(dot(normal, rimLight), 0.0);
 	let rim = pow(1.0 - abs(dot(normal, view)), 2.0);
 	let specPower = select(42.0, 82.0, isNode);
 	let specular = pow(max(dot(reflect(-keyLight, normal), view), 0.0), specPower);
-	let striation = 0.985 + 0.015 * cos(in.dataA.x * select(360.0, 620.0, isSecondary) + in.dataA.w * 4.1);
-	let rimColor = hsvToRgb(vec3<f32>(params.palette.z, params.palette.w * 0.45, 1.05));
-	let detailShade = 1.0 + in.dataB.x * select(0.18, 0.32, !isSecondary);
-	let nodeGlow = in.color * in.dataB.y * (0.34 + params.style.z * 0.26);
+	let hero = select(0.0, in.dataA.w, kind == 0.0);
+	// Striations crawl along the rail a quarter period per beat, so tempo is
+	// visible on the surface; the hero carries the strongest pattern.
+	let stripePhase = in.dataA.x * select(360.0, 620.0, isSecondary) - params.cloth.x * 1.5707963;
+	let stripeAmount = 0.015 + hero * 0.075;
+	let striation = (1.0 - stripeAmount) + stripeAmount * cos(stripePhase);
+	let rimColor = hsvToRgb(vec3<f32>(params.palette.z, params.palette.w * 0.6, 1.05));
+	// Coloured light rig: key carries the accent hue, fill the base hue, so
+	// highlights never bleach the palette to white.
+	let keyColor = hsvToRgb(vec3<f32>(params.palette.y, params.palette.w * 0.45, 1.0));
+	let fillColor = hsvToRgb(vec3<f32>(params.palette.x, params.palette.w * 0.7, 0.6));
+	let detailShade = 1.0 + in.dataB.x * select(0.18, 0.5, !isSecondary);
+	// Brushed-fiber highlight: the tube reads as wound filament, not plastic.
+	let tangent = normalize(in.tangent);
+	let halfVector = normalize(keyLight + view);
+	let tangentDot = dot(tangent, halfVector);
+	let aniso = pow(sqrt(max(1.0 - tangentDot * tangentDot, 0.0)), select(48.0, 90.0, isSecondary));
+	let core = pow(max(dot(normal, view), 0.0), 2.2);
+	let emissive = in.color * in.dataB.y * (0.4 + core * 1.3) * (1.0 + in.dataB.x * 0.6 * hero);
 	let crossingGlow = rimColor * in.dataB.z * (0.16 + params.pulse.y * 0.12);
 
-	var lit = in.color * diffuse * striation * detailShade
+	var lit = in.color * (0.13 + diffuseKey * 0.58 * keyColor + diffuseFill * 0.22 * fillColor) * striation * detailShade
 		+ rimColor * rim * (0.17 + params.style.z * 0.14)
-		+ vec3<f32>(1.0, 0.96, 0.88) * specular * select(0.14, 0.34, isNode)
-		+ nodeGlow + crossingGlow;
-	lit = mix(lit, lit * 0.54, select(0.0, 0.46, isSecondary));
+		+ keyColor * specular * select(0.10, 0.34, isNode)
+		+ keyColor * aniso * select(0.10, 0.24, !isSecondary)
+		+ emissive + crossingGlow;
+	lit = mix(lit, lit * 0.7, select(0.0, 0.3, isSecondary));
 	return vec4<f32>(lit, 1.0);
 }
 `;
@@ -431,14 +499,100 @@ fn vs_main(@builtin(vertex_index) index: u32) -> FullscreenOut {
 }
 `;
 
-export const LOOM_COMPOSITE_WGSL = /* wgsl */ `
+const POST_COMMON_WGSL = /* wgsl */ `
 ${PARAMS_WGSL}
 ${SHARED_WGSL}
 ${FULLSCREEN_WGSL}
+`;
+
+// Temporal feedback: the previous frame is warped a hair outward and along the
+// signal axis, decayed, and max-blended with the new scene. Max-blend (not add)
+// is what keeps trails silky without accumulating to white.
+export const LOOM_FEEDBACK_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var sceneSampler: sampler;
 @group(0) @binding(2) var sceneTexture: texture_2d<f32>;
+@group(0) @binding(3) var previousTexture: texture_2d<f32>;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let centered = in.uv - 0.5;
+	let theta = sin(params.cloth.y * 0.35) * 0.0025 * params.view.w;
+	let c = cos(theta);
+	let sn = sin(theta);
+	let rotated = vec2<f32>(centered.x * c - centered.y * sn, centered.x * sn + centered.y * c) * params.post.y;
+	let previousUv = rotated + 0.5 + vec2<f32>(-0.0006 * params.view.w, 0.0);
+	let edge = min(min(previousUv.x, previousUv.y), min(1.0 - previousUv.x, 1.0 - previousUv.y));
+	let border = smoothstep(0.0, 0.03, edge);
+	let previous = textureSampleLevel(previousTexture, sceneSampler, previousUv, 0.0).rgb;
+	let scene = textureSampleLevel(sceneTexture, sceneSampler, in.uv, 0.0).rgb;
+	let trail = previous * params.post.x * border;
+	return vec4<f32>(max(trail, scene), 1.0);
+}
+`;
+
+// Bloom prefilter: half-resolution 4-tap downsample with a soft HDR knee so
+// only the phosphor cores and light packets bloom, never the chamber.
+export const LOOM_BLOOM_DOWN_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var sceneSampler: sampler;
+@group(0) @binding(2) var sourceTexture: texture_2d<f32>;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let texel = 1.0 / max(params.view.xy, vec2<f32>(1.0));
+	var color = textureSampleLevel(sourceTexture, sceneSampler, in.uv + vec2<f32>(-1.0, -1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTexture, sceneSampler, in.uv + vec2<f32>( 1.0, -1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTexture, sceneSampler, in.uv + vec2<f32>(-1.0,  1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTexture, sceneSampler, in.uv + vec2<f32>( 1.0,  1.0) * texel, 0.0).rgb;
+	color = color * 0.25;
+	let bright = max(color.r, max(color.g, color.b));
+	let knee = max(0.0, bright - params.post.z);
+	let factor = knee / max(1e-4, bright);
+	return vec4<f32>(color * factor, 1.0);
+}
+`;
+
+function loomBlurShader(directionX: number, directionY: number) {
+	return /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var sceneSampler: sampler;
+@group(0) @binding(2) var sourceTexture: texture_2d<f32>;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let texel = 3.2 / max(params.view.xy, vec2<f32>(1.0));
+	let direction = vec2<f32>(${directionX.toFixed(1)}, ${directionY.toFixed(1)}) * texel;
+	var color = textureSampleLevel(sourceTexture, sceneSampler, in.uv, 0.0).rgb * 0.227027;
+	color = color + (textureSampleLevel(sourceTexture, sceneSampler, in.uv + direction * 1.0, 0.0).rgb
+		+ textureSampleLevel(sourceTexture, sceneSampler, in.uv - direction * 1.0, 0.0).rgb) * 0.1945946;
+	color = color + (textureSampleLevel(sourceTexture, sceneSampler, in.uv + direction * 2.0, 0.0).rgb
+		+ textureSampleLevel(sourceTexture, sceneSampler, in.uv - direction * 2.0, 0.0).rgb) * 0.1216216;
+	color = color + (textureSampleLevel(sourceTexture, sceneSampler, in.uv + direction * 3.0, 0.0).rgb
+		+ textureSampleLevel(sourceTexture, sceneSampler, in.uv - direction * 3.0, 0.0).rgb) * 0.054054;
+	color = color + (textureSampleLevel(sourceTexture, sceneSampler, in.uv + direction * 4.0, 0.0).rgb
+		+ textureSampleLevel(sourceTexture, sceneSampler, in.uv - direction * 4.0, 0.0).rgb) * 0.016216;
+	return vec4<f32>(color, 1.0);
+}
+`;
+}
+
+export const LOOM_BLOOM_BLUR_H_WGSL = loomBlurShader(1, 0);
+export const LOOM_BLOOM_BLUR_V_WGSL = loomBlurShader(0, 1);
+
+export const LOOM_COMPOSITE_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var sceneSampler: sampler;
+@group(0) @binding(2) var feedbackTexture: texture_2d<f32>;
+@group(0) @binding(3) var bloomTexture: texture_2d<f32>;
 
 fn aces(color: vec3<f32>) -> vec3<f32> {
 	let a = 2.51;
@@ -453,48 +607,59 @@ fn ign(pixel: vec2<f32>, frame: f32) -> f32 {
 	return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715)) + frame * 0.61803398875));
 }
 
-fn chamberLines(p: vec2<f32>) -> f32 {
-	let horizon = exp(-p.y * p.y * 34.0);
-	let vertical = exp(-pow(abs(sin((p.x + params.camera.x * 0.05) * 16.0)), 2.0) * 900.0)
-		* smoothstep(0.06, 0.52, abs(p.y));
-	let radial = exp(-pow(abs(sin(length(p * vec2<f32>(0.8, 1.0)) * 12.0 - params.cloth.w * 0.06)), 2.0) * 820.0)
-		* smoothstep(0.18, 0.95, length(p));
-	return horizon * 0.2 + vertical * 0.12 + radial * 0.10;
-}
-
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let resolution = params.view.xy;
-	let pixel = 1.0 / max(resolution, vec2<f32>(1.0));
-	let scene = textureSampleLevel(sceneTexture, sceneSampler, in.uv, 0.0).rgb;
-	let blurRadius = 1.05 + params.style.z * 0.72;
-	let blur =
-		textureSampleLevel(sceneTexture, sceneSampler, in.uv + vec2<f32>( pixel.x, 0.0) * blurRadius, 0.0).rgb
-		+ textureSampleLevel(sceneTexture, sceneSampler, in.uv + vec2<f32>(-pixel.x, 0.0) * blurRadius, 0.0).rgb
-		+ textureSampleLevel(sceneTexture, sceneSampler, in.uv + vec2<f32>(0.0,  pixel.y) * blurRadius, 0.0).rgb
-		+ textureSampleLevel(sceneTexture, sceneSampler, in.uv + vec2<f32>(0.0, -pixel.y) * blurRadius, 0.0).rgb;
+	let centered = in.uv - 0.5;
+	let r2 = dot(centered, centered);
 
+	// Lens: a touch of barrel curvature, and chromatic aberration that grows
+	// toward the edges and flares on impacts.
+	let warped = 0.5 + centered * (1.0 + r2 * 0.05);
+	let caAmount = (0.0011 + r2 * 0.008) * params.post.w;
+	let direction = normalize(centered + vec2<f32>(1e-4, 1e-4));
+	let scene = vec3<f32>(
+		textureSampleLevel(feedbackTexture, sceneSampler, warped + direction * caAmount, 0.0).r,
+		textureSampleLevel(feedbackTexture, sceneSampler, warped, 0.0).g,
+		textureSampleLevel(feedbackTexture, sceneSampler, warped - direction * caAmount, 0.0).b
+	);
+	let bloom = textureSampleLevel(bloomTexture, sceneSampler, warped, 0.0).rgb;
+
+	// Chamber. uv.y grows downward, so p.y is flipped to read "up is positive".
 	let aspect = resolution.x / max(resolution.y, 1.0);
-	let p = (in.uv - 0.5) * vec2<f32>(aspect, 1.0);
+	let p = vec2<f32>((warped.x - 0.5) * aspect, 0.5 - warped.y);
 	let distance = length(p * vec2<f32>(0.72, 1.0));
 	let baseHue = mixHueShortest(params.palette.x, params.palette.z, 0.28 + params.shape.w * 0.18);
-	let chamber = hsvToRgb(vec3<f32>(baseHue, params.palette.w * 0.34, 0.09));
-	let depthHaze = exp(-distance * (2.5 - params.shape.z * 0.36));
-	var background = vec3<f32>(0.0018, 0.0024, 0.0048)
-		+ chamber * depthHaze * (0.14 + params.macroRails.x * 0.065);
+	let haze = hsvToRgb(vec3<f32>(baseHue, params.palette.w * 0.55, 0.3));
+	let warm = hsvToRgb(vec3<f32>(params.palette.z, params.palette.w * 0.5, 0.14));
+	// Deep room: cool haze that thins toward the top, a warm band of light
+	// pooling just above the floor line.
+	let depthHaze = exp(-distance * (2.2 - params.shape.z * 0.3));
+	let floorLine = -0.17;
+	let pool = exp(-pow((p.y - floorLine - 0.05) * 7.0, 2.0));
+	var background = vec3<f32>(0.0016, 0.0022, 0.0044)
+		+ haze * depthHaze * (0.8 + params.macroRails.x * 0.2) * (1.0 - params.style.w * 0.5)
+		+ warm * pool * (0.35 + params.macroRails.x * 0.2 + params.pulse.x * 0.7) * (1.0 - params.style.w * 0.7);
 
-	let floor = smoothstep(-0.18, -0.54, p.y);
-	let floorSheen = textureSampleLevel(sceneTexture, sceneSampler, vec2<f32>(in.uv.x, 1.0 - in.uv.y * 0.55), 0.0).rgb;
-	background = background + floorSheen * floor * exp((p.y + 0.25) * 4.0) * 0.055;
-
-	let lineColor = hsvToRgb(vec3<f32>(params.palette.z, params.palette.w * 0.38, 0.24));
-	background = background + lineColor * chamberLines(p) * (0.34 + params.shape.x * 0.34) * (1.0 - params.style.w * 0.7);
+	// Polished floor: the instrument reflects in it, blurred and fading with
+	// distance from the floor line.
+	let floor = smoothstep(floorLine, floorLine - 0.06, p.y);
+	let mirroredUv = vec2<f32>(warped.x, 2.0 * (0.5 - floorLine) - warped.y);
+	let reflection = mix(
+		textureSampleLevel(feedbackTexture, sceneSampler, mirroredUv, 0.0).rgb,
+		textureSampleLevel(bloomTexture, sceneSampler, mirroredUv, 0.0).rgb,
+		0.55
+	);
+	let reflectionFade = exp((p.y - floorLine) * 5.0);
+	background = background + reflection * floor * reflectionFade * (0.22 + params.style.z * 0.1);
+	// Horizon: a soft lit edge where the floor meets the haze.
+	background = background + warm * exp(-pow((p.y - floorLine) * 30.0, 2.0)) * 0.22;
 
 	let vignette = 1.0 - smoothstep(0.54, 1.14, distance);
-	let glow = blur * 0.25 * (0.12 + params.style.z * 0.10);
-	let exposure = 1.06 + params.macroRails.x * 0.14;
-	var color = (background + scene + glow) * exposure * (0.70 + vignette * 0.30);
+	let exposure = 0.94 + params.macroRails.x * 0.2;
+	var color = (background + scene + bloom * (1.0 + params.style.z * 0.3)) * exposure * (0.70 + vignette * 0.30);
 	color = aces(color);
+	color = max((color - 0.5) * 1.14 + 0.5, vec3<f32>(0.0));
 	color = color + (ign(in.uv * resolution, fract(params.view.z) * 60.0) - 0.5) * (1.3 / 255.0);
 	return vec4<f32>(color, 1.0);
 }

@@ -76,9 +76,23 @@ export const VISUALIZER_RESPONSE_PROFILES = {
 		surge: { motion: 1.12, impact: 1.18, persistenceOffset: 0.01, stroke: 1.1, saturation: 1.06 }
 	},
 	loom: {
-		still: { motion: 0.68, impact: 0.62, width: 0.88, glow: 0.76 },
-		flow: { motion: 1, impact: 1, width: 1, glow: 1 },
-		surge: { motion: 1.16, impact: 1.2, width: 1.08, glow: 1.14 }
+		still: {
+			motion: 0.68,
+			impact: 0.62,
+			width: 0.88,
+			glow: 0.76,
+			bloomThresholdOffset: 0.12,
+			feedbackFadeOffset: -0.03
+		},
+		flow: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
+		surge: {
+			motion: 1.16,
+			impact: 1.2,
+			width: 1.08,
+			glow: 1.14,
+			bloomThresholdOffset: -0.1,
+			feedbackFadeOffset: 0.02
+		}
 	}
 } as const satisfies Record<VisualizerEngine, Record<VisualizerResponse, Record<string, number>>>;
 

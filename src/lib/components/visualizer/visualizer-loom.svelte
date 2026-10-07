@@ -6,7 +6,11 @@
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
 	import {
+		LOOM_BLOOM_BLUR_H_WGSL,
+		LOOM_BLOOM_BLUR_V_WGSL,
+		LOOM_BLOOM_DOWN_WGSL,
 		LOOM_COMPOSITE_WGSL,
+		LOOM_FEEDBACK_WGSL,
 		LOOM_INSTANCES,
 		LOOM_SCENE_WGSL,
 		LOOM_STRANDS,
@@ -60,6 +64,8 @@
 	let driftPhase = 0;
 	let seedHi = 0;
 	let seedLo = 0;
+	/** Frames left during which the feedback trail is cleared (source reset, resize). */
+	let feedbackResetFrames = 0;
 	const renderDetailBins = new Float32Array(64);
 
 	type LoomTargets = {
@@ -67,6 +73,12 @@
 		sceneView: GPUTextureView;
 		depth: GPUTexture;
 		depthView: GPUTextureView;
+		/** Ping-pong HDR history for the temporal feedback trail. */
+		feedback: [GPUTexture, GPUTexture];
+		feedbackViews: [GPUTextureView, GPUTextureView];
+		/** Half-resolution bloom chain: [0] prefilter/final, [1] horizontal pass. */
+		bloom: [GPUTexture, GPUTexture];
+		bloomViews: [GPUTextureView, GPUTextureView];
 		width: number;
 		height: number;
 	};
@@ -80,10 +92,21 @@
 		detailBuffer: GPUBuffer;
 		uniforms: Float32Array;
 		scenePipeline: GPURenderPipeline;
+		feedbackPipeline: GPURenderPipeline;
+		bloomDownPipeline: GPURenderPipeline;
+		blurHPipeline: GPURenderPipeline;
+		blurVPipeline: GPURenderPipeline;
 		compositePipeline: GPURenderPipeline;
 		targets: LoomTargets | null;
 		sceneBindGroup: GPUBindGroup;
-		compositeBindGroup: GPUBindGroup | null;
+		/** Indexed by the parity of the frame being read (previous frame). */
+		feedbackBindGroups: [GPUBindGroup, GPUBindGroup] | null;
+		/** Indexed by the parity of the frame just written. */
+		bloomDownBindGroups: [GPUBindGroup, GPUBindGroup] | null;
+		blurHBindGroup: GPUBindGroup | null;
+		blurVBindGroup: GPUBindGroup | null;
+		compositeBindGroups: [GPUBindGroup, GPUBindGroup] | null;
+		parity: 0 | 1;
 	};
 
 	let gpu: LoomGpu | null = null;
@@ -228,37 +251,78 @@
 		if (!targets) return;
 		targets.scene.destroy();
 		targets.depth.destroy();
+		for (const texture of targets.feedback) texture.destroy();
+		for (const texture of targets.bloom) texture.destroy();
 	}
 
 	function ensureTargets(state: LoomGpu, width: number, height: number) {
 		if (state.targets?.width === width && state.targets.height === height) return;
 		destroyTargets(state.targets);
-		const scene = state.device.createTexture({
-			size: { width, height },
-			format: 'rgba16float',
-			usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
-		});
+		const hdr = (label: string, w: number, h: number) =>
+			state.device.createTexture({
+				label,
+				size: { width: w, height: h },
+				format: 'rgba16float',
+				usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+			});
+		const scene = hdr('Loom scene', width, height);
 		const depth = state.device.createTexture({
+			label: 'Loom depth',
 			size: { width, height },
 			format: 'depth24plus',
 			usage: GPUTextureUsage.RENDER_ATTACHMENT
 		});
-		state.targets = {
+		const feedback: [GPUTexture, GPUTexture] = [
+			hdr('Loom feedback A', width, height),
+			hdr('Loom feedback B', width, height)
+		];
+		const bloomWidth = Math.max(1, Math.floor(width / 2));
+		const bloomHeight = Math.max(1, Math.floor(height / 2));
+		const bloom: [GPUTexture, GPUTexture] = [
+			hdr('Loom bloom A', bloomWidth, bloomHeight),
+			hdr('Loom bloom B', bloomWidth, bloomHeight)
+		];
+		const targets: LoomTargets = {
 			scene,
 			sceneView: scene.createView(),
 			depth,
 			depthView: depth.createView(),
+			feedback,
+			feedbackViews: [feedback[0].createView(), feedback[1].createView()],
+			bloom,
+			bloomViews: [bloom[0].createView(), bloom[1].createView()],
 			width,
 			height
 		};
-		state.compositeBindGroup = state.device.createBindGroup({
-			layout: state.compositePipeline.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: state.uniformBuffer } },
-				{ binding: 1, resource: state.sampler },
-				{ binding: 2, resource: state.targets.sceneView }
-			]
-		});
+		state.targets = targets;
+
+		const uniform = { binding: 0, resource: { buffer: state.uniformBuffer } };
+		const sampler = { binding: 1, resource: state.sampler };
+		const bind = (pipeline: GPURenderPipeline, label: string, views: GPUTextureView[]) =>
+			state.device.createBindGroup({
+				label,
+				layout: pipeline.getBindGroupLayout(0),
+				entries: [
+					uniform,
+					sampler,
+					...views.map((view, index) => ({ binding: 2 + index, resource: view }))
+				]
+			});
+		state.feedbackBindGroups = [
+			bind(state.feedbackPipeline, 'Loom feedback reads A', [targets.sceneView, targets.feedbackViews[0]]),
+			bind(state.feedbackPipeline, 'Loom feedback reads B', [targets.sceneView, targets.feedbackViews[1]])
+		];
+		state.bloomDownBindGroups = [
+			bind(state.bloomDownPipeline, 'Loom bloom prefilter A', [targets.feedbackViews[0]]),
+			bind(state.bloomDownPipeline, 'Loom bloom prefilter B', [targets.feedbackViews[1]])
+		];
+		state.blurHBindGroup = bind(state.blurHPipeline, 'Loom bloom blur H', [targets.bloomViews[0]]);
+		state.blurVBindGroup = bind(state.blurVPipeline, 'Loom bloom blur V', [targets.bloomViews[1]]);
+		state.compositeBindGroups = [
+			bind(state.compositePipeline, 'Loom composite A', [targets.feedbackViews[0], targets.bloomViews[0]]),
+			bind(state.compositePipeline, 'Loom composite B', [targets.feedbackViews[1], targets.bloomViews[0]])
+		];
+		feedbackResetFrames = 2;
 	}
 
 	async function initGpu(targetCanvas: HTMLCanvasElement): Promise<LoomGpu> {
@@ -277,6 +341,10 @@
 			const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
 			context.configure({ device, format, alphaMode: 'opaque' });
 			const sceneModule = device.createShaderModule({ code: LOOM_SCENE_WGSL });
+			const feedbackModule = device.createShaderModule({ code: LOOM_FEEDBACK_WGSL });
+			const bloomDownModule = device.createShaderModule({ code: LOOM_BLOOM_DOWN_WGSL });
+			const blurHModule = device.createShaderModule({ code: LOOM_BLOOM_BLUR_H_WGSL });
+			const blurVModule = device.createShaderModule({ code: LOOM_BLOOM_BLUR_V_WGSL });
 			const compositeModule = device.createShaderModule({ code: LOOM_COMPOSITE_WGSL });
 			const assertCompiled = async (module: GPUShaderModule, label: string) => {
 				const info = await module.getCompilationInfo();
@@ -290,9 +358,25 @@
 			};
 			await Promise.all([
 				assertCompiled(sceneModule, 'Loom instrument'),
+				assertCompiled(feedbackModule, 'Loom feedback'),
+				assertCompiled(bloomDownModule, 'Loom bloom prefilter'),
+				assertCompiled(blurHModule, 'Loom bloom blur'),
+				assertCompiled(blurVModule, 'Loom bloom blur'),
 				assertCompiled(compositeModule, 'Loom presentation')
 			]);
-			const pipelines = await Promise.all([
+			const fullscreenPipeline = (
+				label: string,
+				module: GPUShaderModule,
+				targetFormat: GPUTextureFormat
+			) =>
+				device.createRenderPipelineAsync({
+					label,
+					layout: 'auto',
+					vertex: { module, entryPoint: 'vs_main' },
+					fragment: { module, entryPoint: 'fs_main', targets: [{ format: targetFormat }] },
+					primitive: { topology: 'triangle-list' }
+				});
+			const pipelines = (await Promise.all([
 				device.createRenderPipelineAsync({
 					label: 'Loom instrument pipeline',
 					layout: 'auto',
@@ -309,18 +393,19 @@
 						depthCompare: 'less'
 					}
 				}),
-				device.createRenderPipelineAsync({
-					label: 'Loom presentation pipeline',
-					layout: 'auto',
-					vertex: { module: compositeModule, entryPoint: 'vs_main' },
-					fragment: {
-						module: compositeModule,
-						entryPoint: 'fs_main',
-						targets: [{ format }]
-					},
-					primitive: { topology: 'triangle-list' }
-				})
-			]) as [GPURenderPipeline, GPURenderPipeline];
+				fullscreenPipeline('Loom feedback pipeline', feedbackModule, 'rgba16float'),
+				fullscreenPipeline('Loom bloom prefilter pipeline', bloomDownModule, 'rgba16float'),
+				fullscreenPipeline('Loom bloom blur H pipeline', blurHModule, 'rgba16float'),
+				fullscreenPipeline('Loom bloom blur V pipeline', blurVModule, 'rgba16float'),
+				fullscreenPipeline('Loom presentation pipeline', compositeModule, format)
+			])) as [
+				GPURenderPipeline,
+				GPURenderPipeline,
+				GPURenderPipeline,
+				GPURenderPipeline,
+				GPURenderPipeline,
+				GPURenderPipeline
+			];
 
 			uniformBuffer = device.createBuffer({
 				size: LOOM_UNIFORM_BYTES,
@@ -346,10 +431,19 @@
 				detailBuffer,
 				uniforms: new Float32Array(LOOM_UNIFORM_FLOATS),
 				scenePipeline: pipelines[0],
-				compositePipeline: pipelines[1],
+				feedbackPipeline: pipelines[1],
+				bloomDownPipeline: pipelines[2],
+				blurHPipeline: pipelines[3],
+				blurVPipeline: pipelines[4],
+				compositePipeline: pipelines[5],
 				targets: null,
 				sceneBindGroup,
-				compositeBindGroup: null
+				feedbackBindGroups: null,
+				bloomDownBindGroups: null,
+				blurHBindGroup: null,
+				blurVBindGroup: null,
+				compositeBindGroups: null,
+				parity: 0
 			};
 
 			void device.lost.then((info) => {
@@ -411,7 +505,16 @@
 			internalPixels = size.width * size.height;
 		}
 		ensureTargets(state, size.width, size.height);
-		if (!state.targets || !state.compositeBindGroup) return;
+		const targets = state.targets;
+		if (
+			!targets ||
+			!state.feedbackBindGroups ||
+			!state.bloomDownBindGroups ||
+			!state.blurHBindGroup ||
+			!state.blurVBindGroup ||
+			!state.compositeBindGroups
+		)
+			return;
 
 		const feature = vis.getLatest(now);
 		const shared = vis.getJourney(now);
@@ -430,6 +533,7 @@
 			renderBeats = beatAnchor(loom) ?? 0;
 			swayPhase = 0;
 			poseSyncRequested = true;
+			feedbackResetFrames = 2;
 			quietFor = feature ? 0 : 0.5;
 			silence = feature ? 0 : 1;
 		}
@@ -478,6 +582,22 @@
 		);
 		const impact = clamp(pose.impact * responseImpact, 0, 1);
 		const cameraYaw = pose.cameraYaw + Math.sin(driftPhase * 0.5) * 0.045;
+
+		// Post stack: trails shorten on impact and in silence; the bloom knee
+		// drops with energy so drops glow and verses stay graphic.
+		const feedbackFade =
+			feedbackResetFrames > 0
+				? 0
+				: clamp(
+						(0.88 + energy * 0.05 - impact * 0.16 + response.feedbackFadeOffset) *
+							(1 - silence * 0.35),
+						0.4,
+						0.95
+					);
+		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
+		const feedbackZoom = 1 - (0.0025 + renderBands.sub * 0.004) * responseMotion;
+		const bloomThreshold = 0.75 - energy * 0.2 + response.bloomThresholdOffset;
+		const aberration = 1 + impact * 1.8;
 
 		const values: LoomUniformValues = {
 			width: size.width,
@@ -535,7 +655,11 @@
 			seedHi,
 			seedLo,
 			key: pose.key,
-			mode: pose.mode
+			mode: pose.mode,
+			feedbackFade,
+			feedbackZoom,
+			bloomThreshold,
+			aberration
 		};
 		packLoomUniforms(state.uniforms, values);
 
@@ -562,14 +686,14 @@
 				label: 'Loom instrument',
 				colorAttachments: [
 					{
-						view: state.targets.sceneView,
+						view: targets.sceneView,
 						clearValue: { r: 0, g: 0, b: 0, a: 1 },
 						loadOp: 'clear',
 						storeOp: 'store'
 					}
 				],
 				depthStencilAttachment: {
-					view: state.targets.depthView,
+					view: targets.depthView,
 					depthClearValue: 1,
 					depthLoadOp: 'clear',
 					depthStoreOp: 'discard'
@@ -580,23 +704,51 @@
 			pass.draw(LOOM_VERTEX_COUNT, LOOM_INSTANCES);
 			pass.end();
 		}
-		{
+		const previous = state.parity;
+		const next: 0 | 1 = previous === 0 ? 1 : 0;
+		const fullscreen = (
+			label: string,
+			view: GPUTextureView,
+			pipeline: GPURenderPipeline,
+			bindGroup: GPUBindGroup
+		) => {
 			const pass = encoder.beginRenderPass({
-				label: 'Loom present',
+				label,
 				colorAttachments: [
-					{
-						view: state.context.getCurrentTexture().createView(),
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
+					{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }
 				]
 			});
-			pass.setPipeline(state.compositePipeline);
-			pass.setBindGroup(0, state.compositeBindGroup);
+			pass.setPipeline(pipeline);
+			pass.setBindGroup(0, bindGroup);
 			pass.draw(3);
 			pass.end();
+		};
+		// scene + feedback[previous] -> feedback[next]
+		fullscreen(
+			'Loom feedback',
+			targets.feedbackViews[next],
+			state.feedbackPipeline,
+			state.feedbackBindGroups[previous]
+		);
+		// feedback[next] -> bloom[0] (half res, thresholded) -> bloom[1] -> bloom[0]
+		fullscreen(
+			'Loom bloom prefilter',
+			targets.bloomViews[0],
+			state.bloomDownPipeline,
+			state.bloomDownBindGroups[next]
+		);
+		for (let iteration = 0; iteration < 2; iteration += 1) {
+			fullscreen('Loom bloom blur H', targets.bloomViews[1], state.blurHPipeline, state.blurHBindGroup);
+			fullscreen('Loom bloom blur V', targets.bloomViews[0], state.blurVPipeline, state.blurVBindGroup);
 		}
+		// feedback[next] + bloom[0] -> swap chain
+		fullscreen(
+			'Loom present',
+			state.context.getCurrentTexture().createView(),
+			state.compositePipeline,
+			state.compositeBindGroups[next]
+		);
+		state.parity = next;
 		state.device.queue.submit([encoder.finish()]);
 	}
 
@@ -702,7 +854,7 @@
 			aria-label="Loom audio visualizer"
 			data-loom-section={hudSection}
 			data-loom-topology={hudTopology}
-			data-loom-render-passes="2"
+			data-loom-render-passes="8"
 			data-loom-strands={LOOM_STRANDS}
 			data-loom-frame-stride={activeFrameStride}
 			data-loom-refresh-rate={measuredRefreshRate}
