@@ -31,6 +31,8 @@ private let CMD_NEXT: Int32 = 3
 private let CMD_PREV: Int32 = 4
 private let CMD_STOP: Int32 = 5
 private let CMD_SEEK: Int32 = 6
+private let CMD_INTERRUPTED: Int32 = 7
+private let CMD_RESET_OUTPUT: Int32 = 8
 
 private final class MewsikNowPlaying {
     static let shared = MewsikNowPlaying()
@@ -40,6 +42,8 @@ private final class MewsikNowPlaying {
     private var didSetup = false
     private var artworkURL: String?
     private var cachedArtwork: MPMediaItemArtwork?
+    /// Last info pushed to the system, re-asserted when we regain the session.
+    private var lastInfo: [String: Any]?
 
     func setup(handler: @escaping @convention(c) (Int32, Int64) -> Void) {
         lock.lock()
@@ -61,11 +65,34 @@ private final class MewsikNowPlaying {
             NSLog("[mewsik] failed to configure AVAudioSession: \(error)")
         }
 
-        // Re-activate after interruptions (e.g. phone calls, Siri).
+        // Interruptions: another app's audio (TikTok, a call, Siri) stops our
+        // AudioUnit. Tell the engine so it pauses cleanly and rebuilds the
+        // output before it plays again.
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleInterruption(_:)),
             name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+        // The media server restarted under us: every audio object is invalid.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMediaServicesReset(_:)),
+            name: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil
+        )
+        // AirPods taken out / unplugged: pause, like every other player.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleRouteChange(_:)),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+        // Coming back to the foreground: make sure the lock screen shows us.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleDidBecomeActive(_:)),
+            name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
 
@@ -73,6 +100,7 @@ private final class MewsikNowPlaying {
 
         center.playCommand.isEnabled = true
         center.playCommand.addTarget { [weak self] _ in
+            self?.activateSession()
             self?.dispatch(CMD_RESUME, 0)
             return .success
         }
@@ -85,6 +113,7 @@ private final class MewsikNowPlaying {
 
         center.togglePlayPauseCommand.isEnabled = true
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            self?.activateSession()
             self?.dispatch(CMD_TOGGLE, 0)
             return .success
         }
@@ -125,6 +154,22 @@ private final class MewsikNowPlaying {
         h?(cmd, payload)
     }
 
+    private func activateSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            NSLog("[mewsik] failed to activate AVAudioSession: \(error)")
+        }
+    }
+
+    /// Push the last known info again. iOS hands the lock screen to whichever
+    /// app last set info while holding the session, so after another app
+    /// played we have to say "we are back".
+    private func reassert() {
+        guard let info = lastInfo else { return }
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
     @objc private func handleInterruption(_ note: Notification) {
         guard
             let info = note.userInfo,
@@ -132,9 +177,44 @@ private final class MewsikNowPlaying {
             let type = AVAudioSession.InterruptionType(rawValue: typeRaw)
         else { return }
 
-        if type == .ended {
-            try? AVAudioSession.sharedInstance().setActive(true)
+        switch type {
+        case .began:
+            dispatch(CMD_INTERRUPTED, 0)
+        case .ended:
+            activateSession()
+            dispatch(CMD_RESET_OUTPUT, 0)
+            reassert()
+            let optionsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
+            if options.contains(.shouldResume) {
+                dispatch(CMD_RESUME, 0)
+            }
+        @unknown default:
+            break
         }
+    }
+
+    @objc private func handleMediaServicesReset(_ note: Notification) {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .default, options: [])
+        activateSession()
+        dispatch(CMD_RESET_OUTPUT, 0)
+        reassert()
+    }
+
+    @objc private func handleRouteChange(_ note: Notification) {
+        guard
+            let info = note.userInfo,
+            let reasonRaw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+            let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
+        else { return }
+        if reason == .oldDeviceUnavailable {
+            dispatch(CMD_PAUSE, 0)
+        }
+    }
+
+    @objc private func handleDidBecomeActive(_ note: Notification) {
+        reassert()
     }
 
     func update(
@@ -175,6 +255,7 @@ private final class MewsikNowPlaying {
             info[MPMediaItemPropertyArtwork] = cached
         }
 
+        lastInfo = info
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
 
         if !artworkURL.isEmpty && artworkURL != self.artworkURL {
@@ -200,6 +281,7 @@ private final class MewsikNowPlaying {
                 self.cachedArtwork = artwork
                 if var info = MPNowPlayingInfoCenter.default().nowPlayingInfo {
                     info[MPMediaItemPropertyArtwork] = artwork
+                    self.lastInfo = info
                     MPNowPlayingInfoCenter.default().nowPlayingInfo = info
                 }
             }
@@ -207,6 +289,7 @@ private final class MewsikNowPlaying {
     }
 
     func clear() {
+        lastInfo = nil
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         artworkURL = nil
         cachedArtwork = nil

@@ -24,6 +24,8 @@ const CMD_NEXT: i32 = 3;
 const CMD_PREV: i32 = 4;
 const CMD_STOP: i32 = 5;
 const CMD_SEEK: i32 = 6;
+const CMD_INTERRUPTED: i32 = 7;
+const CMD_RESET_OUTPUT: i32 = 8;
 
 extern "C" {
     fn mewsik_now_playing_setup(handler: extern "C" fn(i32, c_longlong));
@@ -71,6 +73,8 @@ extern "C" fn remote_command_handler(cmd_id: i32, payload: c_longlong) {
         CMD_PREV => AudioCommand::Prev,
         CMD_STOP => AudioCommand::Stop,
         CMD_SEEK => AudioCommand::Seek(payload.max(0) as u64),
+        CMD_INTERRUPTED => AudioCommand::Interrupted,
+        CMD_RESET_OUTPUT => AudioCommand::ResetOutput,
         _ => return,
     };
 

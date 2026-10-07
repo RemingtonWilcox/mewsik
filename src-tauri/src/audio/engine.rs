@@ -39,6 +39,12 @@ pub enum AudioCommand {
     ), // station_id, name, url, source, session
     Pause,
     Resume,
+    /// The OS took the audio output away (another app, a call, a route
+    /// change). Behaves like Pause and marks the output for a rebuild.
+    Interrupted,
+    /// Rebuild the output stream and sink, e.g. after an iOS interruption
+    /// ended or media services were reset.
+    ResetOutput,
     Stop,
     StopForError(u64),
     Seek(u64), // ms
@@ -1252,8 +1258,8 @@ impl AudioEngine {
         #[cfg(target_os = "ios")]
         crate::audio::now_playing::setup(cmd_tx.clone());
 
-        let (_stream, stream_handle) = match OutputStream::try_default() {
-            Ok(s) => s,
+        let (mut output_stream, mut sink) = match Self::open_output() {
+            Ok(output) => output,
             Err(e) => {
                 log::error!("Failed to open audio output: {}", e);
                 let _ = event_tx.send(AudioEvent::Error(format!("No audio output: {}", e)));
@@ -1261,8 +1267,10 @@ impl AudioEngine {
                 return;
             }
         };
-
-        let sink = Arc::new(Sink::try_new(&stream_handle).expect("failed to create sink"));
+        // Set when the OS invalidated the output (iOS interruption, media
+        // services reset). The next command that needs audible output
+        // rebuilds the stream first instead of playing into a dead unit.
+        let mut output_needs_reset = false;
         let (tap_tx, tap_rx) = analyzer::tap_channel();
         analyzer::spawn_analyzer(tap_rx, Arc::clone(&app_handle));
         let playback_session = Arc::new(AtomicU64::new(0));
@@ -1281,7 +1289,57 @@ impl AudioEngine {
 
         loop {
             // Process commands
-            match cmd_rx.recv_timeout(Duration::from_millis(50)) {
+            let received = cmd_rx.recv_timeout(Duration::from_millis(50));
+            if output_needs_reset {
+                if let Ok(command) = &received {
+                    if Self::command_needs_live_output(command) {
+                        let resume_queue = matches!(command, AudioCommand::Resume)
+                            && playback_kind == PlaybackKind::Queue;
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut active_play,
+                            awaiting_source,
+                            PlayEndReason::Stopped,
+                        );
+                        awaiting_source = false;
+                        if Self::reopen_output(&mut output_stream, &mut sink, &event_tx) {
+                            output_needs_reset = false;
+                        }
+                        if resume_queue {
+                            // The paused track's decoded audio died with the old
+                            // output; start the entry again rather than resuming
+                            // into silence.
+                            if let Some(entry) = queue.current().cloned() {
+                                if let Err(err) = Self::play_queue_entry(
+                                    &sink,
+                                    &tap_tx,
+                                    &entry,
+                                    &cmd_tx,
+                                    &event_tx,
+                                    &state,
+                                    &db,
+                                    &playback_session,
+                                    &mut position_offset_ms,
+                                    &mut current_position_reports_relative,
+                                    &mut active_play,
+                                    &mut playback_kind,
+                                    &mut awaiting_source,
+                                    &mut desired_playing,
+                                    PlayEndReason::QueueChanged,
+                                ) {
+                                    let _ = event_tx.send(AudioEvent::Error(err));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            match received {
                 Ok(AudioCommand::PlayFile(recording_id, path)) => {
                     Self::reset_playback_session(
                         &sink,
@@ -1601,6 +1659,25 @@ impl AudioEngine {
                         &mut awaiting_source,
                         desired_playing,
                     );
+                }
+                Ok(AudioCommand::Interrupted) => {
+                    output_needs_reset = true;
+                    if playback_kind == PlaybackKind::Idle {
+                        continue;
+                    }
+                    let _ = cmd_tx.send(AudioCommand::Pause);
+                }
+                Ok(AudioCommand::ResetOutput) => {
+                    // Already handled by the pre-match hook when a reset was
+                    // pending. Otherwise rebuild eagerly, keeping the paused
+                    // state and re-pushing it so the lock screen shows us again.
+                    if output_needs_reset {
+                        output_needs_reset = false;
+                    } else if !Self::reopen_output(&mut output_stream, &mut sink, &event_tx) {
+                        output_needs_reset = true;
+                    }
+                    let s = state.lock().clone();
+                    emit_state_changed(&event_tx, s);
                 }
                 Ok(AudioCommand::Pause) => {
                     if playback_kind == PlaybackKind::Radio {
@@ -2351,6 +2428,63 @@ impl AudioEngine {
 
     fn error_session_is_current(playback_session: &AtomicU64, session_id: u64) -> bool {
         playback_session.load(Ordering::SeqCst) == session_id
+    }
+
+    fn open_output() -> Result<(OutputStream, Arc<Sink>), String> {
+        let (stream, handle) = OutputStream::try_default().map_err(|e| e.to_string())?;
+        let sink = Sink::try_new(&handle).map_err(|e| e.to_string())?;
+        Ok((stream, Arc::new(sink)))
+    }
+
+    /// Replaces the output stream and sink in place, carrying the volume over.
+    /// The caller must have reset the playback session first so in-flight
+    /// prepares cannot append to the old sink.
+    fn reopen_output(
+        output_stream: &mut OutputStream,
+        sink: &mut Arc<Sink>,
+        event_tx: &Sender<AudioEvent>,
+    ) -> bool {
+        let volume = sink.volume();
+        match Self::open_output() {
+            Ok((stream, new_sink)) => {
+                new_sink.set_volume(volume);
+                *sink = new_sink;
+                *output_stream = stream;
+                true
+            }
+            Err(e) => {
+                log::error!("Failed to reopen audio output: {}", e);
+                let _ = event_tx.send(AudioEvent::Error(format!(
+                    "Audio output could not be reopened: {}",
+                    e
+                )));
+                false
+            }
+        }
+    }
+
+    /// Commands that put audio on the output, as opposed to editing state.
+    fn command_needs_live_output(command: &AudioCommand) -> bool {
+        !matches!(
+            command,
+            AudioCommand::Pause
+                | AudioCommand::Interrupted
+                | AudioCommand::Stop
+                | AudioCommand::StopForError(..)
+                | AudioCommand::Seek(..)
+                | AudioCommand::SetVolume(..)
+                | AudioCommand::SetShuffle(..)
+                | AudioCommand::SetRepeat(..)
+                | AudioCommand::AddToQueue(..)
+                | AudioCommand::InsertNext(..)
+                | AudioCommand::AppendContextIfSession { .. }
+                | AudioCommand::RemoveFromQueue(..)
+                | AudioCommand::RemoveQueueEntry { .. }
+                | AudioCommand::ClearQueue
+                | AudioCommand::SetQueue(..)
+                | AudioCommand::GetState
+                | AudioCommand::Shutdown
+        )
     }
 
     fn reset_playback_session(
