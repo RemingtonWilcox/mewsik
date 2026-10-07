@@ -32,7 +32,8 @@
     "targets": "all",
     "resources": {
       "../sidecar/dist/index.cjs": "sidecar/dist/index.cjs",
-      "resources/bin/": "bin/"
+      "resources/bin/": "bin/",
+      "resources/seed_favorite_stations.json": "seed_favorite_stations.json"
     },
     "icon": [
       "icons/32x32.png",

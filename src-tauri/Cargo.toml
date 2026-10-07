@@ -15,9 +15,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
-tauri = { version = "2.10.3", features = ["tray-icon"] }
+tauri = { version = "2.10.3", features = [] }
 tauri-plugin-dialog = "2"
-tauri-plugin-drag = "2.1.0"
 tauri-plugin-log = "2"
 tauri-plugin-shell = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -46,3 +45,9 @@ rand = "0.8"
 fuzzy-matcher = "0.3"
 async-trait = "0.1"
 urlencoding = "2"
+
+# Desktop-only deps (tray-icon pulls in desktop-only crates; drag plugin is
+# desktop-only).
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+tauri = { version = "2.10.3", features = ["tray-icon"] }
+tauri-plugin-drag = "2.1.0"

@@ -12,6 +12,12 @@ use tokio::task::JoinSet;
 pub struct RadioBrowserStation {
     pub name: String,
     pub url: String,
+    /// Radio Browser also returns `url_resolved`, the actual MP3/AAC stream URL
+    /// after following any .m3u/.pls playlist redirects. Prefer this when
+    /// non-empty — `url` for some stations (e.g. Dutch Delite DnB) points to a
+    /// playlist file that the audio engine can't decode as audio.
+    #[serde(default)]
+    pub url_resolved: Option<String>,
     pub homepage: Option<String>,
     pub favicon: Option<String>,
     pub country: Option<String>,
@@ -584,4 +590,84 @@ pub fn play_station_search_result(
 
     engine.send(AudioCommand::PlayUrl(station.id, url, name, favicon));
     Ok(())
+}
+
+/// Reads `seed_favorite_stations.json` from the app's bundled resources and
+/// upserts each station as a favorite. Idempotent — `upsert_station` handles
+/// duplicates by URL/radio_browser_id, so calling this multiple times is safe.
+/// Returns the number of new favorites added.
+#[derive(Debug, Deserialize)]
+struct SeedStation {
+    name: String,
+    url: String,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    favicon_url: Option<String>,
+    #[serde(default)]
+    country: Option<String>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    tags: Option<String>,
+    #[serde(default)]
+    codec: Option<String>,
+    #[serde(default)]
+    bitrate: Option<i32>,
+    #[serde(default)]
+    radio_browser_id: Option<String>,
+}
+
+#[tauri::command]
+pub fn seed_favorite_stations_from_bundle(
+    app: tauri::AppHandle,
+    db: State<'_, DbPool>,
+) -> Result<usize, String> {
+    use tauri::Manager;
+    let resource_path = app
+        .path()
+        .resolve(
+            "seed_favorite_stations.json",
+            tauri::path::BaseDirectory::Resource,
+        )
+        .map_err(|e| format!("seed file not bundled: {}", e))?;
+
+    let contents = std::fs::read_to_string(&resource_path)
+        .map_err(|e| format!("failed to read seed file: {}", e))?;
+    let stations: Vec<SeedStation> =
+        serde_json::from_str(&contents).map_err(|e| format!("invalid seed json: {}", e))?;
+
+    // Skip seeding if the user already has favorites — they've manually added
+    // some on this device, don't blindly clobber/duplicate.
+    let existing = queries::get_favorite_stations(&db).map_err(|e| e.to_string())?;
+    let existing_urls: std::collections::HashSet<String> =
+        existing.iter().map(|s| s.url.clone()).collect();
+    if !existing.is_empty() && existing.len() >= stations.len() / 2 {
+        // Probably already seeded. Still idempotent below via upsert, but skip.
+        return Ok(0);
+    }
+
+    let mut added = 0;
+    for s in stations {
+        if existing_urls.contains(&s.url) {
+            continue;
+        }
+        let _ = upsert_station(
+            &db,
+            s.name,
+            s.url,
+            s.homepage,
+            s.favicon_url,
+            s.country,
+            s.language,
+            s.tags,
+            s.codec,
+            s.bitrate,
+            s.radio_browser_id,
+            true,
+            None,
+        )?;
+        added += 1;
+    }
+    Ok(added)
 }

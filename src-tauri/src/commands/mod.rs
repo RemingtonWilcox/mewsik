@@ -1,5 +1,7 @@
 pub mod discovery;
+#[cfg(not(target_os = "ios"))]
 pub mod downloads;
+#[cfg(not(target_os = "ios"))]
 pub mod external_search;
 pub mod library;
 pub mod playback;

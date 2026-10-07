@@ -1,5 +1,6 @@
 use crate::audio::engine::AudioEvent;
 use crate::config::AppConfig;
+#[cfg(not(target_os = "ios"))]
 use crate::external_tools::{find_binary, format_ffmpeg_headers};
 use crossbeam_channel::Sender;
 use parking_lot::{Condvar, Mutex};
@@ -7,6 +8,7 @@ use rodio::{Decoder, Source};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(not(target_os = "ios"))]
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -398,6 +400,7 @@ fn spawn_download_worker(
     Ok(())
 }
 
+#[cfg(not(target_os = "ios"))]
 fn spawn_ffmpeg_transcode_worker(
     url: String,
     headers: HashMap<String, String>,
@@ -673,11 +676,20 @@ pub fn prepare_http_audio_source(
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
+    // Some Radio Browser entries store an .m3u/.pls playlist URL instead of the
+    // direct stream URL. Resolve playlists to the actual stream so the audio
+    // decoder gets MP3/AAC bytes, not playlist text.
+    let resolved_url = if is_live {
+        resolve_playlist_url_blocking(&url).unwrap_or(url)
+    } else {
+        url
+    };
+
     let (writer, reader) = create_unlinked_stream_file()?;
     let shared = Arc::new(SharedBufferedFile::new(reader));
 
     spawn_download_worker(
-        url,
+        resolved_url,
         headers,
         writer,
         Arc::clone(&shared),
@@ -691,6 +703,78 @@ pub fn prepare_http_audio_source(
     prepare_buffered_decoder(shared, initial_buffer_bytes, is_live)
 }
 
+/// If `url` points to a playlist (.m3u, .m3u8, .pls), fetch it, parse the first
+/// stream URL, and return that. Returns `None` if the URL is already a direct
+/// stream or playlist parsing fails. Blocking — call from the prepare thread.
+fn resolve_playlist_url_blocking(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    let looks_like_playlist = lower.ends_with(".m3u")
+        || lower.ends_with(".m3u8")
+        || lower.ends_with(".pls")
+        || lower.ends_with(".asx");
+
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let response = client
+        .get(url)
+        .header("User-Agent", "mewsik/0.1")
+        .send()
+        .ok()?;
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let is_playlist_response = content_type.contains("mpegurl")
+        || content_type.contains("scpls")
+        || content_type.contains("x-mpegurl")
+        || content_type.contains("application/pls")
+        || content_type.starts_with("text/")
+        || content_type.starts_with("application/xml");
+
+    if !looks_like_playlist && !is_playlist_response {
+        return None;
+    }
+
+    let text = response.text().ok()?;
+    parse_first_stream_url(&text)
+}
+
+/// Parses an M3U / M3U8 / PLS playlist body and returns the first non-comment
+/// URL found. Skips `#EXT...` directives and `[playlist]` headers.
+fn parse_first_stream_url(playlist_text: &str) -> Option<String> {
+    for raw_line in playlist_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('[') {
+            continue;
+        }
+
+        // .pls format: `File1=http://...` — extract the value after `=`.
+        let candidate = if let Some((key, value)) = line.split_once('=') {
+            if key.trim().to_ascii_lowercase().starts_with("file") {
+                value.trim()
+            } else {
+                continue;
+            }
+        } else {
+            line
+        };
+
+        if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "ios"))]
 pub fn prepare_ffmpeg_audio_source(
     url: String,
     headers: HashMap<String, String>,

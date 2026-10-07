@@ -62,6 +62,16 @@ pub enum AudioEvent {
     Error(String),
 }
 
+/// Sends a `StateChanged` event and, on iOS, mirrors the state into the
+/// system Now Playing center so the lock screen / AirPods / Control Center
+/// stay in sync. Use this everywhere instead of constructing the
+/// `AudioEvent::StateChanged` send directly.
+fn emit_state_changed(event_tx: &Sender<AudioEvent>, state: PlaybackState) {
+    #[cfg(target_os = "ios")]
+    crate::audio::now_playing::update(&state);
+    let _ = event_tx.send(AudioEvent::StateChanged(state));
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlaybackKind {
     Idle,
@@ -329,7 +339,7 @@ impl AudioEngine {
         s.source = Some(entry.source.clone());
         let state_clone = s.clone();
         drop(s);
-        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+        emit_state_changed(&event_tx, state_clone);
     }
 
     fn start_radio_playback(
@@ -382,9 +392,10 @@ impl AudioEngine {
         s.source = Some("radio".to_string());
         let state_clone = s.clone();
         drop(s);
-        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+        emit_state_changed(&event_tx, state_clone);
     }
 
+    #[cfg(not(target_os = "ios"))]
     fn prepare_youtube_remote_playback(
         queued_entry: QueueEntry,
         url: String,
@@ -482,7 +493,7 @@ impl AudioEngine {
             s.can_seek = false;
             let state_clone = s.clone();
             drop(s);
-            let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+            emit_state_changed(&event_tx, state_clone);
         }
 
         if let Some(path) = entry.file_path.as_ref() {
@@ -500,7 +511,7 @@ impl AudioEngine {
                 s.can_seek = false;
                 let state_clone = s.clone();
                 drop(s);
-                let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                emit_state_changed(&event_tx, state_clone);
             }
             let url = url.clone();
             let headers = entry.source_headers.clone();
@@ -509,12 +520,14 @@ impl AudioEngine {
             let event_tx = event_tx.clone();
             let playback_session = Arc::clone(playback_session);
             let prefer_full_fetch = Self::should_prefer_full_fetch(entry);
+            #[cfg(not(target_os = "ios"))]
             let use_ffmpeg_stream = queued_entry.source == "youtube";
             let stream_mime_type = entry.stream_mime_type.clone();
 
             std::thread::Builder::new()
                 .name("remote-track-prepare".to_string())
                 .spawn(move || {
+                    #[cfg(not(target_os = "ios"))]
                     if use_ffmpeg_stream {
                         Self::prepare_youtube_remote_playback(
                             queued_entry,
@@ -627,7 +640,7 @@ impl AudioEngine {
         s.source = Some(entry.source.clone());
         let state_clone = s.clone();
         drop(s);
-        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+        emit_state_changed(&event_tx, state_clone);
 
         Ok(())
     }
@@ -640,6 +653,12 @@ impl AudioEngine {
         queue_items: Arc<Mutex<Vec<QueueItem>>>,
         db: DbPool,
     ) {
+        // iOS: activate the audio session and register lock-screen / AirPods
+        // remote command handlers BEFORE creating the rodio output stream so
+        // the AudioUnit is allocated under the .playback session category.
+        #[cfg(target_os = "ios")]
+        crate::audio::now_playing::setup(cmd_tx.clone());
+
         let (_stream, stream_handle) = match OutputStream::try_default() {
             Ok(s) => s,
             Err(e) => {
@@ -655,6 +674,10 @@ impl AudioEngine {
         let mut play_started: Option<Instant> = None;
         let mut position_offset_ms: u64 = 0;
         let mut current_position_reports_relative = false;
+        // Last radio station tuple: (station_id, url, name, favicon).
+        // Lets Pause/Resume on radio (which closes the stream) restart cleanly,
+        // and Next/Prev cycle through the user's favorite stations.
+        let mut last_radio_station: Option<(String, String, String, Option<String>)> = None;
         let mut current_play_id: Option<String> = None;
         let mut last_position_update = Instant::now();
         let mut playback_kind = PlaybackKind::Idle;
@@ -730,7 +753,7 @@ impl AudioEngine {
                                     s.source = Some("local".to_string());
                                     let state_clone = s.clone();
                                     drop(s);
-                                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                                    emit_state_changed(&event_tx, state_clone);
                                 }
                                 Err(e) => {
                                     let _ = event_tx
@@ -814,7 +837,7 @@ impl AudioEngine {
                             s.source = Some(entry.source.clone());
                             let state_clone = s.clone();
                             drop(s);
-                            let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                            emit_state_changed(&event_tx, state_clone);
                         }
                         Err(err) => {
                             let _ = event_tx.send(AudioEvent::Error(err));
@@ -850,6 +873,8 @@ impl AudioEngine {
                     );
                 }
                 Ok(AudioCommand::PlayUrl(station_id, url, name, favicon)) => {
+                    last_radio_station =
+                        Some((station_id.clone(), url.clone(), name.clone(), favicon.clone()));
                     let session_id = Self::reset_playback_session(
                         &sink,
                         &playback_session,
@@ -892,7 +917,7 @@ impl AudioEngine {
                         s.position_ms = 0;
                         let sc = s.clone();
                         drop(s);
-                        let _ = event_tx.send(AudioEvent::StateChanged(sc));
+                        emit_state_changed(&event_tx, sc);
                     }
 
                     std::thread::Builder::new()
@@ -966,24 +991,61 @@ impl AudioEngine {
                     );
                 }
                 Ok(AudioCommand::Pause) => {
-                    desired_playing = false;
-                    sink.pause();
-                    let position_ms = Self::playback_position_ms(
-                        &sink,
-                        position_offset_ms,
-                        current_position_reports_relative,
-                        awaiting_source,
-                    );
-                    play_started = None;
-                    let mut s = state.lock();
-                    s.is_playing = false;
-                    s.position_ms = position_ms;
-                    let state_clone = s.clone();
-                    drop(s);
-                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                    // Radio is HTTP streaming — sink.pause() can't truly pause
+                    // a live stream. Stop it cleanly so Resume can restart from
+                    // the current live position via the saved station.
+                    if playback_kind == PlaybackKind::Radio {
+                        Self::reset_playback_session(
+                            &sink,
+                            &playback_session,
+                            &db,
+                            &mut play_started,
+                            &mut position_offset_ms,
+                            &mut current_position_reports_relative,
+                            &mut current_play_id,
+                            awaiting_source,
+                        );
+                        awaiting_source = false;
+                        desired_playing = false;
+                        let mut s = state.lock();
+                        s.is_playing = false;
+                        s.is_buffering = false;
+                        let state_clone = s.clone();
+                        drop(s);
+                        emit_state_changed(&event_tx, state_clone);
+                    } else {
+                        desired_playing = false;
+                        sink.pause();
+                        let position_ms = Self::playback_position_ms(
+                            &sink,
+                            position_offset_ms,
+                            current_position_reports_relative,
+                            awaiting_source,
+                        );
+                        play_started = None;
+                        let mut s = state.lock();
+                        s.is_playing = false;
+                        s.position_ms = position_ms;
+                        let state_clone = s.clone();
+                        drop(s);
+                        emit_state_changed(&event_tx, state_clone);
+                    }
                 }
                 Ok(AudioCommand::Resume) => {
                     desired_playing = true;
+                    // After a radio "pause" (which actually stopped the stream)
+                    // OR after a stop while the user still expects "their last
+                    // radio station" to come back when they hit play on the
+                    // lock screen — replay the saved station.
+                    let needs_radio_replay = playback_kind == PlaybackKind::Radio
+                        && (awaiting_source == false && sink.empty())
+                        || (playback_kind == PlaybackKind::Idle && last_radio_station.is_some());
+                    if needs_radio_replay {
+                        if let Some((id, url, name, favicon)) = last_radio_station.clone() {
+                            let _ = cmd_tx.send(AudioCommand::PlayUrl(id, url, name, favicon));
+                            continue;
+                        }
+                    }
                     if awaiting_source {
                         let mut s = state.lock();
                         s.is_playing = false;
@@ -991,7 +1053,7 @@ impl AudioEngine {
                         s.can_seek = false;
                         let state_clone = s.clone();
                         drop(s);
-                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                        emit_state_changed(&event_tx, state_clone);
                     } else if !sink.empty() {
                         sink.play();
                         play_started = Some(Instant::now());
@@ -1000,7 +1062,7 @@ impl AudioEngine {
                         s.is_buffering = false;
                         let state_clone = s.clone();
                         drop(s);
-                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                        emit_state_changed(&event_tx, state_clone);
                     }
                 }
                 Ok(AudioCommand::Stop) => {
@@ -1025,14 +1087,16 @@ impl AudioEngine {
                     s.volume = sink.volume();
                     let state_clone = s.clone();
                     drop(s);
-                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                    emit_state_changed(&event_tx, state_clone);
                 }
                 Ok(AudioCommand::Seek(ms)) => {
+                    #[cfg_attr(target_os = "ios", allow(unused_variables))]
                     let current_entry = if playback_kind == PlaybackKind::Queue {
                         queue.current().cloned()
                     } else {
                         None
                     };
+                    #[cfg(not(target_os = "ios"))]
                     if let Some(entry) = current_entry {
                         if entry.source == "youtube"
                             && entry.file_path.is_none()
@@ -1065,7 +1129,7 @@ impl AudioEngine {
                                 s.position_ms = ms;
                                 let state_clone = s.clone();
                                 drop(s);
-                                let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                                emit_state_changed(&event_tx, state_clone);
                             }
 
                             let cmd_tx_clone = cmd_tx.clone();
@@ -1109,7 +1173,7 @@ impl AudioEngine {
                             s.position_ms = ms;
                             let state_clone = s.clone();
                             drop(s);
-                            let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                            emit_state_changed(&event_tx, state_clone);
                         }
                         Err(err) => {
                             let should_disable_seek =
@@ -1119,7 +1183,7 @@ impl AudioEngine {
                                 s.can_seek = false;
                                 let state_clone = s.clone();
                                 drop(s);
-                                let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                                emit_state_changed(&event_tx, state_clone);
                             }
                             let _ =
                                 event_tx.send(AudioEvent::Error(format!("Seek failed: {}", err)));
@@ -1132,9 +1196,31 @@ impl AudioEngine {
                     s.volume = vol;
                     let state_clone = s.clone();
                     drop(s);
-                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                    emit_state_changed(&event_tx, state_clone);
                 }
                 Ok(AudioCommand::Next) => {
+                    if playback_kind == PlaybackKind::Radio {
+                        if let Some((id, _, _, _)) = last_radio_station.as_ref() {
+                            if let Ok(favs) = crate::db::queries::get_favorite_stations(&db) {
+                                if !favs.is_empty() {
+                                    let idx =
+                                        favs.iter().position(|s| s.id == *id).unwrap_or(usize::MAX);
+                                    let next = if idx == usize::MAX {
+                                        &favs[0]
+                                    } else {
+                                        &favs[(idx + 1) % favs.len()]
+                                    };
+                                    let _ = cmd_tx.send(AudioCommand::PlayUrl(
+                                        next.id.clone(),
+                                        next.url.clone(),
+                                        next.name.clone(),
+                                        next.favicon_url.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(entry) = queue.next().cloned() {
                         Self::sync_queue_state(&queue, &queue_items);
                         if let Err(err) = Self::play_queue_entry(
@@ -1158,6 +1244,27 @@ impl AudioEngine {
                     }
                 }
                 Ok(AudioCommand::Prev) => {
+                    if playback_kind == PlaybackKind::Radio {
+                        if let Some((id, _, _, _)) = last_radio_station.as_ref() {
+                            if let Ok(favs) = crate::db::queries::get_favorite_stations(&db) {
+                                if !favs.is_empty() {
+                                    let idx = favs.iter().position(|s| s.id == *id);
+                                    let prev = match idx {
+                                        Some(0) => &favs[favs.len() - 1],
+                                        Some(i) => &favs[i - 1],
+                                        None => &favs[0],
+                                    };
+                                    let _ = cmd_tx.send(AudioCommand::PlayUrl(
+                                        prev.id.clone(),
+                                        prev.url.clone(),
+                                        prev.name.clone(),
+                                        prev.favicon_url.clone(),
+                                    ));
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     // If we're more than 3 seconds in, restart current track
                     let pos = Self::playback_position_ms(
                         &sink,
@@ -1216,7 +1323,7 @@ impl AudioEngine {
                     s.is_shuffle = val;
                     let state_clone = s.clone();
                     drop(s);
-                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                    emit_state_changed(&event_tx, state_clone);
                 }
                 Ok(AudioCommand::SetRepeat(mode)) => {
                     let mode_str = match &mode {
@@ -1229,7 +1336,7 @@ impl AudioEngine {
                     s.repeat_mode = mode_str.to_string();
                     let state_clone = s.clone();
                     drop(s);
-                    let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                    emit_state_changed(&event_tx, state_clone);
                 }
                 Ok(AudioCommand::AddToQueue(entry)) => {
                     queue.add(entry);
@@ -1299,7 +1406,7 @@ impl AudioEngine {
                 }
                 Ok(AudioCommand::GetState) => {
                     let s = state.lock().clone();
-                    let _ = event_tx.send(AudioEvent::StateChanged(s));
+                    emit_state_changed(&event_tx, s);
                 }
                 Ok(AudioCommand::Shutdown) => {
                     Self::reset_playback_session(
@@ -1391,7 +1498,7 @@ impl AudioEngine {
                         }
 
                         playback_kind = PlaybackKind::Idle;
-                        let _ = event_tx.send(AudioEvent::StateChanged(state_clone));
+                        emit_state_changed(&event_tx, state_clone);
                     }
                 }
                 last_position_update = Instant::now();

@@ -394,6 +394,10 @@ export const saveStation = (
 
 export const getFavoriteStations = () => safeInvoke<Station[]>('get_favorite_stations', undefined, []);
 
+/** iOS-only: seed the local DB from the bundled desktop favorites JSON. Returns # added. */
+export const seedFavoriteStationsFromBundle = () =>
+	safeInvoke<number>('seed_favorite_stations_from_bundle', undefined, 0);
+
 export const verifyFavoriteStations = () =>
 	safeInvoke<StationHealthResult[]>('verify_favorite_stations', undefined, []);
 export const verifyStationUrls = (urls: string[]) =>

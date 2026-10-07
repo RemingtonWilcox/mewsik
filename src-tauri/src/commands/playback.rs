@@ -3,7 +3,7 @@ use crate::audio::queue::{QueueEntry, RepeatMode};
 use crate::db::models::{PlaybackState, QueueItem};
 use crate::db::{queries, DbPool};
 use crate::download;
-use crate::sources::sidecar_manager::SidecarManager;
+use crate::sources::SidecarManager;
 use crate::sources::stream_cache::StreamCache;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
