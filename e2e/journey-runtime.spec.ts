@@ -299,7 +299,12 @@ test.describe('shared visualizer journey runtime', () => {
 			};
 
 			const run = (hz: number, base: number) => {
-				vis.resetPerformance(`null-cadence-${hz}-${Math.random()}`, base);
+				// Both cadences must start from the identical seed, or the comparison
+				// measures seed-dependent rail speeds instead of step-size drift.
+				// resetPerformance ignores a repeated identity, so bounce through a
+				// scratch identity first.
+				vis.resetPerformance(`null-cadence-scratch-${hz}`, base);
+				vis.resetPerformance('null-cadence', base);
 				for (let index = 1; index <= 30; index += 1) {
 					vis.setLatest({ ...loud, onset: index % 10 === 0 }, base + index * (1000 / 60));
 				}
