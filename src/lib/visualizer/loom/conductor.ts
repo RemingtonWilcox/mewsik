@@ -33,6 +33,10 @@ export type LoomSectionProfile = {
 	twist: number;
 	depth: number;
 	asymmetry: number;
+	/** How far the woven sheet rolls its edges under toward a tunnel. */
+	curl: number;
+	/** How many weft picks the section skips; high values expose bare warp. */
+	weftSparse: number;
 	cameraPitch: number;
 	cameraDistance: number;
 };
@@ -56,6 +60,10 @@ export type LoomConductorFrame = {
 	braid: number;
 	twist: number;
 	depth: number;
+	/** Sheet roll: 0 is a flat woven panel, 1 is a closed tunnel. */
+	curl: number;
+	/** Fraction of weft picks suppressed by the draft; exposes bare warp. */
+	weftSparse: number;
 	/** Kick/body/novelty impulse. It does not select topology or move the camera. */
 	impact: number;
 	/** Phrase-boundary unlacing envelope, decaying over roughly one bar. */
@@ -101,6 +109,8 @@ export const LOOM_CONDUCTOR_LIMITS = {
 	braid: [0.08, 0.96],
 	twist: [0.04, 0.96],
 	depth: [0.12, 0.96],
+	curl: [0, 1],
+	weftSparse: [0, 1],
 	impact: [0, 1],
 	reweave: [0, 1],
 	sectionPulse: [0, 1],
@@ -134,6 +144,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.12,
 		depth: 0.28,
 		asymmetry: 0.08,
+		curl: 0.06,
+		weftSparse: 0.18,
 		cameraPitch: 0.1,
 		cameraDistance: 3.86
 	},
@@ -148,6 +160,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.22,
 		depth: 0.36,
 		asymmetry: 0.12,
+		curl: 0.1,
+		weftSparse: 0.1,
 		cameraPitch: 0.08,
 		cameraDistance: 3.68
 	},
@@ -162,6 +176,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.42,
 		depth: 0.5,
 		asymmetry: 0.28,
+		curl: 0.22,
+		weftSparse: 0.06,
 		cameraPitch: 0.02,
 		cameraDistance: 3.48
 	},
@@ -176,6 +192,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.7,
 		depth: 0.58,
 		asymmetry: 0.34,
+		curl: 0.48,
+		weftSparse: 0.1,
 		cameraPitch: -0.04,
 		cameraDistance: 3.58
 	},
@@ -190,6 +208,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.88,
 		depth: 0.65,
 		asymmetry: 0.4,
+		curl: 0.82,
+		weftSparse: 0.06,
 		cameraPitch: -0.08,
 		cameraDistance: 3.76
 	},
@@ -204,6 +224,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.68,
 		depth: 0.9,
 		asymmetry: 0.2,
+		curl: 0.1,
+		weftSparse: 0,
 		cameraPitch: 0.05,
 		cameraDistance: 2.82
 	},
@@ -218,6 +240,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.62,
 		depth: 0.82,
 		asymmetry: 0.24,
+		curl: 0.16,
+		weftSparse: 0,
 		cameraPitch: 0.04,
 		cameraDistance: 3.02
 	},
@@ -232,6 +256,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.3,
 		depth: 0.72,
 		asymmetry: 0.76,
+		curl: 0.3,
+		weftSparse: 0.45,
 		cameraPitch: 0.15,
 		cameraDistance: 3.34
 	},
@@ -246,6 +272,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.16,
 		depth: 0.62,
 		asymmetry: 0.46,
+		curl: 0.26,
+		weftSparse: 0.62,
 		cameraPitch: 0.19,
 		cameraDistance: 3.72
 	},
@@ -260,6 +288,8 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, LoomSectionProfile>> 
 		twist: 0.1,
 		depth: 0.38,
 		asymmetry: 0.18,
+		curl: 0.08,
+		weftSparse: 0.38,
 		cameraPitch: 0.11,
 		cameraDistance: 3.92
 	}
@@ -455,6 +485,8 @@ export class LoomConductor {
 	private braid = SECTION_PROFILES.intro.braid;
 	private twist = SECTION_PROFILES.intro.twist;
 	private depth = SECTION_PROFILES.intro.depth;
+	private curl = SECTION_PROFILES.intro.curl;
+	private weftSparse = SECTION_PROFILES.intro.weftSparse;
 	private impact = 0;
 	private reweave = 0;
 	private sectionPulse = 0;
@@ -489,6 +521,8 @@ export class LoomConductor {
 		braid: SECTION_PROFILES.intro.braid,
 		twist: SECTION_PROFILES.intro.twist,
 		depth: SECTION_PROFILES.intro.depth,
+		curl: SECTION_PROFILES.intro.curl,
+		weftSparse: SECTION_PROFILES.intro.weftSparse,
 		impact: 0,
 		reweave: 0,
 		sectionPulse: 0,
@@ -542,6 +576,8 @@ export class LoomConductor {
 		this.braid = intro.braid;
 		this.twist = intro.twist;
 		this.depth = intro.depth;
+		this.curl = intro.curl;
+		this.weftSparse = intro.weftSparse;
 		this.impact = 0;
 		this.reweave = 0;
 		this.sectionPulse = 0;
@@ -575,6 +611,8 @@ export class LoomConductor {
 		this.output.braid = this.braid;
 		this.output.twist = this.twist;
 		this.output.depth = this.depth;
+		this.output.curl = this.curl;
+		this.output.weftSparse = this.weftSparse;
 		this.output.impact = 0;
 		this.output.reweave = 0;
 		this.output.sectionPulse = 0;
@@ -833,6 +871,16 @@ export class LoomConductor {
 		this.twist = approach(this.twist, twistTarget, 1.7, dt);
 		this.depth = approach(this.depth, depthTarget, 2.2, dt);
 
+		// Sheet curl rolls toward a tunnel as sections tighten; release and
+		// drop openness uncurl it quickly so landings open instead of squeezing.
+		const curlTarget = clamp01(
+			profile.curl + this.tension * 0.16 - this.dropOpenness * 0.55 - this.release * 0.14
+		);
+		this.curl = approachAsymmetric(this.curl, curlTarget, 1.35, 0.55, dt);
+		// Sparse drafts skip picks so bridges/breakdowns expose bare warp.
+		const sparseTarget = clamp01(profile.weftSparse + (frame.silence ? 0.22 : 0));
+		this.weftSparse = approach(this.weftSparse, sparseTarget, 1.6, dt);
+
 		const topologyRateTarget = clamp(
 			0.075 + this.motion * 0.31 + this.tension * 0.08 + finite(spectrum.spectralMotion) * 0.08,
 			...LOOM_CONDUCTOR_LIMITS.topologyRate
@@ -889,6 +937,8 @@ export class LoomConductor {
 		this.output.braid = this.braid;
 		this.output.twist = this.twist;
 		this.output.depth = this.depth;
+		this.output.curl = this.curl;
+		this.output.weftSparse = this.weftSparse;
 		this.output.impact = this.impact;
 		this.output.reweave = this.reweave;
 		this.output.sectionPulse = this.sectionPulse;

@@ -7,7 +7,7 @@ test-results
 tmp
 *.log
 /.playwright-cli/
-/output/playwright/
+/output/
 
 # Output
 .output
