@@ -285,6 +285,10 @@ fn build_blocking_public_client(url: &Url) -> Result<reqwest::blocking::Client, 
 
     reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        // Blocking reads time out per read. Live streams send continuously,
+        // so 10 s of silence means a stalled server: fail fast and let the
+        // engine's reconnect take over instead of waiting the 30 s default.
+        .timeout(Duration::from_secs(10))
         .user_agent(concat!("mewsik/", env!("CARGO_PKG_VERSION")))
         .redirect(Policy::none())
         .no_proxy()

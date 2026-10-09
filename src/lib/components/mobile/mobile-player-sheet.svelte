@@ -1,6 +1,14 @@
 <script lang="ts">
 	import * as Drawer from '$lib/components/ui/drawer';
-	import { usePlayer, formatTime } from '$lib/state/player.svelte';
+	import {
+		usePlayer,
+		formatTime,
+		connectionStage,
+		displayTitle,
+		isConnecting
+	} from '$lib/state/player.svelte';
+	import StationArt from '$lib/components/station-art.svelte';
+	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
 	import { Slider } from '$lib/components/ui/slider';
 	import {
 		Play,
@@ -10,9 +18,9 @@
 		Shuffle,
 		Repeat,
 		Repeat1,
-		Radio,
 		ChevronDown,
-		LoaderCircle
+		Square,
+		RotateCw
 	} from '@lucide/svelte';
 
 	let { open = $bindable(false) }: { open?: boolean } = $props();
@@ -25,8 +33,12 @@
 			player.state.duration_ms > 0
 	);
 	let isRadio = $derived(player.state.source === 'radio');
-	let title = $derived(player.state.current_title ?? '');
-	let artist = $derived(player.state.current_artist ?? '');
+	let stage = $derived(connectionStage(player.state));
+	let failed = $derived(stage === 'failed');
+	let title = $derived(displayTitle(player.state) ?? '');
+	// For a station the engine's second line is its status, which the stage
+	// line below already says in full.
+	let artist = $derived(isRadio ? '' : (player.state.current_artist ?? ''));
 
 	function onSeekChange(values: number[]) {
 		if (!canSeek) return;
@@ -67,25 +79,34 @@
 
 			<!-- album art -->
 			<div class="flex flex-1 flex-col items-center justify-center gap-8 px-8 pb-4">
-				<div
-					class="aspect-square w-full max-w-sm overflow-hidden rounded-2xl bg-muted shadow-2xl"
-				>
-					{#if player.state.current_album_art}
+				{#if player.state.current_album_art}
+					<div
+						class="aspect-square w-full max-w-sm overflow-hidden rounded-2xl bg-muted shadow-2xl"
+					>
 						<img
 							src={player.state.current_album_art}
 							alt=""
 							class="size-full object-cover"
 						/>
-					{:else}
-						<div class="flex size-full items-center justify-center">
-							<Radio class="size-20 text-muted-foreground" />
-						</div>
-					{/if}
-				</div>
+					</div>
+				{:else}
+					<StationArt
+						name={title}
+						src={null}
+						class="aspect-square w-full max-w-sm rounded-2xl shadow-2xl transition-opacity duration-500 {isConnecting(
+							stage
+						) || failed
+							? 'opacity-70'
+							: ''}"
+						monogramClass="text-7xl"
+					/>
+				{/if}
 
 				<!-- title + artist -->
 				<div class="flex w-full flex-col items-center gap-1 px-4 text-center">
-					<h2 class="line-clamp-2 text-xl font-bold leading-tight">{title}</h2>
+					<h2 class="line-clamp-2 text-xl font-bold leading-tight" title={player.state.current_title ?? undefined}>
+						{title}
+					</h2>
 					{#if artist}
 						<p class="line-clamp-1 text-base text-muted-foreground">{artist}</p>
 					{/if}
@@ -94,9 +115,21 @@
 				<!-- timeline -->
 				<div class="flex w-full flex-col gap-1.5">
 					{#if isRadio}
-						<div class="flex items-center justify-center gap-2 text-xs text-muted-foreground">
-							<span class="size-2 animate-pulse rounded-full bg-red-500"></span>
-							<span class="uppercase tracking-widest">Live</span>
+						<div class="flex min-h-7 items-center justify-center text-sm text-muted-foreground">
+							{#if stage === 'idle'}
+								<span class="text-xs uppercase tracking-widest">Live radio</span>
+							{:else}
+								<ConnectionStatus
+									playback={player.state}
+									long
+									onRetry={() => void player.retryStation()}
+									class={stage === 'playing' ? 'text-xs uppercase tracking-widest' : ''}
+								/>
+							{/if}
+						</div>
+					{:else if isConnecting(stage)}
+						<div class="flex min-h-7 items-center justify-center text-sm text-muted-foreground">
+							<ConnectionStatus playback={player.state} />
 						</div>
 					{:else}
 						<Slider
@@ -138,10 +171,18 @@
 					<button
 						class="flex size-16 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-all hover:bg-primary/90 active:scale-95"
 						onclick={() => player.togglePlay()}
-						aria-label={player.state.is_playing ? 'Pause' : 'Play'}
+						aria-label={failed
+							? 'Retry station'
+							: player.state.is_buffering
+								? 'Stop'
+								: player.state.is_playing
+									? 'Pause'
+									: 'Play'}
 					>
-						{#if player.state.is_buffering}
-							<LoaderCircle class="size-7 animate-spin" />
+						{#if failed}
+							<RotateCw class="size-7" />
+						{:else if player.state.is_buffering}
+							<Square class="size-6 fill-current" />
 						{:else if player.state.is_playing}
 							<Pause class="size-7 fill-current" />
 						{:else}

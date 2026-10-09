@@ -9,7 +9,10 @@ use crate::stations::health::{
     verify_station_urls_inner, StationHealthResult,
 };
 use crate::stations::network::{parse_public_http_url, validate_public_http_url};
-use crate::stations::probe::{probe_station_stream, url_looks_like_playlist};
+use crate::stations::probe::{
+    cached_playable_url, forget_playable_url, probe_station_stream_for_playback,
+    url_looks_like_playlist,
+};
 use crate::stations::scenes::{
     self, SceneInfo, SceneRefreshSummary, StationDiscoveryFeed, StationPick,
 };
@@ -23,6 +26,37 @@ const MAX_DIRECTORY_LIMIT: usize = 100;
 const RAW_DIRECTORY_BATCH_SIZE: usize = 100;
 const MAX_DIRECTORY_PAGE_FETCHES: usize = 6;
 const MAX_DIRECTORY_OFFSET: usize = 100_000;
+/// Concurrent exact-tag lookups for one genre chip.
+const MAX_GENRE_TAGS: usize = 6;
+const GENRE_TAG_LIMIT: usize = 60;
+
+/// Error prefix for a station that failed in the play path and has been
+/// taken off the discovery shelves. The frontend matches on it to drop the
+/// card immediately (`isStationUnavailableError` in src/lib/api/tauri.ts).
+pub const STATION_UNAVAILABLE_ERROR: &str = "station_unavailable";
+
+fn station_unavailable(message: &str) -> String {
+    format!("{STATION_UNAVAILABLE_ERROR}: {message}")
+}
+
+/// A recent successful probe of `url`, reused so replays and resumes start
+/// without another round trip. Ignored (and dropped) when the station's last
+/// play ended in a playback error: the proof is stale, so the caller probes
+/// again and self-heals.
+async fn cached_play_url(db: &DbPool, station_id: Option<&str>, url: &str) -> Option<String> {
+    let resolved = cached_playable_url(url)?;
+    if let Some(station_id) = station_id {
+        if let Ok(Some(reason)) = queries::last_station_play_end_reason(db, station_id) {
+            if reason == "playback_error" {
+                forget_playable_url(url);
+                return None;
+            }
+        }
+    }
+    // The downloader revalidates every hop; this keeps the early rejection
+    // of non-public hosts that the uncached path gets from its probe.
+    validate_public_http_url(&resolved).await.ok()
+}
 
 #[derive(Debug, Serialize)]
 pub struct RadioStationPage {
@@ -205,6 +239,12 @@ async fn search_radio_stations_with_mode(
         Some("tag") => "bytag",
         _ => "byname",
     };
+    // Directory tags are lowercase and tag lookups are case-sensitive.
+    let query = if endpoint == "bytag" {
+        query.trim().to_lowercase()
+    } else {
+        query
+    };
     // hidebroken: the directory continuously checks its stations — skip
     // ones its own monitoring already knows are dead.
     let path = format!(
@@ -224,6 +264,99 @@ async fn search_radio_stations_with_mode(
         .map_err(|e| format!("Failed to parse radio stations: {}", e))?;
 
     Ok(prepare_directory_stations(stations, true))
+}
+
+/// Lowercase, trim, dedupe and bound a genre chip's tag list. radio-browser
+/// tags are lowercase and its tag lookups are case-sensitive, which is why a
+/// chip labelled "Hip Hop" used to return nothing.
+fn normalize_genre_tags(tags: Vec<String>) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let normalized: Vec<String> = tags
+        .into_iter()
+        .map(|tag| tag.trim().to_lowercase())
+        .filter(|tag| !tag.is_empty() && seen.insert(tag.clone()))
+        .collect();
+    if normalized.len() > MAX_GENRE_TAGS {
+        return Err(format!(
+            "Too many genre tags: the maximum is {MAX_GENRE_TAGS}"
+        ));
+    }
+    if normalized.iter().any(|tag| tag.len() > 64) {
+        return Err("Genre tag is too long".to_string());
+    }
+    Ok(normalized)
+}
+
+/// Merge per-tag results: first occurrence of each station wins, HLS and
+/// "every genre" tag spam are dropped, untrusted fields are sanitised.
+fn merge_genre_results(
+    tags: &[String],
+    groups: Vec<Vec<RadioBrowserStation>>,
+) -> Vec<RadioBrowserStation> {
+    let mut seen = std::collections::HashSet::new();
+    // News, talk and sports chips are not genres: score them as broad.
+    let broad = !scenes::terms_name_a_genre(tags);
+    let merged: Vec<RadioBrowserStation> = groups
+        .into_iter()
+        .flatten()
+        .filter(|station| {
+            let key = if station.stationuuid.trim().is_empty() {
+                station.url.trim().to_string()
+            } else {
+                station.stationuuid.trim().to_ascii_lowercase()
+            };
+            seen.insert(key)
+        })
+        .filter(|station| {
+            scenes::tag_focus_for_terms(tags, broad, &station.name, station.tags.as_deref()).score
+                >= scenes::FOCUS_EXCLUDE_BELOW
+        })
+        .collect();
+    prepare_directory_stations(merged, true)
+}
+
+/// A Directory genre chip: every tag in the chip's set is looked up as an
+/// exact radio-browser tag, concurrently, and the results are merged.
+#[tauri::command]
+pub async fn search_radio_stations_by_tags(
+    tags: Vec<String>,
+    sort: Option<String>,
+) -> Result<Vec<RadioBrowserStation>, String> {
+    let tags = normalize_genre_tags(tags)?;
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+    let order = radio_browser_order(sort.as_deref());
+    let mut lookups = tokio::task::JoinSet::new();
+    for (index, tag) in tags.iter().enumerate() {
+        let path = format!(
+            "/json/stations/bytagexact/{}?limit={GENRE_TAG_LIMIT}&order={order}&reverse=true&hidebroken=true",
+            urlencoding::encode(tag)
+        );
+        lookups.spawn(async move {
+            let Some(response) = radio_browser_get(&path).await else {
+                return (index, None);
+            };
+            (
+                index,
+                response.json::<Vec<RadioBrowserStation>>().await.ok(),
+            )
+        });
+    }
+    let mut groups: Vec<Option<Vec<RadioBrowserStation>>> = vec![None; tags.len()];
+    while let Some(joined) = lookups.join_next().await {
+        if let Ok((index, stations)) = joined {
+            groups[index] = stations;
+        }
+    }
+    if groups.iter().all(Option::is_none) {
+        return Err("All radio directory servers are unreachable".to_string());
+    }
+    // Keep the chip's tag order so its primary tag's stations win ties.
+    Ok(merge_genre_results(
+        &tags,
+        groups.into_iter().map(Option::unwrap_or_default).collect(),
+    ))
 }
 
 #[tauri::command]
@@ -428,14 +561,22 @@ pub async fn play_station(
     let client = build_station_health_client()?;
     // Ordinary direct streams need only DNS validation here: the actual
     // downloader safely follows and revalidates every redirect. Playlist and
-    // previously failing URLs still need a bounded content probe/unwrap.
+    // previously failing URLs still need a bounded content probe/unwrap,
+    // unless a probe proved them playable in the last 30 minutes.
     let should_probe = url_looks_like_playlist(&play_url)
         || station
             .as_ref()
             .map(|station| station.fail_count > 0)
             .unwrap_or(false);
-    let playable = if should_probe {
-        probe_station_stream(&client, &play_url).await
+    let cached = if should_probe {
+        cached_play_url(&db, Some(station_id.as_str()), &play_url).await
+    } else {
+        None
+    };
+    let playable = if let Some(cached) = cached {
+        Some(cached)
+    } else if should_probe {
+        probe_station_stream_for_playback(&client, &play_url).await
     } else {
         validate_public_http_url(&play_url).await.ok()
     };
@@ -496,23 +637,60 @@ pub async fn play_station_search_result(
     let _ = favicon;
     let stationuuid = normalize_radio_browser_uuid(&stationuuid)?;
     let play_request = engine.begin_play_request();
-    let client = build_station_health_client()?;
-    let mut candidates = vec![url];
-    for candidate in resolve_station_urls_by_uuid(&stationuuid).await {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
+    let started = std::time::Instant::now();
+    let saved_id = queries::find_station_by_identity(&db, Some(stationuuid.as_str()), &url)
+        .ok()
+        .flatten()
+        .map(|station| station.id);
+
+    let (url, how) = if let Some(cached) = cached_play_url(&db, saved_id.as_deref(), &url).await {
+        (cached, "cache")
+    } else {
+        let client = build_station_health_client()?;
+        // The URL the page holds is almost always current: probe it first
+        // and only ask the directory for replacements when it fails.
+        if let Some(resolved) = probe_station_stream_for_playback(&client, &url).await {
+            (resolved, "probe")
+        } else {
+            let replacements = resolve_station_urls_by_uuid(&stationuuid).await;
+            let directory_reachable = !replacements.is_empty();
+            let mut healed = None;
+            for candidate in replacements {
+                if candidate == url {
+                    continue;
+                }
+                if let Some(resolved) = probe_station_stream_for_playback(&client, &candidate).await
+                {
+                    healed = Some(resolved);
+                    break;
+                }
+            }
+            match healed {
+                Some(resolved) => (resolved, "heal"),
+                None if directory_reachable => {
+                    // The network works and nothing streams: the station is
+                    // dead. Take it off every discovery shelf right away.
+                    if let Err(err) = scenes::mark_station_unplayable(&db, &stationuuid) {
+                        log::warn!("Could not mark station unplayable: {}", err);
+                    }
+                    return Err(station_unavailable(
+                        "Station is unavailable and no working replacement stream was found",
+                    ));
+                }
+                None => {
+                    return Err(
+                        "Station did not respond and the radio directory is unreachable"
+                            .to_string(),
+                    )
+                }
+            }
         }
-    }
-    let mut playable_url = None;
-    for candidate in candidates {
-        if let Some(resolved) = probe_station_stream(&client, &candidate).await {
-            playable_url = Some(resolved);
-            break;
-        }
-    }
-    let url = playable_url.ok_or_else(|| {
-        "Station is unavailable and no working replacement stream was found".to_string()
-    })?;
+    };
+    log::info!(
+        "Station play resolved via {} in {} ms",
+        how,
+        started.elapsed().as_millis()
+    );
 
     let click_uuid = stationuuid.clone();
     let station = upsert_station(
@@ -539,6 +717,10 @@ pub async fn play_station_search_result(
     }
 
     let _ = queries::update_station_last_played(&db, &station.id, &queries::now());
+    if how != "cache" {
+        // A probe in the play path is as good as a background check.
+        let _ = scenes::mark_station_playable(&db, &click_uuid);
+    }
 
     // A directory-result play is just as real as a saved-station play. Report
     // it only after this request wins the playback race so the 24-hour start
@@ -742,6 +924,70 @@ mod tests {
         assert!(items.is_empty());
         assert_eq!(raw_offset, 83);
         assert_eq!(next_offset, 83);
+    }
+
+    #[test]
+    fn genre_chip_tags_are_lowercased_deduplicated_and_bounded() {
+        // "Hip Hop" matched nothing: radio-browser tag lookups are
+        // case-sensitive and every tag is stored lowercase.
+        assert_eq!(
+            normalize_genre_tags(vec![
+                " Hip Hop ".to_string(),
+                "hiphop".to_string(),
+                "HIP HOP".to_string(),
+                "".to_string(),
+                "Rap".to_string(),
+            ])
+            .unwrap(),
+            vec!["hip hop", "hiphop", "rap"]
+        );
+        assert!(
+            normalize_genre_tags((0..=MAX_GENRE_TAGS).map(|i| format!("tag {i}")).collect())
+                .is_err()
+        );
+        assert!(normalize_genre_tags(vec!["a".repeat(65)]).is_err());
+    }
+
+    #[test]
+    fn genre_chip_results_merge_without_duplicates_hls_or_tag_spam() {
+        let tagged = |name: &str, uuid: &str, hls: i32, tags: &str| {
+            let mut station = directory_station(name, hls);
+            station.stationuuid = uuid.to_string();
+            station.tags = Some(tags.to_string());
+            station
+        };
+        let tags = vec!["hip hop".to_string(), "rap".to_string()];
+        let merged = merge_genre_results(
+            &tags,
+            vec![
+                vec![
+                    tagged("Genuine", "a", 0, "hip hop,rap,urban"),
+                    tagged("Every Genre FM", "b", 0, "blues,classical,country,dance,hip hop,jazz,latin,metal,news,pop,reggae,rock,soul,techno"),
+                    tagged("HLS only", "c", 1, "hip hop"),
+                ],
+                vec![
+                    tagged("Genuine", "A", 0, "hip hop,rap,urban"),
+                    tagged("Rap Only", "d", 0, "rap,trap"),
+                ],
+            ],
+        );
+        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Genuine", "Rap Only"]);
+        assert!(merged.iter().all(|station| station.favicon.is_none()));
+
+        // News is not a genre: a public broadcaster that also lists its
+        // music programming is still a news result.
+        let news_tags = vec!["news".to_string(), "public radio".to_string()];
+        let news = merge_genre_results(
+            &news_tags,
+            vec![vec![tagged(
+                "Public Radio One",
+                "e",
+                0,
+                "classical,jazz,npr,public radio",
+            )]],
+        );
+        assert_eq!(news.len(), 1);
     }
 }
 

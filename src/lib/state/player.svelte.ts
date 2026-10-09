@@ -1,5 +1,6 @@
-import type { PlaybackState, RepeatMode } from '$lib/types';
+import type { ConnectionStage, PlaybackState, RepeatMode } from '$lib/types';
 import * as api from '$lib/api/tauri';
+import { cleanStationName } from '$lib/radio/names';
 import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
 import { useVisualizer } from '$lib/state/visualizer.svelte';
 import { visualizerPerformanceIdentity } from '$lib/visualizer/identity';
@@ -19,11 +20,49 @@ const defaultState: PlaybackState = {
 	volume: 1.0,
 	is_shuffle: false,
 	repeat_mode: 'off',
-	source: null
+	source: null,
+	connection_stage: 'idle',
+	reconnect_attempt: 0,
+	reconnect_max: 0,
+	connection_error: null
 };
 
 let state = $state<PlaybackState>({ ...defaultState });
-let pollInterval: ReturnType<typeof setInterval> | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+let polling = false;
+
+/** A station the listener just picked whose play command is still on its way
+ * to the engine (the station check runs first), shown as connecting so the
+ * player reacts at once instead of after the check. */
+interface PendingStation {
+	token: number;
+	id: string | null;
+	name: string;
+	url: string | null;
+}
+let pendingStation: PendingStation | null = null;
+let pendingStationToken = 0;
+
+function withPendingStation(next: PlaybackState, pending: PendingStation): PlaybackState {
+	return {
+		...next,
+		is_playing: false,
+		is_buffering: true,
+		can_seek: false,
+		source: 'radio',
+		current_recording_id: null,
+		current_station_id: pending.id,
+		current_title: pending.name,
+		current_artist: 'Connecting…',
+		current_album_art: null,
+		current_source_url: pending.url,
+		position_ms: 0,
+		duration_ms: 0,
+		connection_stage: 'connecting',
+		reconnect_attempt: 0,
+		connection_error: null
+	};
+}
 let refreshCycle = 0;
 let pendingSeek:
 	| {
@@ -90,6 +129,9 @@ function syncVisualScore(next: PlaybackState) {
 }
 
 function mergePlaybackState(nextState: PlaybackState) {
+	if (pendingStation) {
+		nextState = withPendingStation(nextState, pendingStation);
+	}
 	// Clear immediately when playback is no longer producing trustworthy audio.
 	// The store's 250 ms freshness timeout remains a backstop for missed polls or
 	// native analyzer stalls, while source identity protects fast track switches.
@@ -138,17 +180,24 @@ function scheduleRefresh(delays = [0, 90, 250]) {
 }
 
 function startPolling() {
-	if (pollInterval) return;
-	void refreshState();
-	pollInterval = setInterval(async () => {
-		void refreshState();
-	}, 250);
+	if (polling) return;
+	polling = true;
+	const tick = async () => {
+		await refreshState();
+		if (!polling) return;
+		// Poll faster while something is connecting so each stage shows up
+		// promptly; 250 ms otherwise.
+		const delay = pendingStation || isConnecting(connectionStage(state)) ? 100 : 250;
+		pollTimer = setTimeout(tick, delay);
+	};
+	void tick();
 }
 
 function stopPolling() {
-	if (pollInterval) {
-		clearInterval(pollInterval);
-		pollInterval = null;
+	polling = false;
+	if (pollTimer) {
+		clearTimeout(pollTimer);
+		pollTimer = null;
 	}
 }
 
@@ -196,6 +245,10 @@ export function usePlayer() {
 
 		async togglePlay() {
 			clearPendingSeek();
+			if (state.source === 'radio' && connectionStage(state) === 'failed') {
+				await retryStation();
+				return;
+			}
 			if (state.is_buffering) {
 				clearVisualizerAudio();
 				await api.stopPlayback();
@@ -209,6 +262,36 @@ export function usePlayer() {
 				await api.resume();
 			}
 			scheduleRefresh([0, 50]);
+		},
+
+		/** Replays the station that failed, through the station command so a
+		 * broken URL gets re-resolved instead of retried verbatim. */
+		retryStation,
+
+		/**
+		 * Shows `station` as connecting while `start` (the station play
+		 * command, which checks the stream before the engine sees it) runs.
+		 * Usage: `await player.playStation(station, () => api.playStation(...))`.
+		 */
+		async playStation<T>(
+			station: { id?: string | null; name: string; url?: string | null },
+			start: () => Promise<T>
+		): Promise<T> {
+			clearPendingSeek();
+			const token = ++pendingStationToken;
+			pendingStation = {
+				token,
+				id: station.id ?? null,
+				name: station.name,
+				url: station.url ?? null
+			};
+			state = withPendingStation(state, pendingStation);
+			try {
+				return await start();
+			} finally {
+				if (pendingStation?.token === token) pendingStation = null;
+				scheduleRefresh([0, 90]);
+			}
 		},
 
 		async seek(ms: number) {
@@ -308,6 +391,70 @@ export function usePlayer() {
 			stopPolling();
 		}
 	};
+}
+
+async function retryStation() {
+	clearPendingSeek();
+	const { current_station_id: stationId, current_source_url: url, current_title: name } = state;
+	try {
+		if (stationId && url) {
+			await api.playStation(stationId, url, name ?? '');
+		} else {
+			await api.resume();
+		}
+	} finally {
+		scheduleRefresh();
+	}
+}
+
+/** The connection stage, inferred from the flags when the runtime is too old
+ * to report one. */
+export function connectionStage(playback: PlaybackState): ConnectionStage {
+	if (playback.connection_stage) return playback.connection_stage;
+	if (playback.is_buffering) return playback.source === 'radio' ? 'connecting' : 'buffering';
+	if (playback.is_playing) return 'playing';
+	return 'idle';
+}
+
+/** True while something is being opened and the listener is waiting. */
+export function isConnecting(stage: ConnectionStage): boolean {
+	return stage === 'connecting' || stage === 'buffering' || stage === 'reconnecting';
+}
+
+/** The title the player shows: station names are cleaned of slogans, genre
+ * lists and URLs; track titles are shown as they are. */
+export function displayTitle(playback: PlaybackState): string | null {
+	if (playback.source === 'radio') {
+		return playback.current_title ? cleanStationName(playback.current_title) : null;
+	}
+	return playback.current_title;
+}
+
+/** One calm line about the connection, or null when there is nothing to say
+ * beyond the normal now-playing info. `long` names the station while
+ * connecting ("Connecting to Radio X…"). */
+export function connectionMessage(playback: PlaybackState, long = false): string | null {
+	const stage = connectionStage(playback);
+	const radio = playback.source === 'radio';
+	switch (stage) {
+		case 'connecting': {
+			if (!radio) return 'Buffering…';
+			const station = displayTitle(playback);
+			return long && station ? `Connecting to ${station}…` : 'Connecting…';
+		}
+		case 'buffering':
+			return 'Buffering…';
+		case 'reconnecting': {
+			const attempt = playback.reconnect_attempt ?? 0;
+			const max = playback.reconnect_max ?? 0;
+			if (attempt > 0 && max > 0) return `Reconnecting · attempt ${attempt} of ${max}`;
+			return 'Reconnecting…';
+		}
+		case 'failed':
+			return "Couldn't connect";
+		default:
+			return null;
+	}
 }
 
 export function formatTime(ms: number): string {

@@ -106,14 +106,23 @@ pub fn update(state: &PlaybackState) {
         return;
     }
 
-    let title = CString::new(state.current_title.clone().unwrap_or_default()).unwrap_or_default();
+    let is_live = state.source.as_deref() == Some("radio");
+
+    // Station names are free text full of slogans and genre lists; the lock
+    // screen gets the same short name the in-app player shows. Swift also
+    // derives the placeholder artwork from this title.
+    let raw_title = state.current_title.clone().unwrap_or_default();
+    let display_title = if is_live && !raw_title.is_empty() {
+        crate::audio::station_names::clean_station_name(&raw_title)
+    } else {
+        raw_title
+    };
+    let title = CString::new(display_title).unwrap_or_default();
     let artist = CString::new(state.current_artist.clone().unwrap_or_default()).unwrap_or_default();
     // PlaybackState doesn't carry album separately; pass empty.
     let album = CString::new("").unwrap_or_default();
     let artwork_url =
         CString::new(state.current_album_art.clone().unwrap_or_default()).unwrap_or_default();
-
-    let is_live = state.source.as_deref() == Some("radio");
 
     unsafe {
         mewsik_now_playing_update(

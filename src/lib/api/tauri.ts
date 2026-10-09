@@ -65,7 +65,11 @@ const defaultPlaybackState: PlaybackState = {
 	volume: 1,
 	is_shuffle: false,
 	repeat_mode: 'off',
-	source: null
+	source: null,
+	connection_stage: 'idle',
+	reconnect_attempt: 0,
+	reconnect_max: 0,
+	connection_error: null
 };
 
 const defaultSettings = {
@@ -604,6 +608,11 @@ export const searchRadioStations = (
 		[]
 	);
 
+/** A Directory genre chip: each real radio-browser tag is looked up exactly
+ *  and the results are merged (see src/lib/radio/genres.ts). */
+export const searchRadioStationsByTags = (tags: string[], sort: RadioStationSort = 'smart') =>
+	safeInvoke<RadioBrowserStation[]>('search_radio_stations_by_tags', { tags, sort }, []);
+
 export const browseRadioStations = (
 	sort: RadioStationSort = 'smart',
 	offset = 0,
@@ -662,6 +671,13 @@ export const toggleStationFavorite = (stationId: string) =>
 export const playStation = (stationId: string, url: string, name: string) =>
 	safeInvoke('play_station', { stationId, url, name, favicon: null });
 
+/** Prefix of the error `play_station_search_result` returns when a station
+ *  failed its probe and self-heal and was taken off the discovery shelves. */
+export const STATION_UNAVAILABLE_ERROR = 'station_unavailable';
+
+export const isStationUnavailableError = (error: unknown): boolean =>
+	String(error).includes(STATION_UNAVAILABLE_ERROR);
+
 export const playStationSearchResult = (station: RadioBrowserStation) =>
 	safeInvoke<string>('play_station_search_result', {
 		name: station.name,
@@ -704,6 +720,10 @@ export interface StationPick {
 	score: number;
 	bailRate: number;
 	plays: number;
+	/** Last local probe succeeded within 7 days with no failure since. Only
+	 *  verified picks lead a shelf or become the hero. */
+	verified: boolean;
+	lastCheckedAt: string | null;
 }
 
 export interface StationShelf {

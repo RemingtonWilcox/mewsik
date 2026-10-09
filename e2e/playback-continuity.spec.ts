@@ -2,12 +2,16 @@ import { expect, test, type Page } from '@playwright/test';
 
 interface PlaybackMockOptions {
 	initialShuffle?: boolean;
+	playback?: Record<string, unknown>;
 }
 
 async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}) {
-	await page.addInitScript(({ initialShuffle }) => {
+	await page.addInitScript(({ initialShuffle, playback }) => {
 		type Invocation = { command: string; args: Record<string, unknown> };
-		const runtimeWindow = window as Window & { __PLAYBACK_INVOCATIONS__?: Invocation[] };
+		const runtimeWindow = window as Window & {
+			__PLAYBACK_INVOCATIONS__?: Invocation[];
+			__SET_PLAYBACK__?: (patch: Record<string, unknown>) => void;
+		};
 		runtimeWindow.__PLAYBACK_INVOCATIONS__ = [];
 
 		const tracks = [
@@ -103,7 +107,11 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 			volume: 1,
 			is_shuffle: initialShuffle,
 			repeat_mode: 'off',
-			source: null
+			source: null,
+			...playback
+		};
+		runtimeWindow.__SET_PLAYBACK__ = (patch) => {
+			Object.assign(playbackState, patch);
 		};
 		const queueSnapshot = {
 			session_id: 'queue-session-1',
@@ -187,6 +195,7 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 						playbackState.is_shuffle = Boolean(args.enabled);
 						return null;
 					case 'play_tracks_from':
+					case 'play_station':
 						return null;
 					case 'get_queue':
 						return queueSnapshot;
@@ -209,7 +218,7 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 		(window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
 			unregisterListener: () => undefined
 		};
-	}, { initialShuffle: options.initialShuffle ?? false });
+	}, { initialShuffle: options.initialShuffle ?? false, playback: options.playback ?? {} });
 }
 
 async function playbackInvocations(page: Page) {
@@ -335,6 +344,75 @@ test('Up Next renders the native snapshot and mutates by stable session and entr
 			{
 				command: 'remove_queue_entry',
 				args: { sessionId: 'queue-session-1', entryId: 'entry-later' }
+			}
+		]);
+});
+
+test('radio player names the connection stage and offers Retry when the station fails', async ({ page }) => {
+	const rawName = 'RADIO X :: Hip Hop, Rap, Trap, Techno, House | www.radiox.com [128kbps]';
+	await installPlaybackMock(page, {
+		playback: {
+			source: 'radio',
+			is_buffering: true,
+			current_station_id: 'station-1',
+			current_title: rawName,
+			current_artist: 'Connecting…',
+			current_source_url: 'https://radio.example/live',
+			connection_stage: 'connecting',
+			reconnect_attempt: 0,
+			reconnect_max: 0,
+			connection_error: null
+		}
+	});
+	await page.goto('/');
+
+	const bar = page.locator('[data-player-bar]');
+	// The cleaned name, never the raw slogan-stuffed one.
+	await expect(bar.getByText('RADIO X', { exact: true })).toBeVisible();
+	await expect(bar.getByText('Connecting to RADIO X…')).toBeVisible();
+	await expect(bar.locator('[data-station-art="generated"]')).toBeVisible();
+
+	await page.evaluate(() =>
+		(window as Window & { __SET_PLAYBACK__?: (patch: Record<string, unknown>) => void })
+			.__SET_PLAYBACK__?.({
+				connection_stage: 'reconnecting',
+				reconnect_attempt: 2,
+				reconnect_max: 3
+			})
+	);
+	await expect(bar.getByText('Reconnecting · attempt 2 of 3').first()).toBeVisible();
+
+	await page.evaluate(() =>
+		(window as Window & { __SET_PLAYBACK__?: (patch: Record<string, unknown>) => void })
+			.__SET_PLAYBACK__?.({
+				is_buffering: false,
+				connection_stage: 'failed',
+				reconnect_attempt: 0,
+				connection_error: 'Failed to open station stream',
+				current_artist: "Couldn't connect"
+			})
+	);
+	const failed = bar.locator('[data-connection-stage="failed"]');
+	await expect(failed).toContainText("Couldn't connect");
+	await failed.getByRole('button', { name: 'Retry' }).click();
+
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				((window as Window & {
+					__PLAYBACK_INVOCATIONS__?: Array<{ command: string; args: Record<string, unknown> }>;
+				}).__PLAYBACK_INVOCATIONS__ ?? []).filter(({ command }) => command === 'play_station')
+			)
+		)
+		.toEqual([
+			{
+				command: 'play_station',
+				args: {
+					stationId: 'station-1',
+					url: 'https://radio.example/live',
+					name: rawName,
+					favicon: null
+				}
 			}
 		]);
 });

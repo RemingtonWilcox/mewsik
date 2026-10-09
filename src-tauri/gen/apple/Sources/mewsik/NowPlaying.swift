@@ -42,6 +42,10 @@ private final class MewsikNowPlaying {
     private var didSetup = false
     private var artworkURL: String?
     private var cachedArtwork: MPMediaItemArtwork?
+    /// Generated artwork for items without any (most radio stations), cached
+    /// for the title it was drawn from.
+    private var placeholderTitle: String?
+    private var placeholderArtwork: MPMediaItemArtwork?
     /// Last info pushed to the system, re-asserted when we regain the session.
     private var lastInfo: [String: Any]?
 
@@ -253,6 +257,10 @@ private final class MewsikNowPlaying {
 
         if let cached = cachedArtwork, self.artworkURL == artworkURL {
             info[MPMediaItemPropertyArtwork] = cached
+        } else {
+            // No artwork, or it is still downloading: show the generated
+            // tile so the lock screen is never blank.
+            info[MPMediaItemPropertyArtwork] = generatedArtwork(for: title)
         }
 
         lastInfo = info
@@ -286,6 +294,120 @@ private final class MewsikNowPlaying {
                 }
             }
         }.resume()
+    }
+
+    /// Two-tone gradient plus monogram, deterministic from the title. Mirrors
+    /// the in-app StationArt tile (src/lib/components/station-art.svelte):
+    /// same FNV-1a seed over the title's code points, same hues and angle.
+    private func generatedArtwork(for title: String) -> MPMediaItemArtwork {
+        if let cached = placeholderArtwork, placeholderTitle == title {
+            return cached
+        }
+
+        // FNV-1a, as stationSeed() in src/lib/radio/names.ts.
+        var hash: UInt32 = 0x811c9dc5
+        for scalar in title.unicodeScalars {
+            hash ^= scalar.value
+            hash = hash &* 0x01000193
+        }
+        let seed = Double(hash) / Double(UInt32.max)
+
+        let hueA = (seed * 360).rounded()
+        let hueB = (seed * 360 + 38 + seed * 70).truncatingRemainder(dividingBy: 360).rounded()
+        let angle = (120 + seed * 120).rounded() * Double.pi / 180
+        let colorA = hslColor(hueA, 0.58, 0.30, 1)
+        let colorB = hslColor(hueB, 0.62, 0.16, 1)
+
+        let side: CGFloat = 512
+        let size = CGSize(width: side, height: side)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 2
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let image = renderer.image { rendererContext in
+            let ctx = rendererContext.cgContext
+            let space = CGColorSpaceCreateDeviceRGB()
+            let center = CGPoint(x: side / 2, y: side / 2)
+
+            // CSS linear-gradient(angle): 0deg points up, clockwise.
+            let dx = CGFloat(sin(angle))
+            let dy = CGFloat(-cos(angle))
+            let half = (abs(dx) + abs(dy)) * side / 2
+            if let base = CGGradient(
+                colorsSpace: space,
+                colors: [colorA.cgColor, colorB.cgColor] as CFArray,
+                locations: [0, 1]
+            ) {
+                ctx.drawLinearGradient(
+                    base,
+                    start: CGPoint(x: center.x - dx * half, y: center.y - dy * half),
+                    end: CGPoint(x: center.x + dx * half, y: center.y + dy * half),
+                    options: [.drawsBeforeStartLocation, .drawsAfterEndLocation]
+                )
+            }
+
+            // Soft highlight, like the radial layer at 40% opacity.
+            let glowCenter = CGPoint(x: side * CGFloat(0.2 + seed * 0.6), y: side * 0.18)
+            let farX = max(glowCenter.x, side - glowCenter.x)
+            let farY = max(glowCenter.y, side - glowCenter.y)
+            let glowRadius = 0.6 * (farX * farX + farY * farY).squareRoot()
+            let glow = hslColor(hueB, 0.80, 0.60, 0.22)
+            if let highlight = CGGradient(
+                colorsSpace: space,
+                colors: [glow.cgColor, glow.withAlphaComponent(0).cgColor] as CFArray,
+                locations: [0, 1]
+            ) {
+                ctx.drawRadialGradient(
+                    highlight,
+                    startCenter: glowCenter,
+                    startRadius: 0,
+                    endCenter: glowCenter,
+                    endRadius: glowRadius,
+                    options: []
+                )
+            }
+
+            let text = monogram(for: title) as NSString
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: side * 0.34, weight: .semibold),
+                .foregroundColor: UIColor(white: 1, alpha: 0.85),
+            ]
+            let textSize = text.size(withAttributes: attributes)
+            text.draw(
+                at: CGPoint(x: (side - textSize.width) / 2, y: (side - textSize.height) / 2),
+                withAttributes: attributes
+            )
+        }
+
+        let artwork = MPMediaItemArtwork(boundsSize: size) { _ in image }
+        placeholderTitle = title
+        placeholderArtwork = artwork
+        return artwork
+    }
+
+    /// One or two characters: initials of the first two words, or the first
+    /// two characters of a single word (stationMonogram() in names.ts).
+    private func monogram(for title: String) -> String {
+        let words = title
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        guard let first = words.first else { return "?" }
+        if words.count == 1 {
+            return String(first.prefix(2)).uppercased()
+        }
+        return (String(first.prefix(1)) + String(words[1].prefix(1))).uppercased()
+    }
+
+    /// CSS hsl() to UIColor, which takes hue/saturation/brightness (HSB).
+    private func hslColor(_ hue: Double, _ saturation: Double, _ lightness: Double, _ alpha: Double) -> UIColor {
+        let brightness = lightness + saturation * min(lightness, 1 - lightness)
+        let hsbSaturation = brightness == 0 ? 0 : 2 * (1 - lightness / brightness)
+        return UIColor(
+            hue: CGFloat(hue / 360),
+            saturation: CGFloat(hsbSaturation),
+            brightness: CGFloat(brightness),
+            alpha: CGFloat(alpha)
+        )
     }
 
     func clear() {

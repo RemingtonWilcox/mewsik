@@ -13,12 +13,12 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 use tokio::sync::Mutex;
 
 const SCENE_STALE_AFTER_SECS: i64 = 24 * 60 * 60;
 const STATIONS_PER_TAG_TERM: usize = 60;
-const MAX_NEW_ROW_PROBES_PER_REFRESH: usize = 100;
 const SHELF_CANDIDATES: usize = 24;
 const SHELF_SIZE: usize = 8;
 const FRESH_CANDIDATES: usize = 120;
@@ -46,6 +46,21 @@ const DAILY_SWEEP_INITIAL_DELAY: std::time::Duration = std::time::Duration::from
 const STARTUP_REFRESH_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
 const SWEEP_DELETE_AT_FAIL_COUNT: i32 = 3;
 const SHELF_EXCLUDE_AT_FAIL_COUNT: i32 = 2;
+/// A pick is "verified" when its last probe succeeded within this window.
+/// Only verified picks may lead a shelf or become the hero.
+const VERIFIED_WITHIN_DAYS: i64 = 7;
+/// Shelf candidates whose last check is older than this are re-probed by
+/// the verification pass (so verified picks stay verified).
+const RECHECK_AFTER_HOURS: i64 = 72;
+/// Upper bound on probes per verification pass (refresh or launch).
+const MAX_SHELF_PROBES_PER_PASS: usize = 320;
+/// How deep into each top-affinity scene the for-you shelf may reach.
+const FOR_YOU_CANDIDATES_PER_SCENE: usize = 36;
+/// Stations whose tag focus falls below this are dropped from the scene.
+pub const FOCUS_EXCLUDE_BELOW: f64 = 0.3;
+/// Extra subtractive penalty per unit of missing focus, on top of scaling
+/// quality by focus, so an unfocused but popular station sinks.
+const FOCUS_PENALTY_WEIGHT: f64 = 2.0;
 
 /// True while a refresh is doing network work (set under `REFRESH_LOCK`).
 static REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -97,7 +112,7 @@ pub static SCENES: &[SceneDef] = &[
         description: "High-energy streams that keep the pace up from warm-up to cool-down.",
         family: SceneFamily::Workout,
         accent: "from-orange-500/30 to-transparent",
-        tags: &["workout", "gym", "fitness", "high energy"],
+        tags: &["workout", "fitness", "high energy"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -119,7 +134,7 @@ pub static SCENES: &[SceneDef] = &[
         description: "Heavy low end and rolling hi-hats, Atlanta to everywhere.",
         family: SceneFamily::Hiphop,
         accent: "from-fuchsia-500/30 to-transparent",
-        tags: &["trap", "trap music"],
+        tags: &["trap", "phonk"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -131,11 +146,13 @@ pub static SCENES: &[SceneDef] = &[
             "Dusty drums and sampled loops from the nineties and the heads who kept it alive.",
         family: SceneFamily::Hiphop,
         accent: "from-yellow-600/30 to-transparent",
+        // "boom bap", "90s hip hop" and "golden era" each tag one station or
+        // none on radio-browser; these are the tags golden-era stations use.
         tags: &[
-            "boom bap",
-            "90s hip hop",
             "old school hip hop",
-            "golden era",
+            "classic hip hop",
+            "gangsta rap",
+            "old school",
         ],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
@@ -153,12 +170,14 @@ pub static SCENES: &[SceneDef] = &[
     },
     SceneDef {
         id: "uk-rap-drill",
-        title: "UK rap & drill",
+        title: "UK grime & garage",
         eyebrow: "London and beyond",
-        description: "Grime, drill and UK rap straight from the source.",
+        description: "Grime, UK garage and the London sound straight from the source.",
         family: SceneFamily::Hiphop,
         accent: "from-slate-400/30 to-transparent",
-        tags: &["drill", "uk rap", "grime", "uk drill"],
+        // "drill", "uk rap" and "uk drill" return fewer than five playable
+        // stations; grime and UK garage are where those stations live.
+        tags: &["grime", "uk garage"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -177,10 +196,10 @@ pub static SCENES: &[SceneDef] = &[
         id: "punk",
         title: "Punk",
         eyebrow: "Three chords",
-        description: "Fast, loud and unbothered, from the first wave to pop punk.",
+        description: "Fast, loud and unbothered, from the first wave to post-punk.",
         family: SceneFamily::Rock,
         accent: "from-pink-600/30 to-transparent",
-        tags: &["punk", "punk rock", "pop punk"],
+        tags: &["punk", "punk rock", "post-punk"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -202,7 +221,7 @@ pub static SCENES: &[SceneDef] = &[
         description: "Hardcore punk, metalcore and post-hardcore with no filler.",
         family: SceneFamily::Rock,
         accent: "from-red-700/30 to-transparent",
-        tags: &["hardcore", "hardcore punk", "metalcore", "post-hardcore"],
+        tags: &["hardcore", "metalcore", "post-hardcore", "deathcore"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &["hardcore techno", "hardstyle", "gabber", "happy hardcore"],
     },
@@ -232,10 +251,10 @@ pub static SCENES: &[SceneDef] = &[
         id: "house",
         title: "House",
         eyebrow: "Four on the floor",
-        description: "Deep, tech and disco house from the club to the kitchen.",
+        description: "Deep, tech and soulful house from the club to the kitchen.",
         family: SceneFamily::Electronic,
         accent: "from-sky-500/30 to-transparent",
-        tags: &["house", "deep house", "tech house", "disco house"],
+        tags: &["house", "deep house", "tech house", "soulful house"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -243,10 +262,10 @@ pub static SCENES: &[SceneDef] = &[
         id: "techno",
         title: "Techno",
         eyebrow: "Dark rooms",
-        description: "Minimal, Detroit and warehouse techno, relentless by design.",
+        description: "Minimal, hard and warehouse techno, relentless by design.",
         family: SceneFamily::Electronic,
         accent: "from-indigo-600/30 to-transparent",
-        tags: &["techno", "minimal techno", "detroit techno"],
+        tags: &["techno", "minimal techno", "hard techno"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -292,10 +311,10 @@ pub static SCENES: &[SceneDef] = &[
         id: "synthwave",
         title: "Synthwave",
         eyebrow: "Neon nights",
-        description: "Retrowave, outrun and vaporwave: the eighties that never happened.",
+        description: "Retrowave, chillwave and vaporwave: the eighties that never happened.",
         family: SceneFamily::Electronic,
         accent: "from-purple-500/30 to-transparent",
-        tags: &["synthwave", "retrowave", "outrun", "vaporwave"],
+        tags: &["synthwave", "retrowave", "chillwave", "vaporwave"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -317,7 +336,7 @@ pub static SCENES: &[SceneDef] = &[
         description: "Funk, disco and groove records that move the room.",
         family: SceneFamily::Soul,
         accent: "from-orange-400/30 to-transparent",
-        tags: &["funk", "funk soul", "disco", "groove"],
+        tags: &["funk", "boogie", "disco", "groove"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -347,10 +366,10 @@ pub static SCENES: &[SceneDef] = &[
         id: "afrobeats",
         title: "Afrobeats",
         eyebrow: "Lagos to London",
-        description: "Afrobeats, afropop and amapiano, the sound of the moment.",
+        description: "Afrobeats, highlife and amapiano, the sound of the moment.",
         family: SceneFamily::World,
         accent: "from-yellow-500/30 to-transparent",
-        tags: &["afrobeats", "afrobeat", "afropop", "amapiano"],
+        tags: &["afrobeats", "afrobeat", "highlife", "amapiano"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -394,7 +413,9 @@ pub static SCENES: &[SceneDef] = &[
         description: "Two decades of hits, one-hit wonders and the songs between them.",
         family: SceneFamily::Pop,
         accent: "from-fuchsia-400/30 to-transparent",
-        tags: &["80s", "90s", "80s hits", "90s hits"],
+        // "80s hits" / "90s hits" are nearly unused; the German decade tags
+        // carry most of the catalogue.
+        tags: &["80s", "90s", "80er", "90er"],
         min_bitrate: DEFAULT_MIN_BITRATE,
         exclude_tags: &[],
     },
@@ -421,6 +442,11 @@ pub static SCENES: &[SceneDef] = &[
         exclude_tags: &[],
     },
 ];
+
+/// Scenes defined by an activity, mood or era rather than a genre. Their
+/// stations legitimately span genres, so genre spread costs them half as
+/// much and they have no genre-relevance requirement.
+const BROAD_SCENES: [&str; 5] = ["workout", "pop-hits", "80s-90s", "chill-study", "oldies"];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -465,6 +491,10 @@ pub struct StationPick {
     pub score: f64,
     pub bail_rate: f64,
     pub plays: u32,
+    /// Last local probe succeeded within 7 days and the station has no
+    /// failures since. Only verified picks lead shelves or become the hero.
+    pub verified: bool,
+    pub last_checked_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -533,6 +563,337 @@ fn tags_intersect(station_tags: &[String], terms: &[&str]) -> bool {
     station_tags
         .iter()
         .any(|tag| terms.iter().any(|term| term.eq_ignore_ascii_case(tag)))
+}
+
+// ── Tag focus ──
+//
+// radio-browser tags are free text, and some stations list every genre they
+// have ever played so they surface for every tag search. Tag focus measures
+// how much a station is *about* a scene: how many distinct genre families its
+// tags span, how long its tag list is, and whether the scene's own terms lead
+// its tag list or appear in its name.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GenreFamily {
+    HipHop,
+    Rock,
+    Electronic,
+    Jazz,
+    Classical,
+    Country,
+    Soul,
+    Reggae,
+    Latin,
+    Pop,
+    Chill,
+    Blues,
+    Folk,
+    World,
+    Spoken,
+}
+
+/// Keywords per family, matched as whole words against normalised tags
+/// (lowercase, `&` → "and", punctuation → spaces).
+const GENRE_LEXICON: &[(GenreFamily, &[&str])] = &[
+    (
+        GenreFamily::HipHop,
+        &[
+            "hip hop",
+            "hiphop",
+            "rap",
+            "trap",
+            "drill",
+            "grime",
+            "boom bap",
+            "gangsta",
+            "deutschrap",
+            "phonk",
+        ],
+    ),
+    (
+        GenreFamily::Rock,
+        &[
+            "rock",
+            "metal",
+            "punk",
+            "indie",
+            "alternative",
+            "grunge",
+            "hardcore",
+            "metalcore",
+            "deathcore",
+            "emo",
+            "post hardcore",
+        ],
+    ),
+    (
+        GenreFamily::Electronic,
+        &[
+            "techno",
+            "house",
+            "trance",
+            "psytrance",
+            "edm",
+            "electronic",
+            "electronica",
+            "electro",
+            "dance",
+            "dubstep",
+            "drum and bass",
+            "drum n bass",
+            "dnb",
+            "jungle",
+            "breakbeat",
+            "breaks",
+            "hardstyle",
+            "garage",
+            "synthwave",
+            "retrowave",
+            "idm",
+            "eurodance",
+        ],
+    ),
+    (GenreFamily::Jazz, &["jazz", "bebop", "swing", "big band"]),
+    (
+        GenreFamily::Classical,
+        &[
+            "classical",
+            "baroque",
+            "opera",
+            "orchestral",
+            "symphony",
+            "symphonic",
+            "chamber",
+        ],
+    ),
+    (GenreFamily::Country, &["country", "bluegrass", "americana"]),
+    (
+        GenreFamily::Soul,
+        &[
+            "soul", "rnb", "r and b", "r n b", "funk", "motown", "disco", "boogie",
+        ],
+    ),
+    (GenreFamily::Reggae, &["reggae", "dub", "dancehall", "ska"]),
+    (
+        GenreFamily::Latin,
+        &[
+            "latin",
+            "latino",
+            "reggaeton",
+            "salsa",
+            "bachata",
+            "cumbia",
+            "merengue",
+            "tango",
+            "bossa nova",
+            "samba",
+        ],
+    ),
+    (GenreFamily::Pop, &["pop", "top 40", "hits", "charts"]),
+    (
+        GenreFamily::Chill,
+        &[
+            "ambient",
+            "chillout",
+            "chill",
+            "lounge",
+            "lofi",
+            "lo fi",
+            "downtempo",
+            "chillhop",
+        ],
+    ),
+    (GenreFamily::Blues, &["blues"]),
+    (GenreFamily::Folk, &["folk"]),
+    (
+        GenreFamily::World,
+        &[
+            "afrobeat",
+            "afrobeats",
+            "amapiano",
+            "highlife",
+            "world music",
+        ],
+    ),
+    (GenreFamily::Spoken, &["news", "talk", "sports", "sport"]),
+];
+
+/// Lowercase, `&` → " and ", every non-alphanumeric run → one space, padded
+/// with spaces so whole-word phrases can be found with `contains`.
+fn normalize_words(value: &str) -> String {
+    let lowered = value.to_lowercase().replace('&', " and ");
+    let mut out = String::with_capacity(lowered.len() + 2);
+    out.push(' ');
+    let mut last_space = true;
+    for ch in lowered.chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch);
+            last_space = false;
+        } else if !last_space {
+            out.push(' ');
+            last_space = true;
+        }
+    }
+    if !last_space {
+        out.push(' ');
+    }
+    out
+}
+
+fn contains_phrase(normalized_haystack: &str, phrase: &str) -> bool {
+    let needle = normalize_words(phrase);
+    !needle.trim().is_empty() && normalized_haystack.contains(needle.as_str())
+}
+
+/// `GENRE_LEXICON` with every keyword pre-normalised (ranking runs this over
+/// every cached row on each feed build).
+static NORMALIZED_LEXICON: LazyLock<Vec<(GenreFamily, Vec<String>)>> = LazyLock::new(|| {
+    GENRE_LEXICON
+        .iter()
+        .map(|(family, keywords)| {
+            (
+                *family,
+                keywords
+                    .iter()
+                    .map(|keyword| normalize_words(keyword))
+                    .collect(),
+            )
+        })
+        .collect()
+});
+
+fn families_of(normalized: &str) -> HashSet<GenreFamily> {
+    NORMALIZED_LEXICON
+        .iter()
+        .filter(|(_, keywords)| {
+            keywords
+                .iter()
+                .any(|keyword| normalized.contains(keyword.as_str()))
+        })
+        .map(|(family, _)| *family)
+        .collect()
+}
+
+fn is_broad_scene(scene: &SceneDef) -> bool {
+    BROAD_SCENES.contains(&scene.id)
+}
+
+/// True when any of `terms` names a music genre family (news, talk and
+/// sport are not genres). Terms that do not are scored as broad.
+pub fn terms_name_a_genre<S: AsRef<str>>(terms: &[S]) -> bool {
+    terms.iter().any(|term| {
+        families_of(&normalize_words(term.as_ref()))
+            .iter()
+            .any(|family| *family != GenreFamily::Spoken)
+    })
+}
+
+/// How focused a station's tags are on one scene, 0..1 (1 = fully focused).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagFocus {
+    pub tag_count: usize,
+    /// Distinct genre families the station's tags span.
+    pub families: usize,
+    /// A scene term is among the first three tags or in the station name.
+    pub prominent: bool,
+    /// The station carries at least one tag (or name word) from the scene's
+    /// own genre families. Always true for broad scenes.
+    pub relevant: bool,
+    pub score: f64,
+}
+
+/// Penalty for spanning `families` distinct genre families.
+fn family_spread_penalty(families: usize) -> f64 {
+    match families {
+        0..=2 => 0.0,
+        3 => 0.15,
+        4 => 0.45,
+        5 => 0.65,
+        _ => 0.85,
+    }
+}
+
+/// Penalty for a long tag list: nothing up to 8 tags, then 0.025 per tag,
+/// capped at 0.4 (24+ tags).
+fn tag_length_penalty(tag_count: usize) -> f64 {
+    (tag_count.saturating_sub(8) as f64 * 0.025).min(0.4)
+}
+
+pub fn tag_focus(scene: &SceneDef, name: &str, tags: Option<&str>) -> TagFocus {
+    tag_focus_for_terms(scene.tags, is_broad_scene(scene), name, tags)
+}
+
+/// Tag focus against an arbitrary set of genre terms (a scene's tags or a
+/// Directory genre chip's tags). `broad` halves the genre-spread penalty and
+/// drops the relevance requirement.
+pub fn tag_focus_for_terms<S: AsRef<str>>(
+    terms: &[S],
+    broad: bool,
+    name: &str,
+    tags: Option<&str>,
+) -> TagFocus {
+    let station_tags = split_tags(tags);
+    let normalized_tags: Vec<String> = station_tags.iter().map(|t| normalize_words(t)).collect();
+    let normalized_name = normalize_words(name);
+
+    let mut families: HashSet<GenreFamily> = HashSet::new();
+    for tag in &normalized_tags {
+        families.extend(families_of(tag));
+    }
+
+    let scene_families: HashSet<GenreFamily> = terms
+        .iter()
+        .flat_map(|term| families_of(&normalize_words(term.as_ref())))
+        .collect();
+
+    let is_scene_term = |normalized: &str| {
+        terms
+            .iter()
+            .any(|term| contains_phrase(normalized, term.as_ref()))
+    };
+    let prominent = normalized_tags.iter().take(3).any(|tag| is_scene_term(tag))
+        || is_scene_term(&normalized_name);
+
+    let relevant = broad
+        || scene_families.is_empty()
+        || families
+            .iter()
+            .any(|family| scene_families.contains(family))
+        || !families_of(&normalized_name).is_disjoint(&scene_families);
+
+    if !relevant {
+        return TagFocus {
+            tag_count: station_tags.len(),
+            families: families.len(),
+            prominent,
+            relevant,
+            score: 0.0,
+        };
+    }
+
+    let mut spread = family_spread_penalty(families.len());
+    if broad {
+        spread *= 0.5;
+    }
+    let length = tag_length_penalty(station_tags.len());
+    let prominence = if prominent || station_tags.len() <= 3 {
+        1.0
+    } else {
+        0.8
+    };
+    TagFocus {
+        tag_count: station_tags.len(),
+        families: families.len(),
+        prominent,
+        relevant,
+        score: ((1.0 - spread) * (1.0 - length) * prominence).clamp(0.0, 1.0),
+    }
+}
+
+fn row_focus(row: &SceneStationRow) -> f64 {
+    find_scene(&row.scene_id)
+        .map(|scene| tag_focus(scene, &row.name, row.tags.as_deref()).score)
+        .unwrap_or(1.0)
 }
 
 /// The URL a pick should play: the resolved direct stream when the
@@ -644,6 +1005,10 @@ pub fn prepare_scene_rows(
         {
             continue;
         }
+        // "Every genre" tag spam: never cache it for this scene.
+        if tag_focus(scene, &station.name, station.tags.as_deref()).score < FOCUS_EXCLUDE_BELOW {
+            continue;
+        }
         let uuid = station.stationuuid.trim().to_ascii_lowercase();
         let url = station.url.trim().to_string();
         if uuid.is_empty() || url.is_empty() || !seen.insert(uuid.clone()) {
@@ -720,36 +1085,10 @@ async fn fetch_scene_candidates(scene: &SceneDef) -> Option<Vec<RadioBrowserStat
     any_response.then_some(collected)
 }
 
-/// Probe never-before-seen cache rows. A dead probe sets `fail_count = 1`;
-/// a live one records the check so the daily sweep starts elsewhere.
-async fn probe_new_rows(db: &DbPool, targets: Vec<(String, String)>) -> Result<(), String> {
-    if targets.is_empty() {
-        return Ok(());
-    }
-    let mut uuids_by_url: HashMap<String, Vec<String>> = HashMap::new();
-    for (uuid, url) in targets {
-        if url.len() > MAX_STATION_URL_BYTES {
-            let _ = queries::update_scene_station_health(db, &uuid, 1, &queries::now());
-            continue;
-        }
-        uuids_by_url.entry(url).or_default().push(uuid);
-    }
-    let urls: Vec<String> = uuids_by_url.keys().cloned().collect();
-    let results = verify_station_urls_inner(urls).await?;
-    for result in results {
-        let fail_count = if result.status == "ok" { 0 } else { 1 };
-        let checked_at = result.last_checked_at.clone().unwrap_or_else(queries::now);
-        for uuid in uuids_by_url.get(&result.url).into_iter().flatten() {
-            queries::update_scene_station_health(db, uuid, fail_count, &checked_at)
-                .map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(())
-}
-
 /// Pull every stale scene (or every scene when `force`) from the directory,
 /// upsert the cache, prune rows the directory dropped that already failed
-/// three checks, and probe rows that are new to the cache.
+/// three checks, then probe every row that can reach a shelf and is not
+/// freshly verified (new rows included).
 pub async fn refresh_station_scenes(
     db: &DbPool,
     force: bool,
@@ -771,8 +1110,6 @@ pub async fn refresh_station_scenes(
         return Ok(summary);
     }
 
-    let mut known_uuids = queries::get_cached_scene_station_uuids(db).map_err(|e| e.to_string())?;
-    let mut probe_targets: Vec<(String, String)> = Vec::new();
     let mut unreachable = 0usize;
 
     for scene in scenes {
@@ -783,13 +1120,6 @@ pub async fn refresh_station_scenes(
         let fetched_at = queries::now();
         let rows = prepare_scene_rows(scene, candidates, &fetched_at);
         let returned: HashSet<String> = rows.iter().map(|row| row.station_uuid.clone()).collect();
-        for row in &rows {
-            if known_uuids.insert(row.station_uuid.clone())
-                && probe_targets.len() < MAX_NEW_ROW_PROBES_PER_REFRESH
-            {
-                probe_targets.push((row.station_uuid.clone(), playable_url(row).to_string()));
-            }
-        }
         queries::upsert_scene_stations(db, &rows).map_err(|e| e.to_string())?;
         let pruned =
             queries::prune_scene_stations(db, scene.id, &returned).map_err(|e| e.to_string())?;
@@ -807,7 +1137,9 @@ pub async fn refresh_station_scenes(
         return Err("All radio directory servers are unreachable".to_string());
     }
 
-    probe_new_rows(db, probe_targets).await?;
+    if let Err(err) = verify_shelf_candidates(db).await {
+        log::warn!("Shelf candidate verification after refresh failed: {}", err);
+    }
     summary.took_ms = started.elapsed().as_millis() as u64;
     log::info!(
         "Station scenes refreshed: {} scenes, {} stations, {} pruned in {} ms",
@@ -836,8 +1168,31 @@ pub fn spawn_background_refresh(db: DbPool, force: bool) -> bool {
     true
 }
 
+/// Spawn one background verification pass over shelf candidates (no
+/// directory traffic). Shares the pending flag with refreshes, so the feed
+/// reports `refreshing` while it runs. Returns false when work is pending.
+pub fn spawn_background_verify(db: DbPool) -> bool {
+    if BACKGROUND_REFRESH_PENDING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    tauri::async_runtime::spawn(async move {
+        {
+            let _serialized = REFRESH_LOCK.lock().await;
+            if let Err(err) = verify_shelf_candidates(&db).await {
+                log::warn!("Background shelf verification failed: {}", err);
+            }
+        }
+        BACKGROUND_REFRESH_PENDING.store(false, Ordering::SeqCst);
+    });
+    true
+}
+
 /// Launch task: a short delay, then refresh when any scene is stale so a
-/// fresh install populates itself.
+/// fresh install populates itself; otherwise just re-verify the shelf
+/// candidates that are due a check.
 pub(crate) fn spawn_startup_refresh(db: DbPool) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(STARTUP_REFRESH_DELAY).await;
@@ -850,6 +1205,8 @@ pub(crate) fn spawn_startup_refresh(db: DbPool) {
         };
         if any_stale {
             spawn_background_refresh(db, false);
+        } else {
+            spawn_background_verify(db);
         }
     });
 }
@@ -864,31 +1221,8 @@ pub async fn sweep_cache_health(db: &DbPool) -> Result<usize, String> {
     if rows.is_empty() {
         return Ok(0);
     }
-    let mut uuids_by_url: HashMap<String, Vec<(String, i32)>> = HashMap::new();
-    let checked_at = queries::now();
-    for row in &rows {
-        let url = playable_url(row).to_string();
-        if url.len() > MAX_STATION_URL_BYTES {
-            apply_sweep_result(db, &row.station_uuid, row.fail_count, false, &checked_at)?;
-            continue;
-        }
-        uuids_by_url
-            .entry(url)
-            .or_default()
-            .push((row.station_uuid.clone(), row.fail_count));
-    }
-    let urls: Vec<String> = uuids_by_url.keys().cloned().collect();
-    let results = verify_station_urls_inner(urls).await?;
-    let mut removed = 0;
-    for result in results {
-        let healthy = result.status == "ok";
-        for (uuid, fail_count) in uuids_by_url.get(&result.url).into_iter().flatten() {
-            if apply_sweep_result(db, uuid, *fail_count, healthy, &checked_at)? {
-                removed += 1;
-            }
-        }
-    }
-    Ok(removed)
+    let refs: Vec<&SceneStationRow> = rows.iter().collect();
+    probe_scene_rows(db, &refs).await
 }
 
 /// Returns true when the station was deleted from the cache.
@@ -1033,11 +1367,30 @@ pub fn rank_score(
         row.bitrate.unwrap_or(0),
     );
     let penalty = 2.0 * bail_rate + 3.0 * f64::from(row.fail_count.max(0)) + recency;
-    quality - penalty
+    // Tag focus scales quality and adds its own penalty, so a station that
+    // tags every genre ranks far below a focused one even with more votes.
+    let focus = row_focus(row);
+    quality * focus - FOCUS_PENALTY_WEIGHT * (1.0 - focus) - penalty
 }
 
 pub fn is_shelf_eligible(row: &SceneStationRow) -> bool {
-    row.fail_count < SHELF_EXCLUDE_AT_FAIL_COUNT
+    row.fail_count < SHELF_EXCLUDE_AT_FAIL_COUNT && row_focus(row) >= FOCUS_EXCLUDE_BELOW
+}
+
+/// Probed OK within the last 7 days with no failure since.
+pub fn is_verified(row: &SceneStationRow, now: DateTime<Utc>) -> bool {
+    row.fail_count == 0
+        && checked_within(
+            row.last_checked_at.as_deref(),
+            now,
+            VERIFIED_WITHIN_DAYS * 24,
+        )
+}
+
+fn checked_within(last_checked_at: Option<&str>, now: DateTime<Utc>, hours: i64) -> bool {
+    last_checked_at
+        .and_then(parse_timestamp)
+        .is_some_and(|at| now.signed_duration_since(at) < Duration::hours(hours))
 }
 
 // ── Daily deterministic shuffle ──
@@ -1109,6 +1462,7 @@ pub fn weighted_daily_pick(scores: &[f64], seed: u64, count: usize) -> Vec<usize
 struct Ranked<'a> {
     row: &'a SceneStationRow,
     score: f64,
+    verified: bool,
 }
 
 /// Everything the pure feed builder needs, gathered by `build_discovery_feed`.
@@ -1133,7 +1487,11 @@ fn rank_rows<'a>(
         by_scene
             .entry(row.scene_id.as_str())
             .or_default()
-            .push(Ranked { row, score });
+            .push(Ranked {
+                row,
+                score,
+                verified: is_verified(row, now),
+            });
     }
     for list in by_scene.values_mut() {
         sort_ranked(list);
@@ -1148,6 +1506,104 @@ fn sort_ranked(list: &mut [Ranked<'_>]) {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.row.station_uuid.cmp(&b.row.station_uuid))
     });
+}
+
+/// Best-scoring instance of every station across scenes.
+fn best_by_uuid<'r, 'a>(
+    ranked: &'r HashMap<&'a str, Vec<Ranked<'a>>>,
+) -> HashMap<&'a str, &'r Ranked<'a>> {
+    let mut best: HashMap<&str, &Ranked> = HashMap::new();
+    for list in ranked.values() {
+        for item in list {
+            let entry = best.entry(item.row.station_uuid.as_str()).or_insert(item);
+            if item.score > entry.score {
+                *entry = item;
+            }
+        }
+    }
+    best
+}
+
+/// Candidates for the fresh shelf: every station not played in 14 days,
+/// best instance only, highest score first.
+fn fresh_candidates<'r, 'a>(
+    best: &HashMap<&'a str, &'r Ranked<'a>>,
+    signals: &HashMap<String, StationSignal>,
+    now: DateTime<Utc>,
+) -> Vec<&'r Ranked<'a>> {
+    let mut fresh: Vec<&Ranked> = best
+        .values()
+        .filter(|ranked| {
+            !played_within(
+                signals.get(&ranked.row.station_uuid),
+                now,
+                FRESH_UNPLAYED_DAYS,
+            )
+        })
+        .copied()
+        .collect();
+    fresh.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.row.station_uuid.cmp(&b.row.station_uuid))
+    });
+    fresh
+}
+
+/// The top-affinity scenes the for-you shelf draws unplayed stations from.
+fn top_affinity_scenes(affinity: &HashMap<&'static str, f64>) -> Vec<&'static str> {
+    let mut top: Vec<(&'static str, f64)> = affinity
+        .iter()
+        .filter(|(_, weight)| **weight > 0.0)
+        .map(|(id, weight)| (*id, *weight))
+        .collect();
+    top.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(b.0))
+    });
+    top.into_iter()
+        .take(FOR_YOU_AFFINITY_SCENES)
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Deal `count` picks from a ranked list with the daily shuffle, verified
+/// stations first: the shuffle runs over the top `pool` verified rows, and
+/// unverified rows only fill whatever is left, after every verified pick.
+fn deal_verified_first<'r, 'a>(
+    list: &[&'r Ranked<'a>],
+    seed: u64,
+    pool: usize,
+    count: usize,
+) -> Vec<&'r Ranked<'a>> {
+    let verified: Vec<&Ranked> = list
+        .iter()
+        .filter(|ranked| ranked.verified)
+        .take(pool)
+        .copied()
+        .collect();
+    let scores: Vec<f64> = verified.iter().map(|ranked| ranked.score).collect();
+    let mut dealt: Vec<&Ranked> = weighted_daily_pick(&scores, seed, count)
+        .into_iter()
+        .map(|index| verified[index])
+        .collect();
+    if dealt.len() < count {
+        let unverified: Vec<&Ranked> = list
+            .iter()
+            .filter(|ranked| !ranked.verified)
+            .take(pool)
+            .copied()
+            .collect();
+        let scores: Vec<f64> = unverified.iter().map(|ranked| ranked.score).collect();
+        dealt.extend(
+            weighted_daily_pick(&scores, seed.rotate_left(17), count - dealt.len())
+                .into_iter()
+                .map(|index| unverified[index]),
+        );
+    }
+    dealt
 }
 
 fn scene_reason(
@@ -1179,39 +1635,49 @@ fn make_pick(
         score: ranked.score,
         bail_rate: signal.map(|signal| signal.bail_rate).unwrap_or(0.0),
         plays: signal.map(|signal| signal.plays).unwrap_or(0),
+        verified: ranked.verified,
+        last_checked_at: ranked.row.last_checked_at.clone(),
     }
 }
 
+/// Verified picks always come before unverified ones (stable within each
+/// group). Returns whether the shelf can lead with a verified pick; a shelf
+/// that cannot is omitted.
+fn order_verified_first(items: &mut [StationPick]) -> bool {
+    items.sort_by_key(|pick| !pick.verified);
+    items.first().is_some_and(|pick| pick.verified)
+}
+
 /// Build every shelf from cache rows and history. Pure: the same inputs,
-/// salt and date always yield the same feed.
+/// salt and date always yield the same feed. Every shelf leads with
+/// verified-playable picks; shelves with none are omitted.
 pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
     let signals = compute_station_signals(inputs.plays);
     let affinity = compute_scene_affinity(inputs.plays);
     let ranked = rank_rows(inputs.rows, &signals, inputs.now);
 
-    // Scene shelves: top 24 by score, 8 dealt by the daily shuffle.
+    // Scene shelves: 8 dealt by the daily shuffle, verified picks first.
     let mut scene_shelves: Vec<(f64, usize, StationShelf)> = Vec::new();
     for (position, scene) in SCENES.iter().enumerate() {
         let Some(list) = ranked.get(scene.id) else {
             continue;
         };
-        let top: Vec<&Ranked> = list.iter().take(SHELF_CANDIDATES).collect();
-        let scores: Vec<f64> = top.iter().map(|ranked| ranked.score).collect();
+        let refs: Vec<&Ranked> = list.iter().collect();
         let seed = daily_seed(scene.id, inputs.date, inputs.install_salt);
-        let items: Vec<StationPick> = weighted_daily_pick(&scores, seed, SHELF_SIZE)
-            .into_iter()
-            .map(|index| {
-                let ranked = top[index];
-                let signal = signals.get(&ranked.row.station_uuid);
-                make_pick(
-                    ranked,
-                    signal,
-                    Some(scene.id),
-                    scene_reason(ranked.row, signal, scene.title),
-                )
-            })
-            .collect();
-        if items.is_empty() {
+        let mut items: Vec<StationPick> =
+            deal_verified_first(&refs, seed, SHELF_CANDIDATES, SHELF_SIZE)
+                .into_iter()
+                .map(|ranked| {
+                    let signal = signals.get(&ranked.row.station_uuid);
+                    make_pick(
+                        ranked,
+                        signal,
+                        Some(scene.id),
+                        scene_reason(ranked.row, signal, scene.title),
+                    )
+                })
+                .collect();
+        if !order_verified_first(&mut items) {
             continue;
         }
         scene_shelves.push((
@@ -1234,17 +1700,7 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
     });
 
     // Best instance of every station across scenes, for cross-scene shelves.
-    let mut best_by_uuid: HashMap<&str, &Ranked> = HashMap::new();
-    for list in ranked.values() {
-        for item in list {
-            let entry = best_by_uuid
-                .entry(item.row.station_uuid.as_str())
-                .or_insert(item);
-            if item.score > entry.score {
-                *entry = item;
-            }
-        }
-    }
+    let best = best_by_uuid(&ranked);
 
     let mut shelves = Vec::new();
 
@@ -1267,7 +1723,7 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
             } else {
                 format!("You have played this {} times", signal.plays)
             };
-            let pick = if let Some(ranked) = best_by_uuid.get(uuid.as_str()) {
+            let pick = if let Some(ranked) = best.get(uuid.as_str()) {
                 make_pick(
                     ranked,
                     Some(signal),
@@ -1280,6 +1736,12 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
                     .as_deref()
                     .is_some_and(|id| id.eq_ignore_ascii_case(uuid))
             }) {
+                let verified = play.station.fail_count == 0
+                    && checked_within(
+                        play.station.last_checked_at.as_deref(),
+                        inputs.now,
+                        VERIFIED_WITHIN_DAYS * 24,
+                    );
                 StationPick {
                     station: saved_station_to_station(&play.station, uuid),
                     scene_id: None,
@@ -1287,6 +1749,8 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
                     score: 0.0,
                     bail_rate: signal.bail_rate,
                     plays: signal.plays,
+                    verified,
+                    last_checked_at: play.station.last_checked_at.clone(),
                 }
             } else {
                 continue;
@@ -1296,21 +1760,11 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
         }
 
         // (b) unplayed stations from the top three affinity scenes, round-robin.
-        let mut top_scenes: Vec<(&str, f64)> = affinity
-            .iter()
-            .filter(|(_, weight)| **weight > 0.0)
-            .map(|(id, weight)| (*id, *weight))
-            .collect();
-        top_scenes.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.0.cmp(b.0))
-        });
-        let mut cursors: Vec<(&SceneDef, std::slice::Iter<Ranked>)> = top_scenes
-            .iter()
-            .take(FOR_YOU_AFFINITY_SCENES)
-            .filter_map(|(id, _)| Some((find_scene(id)?, ranked.get(id)?.iter())))
-            .collect();
+        let mut cursors: Vec<(&SceneDef, std::slice::Iter<Ranked>)> =
+            top_affinity_scenes(&affinity)
+                .into_iter()
+                .filter_map(|id| Some((find_scene(id)?, ranked.get(id)?.iter())))
+                .collect();
         let mut progressed = true;
         while items.len() < FOR_YOU_SIZE && progressed {
             progressed = false;
@@ -1336,7 +1790,7 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
             }
         }
 
-        if !items.is_empty() {
+        if order_verified_first(&mut items) {
             shelves.push(StationShelf {
                 id: "for-you".to_string(),
                 kind: ShelfKind::ForYou,
@@ -1349,39 +1803,21 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
     }
 
     // Fresh: not played in 14 days, daily shuffle over the top 120.
-    let mut fresh: Vec<&Ranked> = best_by_uuid
-        .values()
-        .filter(|ranked| {
-            !played_within(
-                signals.get(&ranked.row.station_uuid),
-                inputs.now,
-                FRESH_UNPLAYED_DAYS,
-            )
-        })
-        .cloned()
-        .collect();
-    fresh.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.row.station_uuid.cmp(&b.row.station_uuid))
-    });
-    fresh.truncate(FRESH_CANDIDATES);
-    let fresh_scores: Vec<f64> = fresh.iter().map(|ranked| ranked.score).collect();
+    let fresh = fresh_candidates(&best, &signals, inputs.now);
     let fresh_seed = daily_seed("fresh", inputs.date, inputs.install_salt);
-    let fresh_items: Vec<StationPick> = weighted_daily_pick(&fresh_scores, fresh_seed, FRESH_SIZE)
-        .into_iter()
-        .map(|index| {
-            let ranked = fresh[index];
-            make_pick(
-                ranked,
-                signals.get(&ranked.row.station_uuid),
-                Some(ranked.row.scene_id.as_str()),
-                "Fresh today".to_string(),
-            )
-        })
-        .collect();
-    if !fresh_items.is_empty() {
+    let mut fresh_items: Vec<StationPick> =
+        deal_verified_first(&fresh, fresh_seed, FRESH_CANDIDATES, FRESH_SIZE)
+            .into_iter()
+            .map(|ranked| {
+                make_pick(
+                    ranked,
+                    signals.get(&ranked.row.station_uuid),
+                    Some(ranked.row.scene_id.as_str()),
+                    "Fresh today".to_string(),
+                )
+            })
+            .collect();
+    if order_verified_first(&mut fresh_items) {
         shelves.push(StationShelf {
             id: "fresh".to_string(),
             kind: ShelfKind::Fresh,
@@ -1394,6 +1830,171 @@ pub fn assemble_shelves(inputs: &FeedInputs<'_>) -> Vec<StationShelf> {
 
     shelves.extend(scene_shelves.into_iter().map(|(_, _, shelf)| shelf));
     shelves
+}
+
+// ── Verification ──
+
+fn needs_check(row: &SceneStationRow, now: DateTime<Utc>) -> bool {
+    // A station that just failed once gets another chance sooner than a
+    // healthy one needs re-confirming.
+    let hours = if row.fail_count > 0 {
+        12
+    } else {
+        RECHECK_AFTER_HOURS
+    };
+    !checked_within(row.last_checked_at.as_deref(), now, hours)
+}
+
+/// Every cache row that can appear on a shelf: the top 24 of each scene, the
+/// top 120 fresh candidates and the for-you reach into the top-affinity
+/// scenes. One row per station.
+pub fn shelf_candidate_rows<'a>(
+    rows: &'a [SceneStationRow],
+    plays: &[StationPlayRow],
+    now: DateTime<Utc>,
+) -> Vec<&'a SceneStationRow> {
+    let signals = compute_station_signals(plays);
+    let affinity = compute_scene_affinity(plays);
+    let ranked = rank_rows(rows, &signals, now);
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out: Vec<&SceneStationRow> = Vec::new();
+    let mut push = |row: &'a SceneStationRow| {
+        if seen.insert(row.station_uuid.as_str()) {
+            out.push(row);
+        }
+    };
+    for scene in SCENES {
+        for item in ranked
+            .get(scene.id)
+            .into_iter()
+            .flatten()
+            .take(SHELF_CANDIDATES)
+        {
+            push(item.row);
+        }
+    }
+    let best = best_by_uuid(&ranked);
+    for item in fresh_candidates(&best, &signals, now)
+        .into_iter()
+        .take(FRESH_CANDIDATES)
+    {
+        push(item.row);
+    }
+    if plays.len() >= FOR_YOU_MIN_PLAYS {
+        for id in top_affinity_scenes(&affinity) {
+            for item in ranked
+                .get(id)
+                .into_iter()
+                .flatten()
+                .take(FOR_YOU_CANDIDATES_PER_SCENE)
+            {
+                push(item.row);
+            }
+        }
+    }
+    out
+}
+
+/// Shelf candidates that are unchecked or due a re-check, never-checked
+/// first then oldest check first, at most `limit`.
+pub fn select_probe_targets<'a>(
+    rows: &'a [SceneStationRow],
+    plays: &[StationPlayRow],
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Vec<&'a SceneStationRow> {
+    let mut targets: Vec<&SceneStationRow> = shelf_candidate_rows(rows, plays, now)
+        .into_iter()
+        .filter(|row| needs_check(row, now))
+        .collect();
+    targets.sort_by(|a, b| {
+        a.last_checked_at
+            .is_some()
+            .cmp(&b.last_checked_at.is_some())
+            .then_with(|| a.last_checked_at.cmp(&b.last_checked_at))
+            .then_with(|| a.station_uuid.cmp(&b.station_uuid))
+    });
+    targets.truncate(limit);
+    targets
+}
+
+/// Probe rows concurrently (the health module's bounded verifier, in
+/// batches it accepts) and apply each result: OK resets `fail_count`, a
+/// failure increments it and three failures delete the station from the
+/// cache. Returns the number of deleted stations.
+async fn probe_scene_rows(db: &DbPool, rows: &[&SceneStationRow]) -> Result<usize, String> {
+    const VERIFY_BATCH: usize = 100;
+    let checked_at = queries::now();
+    let mut removed = 0;
+    let mut by_url: HashMap<String, Vec<(String, i32)>> = HashMap::new();
+    let mut seen_uuids: HashSet<&str> = HashSet::new();
+    for row in rows {
+        if !seen_uuids.insert(row.station_uuid.as_str()) {
+            continue;
+        }
+        let url = playable_url(row).trim().to_string();
+        if url.is_empty() || url.len() > MAX_STATION_URL_BYTES {
+            if apply_sweep_result(db, &row.station_uuid, row.fail_count, false, &checked_at)? {
+                removed += 1;
+            }
+            continue;
+        }
+        by_url
+            .entry(url)
+            .or_default()
+            .push((row.station_uuid.clone(), row.fail_count));
+    }
+    let urls: Vec<String> = by_url.keys().cloned().collect();
+    for batch in urls.chunks(VERIFY_BATCH) {
+        let results = verify_station_urls_inner(batch.to_vec()).await?;
+        for result in results {
+            let healthy = result.status == "ok";
+            for (uuid, fail_count) in by_url.get(&result.url).into_iter().flatten() {
+                if apply_sweep_result(db, uuid, *fail_count, healthy, &checked_at)? {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Probe every shelf candidate that is unchecked or due a re-check, so the
+/// hero and the front of every shelf are stations that played recently.
+/// Returns the number of stations probed.
+pub async fn verify_shelf_candidates(db: &DbPool) -> Result<usize, String> {
+    let now = Utc::now();
+    let rows = queries::get_all_scene_stations(db).map_err(|e| e.to_string())?;
+    let plays = queries::get_station_play_rows_since(db, &history_window_start(now))
+        .map_err(|e| e.to_string())?;
+    let targets = select_probe_targets(&rows, &plays, now, MAX_SHELF_PROBES_PER_PASS);
+    if targets.is_empty() {
+        return Ok(0);
+    }
+    let started = Instant::now();
+    let count = targets.len();
+    let removed = probe_scene_rows(db, &targets).await?;
+    log::info!(
+        "Verified {} shelf candidates in {} ms ({} removed)",
+        count,
+        started.elapsed().as_millis(),
+        removed
+    );
+    Ok(count)
+}
+
+/// A pick failed in the play path (probe and self-heal both failed): take
+/// it off every shelf right away. `fail_count >= 2` excludes it.
+pub fn mark_station_unplayable(db: &DbPool, station_uuid: &str) -> Result<(), String> {
+    queries::mark_scene_station_failed(db, &station_uuid.to_ascii_lowercase(), &queries::now())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// A pick just proved playable in the play path: that is a fresh probe.
+pub fn mark_station_playable(db: &DbPool, station_uuid: &str) -> Result<(), String> {
+    queries::update_scene_station_health(db, &station_uuid.to_ascii_lowercase(), 0, &queries::now())
+        .map_err(|e| e.to_string())
 }
 
 fn history_window_start(now: DateTime<Utc>) -> String {
@@ -1419,7 +2020,9 @@ fn cache_age_seconds(refresh_rows: &[SceneRefreshRow], now: DateTime<Utc>) -> Op
 
 /// The feed from the cache alone. Never touches the network: an empty cache
 /// returns `status: empty` (with the scene catalog) and kicks off one
-/// background refresh.
+/// background refresh. While a refresh or verification pass runs the status
+/// is `refreshing` (so the page keeps polling as picks get verified), and a
+/// cache with nothing verified yet starts a verification pass.
 pub fn build_discovery_feed(db: &DbPool) -> Result<StationDiscoveryFeed, String> {
     let now = Utc::now();
     let rows = queries::get_all_scene_stations(db).map_err(|e| e.to_string())?;
@@ -1456,16 +2059,28 @@ pub fn build_discovery_feed(db: &DbPool) -> Result<StationDiscoveryFeed, String>
         now,
     });
 
+    let status = if is_refresh_in_flight() {
+        FeedStatus::Refreshing
+    } else if shelves.is_empty()
+        && !select_probe_targets(&rows, &plays, now, 1).is_empty()
+        && spawn_background_verify(db.clone())
+    {
+        FeedStatus::Refreshing
+    } else {
+        FeedStatus::Ready
+    };
+
     Ok(StationDiscoveryFeed {
         generated_at: now.to_rfc3339(),
-        status: FeedStatus::Ready,
+        status,
         cache_age_seconds: cache_age_seconds(&refresh_rows, now),
         shelves,
         scenes,
     })
 }
 
-/// Ranked rows of one scene without the daily shuffle, for "See all".
+/// Ranked rows of one scene without the daily shuffle, for "See all":
+/// verified stations first, then the unverified ones, each by score.
 pub fn scene_stations_page(
     db: &DbPool,
     scene_id: &str,
@@ -1499,9 +2114,11 @@ fn rank_scene_page(
         .map(|row| Ranked {
             row,
             score: rank_score(row, signals.get(&row.station_uuid), now),
+            verified: is_verified(row, now),
         })
         .collect();
     sort_ranked(&mut ranked);
+    ranked.sort_by_key(|item| !item.verified);
     ranked
         .iter()
         .map(|item| {
@@ -1573,7 +2190,8 @@ mod tests {
             clicktrend: 0,
             fetched_at: "2026-10-07T00:00:00+00:00".to_string(),
             fail_count: 0,
-            last_checked_at: None,
+            // Verified a day before `now()`.
+            last_checked_at: Some("2026-10-06T12:00:00+00:00".to_string()),
         }
     }
 
@@ -2069,5 +2687,317 @@ mod tests {
         let refresh = queries::get_scene_refresh_rows(&db).unwrap();
         assert_eq!(refresh.len(), 1, "the salt row is not a scene");
         assert_eq!(refresh[0].scene_id, "house");
+    }
+
+    // ── Tag focus ──
+
+    /// A real-world shape of a dedicated hip-hop station: a handful of
+    /// tags, all from the hip-hop/R&B side, the genre leading the list.
+    const GENUINE_HIPHOP_NAME: &str = "HOT 108 JAMZ - #1 for Hip Hop";
+    const GENUINE_HIPHOP_TAGS: &str = "hip hop,hiphop,rap,r&b,urban";
+    /// The "every genre" shape: dozens of tags across every family so the
+    /// station surfaces for any tag search. It also has far more votes.
+    const SPAM_NAME: &str = "RADIO MEGAMIX 24/7 :: Hip Hop Rap Techno House Jazz Country Rock Pop";
+    const SPAM_TAGS: &str = "00s,70s,80s,90s,ambient,blues,chillout,classical,country,dance,edm,hip hop,house,jazz,latin,metal,news,oldies,pop,r&b,rap,reggae,rock,soul,techno,top 40,trance";
+    /// A quieter variant: only five tags, but rap + techno + jazz + country.
+    const SCATTERED_TAGS: &str = "rap,techno,jazz,country,hits";
+
+    fn tagged_row(
+        scene_id: &str,
+        uuid: &str,
+        name: &str,
+        tags: &str,
+        votes: i64,
+    ) -> SceneStationRow {
+        let mut row = row(scene_id, uuid, votes);
+        row.name = name.to_string();
+        row.tags = Some(tags.to_string());
+        row
+    }
+
+    #[test]
+    fn tag_focus_separates_a_genuine_hiphop_station_from_genre_spam() {
+        let scene = find_scene("hip-hop").unwrap();
+
+        let genuine = tag_focus(scene, GENUINE_HIPHOP_NAME, Some(GENUINE_HIPHOP_TAGS));
+        assert_eq!(genuine.tag_count, 5);
+        assert_eq!(genuine.families, 2, "hip-hop + soul (r&b)");
+        assert!(genuine.prominent && genuine.relevant);
+        assert!((genuine.score - 1.0).abs() < 1e-9, "{genuine:?}");
+
+        let spam = tag_focus(scene, SPAM_NAME, Some(SPAM_TAGS));
+        assert_eq!(spam.tag_count, 27);
+        assert!(spam.families >= 10, "{spam:?}");
+        assert!(
+            spam.score < FOCUS_EXCLUDE_BELOW,
+            "every-genre stations are excluded from the scene: {spam:?}"
+        );
+
+        let scattered = tag_focus(scene, "Mixed Signals FM", Some(SCATTERED_TAGS));
+        assert_eq!(scattered.families, 5, "{scattered:?}");
+        assert!(
+            scattered.score >= FOCUS_EXCLUDE_BELOW && scattered.score < 0.5,
+            "{scattered:?}"
+        );
+
+        // A techno station tagged with a stray "rap" is not a hip-hop station.
+        let techno = tag_focus(
+            scene,
+            "Berlin Warehouse",
+            Some("techno,minimal techno,electronic"),
+        );
+        assert!(!techno.relevant);
+        assert_eq!(techno.score, 0.0);
+
+        // Electronic sub-genres are one family: a focused techno station is
+        // fully focused for the techno scene.
+        let techno_scene = find_scene("techno").unwrap();
+        let focused = tag_focus(
+            techno_scene,
+            "Berlin Warehouse",
+            Some("techno,minimal techno,electronic,house,dance"),
+        );
+        assert!((focused.score - 1.0).abs() < 1e-9, "{focused:?}");
+    }
+
+    #[test]
+    fn broad_scenes_tolerate_genre_spread_but_not_tag_spam() {
+        let workout = find_scene("workout").unwrap();
+        let gym = tag_focus(
+            workout,
+            "__WORKOUT__ by rautemusik",
+            Some("dance,hip hop,hits,non-stop music,training,workout"),
+        );
+        assert!(gym.prominent, "the name carries the scene term");
+        assert!(gym.score > 0.9, "{gym:?}");
+        let spam = tag_focus(workout, SPAM_NAME, Some(&format!("{SPAM_TAGS},workout")));
+        assert!(spam.score < FOCUS_EXCLUDE_BELOW, "{spam:?}");
+    }
+
+    #[test]
+    fn genuine_hiphop_station_outranks_spam_with_ten_times_the_votes() {
+        let now = now();
+        let genuine = tagged_row(
+            "hip-hop",
+            "genuine",
+            GENUINE_HIPHOP_NAME,
+            GENUINE_HIPHOP_TAGS,
+            300,
+        );
+        let scattered = tagged_row(
+            "hip-hop",
+            "scattered",
+            "Mixed Signals FM",
+            SCATTERED_TAGS,
+            3_000,
+        );
+        let spam = tagged_row("hip-hop", "spam", SPAM_NAME, SPAM_TAGS, 9_000);
+
+        let genuine_score = rank_score(&genuine, None, now);
+        let scattered_score = rank_score(&scattered, None, now);
+        assert!(
+            genuine_score > scattered_score + 1.0,
+            "genuine {genuine_score} vs scattered {scattered_score}"
+        );
+        assert!(!is_shelf_eligible(&spam), "spam is excluded outright");
+        assert!(is_shelf_eligible(&scattered));
+
+        // The ranked "See all" page and the shelf both lead with it.
+        let rows = vec![spam.clone(), scattered.clone(), genuine.clone()];
+        let scene = find_scene("hip-hop").unwrap();
+        let page = rank_scene_page(&rows, &HashMap::new(), scene, now);
+        let uuids: Vec<&str> = page
+            .iter()
+            .map(|p| p.station.stationuuid.as_str())
+            .collect();
+        assert_eq!(uuids, vec!["genuine", "scattered"]);
+
+        // And the refresh never caches the every-genre station for the scene.
+        let directory = vec![
+            serde_json::from_value::<RadioBrowserStation>(serde_json::json!({
+                "name": SPAM_NAME, "url": "https://radio.example/spam", "hls": 0,
+                "homepage": null, "favicon": null, "country": "US", "language": null,
+                "tags": SPAM_TAGS, "codec": "MP3", "bitrate": 128, "votes": 9000,
+                "stationuuid": "spam"
+            }))
+            .unwrap(),
+            serde_json::from_value::<RadioBrowserStation>(serde_json::json!({
+                "name": GENUINE_HIPHOP_NAME, "url": "https://radio.example/genuine", "hls": 0,
+                "homepage": null, "favicon": null, "country": "US", "language": null,
+                "tags": GENUINE_HIPHOP_TAGS, "codec": "MP3", "bitrate": 128, "votes": 300,
+                "stationuuid": "genuine"
+            }))
+            .unwrap(),
+        ];
+        let prepared = prepare_scene_rows(scene, directory, "2026-10-07T00:00:00+00:00");
+        let kept: Vec<&str> = prepared.iter().map(|r| r.station_uuid.as_str()).collect();
+        assert_eq!(kept, vec!["genuine"]);
+    }
+
+    // ── Verified-only surfacing ──
+
+    #[test]
+    fn verification_needs_a_recent_ok_probe() {
+        let now = now();
+        let mut station = row("house", "a", 10);
+        assert!(is_verified(&station, now));
+        station.last_checked_at = Some("2026-09-29T12:00:00+00:00".to_string());
+        assert!(!is_verified(&station, now), "8 days old is not recent");
+        station.last_checked_at = None;
+        assert!(!is_verified(&station, now), "never probed");
+        station.last_checked_at = Some("2026-10-07T11:00:00+00:00".to_string());
+        station.fail_count = 1;
+        assert!(!is_verified(&station, now), "a recent failure is not OK");
+    }
+
+    #[test]
+    fn shelves_lead_with_verified_picks_and_skip_scenes_with_none() {
+        let mut rows = fixture_rows();
+        // House: only three stations verified, and they are low-voted.
+        for row in rows.iter_mut().filter(|row| row.scene_id == "house") {
+            let index: usize = row.station_uuid[6..].parse().unwrap();
+            if index < 27 {
+                row.last_checked_at = None;
+            }
+        }
+        // Jazz: nothing verified at all.
+        for row in rows.iter_mut().filter(|row| row.scene_id == "jazz") {
+            row.last_checked_at = None;
+        }
+        let favorites = HashSet::new();
+        let shelves = assemble_shelves(&FeedInputs {
+            rows: &rows,
+            plays: &[],
+            favorite_uuids: &favorites,
+            install_salt: "install-salt",
+            date: "2026-10-07",
+            now: now(),
+        });
+        for shelf in &shelves {
+            assert!(
+                shelf.items[0].verified,
+                "shelf {} leads unverified",
+                shelf.id
+            );
+            let first_unverified = shelf.items.iter().position(|pick| !pick.verified);
+            if let Some(position) = first_unverified {
+                assert!(
+                    shelf.items[position..].iter().all(|pick| !pick.verified),
+                    "shelf {}: verified after unverified",
+                    shelf.id
+                );
+            }
+        }
+        let house = shelves
+            .iter()
+            .find(|shelf| shelf.id == "scene:house")
+            .unwrap();
+        assert_eq!(house.items.len(), 8);
+        assert_eq!(house.items.iter().filter(|pick| pick.verified).count(), 3);
+        let verified: HashSet<&str> = house.items[..3]
+            .iter()
+            .map(|pick| pick.station.stationuuid.as_str())
+            .collect();
+        assert_eq!(
+            verified,
+            ["house-27", "house-28", "house-29"].into_iter().collect()
+        );
+        assert!(
+            shelves.iter().all(|shelf| shelf.id != "scene:jazz"),
+            "a scene with no verified station has no shelf"
+        );
+        let serialized = serde_json::to_value(&house.items[0]).unwrap();
+        assert_eq!(serialized["verified"], serde_json::json!(true));
+        assert!(serialized["lastCheckedAt"].is_string());
+    }
+
+    #[test]
+    fn probe_targets_cover_shelf_candidates_due_a_check() {
+        let now = now();
+        let mut rows = fixture_rows();
+        for row in rows.iter_mut() {
+            let index: usize = row
+                .station_uuid
+                .rsplit('-')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            row.last_checked_at = match index % 3 {
+                0 => None,
+                1 => Some("2026-10-07T06:00:00+00:00".to_string()), // fresh
+                _ => Some("2026-10-02T00:00:00+00:00".to_string()), // due
+            };
+        }
+        let candidates = shelf_candidate_rows(&rows, &[], now);
+        // 3 scenes x top 24, plus fresh candidates from the same pool.
+        assert_eq!(candidates.len(), 90);
+        let targets = select_probe_targets(&rows, &[], now, 500);
+        assert!(targets.iter().all(|row| needs_check(row, now)));
+        assert!(targets
+            .iter()
+            .all(|row| row.last_checked_at.as_deref() != Some("2026-10-07T06:00:00+00:00")));
+        let first_checked = targets
+            .iter()
+            .position(|row| row.last_checked_at.is_some())
+            .unwrap();
+        assert!(targets[..first_checked]
+            .iter()
+            .all(|row| row.last_checked_at.is_none()));
+        assert!(targets[first_checked..]
+            .iter()
+            .all(|row| row.last_checked_at.is_some()));
+        assert_eq!(select_probe_targets(&rows, &[], now, 5).len(), 5);
+
+        // A row that failed once is re-checked after 12 h, not 72 h.
+        let mut failed = row("house", "x", 10);
+        failed.fail_count = 1;
+        failed.last_checked_at = Some("2026-10-06T23:00:00+00:00".to_string());
+        assert!(needs_check(&failed, now));
+        failed.last_checked_at = Some("2026-10-07T06:00:00+00:00".to_string());
+        assert!(!needs_check(&failed, now));
+    }
+
+    #[test]
+    fn a_failed_play_takes_the_station_off_every_shelf() {
+        let db = crate::db::init_memory_db().unwrap();
+        let mut rows = vec![row("house", "a", 10), row("techno", "a", 10)];
+        rows.push(row("house", "b", 5));
+        queries::upsert_scene_stations(&db, &rows).unwrap();
+        queries::update_scene_station_health(&db, "a", 0, "2026-10-07T01:00:00+00:00").unwrap();
+        mark_station_unplayable(&db, "A").unwrap();
+        let cached = queries::get_all_scene_stations(&db).unwrap();
+        for row in cached.iter().filter(|row| row.station_uuid == "a") {
+            assert_eq!(row.fail_count, 2);
+            assert!(!is_shelf_eligible(row));
+        }
+        let b = cached.iter().find(|row| row.station_uuid == "b").unwrap();
+        assert_eq!(b.fail_count, 0);
+
+        // A later successful play restores it.
+        mark_station_playable(&db, "a").unwrap();
+        let cached = queries::get_all_scene_stations(&db).unwrap();
+        assert!(cached
+            .iter()
+            .filter(|row| row.station_uuid == "a")
+            .all(|row| row.fail_count == 0 && row.last_checked_at.is_some()));
+    }
+
+    #[test]
+    fn every_scene_term_maps_to_its_own_family_or_is_broad() {
+        // Guards the relevance rule: a genre scene whose terms map to no
+        // genre family would accept any station.
+        for scene in SCENES {
+            let families: HashSet<GenreFamily> = scene
+                .tags
+                .iter()
+                .flat_map(|term| families_of(&normalize_words(term)))
+                .collect();
+            assert!(
+                is_broad_scene(scene) || !families.is_empty(),
+                "scene {} has no genre family",
+                scene.id
+            );
+        }
     }
 }
