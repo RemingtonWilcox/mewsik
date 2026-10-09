@@ -36,7 +36,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Signal',
 		subtitle: 'Phosphor score',
 		role: 'Flow',
-		description: 'A continuous instrument trace that draws spectrum, rhythm, harmony, and song structure.',
+		description: 'A night phosphor scope: an XY figure tuned to harmony, beat-swept channel traces and a spectral horizon.',
 		accent: '#a7f3d0',
 		accentMuted: 'rgba(52, 211, 153, 0.46)'
 	},

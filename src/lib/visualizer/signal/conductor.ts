@@ -18,6 +18,14 @@ export type SignalSectionProfile = {
 	openness: number;
 	asymmetry: number;
 	motion: number;
+	/** How many oscilloscope channels share the face, 0..4 (continuous). */
+	channels: number;
+	/** Harmonic complexity of the hero XY figure's frequency ratio, 0..1. */
+	complexity: number;
+	/** Beats per channel sweep: long sweeps in calm sections, short in drops. */
+	sweepBeats: number;
+	/** Spectral horizon write ticks per beat. */
+	ticks: number;
 };
 
 export type SignalConductorFrame = {
@@ -54,6 +62,14 @@ export type SignalConductorFrame = {
 	tracePhase: number;
 	/** Smoothed fifth-axis key angle, 0..1 around the circle. */
 	key: number;
+	/** Section-eased oscilloscope channel count, 0..4 (continuous). */
+	channels: number;
+	/** Section/harmony/tension eased XY-figure ratio complexity, 0..1. */
+	complexity: number;
+	/** Beats per channel sweep; builds tighten it, calm sections lengthen it. */
+	sweepBeats: number;
+	/** Spectral horizon write ticks per beat. */
+	tickRate: number;
 };
 
 const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>> = {
@@ -63,7 +79,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.08,
 		openness: 0.34,
 		asymmetry: 0.05,
-		motion: 0.08
+		motion: 0.08,
+		channels: 0.55,
+		complexity: 0.04,
+		sweepBeats: 4,
+		ticks: 0.25
 	},
 	intro: {
 		shapes: { ellipse: 0.5, lissajous: 0.38, ribbon: 0.09, rosette: 0.03 },
@@ -71,7 +91,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.16,
 		openness: 0.43,
 		asymmetry: 0.1,
-		motion: 0.17
+		motion: 0.17,
+		channels: 1.0,
+		complexity: 0.1,
+		sweepBeats: 4,
+		ticks: 0.5
 	},
 	verse: {
 		shapes: { ellipse: 0.2, lissajous: 0.52, ribbon: 0.22, rosette: 0.06 },
@@ -79,7 +103,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.24,
 		openness: 0.54,
 		asymmetry: 0.27,
-		motion: 0.42
+		motion: 0.42,
+		channels: 1.35,
+		complexity: 0.3,
+		sweepBeats: 2,
+		ticks: 1
 	},
 	pre_chorus: {
 		shapes: { ellipse: 0.1, lissajous: 0.34, ribbon: 0.24, rosette: 0.32 },
@@ -87,7 +115,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.12,
 		openness: 0.38,
 		asymmetry: 0.38,
-		motion: 0.68
+		motion: 0.68,
+		channels: 2.4,
+		complexity: 0.52,
+		sweepBeats: 2,
+		ticks: 1
 	},
 	build: {
 		shapes: { ellipse: 0.05, lissajous: 0.22, ribbon: 0.23, rosette: 0.5 },
@@ -95,7 +127,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.06,
 		openness: 0.27,
 		asymmetry: 0.44,
-		motion: 0.82
+		motion: 0.82,
+		channels: 3.1,
+		complexity: 0.78,
+		sweepBeats: 1,
+		ticks: 2
 	},
 	drop: {
 		shapes: { ellipse: 0.08, lissajous: 0.29, ribbon: 0.13, rosette: 0.5 },
@@ -103,7 +139,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 1,
 		openness: 0.94,
 		asymmetry: 0.18,
-		motion: 1
+		motion: 1,
+		channels: 4.0,
+		complexity: 0.62,
+		sweepBeats: 1,
+		ticks: 2
 	},
 	chorus: {
 		shapes: { ellipse: 0.12, lissajous: 0.33, ribbon: 0.17, rosette: 0.38 },
@@ -111,7 +151,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.78,
 		openness: 0.86,
 		asymmetry: 0.23,
-		motion: 0.86
+		motion: 0.86,
+		channels: 3.5,
+		complexity: 0.48,
+		sweepBeats: 1,
+		ticks: 2
 	},
 	bridge: {
 		shapes: { ellipse: 0.27, lissajous: 0.23, ribbon: 0.43, rosette: 0.07 },
@@ -119,7 +163,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.34,
 		openness: 0.61,
 		asymmetry: 0.76,
-		motion: 0.32
+		motion: 0.32,
+		channels: 2.0,
+		complexity: 0.42,
+		sweepBeats: 2,
+		ticks: 1
 	},
 	breakdown: {
 		shapes: { ellipse: 0.57, lissajous: 0.23, ribbon: 0.17, rosette: 0.03 },
@@ -127,7 +175,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.28,
 		openness: 0.48,
 		asymmetry: 0.43,
-		motion: 0.15
+		motion: 0.15,
+		channels: 0.6,
+		complexity: 0.16,
+		sweepBeats: 4,
+		ticks: 0.5
 	},
 	outro: {
 		shapes: { ellipse: 0.63, lissajous: 0.25, ribbon: 0.1, rosette: 0.02 },
@@ -135,7 +187,11 @@ const SECTION_PROFILES: Readonly<Record<VisualizerSection, SignalSectionProfile>
 		release: 0.14,
 		openness: 0.38,
 		asymmetry: 0.18,
-		motion: 0.1
+		motion: 0.1,
+		channels: 0.7,
+		complexity: 0.06,
+		sweepBeats: 4,
+		ticks: 0.25
 	}
 };
 
@@ -307,6 +363,10 @@ export class SignalConductor {
 	private key = 0;
 	private spectrumTravel = 0;
 	private tracePhase = 0;
+	private channels = SECTION_PROFILES.intro.channels;
+	private complexity = SECTION_PROFILES.intro.complexity;
+	private sweepBeats = SECTION_PROFILES.intro.sweepBeats;
+	private tickRate = SECTION_PROFILES.intro.ticks;
 
 	private readonly output: SignalConductorFrame = {
 		section: 'intro',
@@ -325,7 +385,11 @@ export class SignalConductor {
 		phraseVariation: 0.5,
 		spectrumTravel: 0,
 		tracePhase: 0,
-		key: 0
+		key: 0,
+		channels: SECTION_PROFILES.intro.channels,
+		complexity: SECTION_PROFILES.intro.complexity,
+		sweepBeats: SECTION_PROFILES.intro.sweepBeats,
+		tickRate: SECTION_PROFILES.intro.ticks
 	};
 
 	constructor(seed: SignalSeed = 0) {
@@ -355,6 +419,10 @@ export class SignalConductor {
 		this.key = 0;
 		this.spectrumTravel = 0;
 		this.tracePhase = 0;
+		this.channels = SECTION_PROFILES.intro.channels;
+		this.complexity = SECTION_PROFILES.intro.complexity;
+		this.sweepBeats = SECTION_PROFILES.intro.sweepBeats;
+		this.tickRate = SECTION_PROFILES.intro.ticks;
 		this.output.section = 'intro';
 		writeShapeWeights(this.output.shapeWeights, this.currentShapes);
 		this.output.tension = this.tension;
@@ -372,6 +440,10 @@ export class SignalConductor {
 		this.output.spectrumTravel = 0;
 		this.output.tracePhase = 0;
 		this.output.key = 0;
+		this.output.channels = this.channels;
+		this.output.complexity = this.complexity;
+		this.output.sweepBeats = this.sweepBeats;
+		this.output.tickRate = this.tickRate;
 	}
 
 	update(
@@ -591,6 +663,43 @@ export class SignalConductor {
 		}
 		normalizeSignalShapeWeightArray(this.currentShapes);
 
+		// Composition rails. Sections decide how much of the instrument is lit:
+		// a lone calm trace in a verse, a dense multi-channel figure in a drop.
+		// Energy and anticipation only lean the section's choice; phrase identity
+		// nudges complexity so repeated sections never redraw the same figure.
+		const channelsTarget = clamp(
+			section.channels +
+				(frame.energy - 0.45) * 0.9 +
+				frame.drop.anticipation * 0.5 +
+				spectrum.levels.presence * 0.25 -
+				(frame.silence ? 1 : 0),
+			0,
+			4
+		);
+		const complexityTarget = clamp01(
+			section.complexity +
+				this.phraseBias[1] * 1.6 +
+				this.tension * 0.12 +
+				Math.abs(frame.tonnetz[2]) * 0.06 +
+				spectrum.flatness * 0.08
+		);
+		// Builds tighten the sweep toward half a beat as the riser approaches.
+		const sweepTarget = clamp(
+			section.sweepBeats * (1 - frame.drop.buildProgress * 0.5 - frame.drop.anticipation * 0.2),
+			0.5,
+			4
+		);
+		const tickTarget = clamp(
+			section.ticks * (1 + frame.drop.anticipation * 0.6) + spectrum.levels.kick * 0.25,
+			0.125,
+			3
+		);
+		const barSeconds = beatSeconds * 4;
+		this.channels = approach(this.channels, channelsTarget, clamp(barSeconds * 0.6, 0.8, 3), dt);
+		this.complexity = approach(this.complexity, complexityTarget, clamp(barSeconds, 1.2, 4), dt);
+		this.sweepBeats = approach(this.sweepBeats, sweepTarget, clamp(barSeconds * 0.5, 0.6, 2), dt);
+		this.tickRate = approach(this.tickRate, tickTarget, clamp(barSeconds * 0.5, 0.6, 2), dt);
+
 		this.output.section = frame.section;
 		writeShapeWeights(this.output.shapeWeights, this.currentShapes);
 		this.output.tension = this.tension;
@@ -608,6 +717,10 @@ export class SignalConductor {
 		this.output.spectrumTravel = this.spectrumTravel;
 		this.output.tracePhase = this.tracePhase;
 		this.output.key = this.key;
+		this.output.channels = this.channels;
+		this.output.complexity = this.complexity;
+		this.output.sweepBeats = this.sweepBeats;
+		this.output.tickRate = this.tickRate;
 		return this.output;
 	}
 }
