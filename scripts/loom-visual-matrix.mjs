@@ -21,7 +21,7 @@ const seed = process.env.VIS_SEED ?? 'loom-audit';
 // Each engine labels its canvas and readiness attribute differently.
 const ENGINE_CANVAS = {
 	mk1: ['Prism audio visualizer', 'data-prism-ready'],
-	mk2: ['Soma audio visualizer', 'data-mk2-ready'],
+	mk2: ['Soma audio visualizer', 'data-soma-ready'],
 	signal: ['Signal audio visualizer', 'data-signal-ready'],
 	loom: ['Loom audio visualizer', 'data-loom-ready']
 };

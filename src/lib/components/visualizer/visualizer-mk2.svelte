@@ -1,33 +1,32 @@
 <script lang="ts">
-	// Mark II visualizer — "Drift Through a Fractal Atmosphere"
+	// Soma (engine id mk2) — "Abyssal Bloom"
 	//
-	// Architecture per research findings:
-	//   • Mandelbulb SDF raymarched as the hero — a genuine fractal architecture,
-	//     not a smoothed primitive. Forms read as alien geology, not "blob."
-	//   • Volumetric participating medium — fog accumulates with transmittance
-	//     and phase-weighted key light, while the hero retains real soft shadow.
-	//     Atmosphere stays dimensional without nesting a shadow raymarch inside
-	//     every fog sample.
-	//   • Phrase-held seeded camera compositions with render-rate interpolation.
-	//     The organism evolves inside the shot; the camera never runs a turntable.
-	//   • Photographic 7-stop palette interpolated smoothly — golden hour /
-	//     dusk / deep space stops, never cosine RGB.
-	//   • AgX filmic tone map + stable dither for a clean post-processing
-	//     signature without pasted-on lens overlays.
+	// A dark bioluminescent deep-sea organism in ink-dark water.
+	//   • Hero: a raymarched translucent bell (front and far wall both shaded)
+	//     with fresnel membrane light, radial canals, ctenophore comb rows,
+	//     marginal photophores and organs glowing through the tissue.
+	//   • Tendrils and oral arms are analytic glowing filaments that trail the
+	//     swimming bell; beats launch light packets that travel from the apex
+	//     down the canals and out along the tendrils. Percussion is local light,
+	//     never a whole-frame flash and never whole-body motion.
+	//   • The organism swims between seeded half-phrase waypoints on alternating
+	//     sides of the shot (see mk2/organism.ts), leaning apex-first into travel.
+	//   • Environment that belongs to the subject: depth haze, slow light shafts
+	//     the organism shadows, marine snow lit by its glow for scale and
+	//     parallax, distant pinnacles, and a silt floor with brine pools that
+	//     mirror it and catch a pool of its light.
+	//   • Lifecycle forms change anatomy: seed is compact, sprout tall, winding
+	//     twists canals and coils tendrils, bloom opens a wide scalloped bell,
+	//     shedding erodes the margin and releases glowing buds, dormancy sinks.
+	//   • Post stack (8 passes): scene, temporal feedback (max-blend), half-res
+	//     bloom prefilter, two separable blur rounds, composite with barrel lens,
+	//     chromatic aberration, ACES and interleaved-gradient dither.
 	//
-	// Audio routing (multiple timescales):
-	//   • sub/kick            → localized root pigment/material response
-	//   • body/mids           → axial growth, lobe splitting, winding and folds
-	//   • presence/air        → ridges, filaments, erosion and surface emission
-	//   • spectral direction  → fine surface/environment travel, never rigid-body lean
-	//   • section/phrase      → lifecycle plus reach / coil / divide / hollow / stillness
-	//   • harmony/key         → continuous palette and material development
-	//   • bpmNorm (slow)     → long-form tissue development rate
-	//   • rms (slow)         → light shaft intensity
-	//   • onset (impulse)    → restrained root/surface impact only
-	//
-	// Future iterations: real circle-of-confusion DOF and Mandelbox / hybrid IFS
-	// variants per song seed.
+	// Audio routing: smoothed energy drives swim strokes and tendril undulation;
+	// bass/rootPulse light the organs and the floor pool; mids widen tendril
+	// waves; treble sparkles photophores and plankton; beats move light packets;
+	// phrase position re-drafts tendril lengths and sheds buds; key/mode choose
+	// palette roles. Elapsed time is packed nowhere.
 
 	import { onMount, onDestroy } from 'svelte';
 	import {
@@ -35,10 +34,7 @@
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
-	import {
-		mk2ContinuousPaletteBlend,
-		type Mk2ConductorFrame
-	} from '$lib/visualizer/mk2/conductor';
+	import type { Mk2ConductorFrame } from '$lib/visualizer/mk2/conductor';
 	import {
 		SOMA_QUALITY_PROFILES,
 		SomaAutoQualityController,
@@ -48,9 +44,15 @@
 		type SomaQualityProfile,
 		type SomaQualityTier
 	} from '$lib/visualizer/mk2/runtime';
+	import {
+		SomaSwimmer,
+		somaHueDelta,
+		somaPaletteRoles,
+		type SomaPaletteRoles,
+		type SomaVec3
+	} from '$lib/visualizer/mk2/organism';
 
 	const vis = useVisualizer();
-	const t0 = performance.now();
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -61,19 +63,16 @@
 	// Tripped in onDestroy before teardownGpu so any in-flight RAF tick early-
 	// returns instead of touching destroyed GPU resources mid-frame.
 	let running = false;
-	// Per-TRACK identity seed (Lomas principle): hashed from the recording id,
-	// so the same song always grows the same organism — palette family, camera
-	// identity, FOV, roll — and every different song gets a different world.
-	// Falls back to a random session seed when nothing identifiable plays.
+	// Per-track identity seed: the same song grows the same organism (camera
+	// identity, bell lobes, palette lean) and every song gets a different one.
 	let mk2SongSeed = 0.5;
-	let mk2SecondaryPaletteFamily = 2;
 	let rendererSourceEpoch = -1;
 	let rendererSyncRequested = true;
 	let poseSyncRequested = true;
 
-	// Mk2 borrows Signal's persistent song journey, then moves on deliberately
-	// slower rails. Only root punch and a restrained surface impact react quickly.
 	let temporalResetRequested = true;
+	/** Frames left during which the feedback trail is cleared (source reset, resize). */
+	let feedbackResetFrames = 2;
 	let currentSection = $state('intro');
 	let currentForm = $state('seed');
 	let currentGesture = $state('reach');
@@ -81,6 +80,11 @@
 	let renderPixels = $state(0);
 	let renderStride = $state(1);
 	let measuredRefreshRate = $state(60);
+	/** Organism centre in normalized screen space (-1..1), refreshed four times a second. */
+	let bodyScreen = $state('0.00,0.00');
+	let bodyScreenX = 0;
+	let bodyScreenY = 0;
+	let bodyScreenTimer = 0;
 
 	function dominantLifecycleForm(journey: VisualizerJourneySnapshot['mk2']): string {
 		const forms = [
@@ -97,44 +101,55 @@
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// Audio smoothing — multiple timescales per research recommendation.
-	// Fast-attack/release for transient-driven params; slow for mood-driven.
+	// Audio smoothing — fast rails stay local (organs, packets, photophores);
+	// slow rails steer swimming and the light rig.
 	// ──────────────────────────────────────────────────────────────────────────
 	const smoothed = {
 		bass: 0,
 		mid: 0,
 		treble: 0,
-		centroidSlow: 0.5,
-		chromaXSlow: 1,
-		chromaYSlow: 0,
-		rmsSlow: 0,
-		bpmNormSlow: 0.4,
-		flash: 0,
-		staccato: 0,
-		sustain: 0,
-		paletteXSlow: 1,
-		paletteYSlow: 0,
+		energy: 0,
+		impact: 0,
+		rootPulse: 0,
+		rms: 0,
+		silence: 1,
+		quietFor: 0,
+		beatGlow: 0,
 		responseMotion: 1,
 		responseImpact: 1,
 		responseFog: 1,
 		responseShafts: 1
 	};
+	const renderDetailBins = new Float32Array(64);
+	const BEATS_PER_PHRASE = 32;
+	let renderBeats = 0;
+	let renderBpm = 120;
 
 	function lerp(a: number, b: number, t: number) {
 		return a + (b - a) * t;
 	}
 
+	function clamp(value: number, low: number, high: number) {
+		return Math.min(high, Math.max(low, value));
+	}
+
+	function approach(current: number, target: number, rate: number, dt: number) {
+		return current + (target - current) * (1 - Math.exp(-rate * dt));
+	}
+
+	function approachHue(current: number, target: number, rate: number, dt: number) {
+		const delta = somaHueDelta(current, target);
+		return (((current + delta * (1 - Math.exp(-rate * dt))) % 1) + 1) % 1;
+	}
+
 	// Analyzer events arrive at roughly 60 Hz and are not phase-locked to the
-	// display. Using their already-slow conductor values raw still creates a
-	// hold/jump/hold cadence on a 143/144 Hz panel. Interpolate every macro rail
-	// at render cadence, while advancing unbounded surface phases continuously.
+	// display. Interpolate every macro rail at render cadence, while advancing
+	// unbounded phases continuously.
 	const RENDER_POSE_KEYS = [
 		'growth',
 		'tension',
 		'openness',
 		'suspense',
-		'postureYaw',
-		'posturePitch',
 		'seedForm',
 		'sproutForm',
 		'windingForm',
@@ -152,8 +167,6 @@
 		'morphRate',
 		'spectralTravelRate',
 		'backgroundFlow',
-		'palettePhase',
-		'paletteWarmth',
 		'materialDensity',
 		'materialIridescence',
 		'materialErosion',
@@ -192,10 +205,7 @@
 		'gestureDivide',
 		'gestureHollow',
 		'gestureStillness',
-		'styleRhythmicDensity',
-		'topologyBias',
-		'styleLowHighTilt',
-		'styleTonality'
+		'styleRhythmicDensity'
 	] as const satisfies readonly (keyof Mk2ConductorFrame)[];
 	type RenderPoseKey = (typeof RENDER_POSE_KEYS)[number];
 	const renderPose = Object.fromEntries(RENDER_POSE_KEYS.map((key) => [key, 0])) as Record<
@@ -246,8 +256,8 @@
 	// ──────────────────────────────────────────────────────────────────────────
 	// Camera placement is a held musical shot. Phrase rails interpolate between
 	// compositions; elapsed time never orbits, breathes, or nudges the camera.
-	// This is intentionally boring at the frame level: Soma itself can evolve
-	// without a perpetual handheld wobble being mistaken for audio reactivity.
+	// The organism swims through the held shot; the camera aim only follows it
+	// part of the way, so it travels across the frame instead of being centred.
 	// ──────────────────────────────────────────────────────────────────────────
 	function getCameraPos(
 		perspectiveAzimuth: number,
@@ -265,18 +275,16 @@
 			cameraProfile * 0.22 -
 			cameraLow * 0.08;
 		const baseRadius =
-			(3.48 + (mk2SongSeed - 0.5) * 0.24) *
+			(3.15 + (mk2SongSeed - 0.5) * 0.2) *
 			(1 + cameraOrbit * 0.035 + cameraOverhead * 0.055 - cameraMacro * 0.025);
 		const radius = baseRadius * Math.cos(perspectiveElevation * 0.82);
 		const sideDrift =
 			(mk2SongSeed - 0.5) * 2 * (0.1 + cameraOrbit * 0.06 + cameraProfile * 0.05);
 		const altitudeBias =
-			cameraOverhead * 0.72 - cameraLow * 0.48 + cameraProfile * 0.1 - cameraMacro * 0.08;
+			cameraOverhead * 0.6 - cameraLow * 0.45 + cameraProfile * 0.1 - cameraMacro * 0.08;
 		return [
 			Math.cos(azimuth) * radius + Math.cos(azimuth * 0.37 + seedAngle) * sideDrift,
-			1.12 +
-				Math.sin(perspectiveElevation) * baseRadius * 0.86 +
-				altitudeBias,
+			0.62 + Math.sin(perspectiveElevation) * baseRadius * 0.62 + altitudeBias,
 			Math.sin(azimuth) * radius + Math.sin(azimuth * 0.41 - seedAngle) * sideDrift
 		];
 	}
@@ -294,332 +302,127 @@
 		return dominant[0];
 	}
 
+	const swimmer = new SomaSwimmer();
+	const paletteRoles: SomaPaletteRoles = { base: 0.5, accent: 0.86, rim: 0.31, ink: 0.665, saturation: 0.85 };
+	const renderRoles: SomaPaletteRoles = { ...paletteRoles };
+	const cameraTarget: SomaVec3 = [0, -0.1, 0];
+
+	function beatAnchor(clock: VisualizerJourneySnapshot['director']['clock']) {
+		if (!Number.isFinite(clock.phraseIndex) || !Number.isFinite(clock.phrasePos)) return null;
+		return clock.phraseIndex * BEATS_PER_PHRASE + clock.phrasePos * BEATS_PER_PHRASE;
+	}
+
 	function syncRendererToJourney(snapshot: VisualizerJourneySnapshot) {
 		if (snapshot.sourceEpoch === rendererSourceEpoch) return;
 		rendererSourceEpoch = snapshot.sourceEpoch;
 		mk2SongSeed = snapshot.seed;
-		const primaryFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
-		const stableKey =
-			snapshot.director.context.keyConfidence > 0.35
-				? snapshot.director.context.keyPitchClass
-				: snapshot.signal.key;
-		const familyStep = 2 + Math.floor((((stableKey % 1) + 1) % 1) * 5);
-		mk2SecondaryPaletteFamily = (primaryFamily + familyStep) % 8;
 		currentSection = snapshot.director.section;
+		renderBeats = beatAnchor(snapshot.director.clock) ?? 0;
+		swimmer.reset(mk2SongSeed);
 		rendererSyncRequested = true;
 		poseSyncRequested = true;
 		temporalResetRequested = true;
+		feedbackResetFrames = 2;
 		resetFrameScheduler();
 	}
 
 	// ──────────────────────────────────────────────────────────────────────────
-	// Uniform layout — 96 f32s = 384 bytes (multiple of 16 ✓)
-	// 0-1  resolution
-	// 2    time
-	// 3-7  audio: bass, mid, treble, centroid, rms
-	// 8    flash (onset)
-	// 9    bpmNorm
-	// 10-11 chromaKey x/y (unit-circle smoothed)
-	// 12   chromaStrength
-	// 13-15 camera position
-	// 16-18 camera forward
-	// 19-21 camera right
-	// 22-24 camera up
-	// 25   fovScale
-	// 26   mandelbulbPower (audio + time modulated)
-	// 27   paletteOffset (smoothed centroid + chroma → palette T)
-	// 28   fogDensity
-	// 29   lightShaftIntensity
-	// 30-31 growth / tension
-	// 32-35 palette family / surface impact / openness / rotation phase
-	// 36-39 background phase / posture yaw / posture pitch / suspense
-	// 40-45 lifecycle form weights: seed / sprout / winding / bloom / shedding / dormancy
-	// 46-47 unwrapped morph phase / rate
-	// 48-55 root mass / root pulse / axial stretch / lobe split / folds / cavity / ridges / filaments
-	// 56-58 signed spectral lean / unwrapped spectral travel / travel rate
-	// 59-63 palette phase / warmth / density / iridescence / erosion
-	// 64-70 shot zoom / close study / detail / azimuth / elevation / framing x/y
-	// 71    quality raymarch steps
-	// 72-76 environment DNA: void / current / cavern / horizon / cellular
-	// 77-80 material DNA: membrane / mineral / velvet / crystal
-	// 81-82 secondary palette family / continuous family blend
-	// 83    alignment
-	// 84-89 topology grammar: cocoon / spire / bilateral / torus / coral / shell
-	// 90-94 phrase gesture: reach / coil / divide / hollow / stillness
-	// 95    long-horizon rhythmic density
+	// Uniform layout — 96 f32s = 384 bytes, 24 rows of four. vec3 rows carry a
+	// scalar in their fourth lane. The same struct is declared by every pass.
+	// ──────────────────────────────────────────────────────────────────────────
 	const UNIFORM_FLOATS = 96;
 	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
 
-	const SCENE_WGSL = /* wgsl */ `
+	const UNIFORMS_WGSL = /* wgsl */ `
 struct Uniforms {
-	resolutionX: f32,
-	resolutionY: f32,
-	time: f32,
-	bass: f32,
-	mid: f32,
-	treble: f32,
-	centroid: f32,
-	rms: f32,
-	flash: f32,
-	bpmNorm: f32,
-	chromaX: f32,
-	chromaY: f32,
-	chromaStrength: f32,
-	camPosX: f32,
-	camPosY: f32,
-	camPosZ: f32,
-	camFwdX: f32,
-	camFwdY: f32,
-	camFwdZ: f32,
-	camRightX: f32,
-	camRightY: f32,
-	camRightZ: f32,
-	camUpX: f32,
-	camUpY: f32,
-	camUpZ: f32,
-	fovScale: f32,
-	mandelbulbPower: f32,
-	paletteOffset: f32,
-	fogDensity: f32,
-	lightShaftIntensity: f32,
-	_pad0: f32,
-	_pad1: f32,
-	paletteFamily: f32,
-	surfaceImpact: f32,
-	openness: f32,
-	journeyPhase: f32,
-	backgroundPhase: f32,
-	postureYaw: f32,
-	posturePitch: f32,
-	suspense: f32,
-	seedForm: f32,
-	sproutForm: f32,
-	windingForm: f32,
-	bloomForm: f32,
-	sheddingForm: f32,
-	dormancyForm: f32,
-	morphPhase: f32,
-	morphRate: f32,
-	rootMass: f32,
-	rootPulse: f32,
-	axialStretch: f32,
-	lobeSplit: f32,
-	foldDepth: f32,
-	cavityOpen: f32,
-	surfaceRidges: f32,
-	filamentReach: f32,
-	spectralLean: f32,
-	spectralTravelPhase: f32,
-	spectralTravelRate: f32,
-	palettePhase: f32,
-	paletteWarmth: f32,
-	materialDensity: f32,
-	materialIridescence: f32,
-	materialErosion: f32,
-	shotZoom: f32,
-	closeStudy: f32,
-	detailFocus: f32,
-	perspectiveAzimuth: f32,
-	perspectiveElevation: f32,
-	shotFramingX: f32,
-	shotFramingY: f32,
-	qualitySteps: f32,
-	environmentVoid: f32,
-	environmentCurrent: f32,
-	environmentCavern: f32,
-	environmentHorizon: f32,
-	environmentCellular: f32,
-	materialMembrane: f32,
-	materialMineral: f32,
-	materialVelvet: f32,
-	materialCrystal: f32,
-	paletteFamilyB: f32,
-	paletteFamilyBlend: f32,
-	_pad2: f32,
-	topologyCocoon: f32,
-	topologySpire: f32,
-	topologyBilateral: f32,
-	topologyTorus: f32,
-	topologyCoral: f32,
-	topologyShell: f32,
-	gestureReach: f32,
-	gestureCoil: f32,
-	gestureDivide: f32,
-	gestureHollow: f32,
-	gestureStillness: f32,
-	styleRhythmicDensity: f32,
+	resX: f32, resY: f32, envCavern: f32, qualitySteps: f32,
+	bass: f32, mid: f32, treble: f32, envCellular: f32,
+	energy: f32, impact: f32, rootPulse: f32, beatGlow: f32,
+	beatConveyor: f32, envHorizon: f32, contraction: f32, silence: f32,
+	camPos: vec3<f32>, fovScale: f32,
+	camFwd: vec3<f32>, envCurrent: f32,
+	camRight: vec3<f32>, seed: f32,
+	camUp: vec3<f32>, phrase: f32,
+	bodyPos: vec3<f32>, bodyScale: f32,
+	basisX: vec3<f32>, topoCoral: f32,
+	basisY: vec3<f32>, wavePhase: f32,
+	basisZ: vec3<f32>, topoSpire: f32,
+	localVel: vec3<f32>, keyMode: f32,
+	hueBase: f32, hueAccent: f32, hueRim: f32, saturation: f32,
+	hueInk: f32, topoShell: f32, topoTorus: f32, matCrystal: f32,
+	seedForm: f32, sproutForm: f32, windingForm: f32, bloomForm: f32,
+	sheddingForm: f32, dormancyForm: f32, evolution: f32, matVelvet: f32,
+	rootMass: f32, axialStretch: f32, lobeSplit: f32, foldDepth: f32,
+	cavityOpen: f32, surfaceRidges: f32, filamentReach: f32, spectralLean: f32,
+	density: f32, iridescence: f32, erosion: f32, growth: f32,
+	reach: f32, coil: f32, divide: f32, hollow: f32,
+	stillness: f32, tension: f32, openness: f32, suspense: f32,
+	fogDensity: f32, shaftIntensity: f32, backgroundPhase: f32, rhythmicDensity: f32,
+	feedbackFade: f32, feedbackZoom: f32, bloomThreshold: f32, aberration: f32,
 };
+`;
+
+	const SHARED_WGSL = /* wgsl */ `
+const TAU: f32 = 6.28318530718;
+
+fn hsv(h: f32, s: f32, v: f32) -> vec3<f32> {
+	let p = abs(fract(vec3<f32>(h) + vec3<f32>(0.0, 0.6666667, 0.3333333)) * 6.0 - 3.0);
+	return v * mix(vec3<f32>(1.0), clamp(p - 1.0, vec3<f32>(0.0), vec3<f32>(1.0)), s);
+}
+
+fn mixHue(a: f32, b: f32, amount: f32) -> f32 {
+	let delta = fract(b - a + 0.5) - 0.5;
+	return fract(a + delta * amount);
+}
+
+fn ign(pixel: vec2<f32>) -> f32 {
+	return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+}
+`;
+
+	const SCENE_WGSL = /* wgsl */ `
+${UNIFORMS_WGSL}
+${SHARED_WGSL}
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> bins: array<f32, 64>;
+@group(0) @binding(2) var historySampler: sampler;
+@group(0) @binding(3) var historyTex: texture_2d<f32>;
+
+const FLOOR_Y: f32 = -1.85;
+const TENDRIL_SEGMENTS: i32 = 14;
+const ORAL_ARMS: i32 = 4;
 
 @vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+	var positions = array<vec2<f32>, 3>(
+		vec2<f32>(-1.0, -1.0),
+		vec2<f32>( 3.0, -1.0),
+		vec2<f32>(-1.0,  3.0)
 	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
+	return vec4<f32>(positions[index], 0.0, 1.0);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 7-stop palette LUT — eight coordinated colour worlds. A track keeps a
-// stable primary family and slowly borrows pigment from a harmonically chosen
-// secondary family, so colour develops without flashing between presets.
-// Each family is a totally distinct visual world rather than a rotation
-// through the same hues. Picked by song seed so every track lands a
-// different colour world.
-//   0 dusk        photographic — deep navy → plum → burnt orange → cream → teal
-//   1 aurora      cool — blacks → indigos → cyans → mint → bright magenta cap
-//   2 synthwave   neon — black → hot magenta → cyan → electric purple
-//   3 volcanic    warm — black → ember red → orange → bright yellow → bone white
-//   4 bioluminous UV → cyan → green → chartreuse on near-black field
-//   5 oil-on-water iridescent — petrol blues → magenta → gold → mint shifts
-// ═══════════════════════════════════════════════════════════════════════════
-fn paletteFamily(t: f32, family: i32) -> vec3<f32> {
-	let s = fract(t);
-	let x = s * 7.0;
-	let i = i32(floor(x));
-	let f = smoothstep(0.0, 1.0, x - floor(x));
-	var stops = array<vec3<f32>, 7>(
-		vec3<f32>(0.020, 0.025, 0.080),
-		vec3<f32>(0.090, 0.045, 0.150),
-		vec3<f32>(0.380, 0.120, 0.105),
-		vec3<f32>(0.880, 0.420, 0.150),
-		vec3<f32>(0.950, 0.820, 0.620),
-		vec3<f32>(0.460, 0.580, 0.700),
-		vec3<f32>(0.090, 0.300, 0.380)
-	);
-	if (family == 1) {
-		// aurora
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.010, 0.015, 0.045),
-			vec3<f32>(0.040, 0.025, 0.180),
-			vec3<f32>(0.060, 0.160, 0.420),
-			vec3<f32>(0.180, 0.580, 0.640),
-			vec3<f32>(0.520, 0.880, 0.640),
-			vec3<f32>(0.900, 0.500, 0.880),
-			vec3<f32>(0.310, 0.080, 0.380)
-		);
-	} else if (family == 2) {
-		// synthwave neon
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.020, 0.010, 0.040),
-			vec3<f32>(0.260, 0.020, 0.180),
-			vec3<f32>(0.980, 0.140, 0.520),
-			vec3<f32>(0.620, 0.080, 0.860),
-			vec3<f32>(0.060, 0.780, 0.940),
-			vec3<f32>(0.180, 0.220, 0.640),
-			vec3<f32>(0.880, 0.300, 0.760)
-		);
-	} else if (family == 3) {
-		// volcanic
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.018, 0.008, 0.005),
-			vec3<f32>(0.220, 0.030, 0.020),
-			vec3<f32>(0.640, 0.080, 0.040),
-			vec3<f32>(0.940, 0.380, 0.070),
-			vec3<f32>(0.980, 0.760, 0.180),
-			vec3<f32>(0.980, 0.940, 0.760),
-			vec3<f32>(0.400, 0.100, 0.030)
-		);
-	} else if (family == 4) {
-		// bioluminous
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.005, 0.020, 0.030),
-			vec3<f32>(0.020, 0.060, 0.260),
-			vec3<f32>(0.040, 0.420, 0.580),
-			vec3<f32>(0.180, 0.880, 0.620),
-			vec3<f32>(0.720, 0.980, 0.220),
-			vec3<f32>(0.080, 0.640, 0.480),
-			vec3<f32>(0.040, 0.180, 0.220)
-		);
-	} else if (family == 5) {
-		// oil-on-water iridescent
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.030, 0.060, 0.140),
-			vec3<f32>(0.140, 0.080, 0.420),
-			vec3<f32>(0.060, 0.640, 0.720),
-			vec3<f32>(0.880, 0.380, 0.620),
-			vec3<f32>(0.980, 0.840, 0.300),
-			vec3<f32>(0.580, 0.940, 0.640),
-			vec3<f32>(0.380, 0.120, 0.520)
-		);
-	} else if (family == 6) {
-		// obsidian mineral
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.008, 0.010, 0.014),
-			vec3<f32>(0.055, 0.065, 0.072),
-			vec3<f32>(0.060, 0.250, 0.235),
-			vec3<f32>(0.520, 0.290, 0.110),
-			vec3<f32>(0.840, 0.650, 0.270),
-			vec3<f32>(0.740, 0.710, 0.610),
-			vec3<f32>(0.120, 0.150, 0.160)
-		);
-	} else if (family == 7) {
-		// verdant deep sea
-		stops = array<vec3<f32>, 7>(
-			vec3<f32>(0.005, 0.018, 0.016),
-			vec3<f32>(0.018, 0.095, 0.070),
-			vec3<f32>(0.120, 0.360, 0.160),
-			vec3<f32>(0.680, 0.320, 0.180),
-			vec3<f32>(0.940, 0.620, 0.360),
-			vec3<f32>(0.500, 0.800, 0.700),
-			vec3<f32>(0.050, 0.210, 0.250)
-		);
-	}
-	let a = stops[(i % 7 + 7) % 7];
-	let b = stops[((i + 1) % 7 + 7) % 7];
-	return mix(a, b, f);
+// ── Hashes and noise ──────────────────────────────────────────────────────
+fn h21(p: vec2<f32>) -> f32 {
+	var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+	p3 = p3 + dot(p3, p3.yzx + 33.33);
+	return fract((p3.x + p3.y) * p3.z);
 }
 
-fn palette7(t: f32) -> vec3<f32> {
-	let primary = paletteFamily(t, i32(u.paletteFamily));
-	let secondary = paletteFamily(t + u.paletteWarmth * 0.035, i32(u.paletteFamilyB));
-	let familyBlend = clamp(u.paletteFamilyBlend, 0.0, 0.36);
-	let blended = mix(primary, secondary, familyBlend);
-	let luma = dot(blended, vec3<f32>(0.2126, 0.7152, 0.0722));
-	return clamp(
-		mix(vec3<f32>(luma), blended, 1.08 + familyBlend * 0.18),
-		vec3<f32>(0.0),
-		vec3<f32>(1.0)
-	);
+fn hashLane(n: f32, lane: f32) -> f32 {
+	return h21(vec2<f32>(n + u.seed * 613.0, lane * 7.31 + 19.0));
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Mandelbulb distance estimator. Iterates the formula z = z^n + c where
-// raising to power n is done in spherical coordinates. Returns a distance
-// approximation via the derivative magnitude — accurate enough to raymarch
-// without overshooting the genuine fractal boundary.
-// ═══════════════════════════════════════════════════════════════════════════
-// iters now passed in — audio-driven from caller so the fractal literally
-// reveals more detail during high-energy sections. 4 = smooth blob (calm),
-// 11 = full fractal detail (drop/chorus). This is the actual "evolution"
-// the user wants: the geometry has more or less complexity, not just a
-// pulsing version of the same shape.
-fn mandelbulbDE(p: vec3<f32>, power: f32, iters: i32) -> f32 {
-	var z = p;
-	var dr = 1.0;
-	var r = 0.0;
-	for (var i: i32 = 0; i < iters; i = i + 1) {
-		r = length(z);
-		if (r > 2.0) { break; }
-		let safeR = max(r, 1e-5);
-		let theta = acos(clamp(z.z / safeR, -1.0, 1.0));
-		let phi = atan2(z.y, z.x);
-		dr = pow(safeR, power - 1.0) * power * dr + 1.0;
-		let zr = pow(safeR, power);
-		let nTheta = theta * power;
-		let nPhi = phi * power;
-		z = zr * vec3<f32>(
-			sin(nTheta) * cos(nPhi),
-			sin(nPhi) * sin(nTheta),
-			cos(nTheta)
-		);
-		z = z + p;
-	}
-	let safeR = max(r, 1e-5);
-	return 0.5 * log(safeR) * safeR / max(dr, 1e-5);
+fn vn2(p: vec2<f32>) -> f32 {
+	let i = floor(p);
+	let f = fract(p);
+	let w = f * f * (3.0 - 2.0 * f);
+	let a = h21(i);
+	let b = h21(i + vec2<f32>(1.0, 0.0));
+	let c = h21(i + vec2<f32>(0.0, 1.0));
+	let d = h21(i + vec2<f32>(1.0, 1.0));
+	return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
 fn rot2(v: vec2<f32>, a: f32) -> vec2<f32> {
@@ -633,16 +436,11 @@ fn smin(a: f32, b: f32, k: f32) -> f32 {
 	return mix(b, a, h) - k * h * (1.0 - h);
 }
 
-fn smax(a: f32, b: f32, k: f32) -> f32 {
-	return -smin(-a, -b, k);
-}
-
-fn safeNormalize(v: vec3<f32>, fallback: vec3<f32>) -> vec3<f32> {
-	let lenV = length(v);
-	if (!(lenV > 1e-5 && lenV < 1e10)) {
-		return fallback;
-	}
-	return v / lenV;
+fn sdEllipsoid(p: vec3<f32>, radii: vec3<f32>) -> f32 {
+	let r = max(radii, vec3<f32>(0.004));
+	let k0 = length(p / r);
+	let k1 = max(length(p / (r * r)), 1e-5);
+	return k0 * (k0 - 1.0) / k1;
 }
 
 fn sdCapsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, radius: f32) -> f32 {
@@ -652,1404 +450,868 @@ fn sdCapsule(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, radius: f32) -> f32 {
 	return length(pa - ba * h) - radius;
 }
 
-fn sdEllipsoid(p: vec3<f32>, radii: vec3<f32>) -> f32 {
-	let safeRadii = max(radii, vec3<f32>(0.025));
-	let k0 = length(p / safeRadii);
-	let k1 = max(length(p / (safeRadii * safeRadii)), 1e-5);
-	return k0 * (k0 - 1.0) / k1;
+// ── Palette roles: water is ink, the organism is bioluminescent ───────────
+fn baseCol() -> vec3<f32> { return hsv(u.hueBase, u.saturation, 1.0); }
+fn accentCol() -> vec3<f32> { return hsv(u.hueAccent, u.saturation, 1.0); }
+fn rimCol() -> vec3<f32> { return hsv(u.hueRim, u.saturation * 0.92, 1.0); }
+fn inkCol(v: f32) -> vec3<f32> { return hsv(u.hueInk, 0.8, v); }
+
+fn packetEnergy() -> f32 {
+	return (0.45 + u.energy * 0.9 + u.beatGlow * 0.55 + u.impact * 1.5) * (1.0 - u.silence * 0.9);
 }
 
-fn sproutDirection(i: i32) -> vec3<f32> {
-	if (i == 0) { return safeNormalize(vec3<f32>(0.48, 0.86, 0.12), vec3<f32>(0.0, 1.0, 0.0)); }
-	if (i == 1) { return safeNormalize(vec3<f32>(-0.72, 0.52, 0.34), vec3<f32>(-1.0, 0.0, 0.0)); }
-	if (i == 2) { return safeNormalize(vec3<f32>(0.30, -0.12, 0.94), vec3<f32>(0.0, 0.0, 1.0)); }
-	return safeNormalize(vec3<f32>(-0.24, -0.34, -0.91), vec3<f32>(0.0, 0.0, -1.0));
+// Light emitted at distance t is partly absorbed by the water column.
+fn absorb(t: f32) -> f32 {
+	return exp(-t * u.fogDensity * 1.6);
 }
 
-fn windingDirection(i: i32) -> vec3<f32> {
-	if (i == 0) { return safeNormalize(vec3<f32>(0.30, 0.94, 0.16), vec3<f32>(0.0, 1.0, 0.0)); }
-	if (i == 1) { return safeNormalize(vec3<f32>(-0.34, 0.88, -0.32), vec3<f32>(0.0, 1.0, 0.0)); }
-	if (i == 2) { return safeNormalize(vec3<f32>(0.42, -0.74, 0.52), vec3<f32>(0.0, -1.0, 0.0)); }
-	return safeNormalize(vec3<f32>(-0.48, -0.72, -0.50), vec3<f32>(0.0, -1.0, 0.0));
+// ── Organism frame ────────────────────────────────────────────────────────
+fn toLocal(p: vec3<f32>) -> vec3<f32> {
+	let d = p - u.bodyPos;
+	return vec3<f32>(dot(d, u.basisX), dot(d, u.basisY), dot(d, u.basisZ)) / u.bodyScale;
 }
 
-fn bloomDirection(i: i32) -> vec3<f32> {
-	if (i == 0) { return safeNormalize(vec3<f32>(0.94, 0.25, 0.12), vec3<f32>(1.0, 0.0, 0.0)); }
-	if (i == 1) { return safeNormalize(vec3<f32>(-0.86, 0.20, 0.46), vec3<f32>(-1.0, 0.0, 0.0)); }
-	if (i == 2) { return safeNormalize(vec3<f32>(0.08, 0.58, 0.81), vec3<f32>(0.0, 0.0, 1.0)); }
-	return safeNormalize(vec3<f32>(0.18, -0.78, -0.60), vec3<f32>(0.0, -1.0, 0.0));
+fn toWorld(l: vec3<f32>) -> vec3<f32> {
+	return u.bodyPos + (u.basisX * l.x + u.basisY * l.y + u.basisZ * l.z) * u.bodyScale;
+}
+
+// x: bell radius, y: dome height, z: lobe/canal count, w: margin height.
+fn bellShape() -> vec4<f32> {
+	let radius = 0.5 + u.bloomForm * 0.17 + u.lobeSplit * 0.05 + u.rootMass * 0.04
+		- u.dormancyForm * 0.12 - u.sproutForm * 0.06 - u.seedForm * 0.07 - u.topoSpire * 0.08;
+	let height = 0.38 + u.sproutForm * 0.2 + u.axialStretch * 0.1 + u.topoSpire * 0.2
+		+ u.seedForm * 0.05 - u.bloomForm * 0.09 - u.dormancyForm * 0.07;
+	let lobes = 8.0 + 4.0 * floor(fract(u.seed * 7.31) * 3.0);
+	return vec4<f32>(radius, height, lobes, -0.55 * height);
+}
+
+fn twistRate() -> f32 {
+	return u.windingForm * 1.5 + u.coil * 1.1 + u.topoShell * 0.8 + u.tension * 0.25;
 }
 
 fn organismWarp(p: vec3<f32>) -> vec3<f32> {
-	let growth = u._pad0;
-	let tension = u._pad1;
-	let openness = clamp(u.openness, 0.0, 1.0);
-	let spire = pow(max(u.topologySpire, 0.0), 1.25);
-	let bilateral = pow(max(u.topologyBilateral, 0.0), 1.25);
-	let torus = pow(max(u.topologyTorus, 0.0), 1.25);
-	let coral = pow(max(u.topologyCoral, 0.0), 1.25);
-	let shell = pow(max(u.topologyShell, 0.0), 1.25);
-	let reach = pow(max(u.gestureReach, 0.0), 1.15);
-	let coil = pow(max(u.gestureCoil, 0.0), 1.15);
-	let divide = pow(max(u.gestureDivide, 0.0), 1.15);
-	let hollow = pow(max(u.gestureHollow, 0.0), 1.15);
-	let stillness = pow(max(u.gestureStillness, 0.0), 1.15);
-	// Whole-body breathing is deliberately restrained. Sub and kick now own a
-	// localized material change below. Phrase gestures own silhouette scale.
-	let breath = 1.0
-		+ growth * 0.045
-		+ openness * 0.028
-		+ u.bloomForm * 0.045
-		+ divide * 0.055
-		+ reach * 0.025
-		- u.seedForm * 0.035
-		- u.dormancyForm * 0.085
-		- stillness * 0.055
-		- hollow * 0.018;
-	var q = p / breath;
-
-	// Whole-body orientation is a held compositional decision. No clock, FFT
-	// delta, spectral lean, kick, or impact is allowed to twist the entire subject.
-	// Perspective changes come from patient camera grammar and phrase posture.
-	let globalYaw = u.postureYaw * 0.62
-		+ (coil - divide) * 0.065 + (shell - bilateral) * 0.035;
-	let yawed = rot2(q.xz, globalYaw);
-	q.x = yawed.x;
-	q.z = yawed.y;
-	let pitched = rot2(
-		q.yz,
-		u.posturePitch * 0.70 + (reach - hollow) * 0.045 - stillness * 0.018
-	);
-	q.y = pitched.x;
-	q.z = pitched.y;
-
-	// Spatial asymmetry gives the tissue a living bias, but it is a held pose.
-	// No elapsed-time phase may deform the whole coordinate field: even a very
-	// slow sine eventually reads as the same canned inhale-and-twist loop.
-	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
-		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
-		+ (coil - divide) * 0.42 + (reach - hollow) * 0.31;
-	// A long-form local deformation clock changes anatomy from within. Its
-	// incommensurate, very low rates never rotate, translate, or scale the rigid
-	// subject; they only let different tissue regions grow and relax over minutes.
-	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
+	var q = toLocal(p);
+	// CPU-integrated morph clock. It reshapes tissue from within and never
+	// moves, spins or scales the whole subject; swimming owns placement.
+	let evolutionPhase = u.evolution;
+	let seedPhase = u.seed * TAU;
+	// Swim stroke: the margin squeezes inward and the dome lengthens.
+	let c = u.contraction;
+	let marginZone = smoothstep(0.2, -0.45, q.y);
+	let squeeze = 1.0 + c * (0.06 + marginZone * 0.2);
+	q = vec3<f32>(q.x * squeeze, q.y / (1.0 + c * 0.06), q.z * squeeze);
+	// Winding and coil wind the canals around the axis.
+	let twisted = rot2(q.xz, q.y * twistRate());
+	q = vec3<f32>(twisted.x, q.y, twisted.y);
 	let drift = vec3<f32>(
-		sin(q.y * 1.05 + poseIdentity + evolutionPhase * 0.37) * 0.045
-			+ cos(q.z * 0.73 - poseIdentity * 0.61 - evolutionPhase * 0.19) * 0.030,
-		sin(q.x * 0.82 - poseIdentity * 0.43 + evolutionPhase * 0.23) * 0.032,
-		cos(q.x * 0.92 + poseIdentity * 0.79 + evolutionPhase * 0.31) * 0.045
-			+ sin(q.y * 0.71 + poseIdentity * 0.53 - evolutionPhase * 0.17) * 0.030
+		sin(q.y * 2.3 + evolutionPhase * 0.41 + seedPhase) * 0.035
+			+ cos(q.z * 1.7 - evolutionPhase * 0.23) * 0.02,
+		sin(q.x * 2.1 - evolutionPhase * 0.29 + seedPhase * 0.7) * 0.025,
+		cos(q.y * 1.9 + evolutionPhase * 0.33 + seedPhase * 1.3) * 0.035
 	);
-	q = q + drift * (
-		0.22 + growth * 0.22 + u.sproutForm * 0.18 + u.sheddingForm * 0.15
-			+ coral * 0.28 + reach * 0.16 + hollow * 0.1 - stillness * 0.14
+	return q + drift * (0.6 + u.growth * 0.8 + u.sproutForm * 0.5 + u.sheddingForm * 0.6
+		+ u.erosion * 0.3 - u.stillness * 0.4);
+}
+
+fn bellSDF(q0: vec3<f32>, shape: vec4<f32>) -> f32 {
+	var q = q0;
+	// Divide buds the bell into twin lobes side by side.
+	let split = clamp(u.divide * 0.9, 0.0, 0.85);
+	if (split > 0.001) { q.x = abs(q.x) - shape.x * 0.55 * split; }
+	let radius = shape.x * (1.0 - split * 0.3);
+	let height = shape.y * (1.0 - split * 0.15);
+	// Spire sharpens the apex into a tall cone.
+	let apex = max(q.y, 0.0) / height;
+	let sharpen = 1.0 + u.topoSpire * apex * apex * 1.6;
+	let ang = atan2(q.z, q.x);
+	let margin = smoothstep(0.05 * height, -0.55 * height, q.y);
+	let scallop = 1.0 + margin * (0.05 + u.bloomForm * 0.07 + u.lobeSplit * 0.03) * cos(ang * shape.z);
+	let xz = q.xz * sharpen / scallop;
+	let p = vec3<f32>(xz.x, q.y, xz.y);
+	let outer = sdEllipsoid(p, vec3<f32>(radius, height, radius));
+	let thin = 0.84 + u.hollow * 0.07 - u.density * 0.04 - u.sproutForm * 0.14 - u.seedForm * 0.1 - u.dormancyForm * 0.1;
+	let inner = sdEllipsoid(
+		p - vec3<f32>(0.0, -height * 0.38, 0.0),
+		vec3<f32>(radius * thin, height * 0.8, radius * thin)
 	);
-
-	// Body/mids own large silhouette changes: long sprout, wound build, wide
-	// bloom, and contracted dormancy are genuinely different coordinate fields.
-	let stretchY = max(0.52,
-		0.82 + u.axialStretch * 0.70 + u.sproutForm * 0.14 + u.windingForm * 0.08
-		+ spire * 0.58 + reach * 0.42 - torus * 0.20 - shell * 0.16
-		- u.bloomForm * 0.14 - u.dormancyForm * 0.28 - stillness * 0.16);
-	let stretchX = max(0.64,
-		0.80 + u.lobeSplit * 0.24 + u.bloomForm * 0.18 + u.dormancyForm * 0.12
-		+ bilateral * 0.22 + torus * 0.18 + divide * 0.24 - spire * 0.14);
-	let stretchZ = max(0.64,
-		0.82 + u.lobeSplit * 0.27 + u.bloomForm * 0.20 + u.rootMass * 0.08
-		+ u.dormancyForm * 0.14 + torus * 0.32 + shell * 0.25 + divide * 0.24);
-	q.x = q.x / stretchX;
-	q.y = q.y / stretchY;
-	q.z = q.z / stretchZ;
-
-	// Tissue migrates between upper/lower and near/far regions instead of the
-	// entire organism breathing as one sphere. This produces obvious growth over
-	// a musical passage while keeping the centroid and total scale essentially
-	// stable—expansion in one anatomical region is balanced by contraction in another.
-	let migration = sin(q.y * 1.36 + evolutionPhase * 0.73 + poseIdentity * 0.31);
-	let migrationStrength = (0.035 + growth * 0.038 + reach * 0.025 + divide * 0.03)
-		* (1.0 - stillness * 0.68);
-	q.x = q.x / max(0.82, 1.0 + migration * migrationStrength);
-	q.z = q.z / max(0.84, 1.0 - migration * migrationStrength * 0.78);
-	q.y = q.y + sin(q.x * 1.24 - evolutionPhase * 0.39 + poseIdentity)
-		* migrationStrength * 0.18;
-
-	// Sprout grows as one visibly biased shoot instead of a uniformly stretched
-	// orb. Winding then pulls the cross-section inward before applying its twist;
-	// bloom releases that stored pressure laterally, while dormancy settles flat.
-	let sproutBend = (u.sproutForm + reach * 0.72 + spire * 0.30)
-		* (0.07 + u.axialStretch * 0.075);
-	let growthIdentity = poseIdentity;
-	let growthLeanX = sin(growthIdentity);
-	let growthLeanZ = cos(growthIdentity * 0.83 + 0.7);
-	let sproutCurve = sin(q.y * 1.18 + poseIdentity * 0.23 + evolutionPhase * 0.29) * sproutBend
-		+ q.y * q.y * u.sproutForm * 0.045;
-	q.x = q.x - sproutCurve * growthLeanX;
-	q.z = q.z - sproutCurve * growthLeanZ * 0.72;
-	let windingCompression = 1.0
-		+ (u.windingForm + coil * 0.82 + shell * 0.46) * (0.08 + u.foldDepth * 0.16);
-	q.x = q.x * windingCompression;
-	q.z = q.z * windingCompression;
-
-	// Signed filter motion leans the organism through space instead of changing a
-	// fullscreen overlay. Root energy expands only the lower anatomy.
-	q.x = q.x - q.y * u.spectralLean * (0.10 + u.axialStretch * 0.13);
-	let rootZone = 1.0 - smoothstep(-0.58, 0.34, q.y);
-	let rootExpansionX = 1.0 + rootZone * u.rootMass * 0.18;
-	let rootExpansionZ = 1.0 + rootZone * u.rootMass * 0.15;
-	q.x = q.x / rootExpansionX;
-	q.z = q.z / rootExpansionZ;
-
-	// Use the circular key vector directly. Unlike atan2(), these controls remain
-	// continuous when pitch class crosses the 0/1 boundary.
-	let chromaPull = clamp(u.chromaStrength, 0.0, 1.0);
-	let chromaTilt = u.chromaY * chromaPull * 0.055;
-	let rChroma = rot2(q.xy, chromaTilt);
-	q.x = rChroma.x;
-	q.y = rChroma.y;
-
-	// Builds physically wind inward; mids determine fold depth. Bloom releases
-	// that stored twist into separated lobes rather than a uniform scale pulse.
-	let twist = q.y * (
-		0.16 + tension * 0.32 + u.windingForm * 1.08 + u.foldDepth * 0.62
-			+ coil * 1.24 + shell * 0.74
-	)
-		+ sin(q.z * 1.52 + poseIdentity * 1.09 + evolutionPhase * 0.41)
-			* (0.045 + u.foldDepth * 0.16)
-		+ u.chromaX * chromaPull * 0.045;
-	let rxz = rot2(q.xz, twist);
-	q.x = rxz.x;
-	q.z = rxz.y;
-	let rxy = rot2(
-		q.xy,
-		sin(q.z * 0.96 + poseIdentity * 0.67 - evolutionPhase * 0.27)
-			* (0.035 + u.foldDepth * 0.14)
+	// A minimum wall keeps the margin from thinning into aliasing fur at grazing angles.
+	var d = max(outer, -(inner + radius * 0.035)) / sharpen;
+	// Torus grammar opens a siphon through the apex.
+	let siphon = length(p.xz) - radius * (0.12 + u.topoTorus * 0.2);
+	d = max(d, -siphon - (1.0 - u.topoTorus) * 0.4);
+	// Shedding erodes gaps into the margin between lobes.
+	let gaps = smoothstep(0.55, 0.95, cos(ang * shape.z * 0.5 + floor(u.phrase) * 2.4 + u.seed * 9.0));
+	d = d + gaps * margin * (u.sheddingForm * 0.035 + u.erosion * 0.012);
+	// Manubrium: the central stalk hanging from the cavity ceiling.
+	let stalkLength = height * (0.7 + u.reach * 0.3 + u.sproutForm * 0.25);
+	let stalk = sdCapsule(
+		p,
+		vec3<f32>(0.0, height * 0.4, 0.0),
+		vec3<f32>(0.0, -stalkLength, 0.0),
+		radius * (0.05 + u.rootMass * 0.025)
 	);
-	q.x = rxy.x;
-	q.y = rxy.y;
-	q.y = q.y + sin(q.x * 1.75 + poseIdentity * 0.59 + evolutionPhase * 0.21)
-		* (0.022 + u.foldDepth * 0.075);
-	return q;
+	return smin(d, stalk, 0.025);
+}
+
+// Daughter buds released from the margin during shedding: they bud early in
+// the phrase, detach, drift out and dissolve before the phrase turns.
+fn budSDF(q: vec3<f32>, shape: vec4<f32>) -> f32 {
+	let shed = clamp(u.sheddingForm * 1.1 + u.divide * 0.25, 0.0, 1.0);
+	if (shed < 0.02) { return 10.0; }
+	let phraseIndex = floor(u.phrase);
+	let phrasePos = fract(u.phrase);
+	let release = smoothstep(0.12, 1.0, phrasePos);
+	let life = smoothstep(0.0, 0.16, phrasePos) * smoothstep(1.0, 0.8, phrasePos) * shed;
+	if (life < 0.01) { return 10.0; }
+	var d = 10.0;
+	for (var k: i32 = 0; k < 3; k += 1) {
+		let fk = f32(k);
+		let a = hashLane(phraseIndex, fk + 40.0) * TAU;
+		let lift = hashLane(phraseIndex, fk + 50.0);
+		let dir = normalize(vec3<f32>(cos(a), -0.25 + lift * 0.6, sin(a)));
+		let distance = shape.x * 0.92 + release * (0.55 + hashLane(phraseIndex, fk + 60.0) * 0.6);
+		let center = dir * distance + vec3<f32>(0.0, shape.w * 0.6, 0.0);
+		let size = shape.x * (0.1 + hashLane(phraseIndex, fk + 70.0) * 0.07) * life;
+		d = min(d, sdEllipsoid(q - center, vec3<f32>(size, size * 0.72, size)));
+	}
+	return d;
+}
+
+fn chainAmount() -> f32 {
+	return clamp(u.windingForm * 1.25 + u.coil * 0.4 + u.topoShell * 0.2 - 0.15, 0.0, 1.0);
+}
+
+// Winding grows a siphonophore chain: small swimming bells threaded on a stem
+// below the hero bell, appearing one by one as the build winds up.
+fn chainSDF(q: vec3<f32>, shape: vec4<f32>) -> f32 {
+	let chain = chainAmount();
+	if (chain < 0.02) { return 10.0; }
+	let top = -shape.y * 0.75;
+	var d = 10.0;
+	for (var k: i32 = 0; k < 4; k += 1) {
+		let fk = f32(k);
+		let present = clamp(chain * 4.0 - fk, 0.0, 1.0);
+		if (present < 0.01) { break; }
+		let phi = fk * 2.1 + u.seed * 4.0;
+		let size = shape.x * (0.25 - fk * 0.03) * (0.4 + present * 0.6);
+		let center = vec3<f32>(
+			cos(phi) * shape.x * 0.24,
+			top - (fk + 0.6) * shape.x * 0.5,
+			sin(phi) * shape.x * 0.24
+		);
+		let local = q - center;
+		let outer = sdEllipsoid(local, vec3<f32>(size, size * 0.9, size));
+		let inner = sdEllipsoid(local - vec3<f32>(0.0, -size * 0.45, 0.0), vec3<f32>(size * 0.72, size * 0.7, size * 0.72));
+		d = min(d, max(outer, -inner) + (1.0 - present) * 0.08);
+	}
+	let stem = sdCapsule(q, vec3<f32>(0.0, top, 0.0), vec3<f32>(0.0, top - shape.x * 2.0 * chain, 0.0), shape.x * 0.022);
+	return min(d, stem);
 }
 
 fn map(p: vec3<f32>) -> f32 {
-	let growth = u._pad0;
-	let tension = u._pad1;
-	let cocoonDNA = pow(max(u.topologyCocoon, 0.0), 1.25);
-	let spireDNA = pow(max(u.topologySpire, 0.0), 1.25);
-	let bilateralDNA = pow(max(u.topologyBilateral, 0.0), 1.25);
-	let torusDNA = pow(max(u.topologyTorus, 0.0), 1.25);
-	let coralDNA = pow(max(u.topologyCoral, 0.0), 1.25);
-	let shellDNA = pow(max(u.topologyShell, 0.0), 1.25);
-	let reachGesture = pow(max(u.gestureReach, 0.0), 1.15);
-	let coilGesture = pow(max(u.gestureCoil, 0.0), 1.15);
-	let divideGesture = pow(max(u.gestureDivide, 0.0), 1.15);
-	let hollowGesture = pow(max(u.gestureHollow, 0.0), 1.15);
-	let stillGesture = pow(max(u.gestureStillness, 0.0), 1.15);
-	let poseIdentity = (u.paletteFamily + 1.0) * 2.17
-		+ u.postureYaw * 1.8 + u.posturePitch * 1.3
-		+ (coilGesture - divideGesture) * 0.42
-		+ (reachGesture - hollowGesture) * 0.31;
-	let evolutionPhase = u.morphPhase * 0.85 + u.spectralTravelPhase * 0.073;
-	// Cheap conservative scene bound. All lifecycle appendages and shed fragments
-	// remain within this envelope, so empty screen rays avoid the fractal entirely.
-	let outerBound = length(p) - 1.95;
-	if (outerBound > 0.35) {
-		return outerBound * 0.76;
-	}
+	let bound = length(p - u.bodyPos) - u.bodyScale * 1.8;
+	if (bound > 0.3) { return bound; }
 	let q = organismWarp(p);
-	let bilateralMorph = clamp(bilateralDNA * (0.26 + divideGesture * 0.48), 0.0, 0.68);
-	var coreQ = q;
-	// Fold one true fractal field into two coherent lobes. This preserves the
-	// organism's surface vocabulary instead of gluing smooth primitive balloons
-	// onto its sides.
-	coreQ.x = mix(
-		coreQ.x,
-		abs(coreQ.x) - (0.13 + divideGesture * 0.09),
-		bilateralMorph
-	);
-	let shellCurl = shellDNA * (0.18 + coilGesture * 0.42);
-	let shellTurn = rot2(coreQ.xy, shellCurl * (0.55 + coreQ.z * 0.35));
-	coreQ.x = shellTurn.x - shellDNA * 0.045;
-	coreQ.y = shellTurn.y + shellDNA * 0.025;
-
-	// A single expensive Mandelbulb remains the organic heart. Intro/outro blend
-	// toward a waxy cocoon; active sections reveal the fractal continuously.
-	let cocoonRadii = vec3<f32>(
-		0.60 + u.rootMass * 0.08 + u.bloomForm * 0.12 + u.dormancyForm * 0.10
-			+ cocoonDNA * 0.08 + divideGesture * 0.06,
-		0.68 + u.axialStretch * 0.18 + u.sproutForm * 0.12 - u.dormancyForm * 0.14
-			+ spireDNA * 0.12 + reachGesture * 0.08 - stillGesture * 0.08,
-		0.58 + u.lobeSplit * 0.12 + u.bloomForm * 0.10 + u.dormancyForm * 0.12
-			+ shellDNA * 0.08 + torusDNA * 0.06
-	);
-	let cocoon = sdEllipsoid(coreQ, cocoonRadii);
-	// A lifecycle-owned core scale keeps the expensive fractal itself from reading
-	// as the same ball in every section. Larger coordinate scale means a smaller,
-	// denser core; bloom deliberately moves in the opposite direction.
-	let bodyScale = 1.04 + growth * 0.025 + u.seedForm * 0.12
-		+ u.windingForm * 0.08 + u.sheddingForm * 0.04 + u.dormancyForm * 0.18
-		- u.sproutForm * 0.04 - u.bloomForm * 0.12;
-	// Macro studies earn extra true fractal iterations. Both gates are uniform
-	// across the frame and require an elected close study, so an intricate normal
-	// hero shot never pays the macro cost by accident.
-	var fractalIterations = 6;
-	if (u.closeStudy > 0.55 && u.detailFocus > 0.58) { fractalIterations = 7; }
-	if (u.closeStudy > 0.84 && u.detailFocus > 0.90) { fractalIterations = 8; }
-	let fractal = mandelbulbDE(
-		coreQ * bodyScale,
-		u.mandelbulbPower + tension * 0.28 + u.foldDepth * 0.24 - u.bloomForm * 0.16,
-		fractalIterations
-	) * (1.01 - growth * 0.045);
-	let fractalReveal = clamp(
-		0.34 + u.sproutForm * 0.32 + u.windingForm * 0.46 + u.bloomForm * 0.52
-		+ u.sheddingForm * 0.40 + coralDNA * 0.18 + bilateralDNA * 0.10
-		- cocoonDNA * 0.18 - u.seedForm * 0.08 - u.dormancyForm * 0.12,
-		0.16,
-		0.86
-	);
-	var body = mix(cocoon, fractal, fractalReveal);
-
-	// Torus DNA is expressed as a tunnel through the existing living tissue, not
-	// as a replacement primitive. It can open the silhouette and expose the inner
-	// fractal, but it can never inflate Soma into a giant smooth rubber ring.
-	var torusQ = q;
-	let torusTurn = rot2(torusQ.yz, 0.28 + coilGesture * 0.72 + shellDNA * 0.35);
-	torusQ.y = torusTurn.x;
-	torusQ.z = torusTurn.y;
-	let tunnelRadius = 0.10 + torusDNA * 0.11 + hollowGesture * 0.08;
-	let hollowTunnel = max(
-		length(torusQ.xy) - tunnelRadius,
-		abs(torusQ.z) - (0.46 + divideGesture * 0.10)
-	);
-	let hollowMorph = clamp(torusDNA * (0.18 + hollowGesture * 0.62), 0.0, 0.76);
-	body = mix(body, max(body, -hollowTunnel), hollowMorph);
-
-	// Sub energy grows a rooted lower lobe. This is spatially localized, so a
-	// kick reads as weight entering the organism rather than a fullscreen pulse.
-	let rootCenter = vec3<f32>(u.spectralLean * 0.08, -0.48, 0.02);
-	let rootLobe = sdEllipsoid(
-		q - rootCenter,
-		vec3<f32>(
-			0.31 + u.rootMass * 0.20,
-			0.25 + u.rootMass * 0.13,
-			0.30 + u.rootMass * 0.18
-		)
-	);
-	body = smin(body, rootLobe, 0.085 + u.rootMass * 0.035);
-
-	// Four thick anatomical limbs replace the old hair-thin helixes that lived
-	// inside the core. Their directions, reach, buds, and visibility crossfade
-	// from asymmetric sprout to wound cocoon to open bloom.
-	for (var i: i32 = 0; i < 4; i = i + 1) {
-		var sproutGate = 0.04;
-		var windingGate = 0.50;
-		var bloomGate = 0.88;
-		var lanePolarity = -1.0;
-		if (i == 0) {
-			sproutGate = 1.0;
-			windingGate = 0.82;
-			bloomGate = 1.0;
-			lanePolarity = 1.0;
-		} else if (i == 1) {
-			sproutGate = 0.48;
-			windingGate = 0.74;
-			bloomGate = 0.96;
-		} else if (i == 2) {
-			sproutGate = 0.12;
-			windingGate = 0.58;
-			bloomGate = 0.92;
-			lanePolarity = 1.0;
-		}
-
-		let activeForms = max(u.sproutForm + u.windingForm + u.bloomForm, 1e-4);
-		let bloomMix = clamp(u.bloomForm / activeForms, 0.0, 1.0);
-		let windingMix = clamp(u.windingForm / activeForms, 0.0, 1.0);
-		var direction = safeNormalize(
-			mix(sproutDirection(i), bloomDirection(i), bloomMix),
-			sproutDirection(i)
-		);
-		direction = safeNormalize(
-			mix(direction, windingDirection(i), windingMix * 0.82),
-			direction
-		);
-		let travelTurn = u.postureYaw * (0.92 + f32(i) * 0.08)
-			+ u.posturePitch * 0.54 * lanePolarity
-			+ (coilGesture - divideGesture) * (0.22 + f32(i) * 0.025)
-			+ u.paletteFamily * 0.17 * lanePolarity
-			+ evolutionPhase * (0.085 + f32(i) * 0.009) * lanePolarity;
-		let turned = rot2(direction.xz, travelTurn);
-		direction.x = turned.x;
-		direction.z = turned.y;
-		direction.x = direction.x + u.spectralLean * (0.10 + f32(i) * 0.018) * lanePolarity;
-		direction = safeNormalize(direction, sproutDirection(i));
-
-		let presence = clamp(
-			u.sproutForm * sproutGate + u.windingForm * windingGate
-			+ u.bloomForm * bloomGate + u.sheddingForm * 0.14
-			+ coralDNA * (0.42 + bloomGate * 0.34)
-			+ reachGesture * sproutGate * 0.38
-			+ divideGesture * bloomGate * 0.24
-			- stillGesture * 0.24,
-			0.0,
-			1.0
-		);
-		let laneVariation = 0.90 + f32(i) * 0.055 + lanePolarity * u.spectralLean * 0.08;
-		let reach = (
-			0.46 + u.axialStretch * 0.22 + u.lobeSplit * 0.24
-			+ u.bloomForm * 0.25 + u.filamentReach * 0.10 - u.windingForm * 0.10
-			+ coralDNA * 0.25 + reachGesture * 0.26 + divideGesture * 0.12
-		) * laneVariation;
-		let a = direction * (0.14 + u.windingForm * 0.13);
-		var b = direction * reach;
-		b.y = b.y + sin(poseIdentity * 0.73 + f32(i) * 1.9) * (0.025 + u.foldDepth * 0.07);
-		b.x = b.x + u.spectralLean * lanePolarity * (0.035 + u.lobeSplit * 0.055);
-		let branchRadius = 0.050 + u.rootMass * 0.020 + u.lobeSplit * 0.025
-			+ u.bloomForm * 0.030 + u.filamentReach * 0.015;
-		let branch = sdCapsule(q, a, b, branchRadius);
-		let budRadius = 0.075 + u.lobeSplit * 0.040 + u.bloomForm * 0.055
-			+ divideGesture * 0.020 + coralDNA * 0.015;
-		let bud = sdEllipsoid(
-			q - b,
-			vec3<f32>(budRadius * (1.12 + u.lobeSplit * 0.18), budRadius * 0.86, budRadius)
-		);
-		let appendage = min(branch, bud) + (1.0 - presence) * 0.34;
-		body = smin(body, appendage, 0.035 + presence * 0.030);
-	}
-
-	// Bridge/breakdown opens a real exterior-intersecting tunnel. Unlike the old
-	// tiny internal spheres, this negative space reaches the silhouette from most
-	// camera angles and makes shedding unmistakably different from bloom.
-	var cavityQ = q;
-	let cavityTurn = u.posturePitch * 1.24 + u.postureYaw * 0.46
-		+ shellDNA * 0.54 + coilGesture * 0.62;
-	let cavityYZ = rot2(cavityQ.yz, cavityTurn);
-	cavityQ.y = cavityYZ.x;
-	cavityQ.z = cavityYZ.y;
-	let tunnel = sdCapsule(
-		cavityQ,
-		vec3<f32>(-1.35, 0.0, 0.0),
-		vec3<f32>(1.35, 0.0, 0.0),
-		0.070 + u.cavityOpen * 0.30 + hollowGesture * 0.24 + torusDNA * 0.13
-	);
-	let cavityGate = smoothstep(
-		0.08,
-		0.74,
-		u.cavityOpen + hollowGesture * 0.58 + torusDNA * 0.28 + shellDNA * 0.12
-	);
-	body = smax(body, -tunnel - (1.0 - cavityGate) * 0.46, 0.052);
-	let pocket = length(cavityQ - vec3<f32>(0.34, 0.29, 0.18))
-		- (0.11 + u.cavityOpen * 0.21);
-	body = smax(
-		body,
-		-pocket - (1.0 - max(u.sheddingForm, hollowGesture * 0.8)) * 0.36,
-		0.044
-	);
-
-	// Two coherent shed fragments drift away during bridge/breakdown. They remain
-	// part of this one world-space SDF—no translucent texture layer is involved.
-	let shedGate = clamp(u.sheddingForm * 1.12 + hollowGesture * 0.34 + shellDNA * 0.12, 0.0, 1.0);
-	let fragmentDrift = 0.72 + shedGate * 0.43;
-	let fragmentAOffset = vec3<f32>(
-		fragmentDrift + sin(poseIdentity * 0.61) * 0.12,
-		0.30 + shedGate * 0.18 + cos(poseIdentity * 0.47) * 0.13,
-		-0.20 - shedGate * 0.10 + sin(poseIdentity * 0.39) * 0.10
-	);
-	let fragmentBOffset = vec3<f32>(
-		-fragmentDrift * 0.88 + cos(poseIdentity * 0.53) * 0.15,
-		-0.36 - shedGate * 0.16 + sin(poseIdentity * 0.43) * 0.12,
-		0.43 + shedGate * 0.20 + cos(poseIdentity * 0.31) * 0.11
-	);
-	let fragmentRadius = 0.15 + u.filamentReach * 0.060 + u.materialErosion * 0.050;
-	let fragmentA = sdEllipsoid(
-		q - fragmentAOffset,
-		vec3<f32>(fragmentRadius * 1.35, fragmentRadius * 0.78, fragmentRadius)
-	);
-	let fragmentB = sdEllipsoid(
-		q - fragmentBOffset,
-		vec3<f32>(fragmentRadius, fragmentRadius * 1.28, fragmentRadius * 0.82)
-	);
-	let fragments = min(fragmentA, fragmentB) + (1.0 - shedGate) * 0.34;
-	body = smin(body, fragments, 0.045 + shedGate * 0.025);
-
-	// True Mandelbulb detail, lifecycle anatomy, and hit-time pore material now
-	// provide all fine structure. Removing procedural SDF corrugation prevents
-	// bright grazing light from turning tiny ridges into another stripe pattern
-	// and saves several trigonometric operations on every map evaluation.
-	return body * 0.76;
+	let shape = bellShape();
+	let d = min(min(bellSDF(q, shape), budSDF(q, shape)), chainSDF(q, shape));
+	return d * u.bodyScale * 0.7;
 }
 
 // 4-tap tetrahedral normal estimation.
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
-	let macroFocus = clamp(u.closeStudy * u.detailFocus, 0.0, 1.0);
-	let normalEpsilon = mix(0.0015, 0.00072, macroFocus);
-	let e = vec2<f32>(normalEpsilon, -normalEpsilon);
+	let e = vec2<f32>(0.0016, -0.0016) * u.bodyScale;
 	let m1 = map(p + e.xyy);
 	let m2 = map(p + e.yyx);
 	let m3 = map(p + e.yxy);
 	let m4 = map(p + e.xxx);
-	// Black-square guard — NaN comparisons all return false in WGSL, so a NaN
-	// distance fails (x < 1e10) and we fall back to the up vector. Without
-	// this, NaN propagates through normal/lighting and produces the tile-
-	// shaped black artifacts characteristic of fragment-shader SDF failures.
-	let allFinite = (abs(m1) < 1e10) && (abs(m2) < 1e10)
-		&& (abs(m3) < 1e10) && (abs(m4) < 1e10);
-	if (!allFinite) {
-		return vec3<f32>(0.0, 1.0, 0.0);
+	let n = e.xyy * m1 + e.yyx * m2 + e.yxy * m3 + e.xxx * m4;
+	let len = length(n);
+	if (!(len > 1e-8 && len < 1e8)) { return vec3<f32>(0.0, 1.0, 0.0); }
+	return n / len;
+}
+
+// ── Light packets: each beat launches pulses from the apex down a canal and
+// out along its tendril. g is the path coordinate (0 apex, 0.3 margin, 1 tip).
+fn packetField(g: f32, lane: f32) -> f32 {
+	let beat = u.beatConveyor;
+	let n0 = floor(beat);
+	let fireChance = 0.34 + u.rhythmicDensity * 0.36 + u.energy * 0.22;
+	var sum = 0.0;
+	for (var k: i32 = 0; k < 3; k += 1) {
+		let n = n0 - f32(k);
+		let age = beat - n;
+		let fire = step(hashLane(n, lane), fireChance);
+		let head = age * 0.42 - hashLane(n, lane + 31.0) * 0.06;
+		let x = (g - head) * 17.0;
+		let comet = select(exp(x * 0.6) * 0.55 + exp(-x * x) * 0.45, exp(-x * x * 1.6), x >= 0.0);
+		sum = sum + fire * comet * exp(-age * 0.6);
 	}
-	return safeNormalize(
-		e.xyy * m1 + e.yyx * m2 + e.yxy * m3 + e.xxx * m4,
-		vec3<f32>(0.0, 1.0, 0.0)
-	);
+	return sum;
 }
 
-// Short march toward the key light for the hero's soft surface shadow.
-fn lightVisibility(ro: vec3<f32>, rd: vec3<f32>, maxt: f32) -> f32 {
-	var res = 1.0;
-	var t = 0.02;
-	for (var i: i32 = 0; i < 5; i = i + 1) {
-		var h = map(ro + rd * t);
-		if (!(abs(h) < 1e10)) { h = 0.5; }
-		if (h < 0.001) { return 0.0; }
-		res = min(res, 12.0 * h / t);
-		t = t + clamp(h, 0.05, 0.4);
-		if (t > maxt) { break; }
-	}
-	return clamp(res, 0.0, 1.0);
+struct Surface {
+	emission: vec3<f32>,
+	transmission: f32,
+};
+
+struct Glow {
+	front: vec3<f32>,
+	back: vec3<f32>,
+};
+
+fn shadeMembrane(p: vec3<f32>, rd: vec3<f32>) -> Surface {
+	let n = calcNormal(p);
+	let v = -rd;
+	let ndv = abs(dot(n, v));
+	let fresnel = pow(max(1.0 - ndv, 0.0), 2.6);
+	let q = organismWarp(p);
+	let shape = bellShape();
+	let radial = max(length(q.xz), 0.04);
+	let ang = atan2(q.z, q.x);
+	let gy = clamp((shape.y - q.y) / max(shape.y - shape.w, 0.05), 0.0, 1.0);
+	let lanes = shape.z;
+	let laneCoord = ang / TAU * lanes;
+	let laneRound = floor(laneCoord + 0.5);
+	let lane = laneRound - lanes * floor(laneRound / lanes);
+	let laneOffset = abs(laneCoord - laneRound);
+	let laneDist = laneOffset * TAU / lanes * radial;
+	let onBell = smoothstep(shape.w - 0.16, shape.w - 0.04, q.y);
+	let canal = exp(-pow(laneDist / (0.011 + u.surfaceRidges * 0.006), 2.0)) * smoothstep(0.04, 0.2, gy) * onBell;
+	let ringOffset = (q.y - shape.w) / 0.03;
+	let ring = exp(-ringOffset * ringOffset);
+	let packets = packetField(gy * 0.3, lane) * packetEnergy();
+
+	// Comb rows between the canals: shimmering cilia, the ctenophore signature.
+	let rowDist = abs(laneOffset - 0.5) * TAU / lanes * radial;
+	let row = exp(-pow(rowDist / 0.016, 2.0)) * smoothstep(0.12, 0.3, gy) * smoothstep(0.98, 0.72, gy) * onBell;
+	let cilia = 0.5 + 0.5 * sin(gy * 70.0 - u.wavePhase * 3.2 + lane * 1.3);
+	let iriHue = mixHue(u.hueAccent, u.hueRim, 0.5 + 0.5 * sin(gy * 7.0 + ndv * 5.0 + lane));
+	let iri = hsv(iriHue, u.saturation * 0.85, 1.0) * row * cilia
+		* (0.1 + u.iridescence * 0.35 + u.matCrystal * 0.15 + u.treble * 0.25);
+
+	// Photophores ringing the margin twinkle with the top end.
+	let spotCoord = ang / TAU * lanes * 3.0;
+	let spotCell = floor(spotCoord);
+	let spotDelta = vec2<f32>(
+		(fract(spotCoord) - 0.5) * TAU / (lanes * 3.0) * radial,
+		q.y - shape.w - 0.05
+	);
+	let spot = onBell * exp(-dot(spotDelta, spotDelta) / 0.00035)
+		* (0.2 + u.treble * 1.1 * h21(vec2<f32>(spotCell, 3.0 + floor(u.beatConveyor * 0.5))));
+
+	// Signed spectral detail etches the tissue band by band down the dome.
+	let detail = clamp(bins[u32(clamp(gy * 63.0, 0.0, 63.0))], -1.0, 1.0);
+	// Organs glow through the mesoglea from inside.
+	let sss = exp(-length(q - vec3<f32>(0.0, shape.y * 0.1, 0.0)) * 3.2)
+		* (0.35 + u.bass * 0.5 + u.rootPulse * 0.7);
+
+	// The manubrium is a lantern hanging inside the bell, not a dark plug.
+	let stalkGlow = smoothstep(shape.x * 0.2, shape.x * 0.04, radial) * step(q.y, shape.y * 0.35);
+	// Beats run down the siphonophore chain as well.
+	let chainPackets = (1.0 - onBell) * packetField(0.3 + (shape.w - q.y) * 0.35, 200.0) * packetEnergy();
+	let base = baseCol();
+	let accent = accentCol();
+	let rim = rimCol();
+	var emission = mix(accent, base, 0.3) * stalkGlow * (0.3 + u.bass * 0.4 + packets * 0.8)
+		+ base * fresnel * (0.5 + u.energy * 0.35 + u.openness * 0.15) * 1.05
+		+ base * 0.03 * (0.8 + detail * 0.6)
+		+ accent * canal * (0.14 + packets * 2.0)
+		+ rim * ring * (0.3 + packets * 1.6)
+		+ iri
+		+ accent * spot * 0.6
+		+ mix(base, accent, 0.5) * sss * 0.2
+		+ mix(rim, accent, 0.5) * chainPackets * (0.4 + fresnel);
+	// A cool key from the surface far above gives the bell a wet highlight.
+	let keyDir = normalize(vec3<f32>(0.22, 1.0, 0.14));
+	let spec = pow(max(dot(reflect(-keyDir, n), v), 0.0), 36.0);
+	emission = emission + hsv(u.hueInk - 0.06, 0.35, 1.0)
+		* (spec * (0.18 + u.matCrystal * 0.4) * (1.0 - u.matVelvet * 0.7) + max(dot(n, keyDir), 0.0) * 0.01)
+		* (0.4 + u.shaftIntensity);
+	let transmission = clamp(
+		mix(0.8, 0.2, fresnel) * (1.2 - u.density * 0.5) + u.hollow * 0.12 - u.matVelvet * 0.18,
+		0.1,
+		0.88
+	);
+	let dim = (1.0 - u.silence * 0.55) * (1.0 - u.dormancyForm * 0.35);
+	return Surface(emission * dim, transmission);
 }
 
-// Cheap dither — Bayer 4x4 thresholds for breaking up volumetric stepping
-// banding without proper blue noise textures.
-fn dither(p: vec2<f32>) -> f32 {
-	let bayer = mat4x4<f32>(
-		0.0/16.0, 8.0/16.0, 2.0/16.0,10.0/16.0,
-		12.0/16.0, 4.0/16.0,14.0/16.0, 6.0/16.0,
-		3.0/16.0,11.0/16.0, 1.0/16.0, 9.0/16.0,
-		15.0/16.0, 7.0/16.0,13.0/16.0, 5.0/16.0
-	);
-	let ix = i32(p.x) % 4;
-	let iy = i32(p.y) % 4;
-	return bayer[iy][ix];
+// ── Tendrils: analytic glowing filaments hanging from the margin ──────────
+fn raySegment(ro: vec3<f32>, rd: vec3<f32>, a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
+	let ba = b - a;
+	let oa = ro - a;
+	let bb = max(dot(ba, ba), 1e-8);
+	let rb = dot(rd, ba);
+	let ob = dot(oa, ba);
+	let orr = dot(oa, rd);
+	let h = clamp((ob - rb * orr) / max(bb - rb * rb, 1e-8), 0.0, 1.0);
+	let t = max(rb * h - orr, 0.0);
+	return vec3<f32>(length(oa + rd * t - ba * h), t, h);
 }
 
-// Hash primitive used by the single-sample atmospheric current warp.
-fn h31(p: vec3<f32>) -> f32 {
-	var q = fract(p * vec3<f32>(443.897, 441.423, 437.195));
-	q = q + dot(q, q.yzx + 19.19);
-	return fract((q.x + q.y) * q.z);
+fn tendrilLocal(
+	s: f32, er: vec3<f32>, et: vec3<f32>, rootR: f32, rootY: f32, len: f32,
+	waveK: f32, waveAmp: f32, flare: f32, coilAmt: f32, fi: f32
+) -> vec3<f32> {
+	let phase = s * len * waveK - u.wavePhase * (1.0 + fi * 0.07) + fi * 1.7;
+	let lateral = sin(phase) * waveAmp * s * len;
+	let radialWave = cos(phase * 0.63 + fi) * waveAmp * 0.5 * s * len;
+	let spread = rootR + s * flare * len + radialWave;
+	var p = er * spread + et * lateral;
+	let coiled = rot2(p.xz, coilAmt * s * TAU);
+	p = vec3<f32>(coiled.x, rootY - s * len, coiled.y);
+	// Drag: filaments trail behind the swimming bell.
+	return p - u.localVel * pow(s, 1.4) * len * 1.7;
 }
 
-// 3D value noise — one sample gives the world-space current a soft, organic
-// bend without another raymarch, texture, or stacked fullscreen layer.
-fn vn3(p: vec3<f32>) -> f32 {
-	let i = floor(p);
-	let f = fract(p);
-	let u = f * f * (3.0 - 2.0 * f);
-	let c000 = h31(i);
-	let c100 = h31(i + vec3<f32>(1.0, 0.0, 0.0));
-	let c010 = h31(i + vec3<f32>(0.0, 1.0, 0.0));
-	let c110 = h31(i + vec3<f32>(1.0, 1.0, 0.0));
-	let c001 = h31(i + vec3<f32>(0.0, 0.0, 1.0));
-	let c101 = h31(i + vec3<f32>(1.0, 0.0, 1.0));
-	let c011 = h31(i + vec3<f32>(0.0, 1.0, 1.0));
-	let c111 = h31(i + vec3<f32>(1.0, 1.0, 1.0));
-	let x00 = mix(c000, c100, u.x);
-	let x10 = mix(c010, c110, u.x);
-	let x01 = mix(c001, c101, u.x);
-	let x11 = mix(c011, c111, u.x);
-	let y0 = mix(x00, x10, u.y);
-	let y1 = mix(x01, x11, u.y);
-	return mix(y0, y1, u.z);
-}
+fn tendrils(ro: vec3<f32>, rd: vec3<f32>, pixelAngle: f32, tSplit: f32, tFar: f32) -> Glow {
+	var glow: Glow;
+	let shape = bellShape();
+	let lanes = shape.z;
+	let denseLanes = lanes > 8.5;
+	let marginal = i32(lanes + 0.5);
+	let squeeze = 1.0 + u.contraction * 0.26;
+	let twistAtRim = twistRate() * shape.w;
+	let phraseIndex = floor(u.phrase);
+	let draftBlend = smoothstep(0.86, 1.0, fract(u.phrase));
+	let packetGain = packetEnergy();
+	let accent = accentCol();
+	let rim = rimCol();
+	let reachLength = clamp(
+		0.95 + u.reach * 0.5 + u.filamentReach * 0.35 + u.bloomForm * 0.25 + u.sproutForm * 0.15
+			+ u.topoCoral * 0.2 - u.dormancyForm * 0.5 - u.seedForm * 0.3,
+		0.35,
+		1.9
+	);
+	let flareBase = 0.1 + u.bloomForm * 0.22 + u.openness * 0.08 - u.contraction * 0.12 - u.dormancyForm * 0.08;
+	let waveAmp = 0.035 + u.mid * 0.05 + u.bloomForm * 0.025 + u.filamentReach * 0.02;
+	let coilAmt = (u.windingForm * 0.9 + u.coil * 1.3 + u.topoShell * 0.5) * 0.55;
+	let stalkTip = -shape.y * (0.7 + u.reach * 0.3 + u.sproutForm * 0.25) - shape.x * 2.0 * chainAmount();
+	let sproutFocus = clamp(u.sproutForm * 1.1, 0.0, 0.95);
+	let dashing = clamp(u.sheddingForm * 0.85 + u.erosion * 0.2, 0.0, 0.9);
+	let fade = (1.0 - u.silence * 0.5) * (1.0 - u.dormancyForm * 0.3);
 
-// One coherent world-space atmospheric current. It is sampled at a distant
-// point along the camera ray, so camera translation creates real parallax
-// instead of sliding a screen-space texture over the hero. Growth/tension and
-// the slow audio rails continuously reshape the same field; there are no stars,
-// sprites, flashes, or independent visual layers competing with the organism.
-fn sky(rd: vec3<f32>) -> vec3<f32> {
-	let upT = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0);
-	let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
-		+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
-	let baseT = u.paletteOffset + u.palettePhase * 0.16
-		+ u.paletteWarmth * 0.04 + lifecycleHue;
-	let growth = clamp(u._pad0, 0.0, 1.0);
-	let tension = clamp(u._pad1, 0.0, 1.0);
-	let voidRaw = pow(max(u.environmentVoid, 0.0), 1.8);
-	let currentRaw = pow(max(u.environmentCurrent, 0.0), 1.8);
-	let cavernRaw = pow(max(u.environmentCavern, 0.0), 1.8);
-	let horizonRaw = pow(max(u.environmentHorizon, 0.0), 1.8);
-	let cellularRaw = pow(max(u.environmentCellular, 0.0), 1.8);
-	let environmentWeight = max(
-		voidRaw + currentRaw + cavernRaw + horizonRaw + cellularRaw,
-		0.0001
-	);
-	let voidW = voidRaw / environmentWeight;
-	let currentW = currentRaw / environmentWeight;
-	let cavernW = cavernRaw / environmentWeight;
-	let horizonW = horizonRaw / environmentWeight;
-	let cellularW = cellularRaw / environmentWeight;
-	let horizon = palette7(baseT + 0.03) * (
-		0.010 + currentW * 0.015 + horizonW * 0.014 + cellularW * 0.011
-			+ growth * 0.005 - voidW * 0.004
-	);
-	let zenith = palette7(baseT + 0.70 + u.materialErosion * 0.08)
-		* (0.003 + cavernW * 0.004 + cellularW * 0.003);
-	var bg = mix(horizon, zenith, smoothstep(0.0, 1.0, upT));
-
-	let camPos = vec3<f32>(u.camPosX, u.camPosY, u.camPosZ);
-	let camFwd = safeNormalize(
-		vec3<f32>(u.camFwdX, u.camFwdY, u.camFwdZ),
-		vec3<f32>(0.0, 0.0, -1.0)
-	);
-	let worldP = camPos + rd * 8.0;
-
-	// These are alternate structures inside one coherent 3D atmosphere. They are
-	// sampled in world space, so camera movement reveals parallax instead of
-	// sliding a transparent texture across the screen.
-	let cavernNoise = vn3(
-		worldP * vec3<f32>(0.18, 0.28, 0.18)
-			+ vec3<f32>(u.backgroundPhase * 0.018, 0.0, 0.0)
-	);
-	let cavernStrata = smoothstep(
-		0.50,
-		0.86,
-		0.5 + 0.5 * cos(length(worldP.xz) * 0.72 + worldP.y * 0.34 + cavernNoise * 2.1)
-	);
-	let horizonBand = exp(-abs(rd.y + 0.08 + u.perspectiveElevation * 0.08) * 12.0);
-	let cellularPhase = sin(worldP.x * 0.72 + u.backgroundPhase * 0.11)
-		* sin(worldP.y * 0.61 - u.morphPhase * 0.07)
-		* sin(worldP.z * 0.67 + u.spectralTravelPhase * 0.09);
-	let cellularMembrane = smoothstep(0.22, 0.76, abs(cellularPhase));
-	let depthNoise = vn3(
-		worldP * 0.105 + vec3<f32>(u.backgroundPhase * 0.012, u.morphPhase * 0.006, 0.0)
-	);
-	let parallaxVein = smoothstep(
-		0.54,
-		0.82,
-		vn3(worldP * 0.31 + vec3<f32>(0.0, u.backgroundPhase * 0.022, u.morphPhase * 0.01))
-	);
-	let depthPresence = clamp(cavernW * 0.82 + cellularW * 0.48 + currentW * 0.28, 0.0, 0.78);
-	bg = bg * mix(1.0, mix(0.62, 1.34, depthNoise), depthPresence);
-	bg = bg
-		+ palette7(baseT + 0.58) * cavernStrata * cavernW * 0.15
-		+ palette7(baseT + 0.19) * horizonBand * horizonW * (0.14 + growth * 0.018)
-		+ palette7(baseT + 0.62) * cellularMembrane * cellularW * 0.105
-		+ palette7(baseT + 0.79) * parallaxVein * (cavernW + cellularW * 0.72) * 0.052;
-	bg = bg * (
-		1.0 - cavernW * (1.0 - cavernStrata) * 0.42
-			- cellularW * (1.0 - cellularMembrane) * 0.22
-			- voidW * 0.22
-	);
-	let familyPhase = u.paletteFamily * 1.04719755 + baseT * 1.7
-		+ u.spectralTravelPhase * 0.16;
-	let currentAxis = safeNormalize(
-		vec3<f32>(cos(familyPhase), 0.22 + tension * 0.16, sin(familyPhase)),
-		vec3<f32>(0.7, 0.25, 0.6)
-	);
-	let sideAxis = safeNormalize(
-		cross(currentAxis, vec3<f32>(0.0, 1.0, 0.0)),
-		vec3<f32>(1.0, 0.0, 0.0)
-	);
-	let liftAxis = safeNormalize(cross(sideAxis, currentAxis), vec3<f32>(0.0, 1.0, 0.0));
-	let along = dot(worldP, currentAxis);
-	let across = dot(worldP, sideAxis);
-	let lift = dot(worldP, liftAxis);
-
-	// The CPU integrates this phase from the shared song journey. Persistent
-	// rhythmic identity and tension bend the current; no transient rail touches
-	// background luminance or geometry.
-	// Suspense accelerates the CPU-integrated phase instead of offsetting it here,
-	// so the foreshadowing current can never rewind when anticipation releases.
-	let flowPhase = u.backgroundPhase + familyPhase + u.morphPhase * 0.21;
-	let warpP = worldP * 0.24 + currentAxis * flowPhase * 0.20;
-	let warp = vn3(warpP) - 0.5;
-	let bend = sin(along * 0.54 + flowPhase + warp * 2.0)
-		* (0.30 + u.styleRhythmicDensity * 0.16)
-		+ sin(lift * 0.31 - flowPhase * 0.47 + familyPhase) * (0.10 + tension * 0.10);
-	let currentCoord = across * 0.30 + bend;
-	let currentWidth = 0.32 + u.rootMass * 0.08 + growth * 0.05 + u.openness * 0.05
-		+ u.sproutForm * 0.07 + u.bloomForm * 0.24 + u.sheddingForm * 0.10
-		+ u.dormancyForm * 0.18 - u.windingForm * 0.15 - tension * 0.10
-		- u.suspense * 0.08;
-	let normalizedDistance = currentCoord / max(currentWidth, 0.20);
-	var currentBody = exp(-normalizedDistance * normalizedDistance);
-	// The same atmospheric river divides during bloom and frays during shedding.
-	// This is one world-space field, but its arrangement now follows the lifeform.
-	let splitAmount = clamp(
-		u.bloomForm * 0.98 + u.sheddingForm * 0.68 + u.suspense * 0.30,
-		0.0,
-		0.92
-	);
-	let splitOffset = 0.24 + u.lobeSplit * 0.28 + u.filamentReach * 0.12;
-	let splitA = (currentCoord - splitOffset) / max(currentWidth * 0.72, 0.16);
-	let splitB = (currentCoord + splitOffset) / max(currentWidth * 0.72, 0.16);
-	let splitBody = (exp(-splitA * splitA) + exp(-splitB * splitB)) * 0.58;
-	currentBody = mix(currentBody, splitBody, splitAmount);
-	let filament = 0.72 + 0.28 * (0.5 + 0.5 * sin(along * 1.63 - flowPhase * 0.61 + warp * 2.4));
-	let erosionBreaks = mix(
-		1.0,
-		0.42 + 0.58 * smoothstep(-0.25, 0.55, sin(along * 2.3 + flowPhase * 0.44 + warp * 3.1)),
-		clamp(u.materialErosion + u.suspense * 0.10, 0.0, 1.0)
-	);
-	let current = currentBody * filament * erosionBreaks;
-	let currentCol = mix(
-		palette7(baseT + 0.28 + warp * 0.05),
-		palette7(baseT + 0.55),
-		clamp(0.35 + tension * 0.35 + upT * 0.15, 0.0, 1.0)
-	);
-	let atmosphereTransfer = clamp(
-		(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
-			+ u.cavityOpen * 0.22,
-		0.0,
-		1.0
-	);
-	bg = bg * (1.0 - current * currentW * (0.045 + tension * 0.02));
-	bg = bg + currentCol * current * (0.42 + currentW * 0.72 + cellularW * 0.16) * (
-		0.030 + u.rms * 0.004 + growth * 0.019 + u.sproutForm * 0.006
-			+ u.bloomForm * 0.036 + u.sheddingForm * 0.018
-			+ atmosphereTransfer * 0.015 + u.suspense * 0.008
-	);
-
-	// Preserve a quiet pocket behind the subject. The current remains visible at
-	// the periphery and through negative-space openings without becoming a halo.
-	let heroFocus = pow(clamp(dot(rd, camFwd), 0.0, 1.0), 18.0);
-	bg = bg * (1.0 - heroFocus * (0.24 + tension * 0.05 + u.dormancyForm * 0.08));
-	let backgroundLuma = max(dot(bg, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
-	let backgroundCeiling = 0.13 + horizonW * 0.035 + cellularW * 0.022;
-	bg = bg * min(1.0, backgroundCeiling / backgroundLuma);
-
-	return bg;
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = (frag.xy - 0.5 * res) / res.y;
-
-	// Camera basis from the continuous CPU-side journey.
-	let camPos = vec3<f32>(u.camPosX, u.camPosY, u.camPosZ);
-	let fwd = vec3<f32>(u.camFwdX, u.camFwdY, u.camFwdZ);
-	let right = vec3<f32>(u.camRightX, u.camRightY, u.camRightZ);
-	let up = vec3<f32>(u.camUpX, u.camUpY, u.camUpZ);
-	let rd = normalize(uv.x * right + uv.y * up + fwd * u.fovScale);
-
-	// Lifecycle-directed lighting rigs. Each form has a different photographic
-	// read (soft top light, side light, grazing contrast, back rim, or quiet
-	// overhead light), while harmony only nudges the rig instead of spinning it.
-	let cChroma = u.chromaX;
-	let sChroma = u.chromaY;
-	let lifecycleWeight = max(
-		u.seedForm + u.sproutForm + u.windingForm + u.bloomForm
-			+ u.sheddingForm + u.dormancyForm,
-		0.0001
-	);
-	let lifecycleLight = (
-		vec3<f32>(0.12, 0.97, 0.20) * u.seedForm
-		+ vec3<f32>(0.78, 0.46, 0.30) * u.sproutForm
-		+ vec3<f32>(-0.66, 0.14, 0.74) * u.windingForm
-		+ vec3<f32>(-0.48, 0.54, -0.70) * u.bloomForm
-		+ vec3<f32>(0.64, -0.12, -0.76) * u.sheddingForm
-		+ vec3<f32>(-0.10, 0.98, -0.16) * u.dormancyForm
-	) / lifecycleWeight;
-	let lightDir = safeNormalize(
-		lifecycleLight + vec3<f32>(
-			cChroma * 0.08 + sChroma * 0.04,
-			0.0,
-			cChroma * 0.05 - sChroma * 0.07
-		) * u.chromaStrength,
-		vec3<f32>(0.25, 0.82, 0.50)
-	);
-
-	// ── Volumetric raymarch.
-	// At every step we accumulate fog scattering, attenuated by transmittance.
-	// If a step hits the surface (distance < EPS) we shade it physically and
-	// premultiply the surface contribution by the remaining transmittance,
-	// then return — naturally compositing fog over surface over background.
-	let MAX_STEPS = 56;
-	let MAX_DIST = 10.0;
-	let macroFocus = clamp(u.closeStudy * u.detailFocus, 0.0, 1.0);
-	let EPS_NEAR = mix(0.0014, 0.00062, macroFocus);
-	let EPS_FAR  = mix(0.0070, 0.0036, macroFocus);
-
-	var transmittance = 1.0;
-	var scattered = vec3<f32>(0.0);
-	var t = 0.05 + dither(frag.xy) * 0.04; // dither breaks fog banding
-
-	for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
-		if (i >= i32(clamp(u.qualitySteps, 1.0, f32(MAX_STEPS)))) { break; }
-		if (i >= 48 && (u.closeStudy < 0.55 || u.detailFocus < 0.55)) { break; }
-		if (t > MAX_DIST) { break; }
-		let p = camPos + rd * t;
-		var d = map(p);
-		// Black-square guard — if SDF returns NaN/Inf from a degenerate iteration,
-		// treat as max distance so the marcher skips and the pixel falls through
-		// to sky instead of stamping a NaN tile.
-		if (!(abs(d) < 1e10)) { d = 0.5; }
-		// Distance-adaptive hit threshold — far surfaces use looser EPS so we
-		// don't waste precision; close surfaces tighten so detail reads sharp.
-		// Eliminates the "spamming a close-up that's scaled up" degradation.
-		let EPS = mix(EPS_NEAR, EPS_FAR, smoothstep(0.5, 6.0, t));
-
-		// ── Surface hit
-		if (d < EPS) {
-			let geometryNormal = calcNormal(p);
-			let view = -rd;
-			let shadow = lightVisibility(p + geometryNormal * 0.005, lightDir, 4.0);
-
-			// Two short ambient-occlusion probes preserve crevice depth. The lifecycle
-			// primitives are funded by removing the third probe and two shadow steps,
-			// rather than adding an unbounded second fractal evaluation.
-			var ao = 0.0;
-			var aoW = 0.0;
-			for (var k: i32 = 1; k <= 2; k = k + 1) {
-				let ko = f32(k) * 0.065;
-				var aoSample = map(p + geometryNormal * ko);
-				if (!(abs(aoSample) < 1e10)) { aoSample = ko; }
-				let occ = ko - aoSample;
-				ao = ao + occ * pow(0.6, f32(k));
-				aoW = aoW + pow(0.6, f32(k));
+	for (var i: i32 = 0; i < marginal + ORAL_ARMS; i += 1) {
+		let isOral = i >= marginal;
+		let fi = f32(i);
+		var lane = fi;
+		var theta = lane / lanes * TAU - twistAtRim;
+		var presence = 1.0;
+		var rootR = shape.x * 0.86 / squeeze;
+		var rootY = shape.w;
+		var len = reachLength;
+		var width = 0.0065;
+		var flare = flareBase;
+		if (isOral) {
+			let k = f32(i - marginal);
+			lane = 100.0 + k;
+			theta = (k + 0.25) / f32(ORAL_ARMS) * TAU + u.seed * 3.0;
+			rootR = shape.x * 0.06;
+			rootY = stalkTip;
+			len = reachLength * 0.55;
+			width = 0.015;
+			flare = flareBase * 0.4;
+		} else {
+			// Dense bells grow their in-between tendrils as they bloom.
+			if (denseLanes && (i % 2 == 1)) {
+				presence = clamp(u.bloomForm * 1.2 + u.topoCoral * 0.6 + u.reach * 0.3, 0.0, 1.0);
 			}
-			ao = clamp(1.0 - ao / aoW * 5.0, 0.0, 1.0);
-
-			// One geometry-bound detail field replaces every projected stripe,
-			// triplanar sine, and direct FFT-to-albedo band. It changes material
-			// response under real light, never adds an unlit texture over the form.
-			let surfQ = organismWarp(p);
-			let regionBin = i32(clamp((surfQ.y + 1.90) * 16.58, 0.0, 63.0));
-			let bandDetail = clamp(abs(bins[regionBin]), 0.0, 1.0);
-			let familyOffset = vec3<f32>(
-				u.paletteFamily * 7.13 + 2.7,
-				u.paletteFamily * 3.71 + 11.9,
-				u.paletteFamily * 5.37 + 19.1
-			);
-			let surfaceNoise = vn3(
-				surfQ * (5.4 + u.materialErosion * 4.8 + u.detailFocus * 3.2)
-					+ familyOffset + vec3<f32>(u.morphPhase * 0.012)
-			);
-			let anatomicalNoise = vn3(
-				surfQ * (1.75 + u.materialMineral * 0.55 + u.materialVelvet * 0.22)
-					+ familyOffset * 0.31 - vec3<f32>(u.morphPhase * 0.004)
-			);
-			// One hit-time octave gives broad cocoon lobes actual skin. Its spatial
-			// scale stays fixed while audio changes contrast/roughness, so pores breathe
-			// without crawling or rescaling. This never runs inside the raymarch, SDF
-			// normal, shadow, or AO loops.
-			let microScale = 19.0;
-			let microP = surfQ * microScale + familyOffset * 1.71
-				- vec3<f32>(u.morphPhase * 0.019);
-			let microNoise = vn3(microP);
-			// Keep lighting in the SDF/world frame. The material octave affects pigment
-			// and roughness only, avoiding a detached bump layer on a heavily warped body.
-			let n = geometryNormal;
-			let cosNL = clamp(dot(n, lightDir), 0.0, 1.0);
-			let halfDir = safeNormalize(lightDir + view, lightDir);
-			let cosNH = clamp(dot(n, halfDir), 0.0, 1.0);
-			let cosNV = clamp(dot(n, view), 0.0, 1.0);
-			let pore = smoothstep(0.72, 0.94, 1.0 - surfaceNoise);
-
-			let lifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
-				+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
-			let surfacePalette = u.paletteOffset + u.palettePhase * 0.34
-				+ u.paletteWarmth * 0.075 + lifecycleHue;
-			// The same world-space river that crosses the sky passes through Soma's
-			// skin as a material current. It only bends pigment/roughness; it never
-			// adds unlit brightness, so it cannot become a pasted-on stripe layer.
-			let skinFamilyPhase = u.paletteFamily * 1.04719755 + surfacePalette * 1.7
-				+ u.spectralTravelPhase * 0.16;
-			let skinCurrentAxis = safeNormalize(
-				vec3<f32>(cos(skinFamilyPhase), 0.22 + u._pad1 * 0.16, sin(skinFamilyPhase)),
-				vec3<f32>(0.7, 0.25, 0.6)
-			);
-			let skinFlowPhase = u.backgroundPhase + skinFamilyPhase + u.morphPhase * 0.21;
-			let skinCurrent = sin(
-				dot(p, skinCurrentAxis) * 1.45 - skinFlowPhase * 0.61
-					+ surfaceNoise * 3.1 + microNoise * 0.65
-			);
-			let palT = surfacePalette
-				+ length(surfQ) * 0.12
-				+ n.x * 0.045 + n.y * 0.055
-				+ (surfaceNoise - 0.5) * (0.12 + u.materialErosion * 0.06)
-				+ (microNoise - 0.5) * (0.035 + u.surfaceRidges * 0.055)
-				+ bandDetail * 0.022
-				+ skinCurrent * (0.005 + u.materialIridescence * 0.012);
-			let density = clamp(u.materialDensity, 0.30, 1.0);
-			let rawBaseCol = palette7(palT);
-			let rawBaseLuma = dot(rawBaseCol, vec3<f32>(0.2126, 0.7152, 0.0722));
-			let rawBaseChroma = max(rawBaseCol.r, max(rawBaseCol.g, rawBaseCol.b))
-				- min(rawBaseCol.r, min(rawBaseCol.g, rawBaseCol.b));
-			let pigmentAnchorRaw = palette7(
-				surfacePalette + 0.40
-					+ (surfaceNoise - 0.5) * 0.14
-					+ (microNoise - 0.5) * (0.08 + u.surfaceRidges * 0.05)
-					+ skinCurrent * 0.010
-			);
-			let pigmentAnchorLuma = dot(
-				pigmentAnchorRaw,
-				vec3<f32>(0.2126, 0.7152, 0.0722)
-			);
-			let pigmentAnchor = clamp(
-				mix(vec3<f32>(pigmentAnchorLuma), pigmentAnchorRaw, 1.18),
-				vec3<f32>(0.0),
-				vec3<f32>(1.0)
-			) * 0.55;
-			let washedRecovery = max(
-				smoothstep(0.40, 0.70, rawBaseLuma),
-				(1.0 - smoothstep(0.08, 0.30, rawBaseChroma))
-					* smoothstep(0.22, 0.52, rawBaseLuma)
-			);
-			let paleRecovery = clamp(
-				washedRecovery * (0.50 + density * 0.56)
-					+ u.sproutForm * washedRecovery * 0.08
-					+ u.sheddingForm * washedRecovery * 0.10,
-				0.0,
-				0.94
-			);
-			let broadPigment = smoothstep(0.16, 0.84, anatomicalNoise * 0.68 + surfaceNoise * 0.32);
-			let pigmentGrain = clamp(
-				0.70 + broadPigment * 0.54
-					+ (surfaceNoise - 0.5) * 0.12
-					+ (microNoise - 0.5) * (0.07 + u.surfaceRidges * 0.045),
-				0.58,
-				1.26
-			);
-			// Pale palette stops retain their hue, but are pulled back into a deeper
-			// lifecycle pigment before lighting. White can remain a highlight, not a body.
-			var baseCol = mix(rawBaseCol, pigmentAnchor, paleRecovery) * pigmentGrain;
-			let baseChroma = max(baseCol.r, max(baseCol.g, baseCol.b))
-				- min(baseCol.r, min(baseCol.g, baseCol.b));
-			let chromaticAnchor = palette7(
-				surfacePalette + 0.34 + anatomicalNoise * 0.18 + skinCurrent * 0.01
-			) * (0.34 + broadPigment * 0.12);
-			baseCol = mix(
-				baseCol,
-				chromaticAnchor,
-				(1.0 - smoothstep(0.08, 0.24, baseChroma)) * (0.34 + paleRecovery * 0.32)
-			);
-			// Cap diffuse pigment luminance before any light touches it. Specular and
-			// rim highlights can still flare, but a pale palette stop can no longer
-			// turn the entire close-study body into a white/grey shell.
-			let baseColLuma = max(
-				dot(baseCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
-				0.0001
-			);
-			let pigmentCeiling = 0.44 + density * 0.12 + u.materialIridescence * 0.025;
-			baseCol = baseCol * min(1.0, pigmentCeiling / baseColLuma);
-
-			// Continuous lifecycle material vocabulary: seed/dormancy are waxy,
-			// sprout is wet, winding is taut chitin, bloom is crystalline, and
-			// shedding is dry/porous. The weights crossfade, so the same organism
-			// actually matures rather than swapping arbitrary effects.
-			let membraneDNA = pow(max(u.materialMembrane, 0.0), 1.65);
-			let mineralDNA = pow(max(u.materialMineral, 0.0), 1.65);
-			let velvetDNA = pow(max(u.materialVelvet, 0.0), 1.65);
-			let crystalDNA = pow(max(u.materialCrystal, 0.0), 1.65);
-			let waxRaw = membraneDNA * (0.72 + u.seedForm * 0.38)
-				+ velvetDNA * 0.18 + u.dormancyForm * 0.12;
-			let wetRaw = membraneDNA * (0.32 + u.sproutForm * 0.46);
-			let tautRaw = mineralDNA * (0.72 + u.windingForm * 0.42);
-			let crystalRaw = crystalDNA * (0.76 + u.bloomForm * 0.38);
-			let porousRaw = velvetDNA * (0.84 + u.sheddingForm * 0.42)
-				+ mineralDNA * u.materialErosion * 0.16;
-			let materialWeight = max(waxRaw + wetRaw + tautRaw + crystalRaw + porousRaw, 0.0001);
-			let wax = waxRaw / materialWeight;
-			let wet = wetRaw / materialWeight;
-			let taut = tautRaw / materialWeight;
-			let crystal = crystalRaw / materialWeight;
-			let porous = porousRaw / materialWeight;
-			let ridgeRelief = (surfaceNoise - 0.5) * (0.24 + u.surfaceRidges * 0.24)
-				+ (microNoise - 0.5) * (0.055 + u.surfaceRidges * 0.08)
-				+ skinCurrent * u.surfaceRidges * 0.015;
-			let iridescentShift = u.materialIridescence * (1.0 - cosNV)
-				* (0.10 + surfaceNoise * 0.045)
-				+ skinCurrent * u.materialIridescence * 0.009;
-
-			let roughness = clamp(
-				wax * 0.56 + wet * 0.24 + taut * 0.35 + crystal * 0.22 + porous * 0.80
-					+ pore * porous * 0.08 - bandDetail * (wet + crystal) * 0.035
-					- u.treble * (wet + crystal) * 0.025 - ridgeRelief * 0.12,
-				0.09,
-				0.92
-			);
-			let specStrength = wax * 0.14 + wet * 0.42 + taut * 0.28
-				+ crystal * 0.44 + porous * 0.06;
-			let diffuseStrength = wax * 0.92 + wet * 0.66 + taut * 0.72
-				+ crystal * 0.66 + porous * 0.90;
-			let detailShade = clamp(
-				0.96 + ridgeRelief - pore * porous * 0.22
-					+ (bandDetail - 0.5) * u.mid * 0.035,
-				0.60,
-				1.18
-			);
-
-			// Lighting arrangement and contrast evolve with the lifecycle. All
-			// tints come from the song's palette and stay energy-bounded so bloom
-			// cannot bleach them into white decals.
-			let keyStrength = wax * 0.86 + wet * 1.00 + taut * 1.18
-				+ crystal * 0.95 + porous * 0.90;
-			let fillStrength = wax * 0.42 + wet * 0.32 + taut * 0.14
-				+ crystal * 0.28 + porous * 0.20;
-			let rimStrength = wax * 0.08 + wet * 0.22 + taut * 0.48
-				+ crystal * 0.52 + porous * 0.42;
-			let keyTint = palette7(surfacePalette + 0.16 + iridescentShift * 0.16) * 1.10;
-			let fillTint = palette7(surfacePalette + 0.54) * 0.68;
-			let rimTint = palette7(surfacePalette + 0.79 + iridescentShift * 1.12) * 1.04;
-			let ambientTint = palette7(surfacePalette + 0.66) * 0.42;
-
-			let fillDir = safeNormalize(
-				-lightDir + vec3<f32>(-0.18, -0.36, 0.14),
-				vec3<f32>(-0.25, -0.55, -0.35)
-			);
-			let rimDir = safeNormalize(
-				-lightDir + vec3<f32>(0.08, 0.20, -0.06),
-				-lightDir
-			);
-			let cosNF = clamp(dot(n, fillDir), 0.0, 1.0);
-			let cosNR = clamp(dot(n, rimDir), 0.0, 1.0);
-			let rimFresnel = pow(1.0 - cosNV, 3.8);
-			let direct = keyTint * cosNL * shadow * keyStrength;
-			let fill = fillTint * cosNF * fillStrength;
-			let ambient = ambientTint * (0.16 + max(n.y, 0.0) * 0.16) * (0.78 + ao * 0.22);
-			// AO still carves the fractal, but it can no longer erase all pigment and
-			// leave only a pale rim/specular shell behind.
-			let bodyAo = 0.24 + ao * 0.76;
-			let diffuse = baseCol * (direct + fill + ambient)
-				* bodyAo * detailShade * diffuseStrength * mix(0.90, 1.06, density);
-
-			let specPow = mix(72.0, 11.0, roughness);
-			let specular = pow(cosNH, specPow);
-			let fresnel = 0.04 + 0.96 * pow(1.0 - cosNV, 5.0);
-			let reflected = reflect(-view, n);
-			let envLow = palette7(
-				surfacePalette + 0.48 + reflected.x * 0.035 + iridescentShift * 0.82
-			);
-			let envHigh = palette7(
-				surfacePalette + 0.82 + reflected.z * 0.035 + iridescentShift * 1.18
-			);
-			let environment = mix(
-				envLow,
-				envHigh,
-				smoothstep(-0.60, 0.82, reflected.y)
-			);
-			let reflectionStrength = wet * 0.28 + taut * 0.10 + crystal * 0.36 + wax * 0.04;
-			let specularCol = keyTint * specular * specStrength * shadow
-				+ environment * fresnel * reflectionStrength;
-			let rim = rimTint * cosNR * rimFresnel * rimStrength
-				* (0.78 + u.openness * 0.18);
-
-			// Hits illuminate one small anatomical patch instead of brightening the
-			// whole lower half. This preserves percussion detail without creating the
-			// optical illusion that Soma scales or punches as one object on every kick.
-			let hitCenter = vec3<f32>(
-				u.spectralLean * 0.24,
-				-0.48,
-				sin(u.paletteFamily * 1.71 + u.postureYaw * 0.8) * 0.22
-			);
-			let hitMask = 1.0 - smoothstep(0.10, 0.31, length(surfQ - hitCenter));
-			let impactGain = 1.0 + hitMask * (u.rootPulse * 0.075 + u.surfaceImpact * 0.04);
-			let crevice = palette7(surfacePalette + 0.34) * pow(1.0 - ao, 2.0)
-				* (porous * 0.026 + crystal * 0.014);
-			let deepPigment = mix(pigmentAnchor, baseCol, 0.58);
-			let bodyFill = deepPigment * (0.028 + density * 0.070)
-				* (0.34 + cosNV * 0.46) * (0.48 + bodyAo * 0.52);
-			var surfaceCol = (diffuse + specularCol + rim + bodyFill) * impactGain + crevice;
-			// A chroma-preserving shoulder keeps the many tiny fractal facets from
-			// becoming white pixel confetti while leaving true rim highlights alive.
-			let surfaceLuma = max(
-				dot(surfaceCol, vec3<f32>(0.2126, 0.7152, 0.0722)),
-				0.0001
-			);
-			let lightingShoulder = 0.17 + crystal * 0.025 + wet * 0.018;
-			let compressedLuma = lightingShoulder * (1.0 - exp(-surfaceLuma / lightingShoulder));
-			surfaceCol = surfaceCol * (compressedLuma / surfaceLuma);
-			let shoulderChroma = max(surfaceCol.r, max(surfaceCol.g, surfaceCol.b))
-				- min(surfaceCol.r, min(surfaceCol.g, surfaceCol.b));
-			let lowChromaRecovery = (1.0 - smoothstep(0.055, 0.18, shoulderChroma))
-				* smoothstep(0.055, 0.18, compressedLuma);
-			surfaceCol = mix(
-				surfaceCol,
-				chromaticAnchor * (0.58 + density * 0.16),
-				lowChromaRecovery * 0.62
-			) + specularCol * 0.014 + rim * 0.009;
-			scattered = scattered + surfaceCol * transmittance;
-			transmittance = 0.0;
-			break;
+			// Sprout keeps two long feeding tentacles, like a comb jelly.
+			let primary = (i == 0) || (i == marginal / 2);
+			presence = presence * mix(1.0, select(0.0, 1.0, primary), sproutFocus);
+			if (primary) {
+				len = len * (1.0 + u.sproutForm * 0.7);
+				width = width * (1.0 + u.sproutForm * 0.6);
+			}
 		}
-
-		// ── In-medium fog scattering.
-		// Density mildly increases in concavities near the fractal (proxied by
-		// the SDF value), so fog hugs the form like incense smoke.
-		let proxim = exp(-d * 1.4);
-		// Dense tissue pushes the medium away from its silhouette; shedding and
-		// cavities invite it back in. Body and atmosphere now trade substance
-		// instead of a universal near-surface veil washing every form equally.
-		let atmosphereTransfer = clamp(
-			(1.0 - u.materialDensity) * 0.55 + u.materialErosion * 0.55
-				+ u.cavityOpen * 0.22,
-			0.0,
-			1.0
+		if (presence < 0.02) { continue; }
+		let draft = mix(hashLane(phraseIndex, lane + 7.0), hashLane(phraseIndex + 1.0, lane + 7.0), draftBlend);
+		len = len * (0.62 + draft * 0.62);
+		let waveK = 4.0 + 5.0 * mix(
+			hashLane(phraseIndex, lane + 13.0),
+			hashLane(phraseIndex + 1.0, lane + 13.0),
+			draftBlend
 		);
-		let proximityFog = mix(0.30, 1.10, atmosphereTransfer);
-		let localDensity = u.fogDensity * (0.88 + proxim * proximityFog);
-		// A phase/clearance approximation replaces a nested shadow raymarch at
-		// every fog step. Surface hits still receive a real soft shadow above;
-		// atmosphere keeps directional depth at a tiny fraction of the cost.
-		let lightPhase = pow(max(dot(rd, lightDir), 0.0), 4.0);
-		let clearance = smoothstep(0.015, 0.45, d);
-		let lightV = mix(0.32, 1.0, clearance) * (0.58 + lightPhase * 0.42);
-		// Atmospheric tint — dramatically reduced from earlier attempt. The
-		// per-step contribution gets multiplied by stepDensity and then
-		// summed across ~30 fog steps, so what looks like a "tiny constant"
-		// adds up to a bright central blob when camera points toward the
-		// key light. Baseline 0.12 (was 0.6) and inscatter 0.0028 (was 0.012)
-		// together make fog readable as atmosphere without dominating.
-		let fogLifecycleHue = u.sproutForm * 0.035 + u.windingForm * 0.105
-			+ u.bloomForm * 0.205 + u.sheddingForm * 0.315 + u.dormancyForm * 0.43;
-		let lightTint = palette7(
-			u.paletteOffset + u.palettePhase * 0.34 + u.paletteWarmth * 0.075
-			+ fogLifecycleHue + 0.18
-		) * (0.12 + u.lightShaftIntensity * 0.08);
-		let scatterIn = lightTint * lightV * 0.0028;
-		// organismBloom — disabled. The colored halo around the organism
-		// read as a detached glow overlay. Direct surface lighting carries
-		// the silhouette now; no volumetric helper needed.
-		let organismBloom = vec3<f32>(0.0);
-		let stepDensity = localDensity * 0.08;
-		scattered = scattered + (scatterIn + organismBloom) * stepDensity * transmittance;
-		transmittance = transmittance * exp(-stepDensity);
+		let amp = waveAmp * select(1.0, 1.6, isOral);
+		let er = vec3<f32>(cos(theta), 0.0, sin(theta));
+		let et = vec3<f32>(-sin(theta), 0.0, cos(theta));
 
-		// March step. Smaller in dense areas (near surface), larger in open space.
-		let stepSize = max(d * 0.92, 0.065);
-		t = t + stepSize;
-		if (transmittance < 0.025) { break; }
+		// Bounding sphere: skip filaments this ray cannot come near.
+		let midLocal = er * rootR + vec3<f32>(0.0, rootY - len * 0.5, 0.0) - u.localVel * len * 0.6;
+		let centerW = toWorld(midLocal);
+		let radiusW = (len * 0.75 + rootR * 0.3 + 0.2) * u.bodyScale;
+		let oc = centerW - ro;
+		let tc = dot(oc, rd);
+		if (dot(oc, oc) - tc * tc > radiusW * radiusW) { continue; }
+
+		var best = 0.0;
+		var bestT = 0.0;
+		var bestS = 0.0;
+		var previous = toWorld(tendrilLocal(0.0, er, et, rootR, rootY, len, waveK, amp, flare, coilAmt, fi));
+		for (var j: i32 = 1; j <= TENDRIL_SEGMENTS; j += 1) {
+			let s = f32(j) / f32(TENDRIL_SEGMENTS);
+			let current = toWorld(tendrilLocal(s, er, et, rootR, rootY, len, waveK, amp, flare, coilAmt, fi));
+			let hitInfo = raySegment(ro, rd, previous, current);
+			let along = (f32(j - 1) + hitInfo.z) / f32(TENDRIL_SEGMENTS);
+			var wWorld = width * (1.0 - along * 0.6) * u.bodyScale;
+			if (isOral) { wWorld = wWorld * (0.75 + 0.45 * sin(along * 38.0 + fi * 2.0)); }
+			let footprint = hitInfo.y * pixelAngle;
+			let w = max(wWorld, footprint * 0.85);
+			let core = exp(-pow(hitInfo.x / w, 2.0)) * (wWorld / w);
+			let halo = exp(-hitInfo.x / (wWorld * 5.0 + footprint * 2.5)) * 0.08;
+			// Shedding breaks filaments into drifting fragments.
+			let dash = mix(1.0, smoothstep(0.35, 0.6, 0.5 + 0.5 * sin(along * 26.0 + fi * 2.3 + u.phrase * 3.0)), dashing);
+			let intensity = (core + halo) * dash;
+			if (intensity > best) {
+				best = intensity;
+				bestT = hitInfo.y;
+				bestS = along;
+			}
+			previous = current;
+		}
+		best = best * presence;
+		if (best < 0.002 || bestT > tFar) { continue; }
+		let g = select(0.3 + 0.7 * bestS, bestS, isOral);
+		let packets = packetField(g, lane) * packetGain;
+		let body = select(rim, accent, isOral) * (0.2 + 0.45 * (1.0 - bestS));
+		let light = (body + mix(accent, rim, 0.3) * packets * 2.2) * best * absorb(bestT) * fade;
+		if (bestT < tSplit) { glow.front = glow.front + light; } else { glow.back = glow.back + light; }
 	}
-
-	// Composite remaining transmittance with the current field. An explicit
-	// branch lets opaque hero pixels skip all background noise/math.
-	var col = scattered;
-	if (transmittance > 0.001) {
-		col = col + sky(rd) * transmittance;
-	}
-
-	// Gentle distance vignette (matches the eye's expectation of dimmer edges).
-	let centered = (frag.xy - 0.5 * res) / res.y;
-	let vig = smoothstep(1.2, 0.35, length(centered) * 1.3);
-	col = col * (0.78 + 0.22 * vig);
-
-	return vec4<f32>(col, 1.0);
+	return glow;
 }
-`;
 
-	// ──────────────────────────────────────────────────────────────────────────
-	// Kawase bloom — diagonal 4-tap downsample with optional HDR threshold for
-	// the first level (so only bright pixels actually bloom). Subsequent levels
-	// use threshold = 0 so the already-bright glow propagates evenly.
-	// ──────────────────────────────────────────────────────────────────────────
-	const BLOOM_DOWN_WGSL = /* wgsl */ `
-struct BloomParams {
-	srcResX: f32,
-	srcResY: f32,
-	dstResX: f32,
-	dstResY: f32,
-	threshold: f32,
-	_pad0: f32,
-	_pad1: f32,
-	_pad2: f32,
-};
+// Gonads: four horseshoe arcs glowing inside the bell, drawn as filaments so
+// they read as anatomy rather than a pair of eyes. Kicks light them locally.
+fn organs(ro: vec3<f32>, rd: vec3<f32>, pixelAngle: f32, tSplit: f32, tFar: f32) -> Glow {
+	var glow: Glow;
+	let shape = bellShape();
+	let accent = accentCol();
+	let rim = rimCol();
+	let pulse = (0.45 + u.bass * 0.6 + u.rootPulse * 1.4) * (1.0 - u.silence * 0.6) * (1.0 - u.dormancyForm * 0.4);
+	let arcRadius = shape.x * 0.3;
+	for (var k: i32 = 0; k < 4; k += 1) {
+		let a = f32(k) * TAU * 0.25 + 0.785 + u.seed * 5.0;
+		var best = 0.0;
+		var bestT = 0.0;
+		let ca = cos(a);
+		let sa = sin(a);
+		var previous = toWorld(vec3<f32>(ca * arcRadius * 0.66, shape.y * 0.3, sa * arcRadius * 0.66));
+		for (var j: i32 = 1; j <= 4; j += 1) {
+			let tj = f32(j) * 0.25;
+			let r = arcRadius * (0.66 + tj * 0.5 + sin(tj * 3.14159) * 0.12);
+			let current = toWorld(vec3<f32>(ca * r, shape.y * (0.3 - tj * 0.5), sa * r));
+			let hitInfo = raySegment(ro, rd, previous, current);
+			let wWorld = shape.x * 0.024 * u.bodyScale * (1.0 + u.bass * 0.3);
+			let footprint = hitInfo.y * pixelAngle;
+			let w = max(wWorld, footprint * 0.85);
+			let intensity = exp(-pow(hitInfo.x / w, 2.0)) * (wWorld / w)
+				+ exp(-hitInfo.x / (wWorld * 3.0 + footprint * 2.0)) * 0.12;
+			if (intensity > best) {
+				best = intensity;
+				bestT = hitInfo.y;
+			}
+			previous = current;
+		}
+		if (best < 0.002 || bestT > tFar) { continue; }
+		let light = mix(accent, rim, f32(k % 2) * 0.5) * best * pulse * 0.55 * absorb(bestT);
+		if (bestT < tSplit) { glow.front = glow.front + light; } else { glow.back = glow.back + light; }
+	}
+	return glow;
+}
 
-@group(0) @binding(0) var<uniform> p: BloomParams;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var srcTex: texture_2d<f32>;
+// Marine snow on five depth layers: world-anchored, slowly sinking, lit by
+// the organism when it passes. It gives the frame scale and parallax.
+fn marineSnow(ro: vec3<f32>, rd: vec3<f32>, pixelAngle: f32, tSplit: f32, tFar: f32) -> Glow {
+	var glow: Glow;
+	let facing = max(dot(rd, u.camFwd), 0.25);
+	let lightCol = mix(baseCol(), accentCol(), 0.3);
+	let plankton = accentCol();
+	for (var k: i32 = 0; k < 5; k += 1) {
+		let fk = f32(k);
+		let depth = 0.8 + fk * 1.15 + fk * fk * 0.22;
+		let tk = depth / facing;
+		if (tk > tFar) { continue; }
+		let p = ro + rd * tk;
+		let cell = 0.16 + fk * 0.05;
+		let sink = u.backgroundPhase * (1.6 + fk * 0.2);
+		let coord = vec2<f32>(
+			dot(p, u.camRight) + sink * 0.35 * (u.envCurrent + 0.2),
+			dot(p, u.camUp) + sink
+		) / cell;
+		let id = floor(coord);
+		let h = h21(id + vec2<f32>(fk * 37.0, u.seed * 91.0));
+		if (h > 0.5 + u.envCellular * 0.35) { continue; }
+		let center = vec2<f32>(h21(id + 11.7), h21(id + 23.1)) * 0.7 + 0.15;
+		let dist = length((fract(coord) - center) * cell);
+		let rWorld = cell * (0.012 + h * 0.03);
+		let footprint = tk * pixelAngle;
+		let r = max(rWorld, footprint * 0.7);
+		let cover = exp(-(dist * dist) / (r * r)) * (rWorld * rWorld) / (r * r);
+		if (cover < 0.001) { continue; }
+		let toBody = length(p - u.bodyPos);
+		let lit = 0.05 + 1.4 * u.bodyScale / (1.0 + toBody * toBody * 2.5);
+		let own = step(h, 0.04 + u.envCellular * 0.05) * (0.6 + u.treble * 1.4);
+		let light = (lightCol * lit + plankton * own) * cover * absorb(tk) * 0.5;
+		if (tk < tSplit) { glow.front = glow.front + light; } else { glow.back = glow.back + light; }
+	}
+	return glow;
+}
 
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
-	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
+// ── Environment ───────────────────────────────────────────────────────────
+fn waterColor(rd: vec3<f32>) -> vec3<f32> {
+	let up = rd.y;
+	var col = inkCol(0.028);
+	col = mix(col, inkCol(0.07), smoothstep(-0.5, 0.12, up));
+	col = mix(col, hsv(u.hueInk - 0.05, 0.62, 0.17 + u.envHorizon * 0.05), smoothstep(0.1, 0.95, up));
+	// Thermocline: a faint lit layer of water at the horizon.
+	let layer = (up - 0.04) * 10.0;
+	col = col + hsv(u.hueInk + 0.02, 0.55, 1.0) * exp(-layer * layer)
+		* (0.025 + u.envHorizon * 0.05);
+	// Distant pinnacles in the haze give the deep a sense of scale.
+	let az = atan2(rd.z, rd.x);
+	let ridge = -0.03 + vn2(vec2<f32>(az * 3.2 + u.seed * 40.0, 1.5)) * (0.05 + u.envCavern * 0.12)
+		+ vn2(vec2<f32>(az * 11.0, 4.0)) * 0.018;
+	let rock = smoothstep(ridge + 0.004, ridge - 0.004, up) * smoothstep(-0.3, -0.02, up);
+	col = mix(col, inkCol(0.03), rock * (0.55 + u.envCavern * 0.3));
+	return col;
+}
+
+fn shaftField(p: vec3<f32>) -> f32 {
+	let keyDir = normalize(vec3<f32>(0.22, 1.0, 0.14));
+	let proj = p.xz - keyDir.xz / keyDir.y * p.y;
+	let flow = vec2<f32>(u.backgroundPhase * 0.6, u.backgroundPhase * 0.25);
+	let n = vn2(proj * 0.42 + flow) * 0.7 + vn2(proj * 1.1 - flow * 1.3 + 5.0) * 0.3;
+	var s = smoothstep(0.52, 0.88, n);
+	s = s * clamp(exp((p.y - 2.4) * 0.42), 0.0, 1.0);
+	// The organism casts a soft shadow down its own light shafts.
+	let bodyProj = u.bodyPos.xz - keyDir.xz / keyDir.y * u.bodyPos.y;
+	let shadowR = u.bodyScale * 0.55;
+	let shadow = smoothstep(shadowR * 0.5, shadowR * 1.4, length(proj - bodyProj));
+	return s * mix(1.0, shadow, step(p.y, u.bodyPos.y));
+}
+
+fn shaftInscatter(ro: vec3<f32>, rd: vec3<f32>, tEnd: f32, jitter: f32) -> vec3<f32> {
+	let keyDir = normalize(vec3<f32>(0.22, 1.0, 0.14));
+	let dt = tEnd / 8.0;
+	var sum = 0.0;
+	for (var k: i32 = 0; k < 8; k += 1) {
+		let tk = (f32(k) + jitter) * dt;
+		sum = sum + shaftField(ro + rd * tk) * exp(-tk * 0.1);
+	}
+	let forward = 0.45 + 0.55 * pow(max(dot(rd, keyDir), 0.0), 3.0);
+	return hsv(u.hueInk - 0.06, 0.42, 1.0) * sum * dt * u.shaftIntensity * 0.2 * forward;
+}
+
+// Reproject a world point into last frame's feedback image.
+fn sampleHistory(world: vec3<f32>) -> vec3<f32> {
+	let v = world - u.camPos;
+	let z = dot(v, u.camFwd);
+	if (z < 0.2) { return vec3<f32>(0.0); }
+	let sx = dot(v, u.camRight) / z * u.fovScale;
+	let sy = dot(v, u.camUp) / z * u.fovScale;
+	let uv = vec2<f32>(sx * u.resY / u.resX + 0.5, 0.5 - sy);
+	let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+	if (edge < 0.0) { return vec3<f32>(0.0); }
+	let o = vec2<f32>(0.0025, 0.0);
+	let c = textureSampleLevel(historyTex, historySampler, uv, 0.0).rgb * 0.5
+		+ (textureSampleLevel(historyTex, historySampler, uv + o, 0.0).rgb
+			+ textureSampleLevel(historyTex, historySampler, uv - o, 0.0).rgb) * 0.25;
+	return c * smoothstep(0.0, 0.06, edge);
+}
+
+fn floorShade(ro: vec3<f32>, rd: vec3<f32>, t: f32) -> vec3<f32> {
+	let p = ro + rd * t;
+	let xz = p.xz;
+	let silt = vn2(xz * 1.6 + vec2<f32>(u.seed * 13.0, 3.0)) * 0.55 + vn2(xz * 4.7 + 9.0) * 0.3
+		+ vn2(xz * 13.0) * 0.15;
+	let dune = vn2(xz * vec2<f32>(0.5, 0.9) + vec2<f32>(2.0, u.seed * 5.0));
+	// The organism is the floor's light: a pool of its colour follows it.
+	let toBody = u.bodyPos - p;
+	let dist2 = dot(toBody, toBody);
+	let facing = clamp(toBody.y * inverseSqrt(dist2 + 1e-4), 0.0, 1.0);
+	let lightCol = mix(baseCol(), accentCol(), 0.35)
+		* (0.8 + u.energy * 0.7 + u.rootPulse * 0.5 + u.beatGlow * 0.2)
+		* (1.0 - u.silence * 0.6) * (1.0 - u.dormancyForm * 0.3);
+	let bio = lightCol * (0.3 + facing * 0.7) * u.bodyScale / (1.0 + dist2 * 0.9);
+	let caustic = shaftField(p) * u.shaftIntensity;
+	let albedo = mix(0.5, 1.0, silt) * (0.75 + dune * 0.5);
+	var col = albedo * (bio * 2.2 + hsv(u.hueInk - 0.04, 0.45, 1.0) * caustic * 0.45 + inkCol(0.05));
+	// Brine pools: still, heavy water that mirrors the organism.
+	let poolNoise = vn2(xz * 0.28 + vec2<f32>(u.seed * 31.0, 7.0));
+	let pool = smoothstep(0.5, 0.56, poolNoise);
+	let fres = 0.04 + 0.96 * pow(1.0 - abs(rd.y), 5.0);
+	let reflectivity = mix(0.06, 0.5, pool) * mix(0.35, 1.0, fres);
+	let reflected = vec3<f32>(rd.x, -rd.y, rd.z);
+	let mirrorPoint = p + reflected * length(u.bodyPos - p);
+	col = col * (1.0 - pool * 0.5) + sampleHistory(mirrorPoint) * reflectivity;
+	// A faint lit lip where brine meets silt.
+	let lip = smoothstep(0.47, 0.5, poolNoise) - smoothstep(0.5, 0.53, poolNoise);
+	col = col + lightCol * lip * 0.08 / (1.0 + dist2 * 0.6);
+	let haze = exp(-t * (u.fogDensity * 1.6 + 0.04));
+	return mix(waterColor(rd), col, haze);
 }
 
 @fragment
 fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let dstRes = vec2<f32>(p.dstResX, p.dstResY);
-	let uv = frag.xy / dstRes;
-	let texel = vec2<f32>(1.0 / p.srcResX, 1.0 / p.srcResY);
-	// Diagonal 4-tap (Kawase-style)
-	var c = textureSample(srcTex, samp, uv + vec2<f32>(-1.0, -1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0, -1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  1.0) * texel).rgb;
-	c = c * 0.25;
-	// Soft HDR threshold — only triggers on first level (threshold > 0).
-	if (p.threshold > 0.0) {
-		let bright = max(c.r, max(c.g, c.b));
-		let knee = max(0.0, bright - p.threshold);
-		let factor = knee / max(1e-4, bright);
-		c = c * factor;
+	let res = vec2<f32>(u.resX, u.resY);
+	let uv = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / res.y;
+	let ro = u.camPos;
+	let rd = normalize(uv.x * u.camRight + uv.y * u.camUp + u.camFwd * u.fovScale);
+	let pixelAngle = 1.0 / (res.y * u.fovScale);
+	let jitter = ign(frag.xy);
+
+	var tFloor = 1e5;
+	if (rd.y < -0.0001) { tFloor = (FLOOR_Y - ro.y) / rd.y; }
+	let tLimit = min(tFloor, 18.0);
+
+	// Primary march: the organism is the only distance field in the scene.
+	var t = 0.02 + jitter * 0.02;
+	var hit = false;
+	var minD = 1e5;
+	let steps = i32(clamp(u.qualitySteps, 16.0, 96.0));
+	for (var i: i32 = 0; i < 96; i += 1) {
+		if (i >= steps) { break; }
+		var d = map(ro + rd * t);
+		if (!(abs(d) < 1e10)) { d = 0.5; }
+		minD = min(minD, d);
+		if (d < 0.0011 * (1.0 + t)) { hit = true; break; }
+		t = t + d;
+		if (t > tLimit) { break; }
 	}
-	return vec4<f32>(c, 1.0);
+	let tHit = select(1e5, t, hit);
+
+	var front = Surface(vec3<f32>(0.0), 1.0);
+	var far = Surface(vec3<f32>(0.0), 1.0);
+	var tBack = 1e5;
+	if (hit) {
+		front = shadeMembrane(ro + rd * tHit, rd);
+		// Cross the membrane, then find the far wall of the bell through it.
+		var tb = tHit + 0.01 * u.bodyScale;
+		for (var i: i32 = 0; i < 14; i += 1) {
+			let d = map(ro + rd * tb);
+			if (!(abs(d) < 1e10) || d > 0.002) { break; }
+			tb = tb + max(-d, 0.006);
+		}
+		for (var i: i32 = 0; i < 28; i += 1) {
+			let d = map(ro + rd * tb);
+			if (!(abs(d) < 1e10)) { break; }
+			if (d < 0.0015 * (1.0 + tb)) { tBack = tb; break; }
+			tb = tb + d;
+			if (tb > tHit + 3.0 * u.bodyScale) { break; }
+		}
+		if (tBack < 1e4) { far = shadeMembrane(ro + rd * tBack, rd); }
+	}
+
+	let tFar = tFloor;
+	let tend = tendrils(ro, rd, pixelAngle, tHit, tFar);
+	let organ = organs(ro, rd, pixelAngle, tHit, tFar);
+	let snow = marineSnow(ro, rd, pixelAngle, tHit, tFar);
+	let glowFront = tend.front + organ.front + snow.front;
+	let glowBack = tend.back + organ.back + snow.back;
+
+	var background: vec3<f32>;
+	if (tFloor < 1e4) { background = floorShade(ro, rd, tFloor); } else { background = waterColor(rd); }
+	let shafts = shaftInscatter(ro, rd, min(tFloor, 14.0), jitter);
+
+	var col: vec3<f32>;
+	if (hit) {
+		let nearAbsorb = absorb(tHit);
+		let farAbsorb = absorb(tBack);
+		let behind = far.emission * farAbsorb + far.transmission * background + glowBack;
+		col = glowFront + front.emission * nearAbsorb + front.transmission * behind + shafts * 0.7;
+		// Water veils the subject a little with depth.
+		col = col + waterColor(rd) * (1.0 - nearAbsorb) * 0.5;
+	} else {
+		let aura = mix(baseCol(), accentCol(), 0.25) * exp(-max(minD, 0.0) / (0.05 * u.bodyScale))
+			* 0.1 * (0.6 + u.energy * 0.5) * (1.0 - u.silence * 0.6);
+		col = background + glowFront + shafts + aura;
+	}
+	// A single non-finite pixel would be smeared into a box by the bloom blur.
+	let finite = all(col == col) && all(abs(col) < vec3<f32>(1e4));
+	return vec4<f32>(select(vec3<f32>(0.0), clamp(col, vec3<f32>(0.0), vec3<f32>(64.0)), finite), 1.0);
 }
 `;
 
-	// Upsample with Kawase 4-tap and ADDITIVELY blend into destination so the
-	// smaller bloom mip contributions accumulate cleanly into the parent mip.
-	const BLOOM_UP_WGSL = /* wgsl */ `
-struct BloomParams {
-	srcResX: f32,
-	srcResY: f32,
-	dstResX: f32,
-	dstResY: f32,
-	threshold: f32,
-	intensity: f32,
-	_pad1: f32,
-	_pad2: f32,
+	const FULLSCREEN_WGSL = /* wgsl */ `
+struct FullscreenOut {
+	@builtin(position) position: vec4<f32>,
+	@location(0) uv: vec2<f32>,
 };
-
-@group(0) @binding(0) var<uniform> p: BloomParams;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var srcTex: texture_2d<f32>;
 
 @vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
+fn vs_main(@builtin(vertex_index) index: u32) -> FullscreenOut {
+	var positions = array<vec2<f32>, 3>(
+		vec2<f32>(-1.0, -1.0),
+		vec2<f32>( 3.0, -1.0),
+		vec2<f32>(-1.0,  3.0)
 	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let dstRes = vec2<f32>(p.dstResX, p.dstResY);
-	let uv = frag.xy / dstRes;
-	let texel = vec2<f32>(1.0 / p.srcResX, 1.0 / p.srcResY);
-	// Five-tap tent blur. The scene's temporal accumulation supplies the soft
-	// tail, so four diagonal reads per mip were redundant bandwidth.
-	var c = textureSample(srcTex, samp, uv).rgb * 0.4;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  0.0) * texel).rgb * 0.15;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  0.0) * texel).rgb * 0.15;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0, -1.0) * texel).rgb * 0.15;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 0.0,  1.0) * texel).rgb * 0.15;
-	return vec4<f32>(c * p.intensity, 1.0);
+	let point = positions[index];
+	var out: FullscreenOut;
+	out.position = vec4<f32>(point, 0.0, 1.0);
+	out.uv = vec2<f32>(point.x * 0.5 + 0.5, 1.0 - (point.y * 0.5 + 0.5));
+	return out;
 }
 `;
 
-	// ──────────────────────────────────────────────────────────────────────────
-	// HDR composite — merges scene + bloom with previous frame's composite for
-	// temporal motion blur. Stays in linear HDR; tone-map happens later in the
-	// present pass so we don't double-ACES.
-	// ──────────────────────────────────────────────────────────────────────────
-	const COMPOSITE_WGSL = /* wgsl */ `
-struct Uniforms {
-	resolutionX: f32,
-	resolutionY: f32,
-	time: f32,
-	bass: f32,
-	mid: f32,
-	treble: f32,
-	centroid: f32,
-	rms: f32,
-	flash: f32,
-	bpmNorm: f32,
-	chromaX: f32,
-	chromaY: f32,
-	chromaStrength: f32,
-	camPosX: f32,
-	camPosY: f32,
-	camPosZ: f32,
-	camFwdX: f32,
-	camFwdY: f32,
-	camFwdZ: f32,
-	camRightX: f32,
-	camRightY: f32,
-	camRightZ: f32,
-	camUpX: f32,
-	camUpY: f32,
-	camUpZ: f32,
-	fovScale: f32,
-	mandelbulbPower: f32,
-	paletteOffset: f32,
-	fogDensity: f32,
-	lightShaftIntensity: f32,
-	_pad0: f32,
-	_pad1: f32,
-	paletteFamily: f32,
-	surfaceImpact: f32,
-	openness: f32,
-	journeyPhase: f32,
-	backgroundPhase: f32,
-	postureYaw: f32,
-	posturePitch: f32,
-	suspense: f32,
-};
+	const POST_COMMON_WGSL = /* wgsl */ `
+${UNIFORMS_WGSL}
+${SHARED_WGSL}
+${FULLSCREEN_WGSL}
+`;
+
+	// Temporal feedback: last frame, nudged a hair upward and outward, decays
+	// and is max-blended with the new scene so the organism leaves a luminous
+	// wake without accumulating to white.
+	const FEEDBACK_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var sceneTex: texture_2d<f32>;
-@group(0) @binding(3) var bloomTex: texture_2d<f32>;
-@group(0) @binding(4) var prevTex: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
-	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
-}
+@group(0) @binding(3) var previousTex: texture_2d<f32>;
 
 @fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = frag.xy / res;
-	// Linear-domain merge: scene + bloom + prev frame for temporal motion blur.
-	let scene = textureSample(sceneTex, samp, uv).rgb;
-	let bloom = textureSample(bloomTex, samp, uv).rgb;
-	let prev = textureSample(prevTex, samp, uv).rgb;
-	let current = scene + bloom * 0.55;
-	// Five percent continuity softens raymarch shimmer without holding an old
-	// lighting arrangement over a new perspective.
-	let blended = mix(current, prev, 0.05);
-	return vec4<f32>(blended, 1.0);
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let centered = in.uv - 0.5;
+	let previousUv = centered * u.feedbackZoom + 0.5 + vec2<f32>(0.0, 0.0006);
+	let edge = min(min(previousUv.x, previousUv.y), min(1.0 - previousUv.x, 1.0 - previousUv.y));
+	let border = smoothstep(0.0, 0.03, edge);
+	// The trail diffuses a little every frame, so a moving bell leaves a soft
+	// luminous wake instead of crisp onion-skin copies of its canals.
+	let px = 1.6 / max(vec2<f32>(u.resX, u.resY), vec2<f32>(1.0));
+	let previous = textureSampleLevel(previousTex, samp, previousUv, 0.0).rgb * 0.36
+		+ (textureSampleLevel(previousTex, samp, previousUv + vec2<f32>(px.x, 0.0), 0.0).rgb
+			+ textureSampleLevel(previousTex, samp, previousUv - vec2<f32>(px.x, 0.0), 0.0).rgb
+			+ textureSampleLevel(previousTex, samp, previousUv + vec2<f32>(0.0, px.y), 0.0).rgb
+			+ textureSampleLevel(previousTex, samp, previousUv - vec2<f32>(0.0, px.y), 0.0).rgb) * 0.16;
+	let scene = textureSampleLevel(sceneTex, samp, in.uv, 0.0).rgb;
+	return vec4<f32>(max(previous * u.feedbackFade * border, scene), 1.0);
 }
 `;
 
-	// ──────────────────────────────────────────────────────────────────────────
-	// Present pass — tone-map + stable dither.
-	// Reads the temporally-blended HDR composite and outputs sRGB to the swap
-	// chain. Doing tone-map here (not in composite) keeps temporal blend linear.
-	// ──────────────────────────────────────────────────────────────────────────
-	const PRESENT_WGSL = /* wgsl */ `
-struct Uniforms {
-	resolutionX: f32,
-	resolutionY: f32,
-	time: f32,
-	bass: f32,
-	mid: f32,
-	treble: f32,
-	centroid: f32,
-	rms: f32,
-	flash: f32,
-	bpmNorm: f32,
-	chromaX: f32,
-	chromaY: f32,
-	chromaStrength: f32,
-	camPosX: f32,
-	camPosY: f32,
-	camPosZ: f32,
-	camFwdX: f32,
-	camFwdY: f32,
-	camFwdZ: f32,
-	camRightX: f32,
-	camRightY: f32,
-	camRightZ: f32,
-	camUpX: f32,
-	camUpY: f32,
-	camUpZ: f32,
-	fovScale: f32,
-	mandelbulbPower: f32,
-	paletteOffset: f32,
-	fogDensity: f32,
-	lightShaftIntensity: f32,
-	_pad0: f32,
-	_pad1: f32,
-	paletteFamily: f32,
-	surfaceImpact: f32,
-	openness: f32,
-	journeyPhase: f32,
-	backgroundPhase: f32,
-	postureYaw: f32,
-	posturePitch: f32,
-	suspense: f32,
-};
+	// Bloom prefilter: half resolution with a soft HDR knee so only emissive
+	// cores, packets and membrane edges bloom, never the water.
+	const BLOOM_DOWN_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var compositeTex: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0)
-	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
-}
-
-// AgX tone-map (Troy Sobotka). Preserves saturation in bright hues better
-// than the cheap ACES approximation — gold cores stay gold instead of
-// bleaching to white.
-fn agx(c: vec3<f32>) -> vec3<f32> {
-	let m = mat3x3<f32>(
-		0.842479062253094, 0.0423282422610123, 0.0423756549057051,
-		0.0784335999999992, 0.878468636469772, 0.0784336,
-		0.0792237451477643, 0.0791661274605434, 0.879142973793104
-	);
-	let x = m * c;
-	let lo = vec3<f32>(0.0001);
-	let mapped = clamp((log2(max(x, lo)) + 12.47393) / (12.47393 + 4.026069), vec3<f32>(0.0), vec3<f32>(1.0));
-	let m2 = mapped * mapped;
-	let m4 = m2 * m2;
-	return -17.86 * m4 * m2 + 78.01 * m4 * mapped - 126.7 * m4 + 92.06 * m2 * mapped - 28.72 * m2 + 4.361 * mapped - vec3<f32>(0.1718);
-}
-
-// IGN — Jorge Jimenez interleaved gradient noise, used only as stable
-// pre-quantization dither. It no longer changes every frame like film static.
-fn ign(pixel: vec2<f32>) -> f32 {
-	let m = vec3<f32>(0.06711056, 0.00583715, 52.9829189);
-	return fract(m.z * fract(dot(pixel, m.xy)));
-}
+@group(0) @binding(2) var sourceTex: texture_2d<f32>;
 
 @fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = frag.xy / res;
-	let texel = vec2<f32>(1.0 / res.x, 1.0 / res.y);
-	let center = textureSample(compositeTex, samp, uv).rgb;
-	let north = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, -texel.y)).rgb;
-	let south = textureSample(compositeTex, samp, uv + vec2<f32>(0.0, texel.y)).rgb;
-	let east = textureSample(compositeTex, samp, uv + vec2<f32>(texel.x, 0.0)).rgb;
-	let west = textureSample(compositeTex, samp, uv + vec2<f32>(-texel.x, 0.0)).rgb;
-	let lumaWeights = vec3<f32>(0.2126, 0.7152, 0.0722);
-	let centerLuma = dot(center, lumaWeights);
-	let northLuma = dot(north, lumaWeights);
-	let southLuma = dot(south, lumaWeights);
-	let eastLuma = dot(east, lumaWeights);
-	let westLuma = dot(west, lumaWeights);
-	let minLuma = min(centerLuma, min(min(northLuma, southLuma), min(eastLuma, westLuma)));
-	let maxLuma = max(centerLuma, max(max(northLuma, southLuma), max(eastLuma, westLuma)));
-	let contrast = maxLuma - minLuma;
-	let localAverage = (north + south + east + west) * 0.25;
-	let localLuma = dot(localAverage, lumaWeights);
-	let threshold = 0.006 + maxLuma * 0.075;
-	let isolatedEdge = clamp(
-		abs(centerLuma - localLuma) / max(contrast, 0.0001),
-		0.0,
-		1.0
-	);
-	let edgeBlend = smoothstep(threshold, threshold * 2.6, contrast) * isolatedEdge * 0.34;
-	var col = mix(center, localAverage, edgeBlend);
-
-	col = agx(col);
-	// Black-point lift + micro-contrast so the deep volumetric blacks don't
-	// read as flat. AgX is gentler than ACES so blacks need a little help.
-	col = max(col - vec3<f32>(0.018), vec3<f32>(0.0));
-	col = pow(col, vec3<f32>(1.06));
-
-	// Pre-quantization dither — kills 8-bit banding in volumetric gradients.
-	col = col + vec3<f32>((ign(frag.xy + vec2<f32>(33.0, 71.0)) - 0.5) / 255.0);
-
-	return vec4<f32>(col, 1.0);
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let texel = 1.0 / max(vec2<f32>(u.resX, u.resY), vec2<f32>(1.0));
+	var color = textureSampleLevel(sourceTex, samp, in.uv + vec2<f32>(-1.0, -1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTex, samp, in.uv + vec2<f32>( 1.0, -1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTex, samp, in.uv + vec2<f32>(-1.0,  1.0) * texel, 0.0).rgb;
+	color = color + textureSampleLevel(sourceTex, samp, in.uv + vec2<f32>( 1.0,  1.0) * texel, 0.0).rgb;
+	color = color * 0.25;
+	let bright = max(color.r, max(color.g, color.b));
+	let knee = max(0.0, bright - u.bloomThreshold);
+	return vec4<f32>(color * (knee / max(1e-4, bright)), 1.0);
 }
 `;
 
-	// Bloom param uniform layout — 8 f32s = 32 bytes (×3 mips, down + up).
-	const BLOOM_PARAM_FLOATS = 8;
-	const BLOOM_PARAM_BYTES = BLOOM_PARAM_FLOATS * 4;
-	const BLOOM_LEVELS = 3;
+	function blurShader(directionX: number, directionY: number) {
+		return /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var sourceTex: texture_2d<f32>;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let texel = 3.2 / max(vec2<f32>(u.resX, u.resY), vec2<f32>(1.0));
+	let direction = vec2<f32>(${directionX.toFixed(1)}, ${directionY.toFixed(1)}) * texel;
+	var color = textureSampleLevel(sourceTex, samp, in.uv, 0.0).rgb * 0.227027;
+	color = color + (textureSampleLevel(sourceTex, samp, in.uv + direction, 0.0).rgb
+		+ textureSampleLevel(sourceTex, samp, in.uv - direction, 0.0).rgb) * 0.1945946;
+	color = color + (textureSampleLevel(sourceTex, samp, in.uv + direction * 2.0, 0.0).rgb
+		+ textureSampleLevel(sourceTex, samp, in.uv - direction * 2.0, 0.0).rgb) * 0.1216216;
+	color = color + (textureSampleLevel(sourceTex, samp, in.uv + direction * 3.0, 0.0).rgb
+		+ textureSampleLevel(sourceTex, samp, in.uv - direction * 3.0, 0.0).rgb) * 0.054054;
+	color = color + (textureSampleLevel(sourceTex, samp, in.uv + direction * 4.0, 0.0).rgb
+		+ textureSampleLevel(sourceTex, samp, in.uv - direction * 4.0, 0.0).rgb) * 0.016216;
+	return vec4<f32>(color, 1.0);
+}
+`;
+	}
+
+	const BLUR_H_WGSL = blurShader(1, 0);
+	const BLUR_V_WGSL = blurShader(0, 1);
+
+	// Composite: barrel lens with chromatic aberration that grows toward the
+	// edges and flares on impacts, bloom as an accent, vignette, ACES, a gentle
+	// S-curve that keeps the ink tones, and interleaved-gradient dither.
+	const COMPOSITE_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var feedbackTex: texture_2d<f32>;
+@group(0) @binding(3) var bloomTex: texture_2d<f32>;
+
+fn aces(color: vec3<f32>) -> vec3<f32> {
+	let a = 2.51;
+	let b = 0.03;
+	let c = 2.43;
+	let d = 0.59;
+	let e = 0.14;
+	return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let resolution = vec2<f32>(u.resX, u.resY);
+	let centered = in.uv - 0.5;
+	let r2 = dot(centered, centered);
+	let warped = 0.5 + centered * (1.0 + r2 * 0.045);
+	let caAmount = (0.0009 + r2 * 0.0075) * u.aberration;
+	let direction = normalize(centered + vec2<f32>(1e-4, 1e-4));
+	let scene = vec3<f32>(
+		textureSampleLevel(feedbackTex, samp, warped + direction * caAmount, 0.0).r,
+		textureSampleLevel(feedbackTex, samp, warped, 0.0).g,
+		textureSampleLevel(feedbackTex, samp, warped - direction * caAmount, 0.0).b
+	);
+	let bloom = textureSampleLevel(bloomTex, samp, warped, 0.0).rgb;
+	let aspect = resolution.x / max(resolution.y, 1.0);
+	let distance = length(centered * vec2<f32>(aspect, 1.0));
+	let vignette = 1.0 - smoothstep(0.38, 1.05, distance);
+	var color = (scene + bloom * 0.9) * (0.6 + vignette * 0.4);
+	color = aces(color * 1.05);
+	color = mix(color, color * color * (3.0 - 2.0 * color), 0.18);
+	color = color + (ign(in.uv * resolution) - 0.5) * (1.3 / 255.0);
+	return vec4<f32>(color, 1.0);
+}
+`;
 
 	const BIN_COUNT = 64;
 	const BINS_BYTES = BIN_COUNT * 4;
+
+	type SomaTargets = {
+		scene: GPUTexture;
+		sceneView: GPUTextureView;
+		/** Ping-pong HDR history for the temporal feedback trail. */
+		feedback: [GPUTexture, GPUTexture];
+		feedbackViews: [GPUTextureView, GPUTextureView];
+		/** Half-resolution bloom chain: [0] prefilter/final, [1] horizontal pass. */
+		bloom: [GPUTexture, GPUTexture];
+		bloomViews: [GPUTextureView, GPUTextureView];
+		width: number;
+		height: number;
+	};
+
+	type SomaBindGroups = {
+		/** Indexed by the parity of the history frame the scene reads. */
+		scene: [GPUBindGroup, GPUBindGroup];
+		feedback: [GPUBindGroup, GPUBindGroup];
+		/** Indexed by the parity of the frame just written. */
+		bloomDown: [GPUBindGroup, GPUBindGroup];
+		blurH: GPUBindGroup;
+		blurV: GPUBindGroup;
+		composite: [GPUBindGroup, GPUBindGroup];
+	};
 
 	type GPU = {
 		device: GPUDevice;
@@ -2058,37 +1320,19 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		sampler: GPUSampler;
 		uniformBuf: GPUBuffer;
 		uniformData: Float32Array;
-		bloomParamBuf: GPUBuffer;
-		bloomParamData: Float32Array;
-		// Spectrum storage sampled directly by the raymarched surface.
+		// Spectrum storage sampled directly by the raymarched membrane.
 		binsBuf: GPUBuffer;
-		binsData: Float32Array;
 		pipelines: {
 			scene: GPURenderPipeline;
+			feedback: GPURenderPipeline;
 			bloomDown: GPURenderPipeline;
-			bloomUp: GPURenderPipeline;
+			blurH: GPURenderPipeline;
+			blurV: GPURenderPipeline;
 			composite: GPURenderPipeline;
-			present: GPURenderPipeline;
 		};
-		targets: {
-			scene: GPUTexture;
-			sceneView: GPUTextureView;
-			bloomMips: GPUTexture[];
-			bloomViews: GPUTextureView[];
-			bloomSizes: { w: number; h: number }[];
-			compositeAB: [GPUTexture, GPUTexture];
-			compositeViewsAB: [GPUTextureView, GPUTextureView];
-			width: number;
-			height: number;
-		} | null;
-		bindGroups: {
-			scene: GPUBindGroup;
-			composite: [GPUBindGroup, GPUBindGroup];
-			present: [GPUBindGroup, GPUBindGroup];
-			bloomDownBGs: GPUBindGroup[];
-			bloomUpBGs: GPUBindGroup[];
-		} | null;
-		frame: number;
+		targets: SomaTargets | null;
+		bindGroups: SomaBindGroups | null;
+		parity: 0 | 1;
 	};
 
 	let gpu: GPU | null = null;
@@ -2157,134 +1401,83 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		return qualityProfile;
 	}
 
-	function buildTargets(device: GPUDevice, w: number, h: number) {
-		const hdr: GPUTextureFormat = 'rgba16float';
-		const scene = device.createTexture({
-			size: { width: Math.max(1, w), height: Math.max(1, h) },
-			format: hdr,
-			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
-		});
-		// Bloom mip chain — start at 1/2, halve each level.
-		const bloomMips: GPUTexture[] = [];
-		const bloomViews: GPUTextureView[] = [];
-		const bloomSizes: { w: number; h: number }[] = [];
-		let mw = Math.max(1, Math.floor(w / 2));
-		let mh = Math.max(1, Math.floor(h / 2));
-		for (let i = 0; i < BLOOM_LEVELS; i++) {
-			const tex = device.createTexture({
-				size: { width: mw, height: mh },
-				format: hdr,
+	function buildTargets(device: GPUDevice, w: number, h: number): SomaTargets {
+		const hdr = (label: string, width: number, height: number) =>
+			device.createTexture({
+				label,
+				size: { width: Math.max(1, width), height: Math.max(1, height) },
+				format: 'rgba16float',
 				usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
 			});
-			bloomMips.push(tex);
-			bloomViews.push(tex.createView());
-			bloomSizes.push({ w: mw, h: mh });
-			mw = Math.max(1, Math.floor(mw / 2));
-			mh = Math.max(1, Math.floor(mh / 2));
-		}
-		// Ping-pong composite textures (full res HDR) for temporal motion blur.
-		const cA = device.createTexture({
-			size: { width: Math.max(1, w), height: Math.max(1, h) },
-			format: hdr,
-			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
-		});
-		const cB = device.createTexture({
-			size: { width: Math.max(1, w), height: Math.max(1, h) },
-			format: hdr,
-			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
-		});
+		const scene = hdr('Soma scene', w, h);
+		const feedback: [GPUTexture, GPUTexture] = [
+			hdr('Soma feedback A', w, h),
+			hdr('Soma feedback B', w, h)
+		];
+		const bloomWidth = Math.max(1, Math.floor(w / 2));
+		const bloomHeight = Math.max(1, Math.floor(h / 2));
+		const bloom: [GPUTexture, GPUTexture] = [
+			hdr('Soma bloom A', bloomWidth, bloomHeight),
+			hdr('Soma bloom B', bloomWidth, bloomHeight)
+		];
 		return {
 			scene,
 			sceneView: scene.createView(),
-			bloomMips,
-			bloomViews,
-			bloomSizes,
-			compositeAB: [cA, cB] as [GPUTexture, GPUTexture],
-			compositeViewsAB: [cA.createView(), cB.createView()] as [GPUTextureView, GPUTextureView],
+			feedback,
+			feedbackViews: [feedback[0].createView(), feedback[1].createView()],
+			bloom,
+			bloomViews: [bloom[0].createView(), bloom[1].createView()],
 			width: w,
 			height: h
 		};
 	}
 
-	function buildBindGroups(g: GPU) {
+	function buildBindGroups(g: GPU): SomaBindGroups | null {
 		if (!g.targets) return null;
-		const { device, pipelines, uniformBuf, bloomParamBuf, sampler, targets, binsBuf } = g;
-		const scene = device.createBindGroup({
-			layout: pipelines.scene.getBindGroupLayout(0),
-			entries: [
-				{ binding: 0, resource: { buffer: uniformBuf } },
-				{ binding: 1, resource: { buffer: binsBuf } }
+		const { device, pipelines, uniformBuf, sampler, targets, binsBuf } = g;
+		const uniform = { binding: 0, resource: { buffer: uniformBuf } };
+		const samplerEntry = { binding: 1, resource: sampler };
+		const bind = (pipeline: GPURenderPipeline, label: string, views: GPUTextureView[]) =>
+			device.createBindGroup({
+				label,
+				layout: pipeline.getBindGroupLayout(0),
+				entries: [
+					uniform,
+					samplerEntry,
+					...views.map((view, index) => ({ binding: 2 + index, resource: view }))
+				]
+			});
+		const sceneBind = (history: GPUTextureView, label: string) =>
+			device.createBindGroup({
+				label,
+				layout: pipelines.scene.getBindGroupLayout(0),
+				entries: [
+					{ binding: 0, resource: { buffer: uniformBuf } },
+					{ binding: 1, resource: { buffer: binsBuf } },
+					{ binding: 2, resource: sampler },
+					{ binding: 3, resource: history }
+				]
+			});
+		return {
+			scene: [
+				sceneBind(targets.feedbackViews[0], 'Soma scene reads A'),
+				sceneBind(targets.feedbackViews[1], 'Soma scene reads B')
+			],
+			feedback: [
+				bind(pipelines.feedback, 'Soma feedback reads A', [targets.sceneView, targets.feedbackViews[0]]),
+				bind(pipelines.feedback, 'Soma feedback reads B', [targets.sceneView, targets.feedbackViews[1]])
+			],
+			bloomDown: [
+				bind(pipelines.bloomDown, 'Soma bloom prefilter A', [targets.feedbackViews[0]]),
+				bind(pipelines.bloomDown, 'Soma bloom prefilter B', [targets.feedbackViews[1]])
+			],
+			blurH: bind(pipelines.blurH, 'Soma bloom blur H', [targets.bloomViews[0]]),
+			blurV: bind(pipelines.blurV, 'Soma bloom blur V', [targets.bloomViews[1]]),
+			composite: [
+				bind(pipelines.composite, 'Soma composite A', [targets.feedbackViews[0], targets.bloomViews[0]]),
+				bind(pipelines.composite, 'Soma composite B', [targets.feedbackViews[1], targets.bloomViews[0]])
 			]
-		});
-		// Composite has 2 bind groups — each reads a different prevTex (the
-		// other ping-pong texture). Output target alternates each frame.
-		const composite: [GPUBindGroup, GPUBindGroup] = [0, 1].map((i) =>
-			device.createBindGroup({
-				layout: pipelines.composite.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: targets.sceneView },
-					{ binding: 3, resource: targets.bloomViews[0] },
-					{ binding: 4, resource: targets.compositeViewsAB[i] }
-				]
-			})
-		) as [GPUBindGroup, GPUBindGroup];
-		// Present has 2 bind groups so it can read the current composite ping-pong
-		// slot without any separate screen-space overlay textures.
-		const present: [GPUBindGroup, GPUBindGroup] = [0, 1].map((i) =>
-			device.createBindGroup({
-				layout: pipelines.present.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: targets.compositeViewsAB[i] }
-				]
-			})
-		) as [GPUBindGroup, GPUBindGroup];
-		// Bloom downsample bind groups: source for level i is sceneTex (i=0) or
-		// bloomMip[i-1]. Each has a dedicated uniform-buffer slice for params.
-		const bloomDownBGs: GPUBindGroup[] = [];
-		for (let i = 0; i < BLOOM_LEVELS; i++) {
-			const src = i === 0 ? targets.sceneView : targets.bloomViews[i - 1];
-			bloomDownBGs.push(
-				device.createBindGroup({
-					layout: pipelines.bloomDown.getBindGroupLayout(0),
-					entries: [
-						{
-							binding: 0,
-							resource: { buffer: bloomParamBuf, offset: i * 256, size: BLOOM_PARAM_BYTES }
-						},
-						{ binding: 1, resource: sampler },
-						{ binding: 2, resource: src }
-					]
-				})
-			);
-		}
-		// Bloom upsample bind groups: src=mip[i+1], dst=mip[i]. Param slices
-		// begin immediately after the three downsample slices.
-		const bloomUpBGs: GPUBindGroup[] = [];
-		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
-			const srcLevel = BLOOM_LEVELS - 1 - i;
-			bloomUpBGs.push(
-				device.createBindGroup({
-					layout: pipelines.bloomUp.getBindGroupLayout(0),
-					entries: [
-						{
-							binding: 0,
-							resource: {
-								buffer: bloomParamBuf,
-								offset: (BLOOM_LEVELS + i) * 256,
-								size: BLOOM_PARAM_BYTES
-							}
-						},
-						{ binding: 1, resource: sampler },
-						{ binding: 2, resource: targets.bloomViews[srcLevel] }
-					]
-				})
-			);
-		}
-		return { scene, composite, present, bloomDownBGs, bloomUpBGs };
+		};
 	}
 
 	async function initGpu(c: HTMLCanvasElement): Promise<GPU | null> {
@@ -2307,121 +1500,98 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			return null;
 		}
 		const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
-		context.configure({ device, format, alphaMode: 'opaque' });
+		let uniformBuf: GPUBuffer | null = null;
+		let binsBuf: GPUBuffer | null = null;
+		try {
+			context.configure({ device, format, alphaMode: 'opaque' });
 
-		const hdr: GPUTextureFormat = 'rgba16float';
+			const shaderModule = async (label: string, code: string) => {
+				const module = device.createShaderModule({ label, code });
+				const info = await module.getCompilationInfo?.();
+				const errors =
+					info?.messages.filter((message) => message.type === 'error').slice(0, 4) ?? [];
+				if (errors.length > 0) {
+					const details = errors
+						.map((message) => {
+							const line = message.lineNum ? `:${message.lineNum}:${message.linePos}` : '';
+							return `${label}${line} ${message.message}`;
+						})
+						.join(' | ');
+					throw new Error(`Soma shader failed to compile: ${details}`);
+				}
+				return module;
+			};
 
-		const shaderModule = async (label: string, code: string) => {
-			const module = device.createShaderModule({ label, code });
-			const info = await module.getCompilationInfo?.();
-			const errors =
-				info?.messages.filter((message) => message.type === 'error').slice(0, 4) ?? [];
-			if (errors.length > 0) {
-				const details = errors
-					.map((message) => {
-						const line = message.lineNum ? `:${message.lineNum}:${message.linePos}` : '';
-						return `${label}${line} ${message.message}`;
-					})
-					.join(' | ');
-				throw new Error(`Soma shader failed to compile: ${details}`);
+			const mkPipeline = async (label: string, code: string, target: GPUTextureFormat) => {
+				const module = await shaderModule(label, code);
+				return device.createRenderPipelineAsync({
+					label,
+					layout: 'auto',
+					vertex: { module, entryPoint: 'vs_main' },
+					fragment: { module, entryPoint: 'fs_main', targets: [{ format: target }] },
+					primitive: { topology: 'triangle-list' }
+				});
+			};
+
+			const hdr: GPUTextureFormat = 'rgba16float';
+			const [scene, feedback, bloomDown, blurH, blurV, composite] = await Promise.all([
+				mkPipeline('Soma abyss scene', SCENE_WGSL, hdr),
+				mkPipeline('Soma feedback', FEEDBACK_WGSL, hdr),
+				mkPipeline('Soma bloom prefilter', BLOOM_DOWN_WGSL, hdr),
+				mkPipeline('Soma bloom blur H', BLUR_H_WGSL, hdr),
+				mkPipeline('Soma bloom blur V', BLUR_V_WGSL, hdr),
+				mkPipeline('Soma composite', COMPOSITE_WGSL, format)
+			]);
+
+			uniformBuf = device.createBuffer({
+				size: UNIFORM_BYTES,
+				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+			});
+			binsBuf = device.createBuffer({
+				size: BINS_BYTES,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
+
+			return {
+				device,
+				context,
+				format,
+				sampler: device.createSampler({
+					magFilter: 'linear',
+					minFilter: 'linear',
+					addressModeU: 'clamp-to-edge',
+					addressModeV: 'clamp-to-edge'
+				}),
+				uniformBuf,
+				uniformData: new Float32Array(UNIFORM_FLOATS),
+				binsBuf,
+				pipelines: { scene, feedback, bloomDown, blurH, blurV, composite },
+				targets: null,
+				bindGroups: null,
+				parity: 0
+			};
+		} catch (error) {
+			uniformBuf?.destroy();
+			binsBuf?.destroy();
+			try {
+				context.unconfigure();
+			} catch {
+				// A failed configure may also make unconfigure unavailable.
 			}
-			return module;
-		};
-
-		const mkPipeline = async (label: string, code: string, target: GPUTextureFormat) => {
-			const module = await shaderModule(label, code);
-			return device.createRenderPipeline({
-				layout: 'auto',
-				vertex: { module, entryPoint: 'vs_main' },
-				fragment: { module, entryPoint: 'fs_main', targets: [{ format: target }] },
-				primitive: { topology: 'triangle-list' }
-			});
-		};
-
-		// Bloom upsample uses additive blend so each mip's contribution accumulates
-		// cleanly into the parent. Downsample uses replace.
-		const mkUpsamplePipeline = async (label: string, code: string) => {
-			const module = await shaderModule(label, code);
-			return device.createRenderPipeline({
-				layout: 'auto',
-				vertex: { module, entryPoint: 'vs_main' },
-				fragment: {
-					module,
-					entryPoint: 'fs_main',
-					targets: [
-						{
-							format: hdr,
-							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
-							}
-						}
-					]
-				},
-				primitive: { topology: 'triangle-list' }
-			});
-		};
-
-		const pipelines = {
-			scene: await mkPipeline('Soma scene shader', SCENE_WGSL, hdr),
-			bloomDown: await mkPipeline('Soma bloom-down shader', BLOOM_DOWN_WGSL, hdr),
-			bloomUp: await mkUpsamplePipeline('Soma bloom-up shader', BLOOM_UP_WGSL),
-			composite: await mkPipeline('Soma composite shader', COMPOSITE_WGSL, hdr),
-			present: await mkPipeline('Soma present shader', PRESENT_WGSL, format)
-		};
-
-		const sampler = device.createSampler({
-			magFilter: 'linear',
-			minFilter: 'linear',
-			addressModeU: 'clamp-to-edge',
-			addressModeV: 'clamp-to-edge'
-		});
-
-		const uniformBuf = device.createBuffer({
-			size: UNIFORM_BYTES,
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-		});
-
-		const bloomParamBuf = device.createBuffer({
-			size: 256 * (BLOOM_LEVELS * 2 - 1),
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-		});
-
-		// Spectrum storage remains part of the scene pipeline: the raymarched
-		// surface maps vertical regions to individual FFT bins.
-		const binsBuf = device.createBuffer({
-			size: BINS_BYTES,
-			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-		});
-
-		return {
-			device,
-			context,
-			format,
-			sampler,
-			uniformBuf,
-			uniformData: new Float32Array(UNIFORM_FLOATS),
-			bloomParamBuf,
-			bloomParamData: new Float32Array(BLOOM_PARAM_FLOATS),
-			binsBuf,
-			binsData: new Float32Array(BIN_COUNT),
-			pipelines,
-			targets: null,
-			bindGroups: null,
-			frame: 0
-		};
+			device.destroy?.();
+			throw error;
+		}
 	}
 
 	function discardTargets(g: GPU) {
 		if (g.targets) {
 			g.targets.scene.destroy();
-			for (const t of g.targets.bloomMips) t.destroy();
-			g.targets.compositeAB[0].destroy();
-			g.targets.compositeAB[1].destroy();
+			for (const texture of g.targets.feedback) texture.destroy();
+			for (const texture of g.targets.bloom) texture.destroy();
 		}
 		g.targets = null;
 		g.bindGroups = null;
-		g.frame = 0;
+		g.parity = 0;
 	}
 
 	function ensureTargets(g: GPU, w: number, h: number) {
@@ -2429,14 +1599,20 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		discardTargets(g);
 		g.targets = buildTargets(g.device, w, h);
 		g.bindGroups = buildBindGroups(g);
+		// Fresh history: never warp a stale or differently-sized trail.
+		feedbackResetFrames = 2;
 	}
 
 	function destroyGpuResources(g: GPU) {
 		try {
 			discardTargets(g);
 			g.uniformBuf.destroy();
-			g.bloomParamBuf.destroy();
 			g.binsBuf.destroy();
+			try {
+				g.context.unconfigure();
+			} catch {
+				// The device may already be lost.
+			}
 			g.device.destroy?.();
 		} catch {}
 	}
@@ -2463,6 +1639,22 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		const doomed = gpu;
 		gpu = null;
 		destroyGpuResources(doomed);
+	}
+
+	function normalize3(v: SomaVec3): SomaVec3 {
+		const length = Math.hypot(v[0], v[1], v[2]) || 1;
+		v[0] /= length;
+		v[1] /= length;
+		v[2] /= length;
+		return v;
+	}
+
+	function cross3(a: Readonly<SomaVec3>, b: Readonly<SomaVec3>): SomaVec3 {
+		return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+	}
+
+	function dot3(a: Readonly<SomaVec3>, b: Readonly<SomaVec3>) {
+		return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 	}
 
 	function loop(frameNow = performance.now()) {
@@ -2498,6 +1690,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			: refreshIntervalMs * activeFrameStride;
 		lastRenderedAt = frameNow;
 		const frameDt = Math.min(1, Math.max(0.001, elapsedMs / 1000));
+		const motionDt = Math.min(frameDt, 0.1);
 
 		const activeQuality = updateQualityProfile(hadPreviousRender ? elapsedMs : null);
 		const { width: w, height: h } = somaBackingSize(
@@ -2515,8 +1708,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 		// Bind the current source epoch before preserving or recreating temporal
 		// targets. A track switch must never present one frame of the previous
-		// source's composite history.
-		const time = (performance.now() - t0) / 1000;
+		// source's feedback history.
 		const feat = vis.getLatest(frameNow);
 		const shared = vis.getJourney(frameNow);
 		syncRendererToJourney(shared);
@@ -2533,132 +1725,107 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			failGpuDevice(
 				targetGpu,
 				targetGeneration,
-				`Mk2 could not prepare its WebGPU render targets: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+				`Soma could not prepare its WebGPU render targets: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
 			);
 			return;
 		}
-		if (!gpu.bindGroups || !gpu.targets) {
-			return;
-		}
+		const targets = gpu.targets;
+		const bindGroups = gpu.bindGroups;
+		if (!bindGroups || !targets) return;
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
-		const signalJourney = shared.signal;
 		const journey = shared.mk2;
+		const snapAim = poseSyncRequested;
 		const pose = updateRenderPose(journey, frameDt);
 		currentSection = directed.section;
 		currentForm = dominantLifecycleForm(journey);
 		currentGesture = dominantGesture(journey);
 
-		// Time-correct renderer-side polish. The musical controller already owns
-		// the longer envelopes; this final smoothing only keeps GPU uniforms calm.
-		const frameScale = frameDt * 60;
-		const alpha = (at60Hz: number) => 1 - Math.pow(1 - at60Hz, frameScale);
-		const chromaAngle = signalJourney.key * Math.PI * 2;
 		const response = VISUALIZER_RESPONSE_PROFILES.mk2[vis.response];
-		const responseMotionTarget = response.motion;
-		const responseImpactTarget = response.impact;
-		const responseFogTarget = response.fog;
-		const responseShaftsTarget = response.shafts;
-		const baseHue = directed.palette.baseHue;
-		const hueDelta = ((directed.palette.accentHue - baseHue + 1.5) % 1) - 0.5;
-		const tonnetzBlend = mk2ContinuousPaletteBlend(signalJourney.spectrumTravel);
-		const paletteTarget =
-			baseHue + hueDelta * tonnetzBlend + (spectrum.centroid - 0.5) * 0.055;
-		const paletteTargetAngle = paletteTarget * Math.PI * 2;
-		const paletteXTarget = Math.cos(paletteTargetAngle);
-		const paletteYTarget = Math.sin(paletteTargetAngle);
+		somaPaletteRoles(directed.palette, directed.context.keyMode, paletteRoles);
+
+		// Silence: an absent or near-silent analyzer slowly dims the organism.
+		const rmsTarget = clamp(feat?.rms ?? 0, 0, 1);
+		if (!feat || rmsTarget < 0.009) smoothed.quietFor += frameDt;
+		else smoothed.quietFor = 0;
+		const silent = smoothed.quietFor > 0.45 ? 1 : 0;
+
 		if (rendererSyncRequested) {
 			smoothed.bass = spectrum.bass;
 			smoothed.mid = spectrum.mid;
 			smoothed.treble = spectrum.treble;
-			smoothed.centroidSlow = spectrum.centroid;
-			smoothed.rmsSlow = journey.macroEnergy;
-			smoothed.bpmNormSlow = signalJourney.tempo;
-			smoothed.flash = 0;
-			smoothed.staccato = 0;
-			smoothed.sustain = pose.openness;
-			smoothed.chromaXSlow = Math.cos(chromaAngle);
-			smoothed.chromaYSlow = Math.sin(chromaAngle);
-			smoothed.paletteXSlow = paletteXTarget;
-			smoothed.paletteYSlow = paletteYTarget;
-			smoothed.responseMotion = responseMotionTarget;
-			smoothed.responseImpact = responseImpactTarget;
-			smoothed.responseFog = responseFogTarget;
-			smoothed.responseShafts = responseShaftsTarget;
+			smoothed.energy = journey.macroEnergy;
+			smoothed.impact = 0;
+			smoothed.rootPulse = 0;
+			smoothed.rms = rmsTarget;
+			smoothed.silence = feat ? 0 : 1;
+			smoothed.beatGlow = 0;
+			smoothed.responseMotion = response.motion;
+			smoothed.responseImpact = response.impact;
+			smoothed.responseFog = response.fog;
+			smoothed.responseShafts = response.shafts;
+			Object.assign(renderRoles, paletteRoles);
+			for (let index = 0; index < BIN_COUNT; index += 1) {
+				renderDetailBins[index] = spectrum.detailBins[index] ?? 0;
+			}
 			rendererSyncRequested = false;
 		} else {
-			smoothed.bass = lerp(smoothed.bass, spectrum.bass, alpha(0.12));
-			smoothed.mid = lerp(smoothed.mid, spectrum.mid, alpha(0.09));
-			smoothed.treble = lerp(smoothed.treble, spectrum.treble, alpha(0.15));
-			smoothed.centroidSlow = lerp(smoothed.centroidSlow, spectrum.centroid, alpha(0.025));
-			smoothed.rmsSlow = lerp(smoothed.rmsSlow, journey.macroEnergy, alpha(0.012));
-			smoothed.bpmNormSlow = lerp(smoothed.bpmNormSlow, signalJourney.tempo, alpha(0.02));
-			smoothed.flash = lerp(smoothed.flash, journey.impact, alpha(0.32));
-			smoothed.staccato = lerp(smoothed.staccato, journey.impact, alpha(0.38));
-			smoothed.sustain = lerp(smoothed.sustain, pose.openness, alpha(0.035));
-			smoothed.chromaXSlow = lerp(smoothed.chromaXSlow, Math.cos(chromaAngle), alpha(0.025));
-			smoothed.chromaYSlow = lerp(smoothed.chromaYSlow, Math.sin(chromaAngle), alpha(0.025));
-			const paletteX = lerp(smoothed.paletteXSlow, paletteXTarget, alpha(0.0045));
-			const paletteY = lerp(smoothed.paletteYSlow, paletteYTarget, alpha(0.0045));
-			const paletteLength = Math.hypot(paletteX, paletteY);
-			if (paletteLength > 0.001) {
-				smoothed.paletteXSlow = paletteX / paletteLength;
-				smoothed.paletteYSlow = paletteY / paletteLength;
-			} else {
-				smoothed.paletteXSlow = paletteXTarget;
-				smoothed.paletteYSlow = paletteYTarget;
+			smoothed.bass = approach(smoothed.bass, spectrum.bass, 7, frameDt);
+			smoothed.mid = approach(smoothed.mid, spectrum.mid, 4, frameDt);
+			smoothed.treble = approach(smoothed.treble, spectrum.treble, 9, frameDt);
+			smoothed.energy = approach(smoothed.energy, journey.macroEnergy, 1.2, frameDt);
+			smoothed.impact = approach(smoothed.impact, journey.impact, 18, frameDt);
+			smoothed.rootPulse = approach(smoothed.rootPulse, journey.rootPulse, 16, frameDt);
+			smoothed.rms = approach(smoothed.rms, rmsTarget, rmsTarget > smoothed.rms ? 17 : 6, frameDt);
+			smoothed.silence = approach(smoothed.silence, silent, silent ? 3 : 10, frameDt);
+			// Response changes are instrument gestures: glide them in.
+			smoothed.responseMotion = approach(smoothed.responseMotion, response.motion, 2.7, frameDt);
+			smoothed.responseImpact = approach(smoothed.responseImpact, response.impact, 4.2, frameDt);
+			smoothed.responseFog = approach(smoothed.responseFog, response.fog, 2.4, frameDt);
+			smoothed.responseShafts = approach(smoothed.responseShafts, response.shafts, 2.4, frameDt);
+			renderRoles.base = approachHue(renderRoles.base, paletteRoles.base, 1.6, frameDt);
+			renderRoles.accent = approachHue(renderRoles.accent, paletteRoles.accent, 1.6, frameDt);
+			renderRoles.rim = approachHue(renderRoles.rim, paletteRoles.rim, 1.6, frameDt);
+			renderRoles.ink = approachHue(renderRoles.ink, paletteRoles.ink, 0.8, frameDt);
+			renderRoles.saturation = approach(renderRoles.saturation, paletteRoles.saturation, 1.6, frameDt);
+			const detailMix = 1 - Math.exp(-frameDt / 0.06);
+			for (let index = 0; index < BIN_COUNT; index += 1) {
+				renderDetailBins[index] +=
+					((spectrum.detailBins[index] ?? 0) - renderDetailBins[index]) * detailMix;
 			}
-			// Response changes are instrument gestures, not edits to the camera cut.
-			// Glide them onto the renderer so changing modes cannot dolly-jump Soma.
-			smoothed.responseMotion = lerp(smoothed.responseMotion, responseMotionTarget, alpha(0.045));
-			smoothed.responseImpact = lerp(smoothed.responseImpact, responseImpactTarget, alpha(0.07));
-			smoothed.responseFog = lerp(smoothed.responseFog, responseFogTarget, alpha(0.04));
-			smoothed.responseShafts = lerp(smoothed.responseShafts, responseShaftsTarget, alpha(0.04));
 		}
 
-		const growth = pose.growth;
-		const tension = pose.tension;
-		const mandelbulbPower = Math.max(
-			6.15,
-			Math.min(
-				8.45,
-				7.05 +
-					pose.topologyBias * 1.15 +
-					pose.styleLowHighTilt * 0.38 +
-					(pose.styleTonality - 0.5) * 0.24 +
-					(pose.materialMineral - pose.materialMembrane) * 0.22 +
-					(pose.gestureCoil - pose.gestureDivide) * 0.18
-			)
+		// Song-time beat conveyor: integrated from tempo, gently pulled to the
+		// director's phrase anchor so seeks snap and live drift never accumulates.
+		const clock = directed.clock;
+		const bpmTarget = clamp(clock.tempoBpm || 0, 0, 220);
+		renderBpm = approach(renderBpm, bpmTarget >= 30 ? bpmTarget : 120, 2, frameDt);
+		if (feat && smoothed.silence < 0.5) renderBeats += (motionDt * renderBpm) / 60;
+		const anchor = beatAnchor(clock);
+		if (feat && anchor !== null) {
+			const diff = anchor - renderBeats;
+			if (Math.abs(diff) > BEATS_PER_PHRASE * 0.75) renderBeats = anchor;
+			else renderBeats += diff * (1 - Math.exp(-motionDt / 0.45));
+		}
+		smoothed.beatGlow = approach(
+			smoothed.beatGlow,
+			feat ? Math.exp(-clamp(clock.beatPhase, 0, 1) * 5) : 0,
+			30,
+			frameDt
 		);
-		const paletteOffset =
-			((Math.atan2(smoothed.paletteYSlow, smoothed.paletteXSlow) / (Math.PI * 2)) % 1 + 1) % 1;
-		const paletteFamily = Math.min(7, Math.floor(mk2SongSeed * 8));
-		const paletteFamilyB = mk2SecondaryPaletteFamily;
-		const paletteFamilyBlend = Math.max(
-			0.04,
-			Math.min(
-				0.3,
-				0.055 +
-					Math.abs(hueDelta) * 0.16 +
-					pose.materialIridescence * 0.12 +
-					directed.context.keyConfidence * 0.055
-			)
-		);
+
 		const responseMotion = smoothed.responseMotion;
 		const responseImpact = smoothed.responseImpact;
-		const fogDensity = Math.max(
-			0.032,
-			Math.min(0.088, pose.fogDensity * smoothed.responseFog)
-		);
-		const lightShaftIntensity = Math.max(
-			0.18,
-			Math.min(0.8, pose.shaftIntensity * smoothed.responseShafts)
-		);
-		const responseShotZoom = 1 + (pose.shotZoom - 1) * responseMotion;
-		const shotZoom = Math.max(0.9, Math.min(1.72, responseShotZoom));
-		const closeStudy = Math.max(0, Math.min(1, pose.closeStudy * responseMotion));
-		const detailFocus = Math.max(0, Math.min(1, pose.detailFocus * responseMotion));
+		const energy = clamp(smoothed.energy * 0.8 + smoothed.rms * 0.2, 0, 1);
+		const impact = clamp(smoothed.impact * responseImpact, 0, 1);
+		const fogDensity = clamp(pose.fogDensity * smoothed.responseFog, 0.03, 0.1);
+		const shaftIntensity = clamp(pose.shaftIntensity * smoothed.responseShafts, 0.15, 0.85);
+
+		// ── Held camera shot (phrase rails), as before.
+		const shotZoom = clamp(1 + (pose.shotZoom - 1) * responseMotion, 0.9, 1.72);
+		const closeStudy = clamp(pose.closeStudy * responseMotion, 0, 1);
+		const detailFocus = clamp(pose.detailFocus * responseMotion, 0, 1);
 		const zoomDelta = shotZoom - 1;
 		let cameraOrbit = Math.pow(Math.max(0, pose.cameraOrbit), 1.75);
 		let cameraProfile = Math.pow(Math.max(0, pose.cameraProfile), 1.75);
@@ -2674,37 +1841,18 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		cameraOverhead /= cameraWeightSum;
 		cameraLow /= cameraWeightSum;
 		cameraMacro /= cameraWeightSum;
-		const macroStudyRamp = Math.max(0, Math.min(1, (closeStudy - 0.34) / 0.5));
-		const intentionalMacro = Math.max(
-			0,
-			Math.min(1, cameraMacro * macroStudyRamp * (0.74 + detailFocus * 0.26))
-		);
+		const macroStudyRamp = clamp((closeStudy - 0.34) / 0.5, 0, 1);
+		const intentionalMacro = clamp(cameraMacro * macroStudyRamp * (0.74 + detailFocus * 0.26), 0, 1);
 		const effectiveZoomDelta = zoomDelta * (0.5 + intentionalMacro * 0.5);
-		// Combine a safe dolly with a mild optical push. Even at the closest
-		// elected study the camera remains outside the organism's scene bound.
-		const dollyScale = 1 / (1 + effectiveZoomDelta * 0.32);
+		const dollyScale = 1 / (1 + effectiveZoomDelta * 0.3);
 		const shotLens =
-			cameraOrbit * 0.86 +
-			cameraProfile * 0.96 +
-			cameraOverhead * 0.88 +
-			cameraLow * 0.82 +
+			cameraOrbit * 0.98 +
+			cameraProfile * 1.06 +
+			cameraOverhead * 1.0 +
+			cameraLow * 0.94 +
 			cameraMacro * 1.24;
-		const requestedFovScale =
-			(shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
-		const subjectExtent =
-			1 + pose.axialStretch * 0.28 + pose.filamentReach * 0.09 + pose.lobeSplit * 0.07;
-		const fovScale =
-			requestedFovScale /
-			(1 + (subjectExtent - 1) * (1 - intentionalMacro * 0.72));
+		const fovScale = (shotLens + mk2SongSeed * 0.08) * (1 + effectiveZoomDelta * 0.08);
 
-		// Camera composition moves only when the phrase-held shot rails change.
-		// Impacts, FFT deltas, and autonomous clocks never move the camera.
-		const sessionTargetY =
-			-0.08 +
-			(mk2SongSeed - 0.5) * 0.1 +
-			pose.axialStretch * 0.14 -
-			pose.lobeSplit * 0.025;
-		const sessionRoll = (mk2SongSeed - 0.5) * 0.14;
 		const camPosRaw = getCameraPos(
 			pose.perspectiveAzimuth,
 			pose.perspectiveElevation,
@@ -2715,318 +1863,285 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			cameraMacro
 		);
 		const cameraScale = pose.cameraDistance * dollyScale;
-		const camPos: [number, number, number] = [
+		const camPos: SomaVec3 = [
 			camPosRaw[0] * cameraScale,
-			camPosRaw[1] * cameraScale,
+			Math.max(-1.35, camPosRaw[1] * cameraScale),
 			camPosRaw[2] * cameraScale
 		];
-		// Phrase/key posture now belongs to the organism only. Applying it to the
-		// body, camera path, and camera target at once amplified tiny analysis
-		// reversals into the old ten-degree twitch-and-return motion.
-		const horizontalLength = Math.hypot(camPos[0], camPos[2]) || 1;
-		const framingRightX = camPos[2] / horizontalLength;
-		const framingRightZ = -camPos[0] / horizontalLength;
-		const framingScale = 1 - closeStudy * 0.34;
-		const camTarget: [number, number, number] = [
-			framingRightX * pose.shotFramingX * framingScale,
-			sessionTargetY + pose.shotFramingY * framingScale,
-			framingRightZ * pose.shotFramingX * framingScale
+		const horizontal = Math.hypot(camPos[0], camPos[2]) || 1;
+		const forwardH: SomaVec3 = [-camPos[0] / horizontal, 0, -camPos[2] / horizontal];
+		const rightH: SomaVec3 = [-forwardH[2], 0, forwardH[0]];
+
+		// ── Swim: the organism travels between seeded half-phrase waypoints.
+		const divide = clamp(pose.gestureDivide + pose.topologyBilateral * 0.35, 0, 1);
+		swimmer.update({
+			dt: motionDt,
+			beats: renderBeats,
+			energy,
+			motion: responseMotion,
+			reach: pose.gestureReach,
+			stillness: pose.gestureStillness,
+			bloom: pose.bloomForm,
+			dormancy: pose.dormancyForm,
+			openness: pose.openness,
+			silence: smoothed.silence,
+			right: rightH,
+			forward: forwardH
+		});
+		const bodyPos = swimmer.position;
+		const bodyScale = clamp(
+			0.9 + pose.growth * 0.22 + pose.bloomForm * 0.08 - pose.dormancyForm * 0.12 -
+				pose.seedForm * 0.08 - pose.topologyCocoon * 0.05,
+			0.7,
+			1.2
+		);
+
+		// The aim only follows the organism part of the way, so it crosses the
+		// frame; close studies follow more tightly to keep it in shot.
+		const follow = 0.14 + closeStudy * 0.45;
+		const framing = 1 - closeStudy * 0.34;
+		const aim: SomaVec3 = [
+			bodyPos[0] * follow + rightH[0] * pose.shotFramingX * framing,
+			-0.12 + (bodyPos[1] + 0.12) * follow * 0.8 + pose.shotFramingY * framing,
+			bodyPos[2] * follow + rightH[2] * pose.shotFramingX * framing
 		];
-		const fwd: [number, number, number] = [
-			camTarget[0] - camPos[0],
-			camTarget[1] - camPos[1],
-			camTarget[2] - camPos[2]
-		];
-		const fwdLen = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1;
-		fwd[0] /= fwdLen;
-		fwd[1] /= fwdLen;
-		fwd[2] /= fwdLen;
-		// cross(fwd, worldUp=(0,1,0)) = (fwd.z, 0, -fwd.x)
-		const right: [number, number, number] = [fwd[2], 0, -fwd[0]];
-		const rLen = Math.hypot(right[0], right[1], right[2]) || 1;
-		right[0] /= rLen;
-		right[1] /= rLen;
-		right[2] /= rLen;
-		// up = cross(right, fwd) — then roll around fwd by sessionRoll so the
-		// horizon line is tilted per session. Adds Dutch-angle camera identity.
-		const baseUp: [number, number, number] = [
-			right[1] * fwd[2] - right[2] * fwd[1],
-			right[2] * fwd[0] - right[0] * fwd[2],
-			right[0] * fwd[1] - right[1] * fwd[0]
-		];
+		const aimFollow = snapAim ? 1 : 1 - Math.exp(-motionDt / 0.5);
+		for (let axis = 0; axis < 3; axis += 1) {
+			cameraTarget[axis] += (aim[axis] - cameraTarget[axis]) * aimFollow;
+		}
+		const fwd = normalize3([
+			cameraTarget[0] - camPos[0],
+			cameraTarget[1] - camPos[1],
+			cameraTarget[2] - camPos[2]
+		]);
+		const right = normalize3(cross3(fwd, [0, 1, 0]));
+		const sessionRoll = (mk2SongSeed - 0.5) * 0.12;
+		const baseUp = cross3(right, fwd);
 		const cr = Math.cos(sessionRoll);
 		const sr = Math.sin(sessionRoll);
-		const camUp: [number, number, number] = [
-			baseUp[0] * cr + right[0] * sr,
-			baseUp[1] * cr + right[1] * sr,
-			baseUp[2] * cr + right[2] * sr
+		const camRight: SomaVec3 = [
+			right[0] * cr + baseUp[0] * sr,
+			right[1] * cr + baseUp[1] * sr,
+			right[2] * cr + baseUp[2] * sr
 		];
-		const rolledRight: [number, number, number] = [
-			right[0] * cr - baseUp[0] * sr,
-			right[1] * cr - baseUp[1] * sr,
-			right[2] * cr - baseUp[2] * sr
+		const camUp: SomaVec3 = [
+			baseUp[0] * cr - right[0] * sr,
+			baseUp[1] * cr - right[1] * sr,
+			baseUp[2] * cr - right[2] * sr
 		];
-		right[0] = rolledRight[0];
-		right[1] = rolledRight[1];
-		right[2] = rolledRight[2];
+
+		// Organism frame: Y is the swim axis; X is the camera-horizontal right
+		// projected onto the plane perpendicular to it.
+		const basisY: SomaVec3 = [swimmer.axis[0], swimmer.axis[1], swimmer.axis[2]];
+		const along = dot3(rightH, basisY);
+		const basisX = normalize3([
+			rightH[0] - basisY[0] * along,
+			rightH[1] - basisY[1] * along,
+			rightH[2] - basisY[2] * along
+		]);
+		const basisZ = cross3(basisX, basisY);
+		const velocity = swimmer.velocity;
+		const localVel: SomaVec3 = [
+			dot3(velocity, basisX) / bodyScale,
+			dot3(velocity, basisY) / bodyScale,
+			dot3(velocity, basisZ) / bodyScale
+		];
+
+		{
+			const v: SomaVec3 = [bodyPos[0] - camPos[0], bodyPos[1] - camPos[1], bodyPos[2] - camPos[2]];
+			const depth = Math.max(0.1, dot3(v, fwd));
+			bodyScreenX = (dot3(v, camRight) / depth) * fovScale / (0.5 * (w / h));
+			bodyScreenY = (dot3(v, camUp) / depth) * fovScale / 0.5;
+			bodyScreenTimer -= frameDt;
+			if (bodyScreenTimer <= 0) {
+				bodyScreenTimer = 0.25;
+				bodyScreen = `${bodyScreenX.toFixed(2)},${bodyScreenY.toFixed(2)}`;
+			}
+		}
+
+		// ── Post: trails shorten on impacts and in silence; bloom knee drops with
+		// energy so drops glow while verses stay graphic.
+		const feedbackFade =
+			feedbackResetFrames > 0
+				? 0
+				: clamp((0.83 + energy * 0.06 - impact * 0.1) * (1 - smoothed.silence * 0.3), 0.4, 0.92);
+		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
+		const feedbackZoom = 1 - (0.0012 + smoothed.bass * 0.0018) * responseMotion;
+		const bloomThreshold = 0.72 - energy * 0.16;
+		const aberration = 1 + impact * 1.6;
+		const keyMode =
+			directed.context.keyMode === 'major' ? 1 : directed.context.keyMode === 'minor' ? -1 : 0;
+		const phrase = renderBeats / BEATS_PER_PHRASE;
+		const environmentVoid = clamp(pose.environmentVoid, 0, 1);
 
 		const u = gpu.uniformData;
 		u[0] = w;
 		u[1] = h;
-		u[2] = time;
-		u[3] = smoothed.bass;
-		u[4] = smoothed.mid;
-		u[5] = smoothed.treble;
-		u[6] = smoothed.centroidSlow;
-		u[7] = smoothed.rmsSlow;
-		u[8] = smoothed.flash;
-		u[9] = smoothed.bpmNormSlow;
-		u[10] = smoothed.chromaXSlow;
-		u[11] = smoothed.chromaYSlow;
-		u[12] = Math.max(feat?.chroma_strength ?? 0, directed.context.keyConfidence);
-		u[13] = camPos[0];
-		u[14] = camPos[1];
-		u[15] = camPos[2];
-		u[16] = fwd[0];
-		u[17] = fwd[1];
-		u[18] = fwd[2];
-		u[19] = right[0];
-		u[20] = right[1];
-		u[21] = right[2];
-		u[22] = camUp[0];
-		u[23] = camUp[1];
-		u[24] = camUp[2];
-		u[25] = fovScale;
-		u[26] = mandelbulbPower;
-		u[27] = paletteOffset;
-		u[28] = fogDensity;
-		u[29] = lightShaftIntensity;
-		u[30] = growth;
-		u[31] = tension;
-		// Per-track palette family stays stable; harmonic analysis moves within
-		// it, so the track develops without looking like a preset roulette.
-		u[32] = paletteFamily;
-		u[33] = Math.min(1, smoothed.staccato * responseImpact * 0.4);
-		u[34] = smoothed.sustain;
-		// Reserved legacy slot. Whole-subject clock rotation is intentionally disabled.
-		u[35] = 0;
-		u[36] = renderPhases.backgroundFlowPhase;
-		u[37] = pose.postureYaw;
-		u[38] = pose.posturePitch;
-		u[39] = pose.suspense;
-		u[40] = pose.seedForm;
-		u[41] = pose.sproutForm;
-		u[42] = pose.windingForm;
-		u[43] = pose.bloomForm;
-		u[44] = pose.sheddingForm;
-		u[45] = pose.dormancyForm;
-		u[46] = renderPhases.morphPhase;
-		u[47] = pose.morphRate;
-		u[48] = pose.rootMass;
-		u[49] = Math.min(1, journey.rootPulse * responseImpact * 0.55);
-		u[50] = pose.axialStretch;
-		u[51] = pose.lobeSplit;
-		u[52] = pose.foldDepth;
-		u[53] = pose.cavityOpen;
-		u[54] = pose.surfaceRidges;
-		u[55] = pose.filamentReach;
-		u[56] = pose.spectralLean;
-		u[57] = renderPhases.spectralTravelPhase;
-		u[58] = pose.spectralTravelRate;
-		u[59] = pose.palettePhase;
-		u[60] = pose.paletteWarmth;
-		u[61] = pose.materialDensity;
-		u[62] = pose.materialIridescence;
-		u[63] = pose.materialErosion;
-		u[64] = shotZoom;
-		u[65] = closeStudy;
-		u[66] = detailFocus;
-		u[67] = pose.perspectiveAzimuth;
-		u[68] = pose.perspectiveElevation;
-		u[69] = pose.shotFramingX;
-		u[70] = pose.shotFramingY;
-		u[71] = qualityProfile.raymarchSteps;
-		u[72] = pose.environmentVoid;
-		u[73] = pose.environmentCurrent;
-		u[74] = pose.environmentCavern;
-		u[75] = pose.environmentHorizon;
-		u[76] = pose.environmentCellular;
-		u[77] = pose.materialMembrane;
-		u[78] = pose.materialMineral;
-		u[79] = pose.materialVelvet;
-		u[80] = pose.materialCrystal;
-		u[81] = paletteFamilyB;
-		u[82] = paletteFamilyBlend;
-		u[83] = 0;
-		u[84] = pose.topologyCocoon;
-		u[85] = pose.topologySpire;
-		u[86] = pose.topologyBilateral;
-		u[87] = pose.topologyTorus;
-		u[88] = pose.topologyCoral;
-		u[89] = pose.topologyShell;
-		u[90] = pose.gestureReach;
-		u[91] = pose.gestureCoil;
-		u[92] = pose.gestureDivide;
-		u[93] = pose.gestureHollow;
-		u[94] = pose.gestureStillness;
-		u[95] = pose.styleRhythmicDensity;
+		u[2] = pose.environmentCavern;
+		u[3] = qualityProfile.raymarchSteps;
+		u[4] = smoothed.bass;
+		u[5] = smoothed.mid;
+		u[6] = smoothed.treble;
+		u[7] = clamp(pose.environmentCellular * (1 - environmentVoid * 0.5), 0, 1);
+		u[8] = energy;
+		u[9] = impact;
+		u[10] = clamp(smoothed.rootPulse * responseImpact * 0.8, 0, 1);
+		u[11] = smoothed.beatGlow;
+		u[12] = renderBeats;
+		u[13] = pose.environmentHorizon;
+		u[14] = swimmer.stroke * responseMotion;
+		u[15] = smoothed.silence;
+		u[16] = camPos[0];
+		u[17] = camPos[1];
+		u[18] = camPos[2];
+		u[19] = fovScale;
+		u[20] = fwd[0];
+		u[21] = fwd[1];
+		u[22] = fwd[2];
+		u[23] = pose.environmentCurrent;
+		u[24] = camRight[0];
+		u[25] = camRight[1];
+		u[26] = camRight[2];
+		u[27] = mk2SongSeed;
+		u[28] = camUp[0];
+		u[29] = camUp[1];
+		u[30] = camUp[2];
+		u[31] = phrase;
+		u[32] = bodyPos[0];
+		u[33] = bodyPos[1];
+		u[34] = bodyPos[2];
+		u[35] = bodyScale;
+		u[36] = basisX[0];
+		u[37] = basisX[1];
+		u[38] = basisX[2];
+		u[39] = pose.topologyCoral;
+		u[40] = basisY[0];
+		u[41] = basisY[1];
+		u[42] = basisY[2];
+		u[43] = swimmer.wavePhase;
+		u[44] = basisZ[0];
+		u[45] = basisZ[1];
+		u[46] = basisZ[2];
+		u[47] = pose.topologySpire;
+		u[48] = localVel[0];
+		u[49] = localVel[1];
+		u[50] = localVel[2];
+		u[51] = keyMode;
+		u[52] = renderRoles.base;
+		u[53] = renderRoles.accent;
+		u[54] = renderRoles.rim;
+		u[55] = renderRoles.saturation;
+		u[56] = renderRoles.ink;
+		u[57] = pose.topologyShell;
+		u[58] = pose.topologyTorus;
+		u[59] = pose.materialCrystal;
+		u[60] = pose.seedForm;
+		u[61] = pose.sproutForm;
+		u[62] = pose.windingForm;
+		u[63] = pose.bloomForm;
+		u[64] = pose.sheddingForm;
+		u[65] = pose.dormancyForm;
+		u[66] = renderPhases.morphPhase * 0.85 + renderPhases.spectralTravelPhase * 0.073;
+		u[67] = clamp(pose.materialVelvet + pose.materialMineral * 0.5, 0, 1);
+		u[68] = pose.rootMass;
+		u[69] = pose.axialStretch;
+		u[70] = pose.lobeSplit;
+		u[71] = pose.foldDepth;
+		u[72] = pose.cavityOpen;
+		u[73] = pose.surfaceRidges;
+		u[74] = pose.filamentReach;
+		u[75] = pose.spectralLean;
+		u[76] = pose.materialDensity;
+		u[77] = pose.materialIridescence;
+		u[78] = pose.materialErosion;
+		u[79] = pose.growth;
+		u[80] = pose.gestureReach;
+		u[81] = pose.gestureCoil;
+		u[82] = divide;
+		u[83] = clamp(pose.gestureHollow + pose.materialMembrane * 0.25, 0, 1);
+		u[84] = pose.gestureStillness;
+		u[85] = pose.tension;
+		u[86] = pose.openness;
+		u[87] = pose.suspense;
+		u[88] = fogDensity;
+		u[89] = shaftIntensity;
+		u[90] = renderPhases.backgroundFlowPhase;
+		u[91] = pose.styleRhythmicDensity;
+		u[92] = feedbackFade;
+		u[93] = feedbackZoom;
+		u[94] = bloomThreshold;
+		u[95] = aberration;
 		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
-
-		// Upload decoded, baseline-relative detail. Static hiss and compressed
-		// display-bin floor no longer shimmer across the entire surface.
-		gpu.binsData.set(spectrum.detailBins);
 		gpu.device.queue.writeBuffer(
 			gpu.binsBuf,
 			0,
-			gpu.binsData.buffer,
-			gpu.binsData.byteOffset,
-			gpu.binsData.byteLength
+			renderDetailBins.buffer,
+			renderDetailBins.byteOffset,
+			renderDetailBins.byteLength
 		);
 
-		// ── Pack bloom params for five passes (3 down + 2 up).
-		// Each slice is 256-byte aligned (WebGPU minimum dynamic uniform alignment).
-		const bloomThreshold = 1.15; // HDR threshold for first downsample
-		const bloomIntensity = 0.3; // contribution scale for each upsample
-		const gpuRef = gpu;
-		const bp = gpuRef.bloomParamData;
-		// Helper to write a slice
-		const writeSlice = (passIdx: number, fields: number[]) => {
-			for (let k = 0; k < BLOOM_PARAM_FLOATS; k++) bp[k] = fields[k] ?? 0;
-			gpuRef.device.queue.writeBuffer(
-				gpuRef.bloomParamBuf,
-				passIdx * 256,
-				bp.buffer,
-				bp.byteOffset,
-				BLOOM_PARAM_BYTES
-			);
-		};
-		// Down passes: source resolution → destination (half each level)
-		const t = gpu.targets;
-		// Level 0 down: src = scene full res; dst = mip 0 (half)
-		writeSlice(0, [w, h, t.bloomSizes[0].w, t.bloomSizes[0].h, bloomThreshold, 0, 0, 0]);
-		for (let i = 1; i < BLOOM_LEVELS; i++) {
-			const src = t.bloomSizes[i - 1];
-			const dst = t.bloomSizes[i];
-			writeSlice(i, [src.w, src.h, dst.w, dst.h, 0, 0, 0, 0]);
-		}
-		// Up passes climb from the smallest mip back to mip 0.
-		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
-			const srcLevel = BLOOM_LEVELS - 1 - i;
-			const dstLevel = srcLevel - 1;
-			const src = t.bloomSizes[srcLevel];
-			const dst = t.bloomSizes[dstLevel];
-			writeSlice(BLOOM_LEVELS + i, [src.w, src.h, dst.w, dst.h, 0, bloomIntensity, 0, 0]);
-		}
-
-		const submittingGpu = gpuRef;
-		const submittingBindGroups = submittingGpu.bindGroups;
-		if (!submittingBindGroups) return;
+		const submittingGpu = gpu;
 		const submittingGeneration = initGeneration;
 		try {
-			const encoder = submittingGpu.device.createCommandEncoder();
-
-		// Scene → sceneTex
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.sceneView,
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(submittingGpu.pipelines.scene);
-			pass.setBindGroup(0, submittingBindGroups.scene);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// Bloom downsample chain (clear each mip, threshold on first only).
-		for (let i = 0; i < BLOOM_LEVELS; i++) {
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.bloomViews[i],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(submittingGpu.pipelines.bloomDown);
-			pass.setBindGroup(0, submittingBindGroups.bloomDownBGs[i]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// Bloom upsample chain (additive blend into parent mip).
-		for (let i = 0; i < BLOOM_LEVELS - 1; i++) {
-			const dstLevel = BLOOM_LEVELS - 2 - i;
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{ view: t.bloomViews[dstLevel], loadOp: 'load', storeOp: 'store' }
-				]
-			});
-			pass.setPipeline(submittingGpu.pipelines.bloomUp);
-			pass.setBindGroup(0, submittingBindGroups.bloomUpBGs[i]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		const prevIdx = (submittingGpu.frame % 2) as 0 | 1;
-		const currIdx = (1 - prevIdx) as 0 | 1;
-
-		// Composite → compositeTex (current ping-pong slot). Reads prev slot for
-		// temporal motion blur via mix() in the shader.
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.compositeViewsAB[currIdx],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(submittingGpu.pipelines.composite);
-			pass.setBindGroup(0, submittingBindGroups.composite[prevIdx]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// Present (tone-map + stable dither) → swap chain
-		{
-			const view = submittingGpu.context.getCurrentTexture().createView();
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view,
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(submittingGpu.pipelines.present);
-			pass.setBindGroup(0, submittingBindGroups.present[currIdx]);
-			pass.draw(6);
-			pass.end();
-		}
-
+			const encoder = submittingGpu.device.createCommandEncoder({ label: 'Soma frame' });
+			const previous = submittingGpu.parity;
+			const next: 0 | 1 = previous === 0 ? 1 : 0;
+			const fullscreen = (
+				label: string,
+				view: GPUTextureView,
+				pipeline: GPURenderPipeline,
+				bindGroup: GPUBindGroup
+			) => {
+				const pass = encoder.beginRenderPass({
+					label,
+					colorAttachments: [
+						{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }
+					]
+				});
+				pass.setPipeline(pipeline);
+				pass.setBindGroup(0, bindGroup);
+				pass.draw(3);
+				pass.end();
+			};
+			// 1. scene (reads last frame's feedback for brine-pool reflections)
+			fullscreen('Soma abyss', targets.sceneView, submittingGpu.pipelines.scene, bindGroups.scene[previous]);
+			// 2. scene + feedback[previous] -> feedback[next]
+			fullscreen(
+				'Soma feedback',
+				targets.feedbackViews[next],
+				submittingGpu.pipelines.feedback,
+				bindGroups.feedback[previous]
+			);
+			// 3. feedback[next] -> bloom[0] (half res, thresholded)
+			fullscreen(
+				'Soma bloom prefilter',
+				targets.bloomViews[0],
+				submittingGpu.pipelines.bloomDown,
+				bindGroups.bloomDown[next]
+			);
+			// 4-7. two separable blur rounds
+			for (let iteration = 0; iteration < 2; iteration += 1) {
+				fullscreen('Soma bloom blur H', targets.bloomViews[1], submittingGpu.pipelines.blurH, bindGroups.blurH);
+				fullscreen('Soma bloom blur V', targets.bloomViews[0], submittingGpu.pipelines.blurV, bindGroups.blurV);
+			}
+			// 8. composite -> swap chain
+			fullscreen(
+				'Soma present',
+				submittingGpu.context.getCurrentTexture().createView(),
+				submittingGpu.pipelines.composite,
+				bindGroups.composite[next]
+			);
 			submittingGpu.device.queue.submit([encoder.finish()]);
+			submittingGpu.parity = next;
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
 			failGpuDevice(
 				submittingGpu,
 				submittingGeneration,
-				`Mk2 could not encode or submit WebGPU work: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+				`Soma could not encode or submit WebGPU work: ${detail}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
 			);
 			return;
 		}
-		submittingGpu.frame++;
 		if (!gpuReady) gpuReady = true;
 	}
 
@@ -3049,13 +2164,14 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 				}
 				gpu = g;
 				resetFrameScheduler();
+				temporalResetRequested = true;
 				void g.device.lost.then((info) => {
 					const reason = info.reason === 'destroyed' ? 'destroyed unexpectedly' : 'lost';
 					const detail = info.message.trim();
 					failGpuDevice(
 						g,
 						generation,
-						`Mk2's WebGPU device was ${reason}${detail ? `: ${detail}` : ''}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
+						`Soma's WebGPU device was ${reason}${detail ? `: ${detail}` : ''}. Switch to another visualizer and back to retry; if it repeats, restart Mewsik or update the graphics driver.`
 					);
 				});
 			})
@@ -3094,7 +2210,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		<div
 			class="pointer-events-none absolute inset-0 transition-opacity duration-500"
 			class:opacity-0={gpuReady}
-			style="background: radial-gradient(circle at 50% 44%, #171029 0%, #070410 46%, #000 78%);"
+			style="background: radial-gradient(circle at 50% 40%, #0a0b22 0%, #04040f 50%, #000 80%);"
 			aria-hidden="true"
 		></div>
 		<canvas
@@ -3107,6 +2223,8 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			data-mk2-gesture={currentGesture}
 			data-mk2-uniform-bytes={UNIFORM_BYTES}
 			data-mk2-render-passes="8"
+			data-soma-ready={String(gpuReady)}
+			data-soma-body-screen={bodyScreen}
 			data-soma-quality={qualityTier}
 			data-soma-render-pixels={renderPixels}
 			data-soma-max-pixels={SOMA_QUALITY_PROFILES[qualityTier].maxPixels}

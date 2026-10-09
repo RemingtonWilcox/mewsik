@@ -228,4 +228,184 @@ test.describe('Soma render runtime', () => {
 		expect(geometry).not.toContain('u.backgroundPhase');
 		expect(geometry).not.toContain('u.journeyPhase');
 	});
+
+	test('swims between half-phrase waypoints on both sides of the shot without jumping', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/mk2/organism.ts';
+			const { SomaSwimmer, SOMA_SWIM_BOUNDS } = await import(modulePath);
+			const swimmer = new SomaSwimmer();
+			swimmer.reset(0.37);
+			const input = {
+				dt: 1 / 60,
+				beats: 0,
+				energy: 0.6,
+				motion: 1,
+				reach: 0,
+				stillness: 0,
+				bloom: 0.3,
+				dormancy: 0,
+				openness: 0.5,
+				silence: 0,
+				right: [1, 0, 0] as [number, number, number],
+				forward: [0, 0, -1] as [number, number, number]
+			};
+			let maxStep = 0;
+			let minX = Infinity;
+			let maxX = -Infinity;
+			let leftBounds = false;
+			let previous: number[] | null = null;
+			// 128 beats at 120 bpm: eight waypoints.
+			for (let frame = 0; frame < 64 * 60; frame += 1) {
+				input.beats = (frame / 60) * 2;
+				swimmer.update(input);
+				const [x, y, z] = swimmer.position;
+				if (previous) {
+					maxStep = Math.max(maxStep, Math.hypot(x - previous[0], y - previous[1], z - previous[2]));
+				}
+				previous = [x, y, z];
+				if (frame > 60 * 8) {
+					minX = Math.min(minX, x);
+					maxX = Math.max(maxX, x);
+				}
+				if (
+					Math.abs(x) > SOMA_SWIM_BOUNDS.across + 0.2 ||
+					y > SOMA_SWIM_BOUNDS.up + 0.2 ||
+					y < SOMA_SWIM_BOUNDS.down - 0.2
+				) {
+					leftBounds = true;
+				}
+			}
+			const a = new SomaSwimmer();
+			const b = new SomaSwimmer();
+			a.reset(0.5);
+			b.reset(0.5);
+			for (let frame = 0; frame < 600; frame += 1) {
+				input.beats = (frame / 60) * 2;
+				a.update(input);
+				b.update(input);
+			}
+			return {
+				maxStep,
+				minX,
+				maxX,
+				leftBounds,
+				deterministic: a.position.every((value: number, i: number) => value === b.position[i]),
+				axisLength: Math.hypot(...swimmer.axis)
+			};
+		});
+
+		expect(result.leftBounds).toBe(false);
+		// Speed-limited: never more than 0.32 world units per second.
+		expect(result.maxStep).toBeLessThan(0.32 / 60 + 1e-4);
+		// It really crosses the shot instead of parking in the centre.
+		expect(result.minX).toBeLessThan(-0.45);
+		expect(result.maxX).toBeGreaterThan(0.45);
+		expect(result.deterministic).toBe(true);
+		expect(result.axisLength).toBeCloseTo(1, 5);
+	});
+
+	test('stillness and silence calm the swim without moving the body on beats', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/mk2/organism.ts';
+			const { SomaSwimmer } = await import(modulePath);
+			const base = {
+				dt: 1 / 60,
+				beats: 4,
+				energy: 0.7,
+				motion: 1,
+				reach: 0,
+				stillness: 0,
+				bloom: 0,
+				dormancy: 0,
+				openness: 0.4,
+				silence: 0,
+				right: [1, 0, 0] as [number, number, number],
+				forward: [0, 0, -1] as [number, number, number]
+			};
+			const strokes = (overrides: Record<string, number>) => {
+				const swimmer = new SomaSwimmer();
+				swimmer.reset(0.2);
+				let peak = 0;
+				for (let frame = 0; frame < 30 * 60; frame += 1) {
+					swimmer.update({ ...base, ...overrides });
+					peak = Math.max(peak, swimmer.stroke);
+				}
+				return peak;
+			};
+			// Same song position: beats held constant, so only smoothed energy can move it.
+			const held = new SomaSwimmer();
+			held.reset(0.2);
+			for (let frame = 0; frame < 60 * 60; frame += 1) held.update(base);
+			const settled = [...held.position];
+			for (let frame = 0; frame < 60; frame += 1) held.update(base);
+			return {
+				active: strokes({}),
+				still: strokes({ stillness: 1 }),
+				silent: strokes({ silence: 1 }),
+				drift: Math.hypot(
+					held.position[0] - settled[0],
+					held.position[1] - settled[1],
+					held.position[2] - settled[2]
+				)
+			};
+		});
+
+		expect(result.active).toBeGreaterThan(0.5);
+		expect(result.still).toBeLessThan(result.active * 0.4);
+		expect(result.silent).toBeLessThan(result.active * 0.3);
+		expect(result.drift).toBeLessThan(0.01);
+	});
+
+	test('palette roles stay bioluminescent over an ink-indigo sea for every key', async ({
+		page
+	}) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const modulePath = '/src/lib/visualizer/mk2/organism.ts';
+			const { SOMA_BIO_ANCHORS, somaHueDelta, somaPaletteRoles } = await import(modulePath);
+			const nearest = (hue: number) =>
+				Math.min(...SOMA_BIO_ANCHORS.map((anchor: number) => Math.abs(somaHueDelta(hue, anchor))));
+			let worstPull = 0;
+			let minSeparation = 1;
+			let minInk = 1;
+			let maxInk = 0;
+			const bases = new Set<string>();
+			for (let i = 0; i < 48; i += 1) {
+				for (const mode of ['major', 'minor', 'unknown'] as const) {
+					const palette = {
+						baseHue: i / 48,
+						accentHue: (i / 48 + 0.31) % 1,
+						rimHue: (i / 48 + 0.62) % 1,
+						saturation: 0.6
+					};
+					const roles = somaPaletteRoles(palette, mode, {
+						base: 0,
+						accent: 0,
+						rim: 0,
+						ink: 0,
+						saturation: 0
+					});
+					worstPull = Math.max(worstPull, nearest(roles.base) / Math.max(nearest(palette.baseHue), 1e-3));
+					minSeparation = Math.min(minSeparation, Math.abs(somaHueDelta(roles.base, roles.accent)));
+					minInk = Math.min(minInk, roles.ink);
+					maxInk = Math.max(maxInk, roles.ink);
+					bases.add(roles.base.toFixed(2));
+					if (roles.saturation < 0.74) worstPull = 99;
+				}
+			}
+			return { worstPull, minSeparation, minInk, maxInk, distinctBases: bases.size };
+		});
+
+		// Every base hue moves at least halfway toward a bioluminescent anchor.
+		expect(result.worstPull).toBeLessThanOrEqual(0.451);
+		expect(result.minSeparation).toBeGreaterThanOrEqual(0.139);
+		expect(result.minInk).toBeGreaterThan(0.6);
+		expect(result.maxInk).toBeLessThan(0.73);
+		// Still a wide range of colours across keys, not one preset.
+		expect(result.distinctBases).toBeGreaterThan(20);
+	});
 });

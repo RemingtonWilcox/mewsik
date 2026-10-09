@@ -28,7 +28,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Soma',
 		subtitle: 'Living fractal',
 		role: 'Evolution',
-		description: 'A cinematic organism that grows, sheds, relights, and changes perspective across the song.',
+		description: 'A bioluminescent deep-sea organism; beats travel as light along its body and tendrils.',
 		accent: '#fde68a',
 		accentMuted: 'rgba(251, 191, 36, 0.46)'
 	},
