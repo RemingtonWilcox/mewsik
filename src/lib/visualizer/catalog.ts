@@ -20,7 +20,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Prism',
 		subtitle: 'Rhythmic geometry',
 		role: 'Impact',
-		description: 'Crisp mirrored architecture that turns beats and harmony into immediate motion.',
+		description: 'An obsidian rose window; beats travel as light through jewel glass.',
 		accent: '#e9d5ff',
 		accentMuted: 'rgba(216, 180, 254, 0.46)'
 	},
@@ -28,7 +28,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Soma',
 		subtitle: 'Living fractal',
 		role: 'Evolution',
-		description: 'A cinematic organism that grows, sheds, relights, and changes perspective across the song.',
+		description: 'A bioluminescent deep-sea organism; beats travel as light along its body and tendrils.',
 		accent: '#fde68a',
 		accentMuted: 'rgba(251, 191, 36, 0.46)'
 	},
@@ -36,7 +36,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Signal',
 		subtitle: 'Phosphor score',
 		role: 'Flow',
-		description: 'A continuous instrument trace that draws spectrum, rhythm, harmony, and song structure.',
+		description: 'A night phosphor scope: an XY figure tuned to harmony, beat-swept channel traces and a spectral horizon.',
 		accent: '#a7f3d0',
 		accentMuted: 'rgba(52, 211, 153, 0.46)'
 	},

@@ -3,7 +3,7 @@ use super::http_stream;
 use super::queue::{new_queue_session_id, PlayQueue, QueueEntry, RepeatMode};
 use crate::db::{
     self,
-    models::{PlaybackState, QueueItem, QueueSnapshot},
+    models::{ConnectionStage, PlaybackState, QueueItem, QueueSnapshot},
     DbPool,
 };
 use crossbeam_channel::{Receiver, Sender};
@@ -30,13 +30,30 @@ pub enum AudioCommand {
     PlayFetchedRemote(QueueEntry, Vec<u8>, u64, u64),
     PlayPreparedRemote(QueueEntry, Box<dyn Source<Item = i16> + Send>, u64, u64),
     PlayUrl(String, String, String), // station_id, url, name
-    PlayPreparedRadio(
-        String,
-        String,
-        String,
-        Box<dyn Source<Item = i16> + Send>,
-        u64,
-    ), // station_id, name, url, source, session
+    /// Internal: reopen the current station after its stream dropped.
+    ReconnectRadio {
+        station_id: String,
+        url: String,
+        name: String,
+        attempt: u32,
+    },
+    /// Internal: the station's server answered; the start buffer is filling.
+    RadioConnected(u64),
+    /// Internal: the station stream could not be opened or decoded.
+    RadioFailed {
+        session_id: u64,
+        error: String,
+    },
+    PlayPreparedRadio {
+        station_id: String,
+        name: String,
+        url: String,
+        source: Box<dyn Source<Item = i16> + Send>,
+        session_id: u64,
+        /// When the engine received the play command, for stage timings.
+        started: Instant,
+        report: http_stream::LiveStartReport,
+    },
     Pause,
     Resume,
     /// The OS took the audio output away (another app, a call, a route
@@ -92,6 +109,96 @@ fn command_invalidates_queue_owner(command: &AudioCommand) -> bool {
             | AudioCommand::ClearQueue
             | AudioCommand::Shutdown
     )
+}
+
+/// Reconnect attempts after a live stream drops before the player gives up
+/// and shows "Couldn't connect".
+const RADIO_MAX_RECONNECTS: u32 = 3;
+
+/// Backoff before reconnect `attempt` (1-based): 0.9 s, 1.8 s, 2.7 s.
+fn radio_reconnect_backoff(attempt: u32) -> Duration {
+    Duration::from_millis(900 * u64::from(attempt.max(1)))
+}
+
+/// The second line for a station, which iOS shows on the lock screen.
+fn radio_status_line(stage: ConnectionStage) -> &'static str {
+    match stage {
+        ConnectionStage::Connecting => "Connecting…",
+        ConnectionStage::Buffering => "Buffering…",
+        ConnectionStage::Reconnecting => "Reconnecting…",
+        ConnectionStage::Failed => "Couldn't connect",
+        ConnectionStage::Idle | ConnectionStage::Playing => "Radio",
+    }
+}
+
+/// Moves a station's state to `stage`, keeping the lock-screen line in step.
+fn set_radio_stage(state: &mut PlaybackState, stage: ConnectionStage) {
+    state.set_connection_stage(stage);
+    state.current_artist = Some(radio_status_line(stage).to_string());
+}
+
+#[cfg(test)]
+mod connection_stage_tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backoff_grows_per_attempt() {
+        assert_eq!(radio_reconnect_backoff(1), Duration::from_millis(900));
+        assert_eq!(radio_reconnect_backoff(3), Duration::from_millis(2_700));
+        assert_eq!(radio_reconnect_backoff(0), Duration::from_millis(900));
+    }
+
+    #[test]
+    fn radio_stage_keeps_the_lock_screen_line_in_step() {
+        let mut state = PlaybackState::default();
+        set_radio_stage(&mut state, ConnectionStage::Connecting);
+        assert_eq!(state.current_artist.as_deref(), Some("Connecting…"));
+
+        set_radio_stage(&mut state, ConnectionStage::Reconnecting);
+        state.reconnect_attempt = 2;
+        state.reconnect_max = RADIO_MAX_RECONNECTS;
+        assert_eq!(state.current_artist.as_deref(), Some("Reconnecting…"));
+
+        set_radio_stage(&mut state, ConnectionStage::Failed);
+        state.connection_error = Some("timed out".to_string());
+        // Leaving reconnecting clears the attempt; failure keeps its reason.
+        assert_eq!(state.reconnect_attempt, 0);
+        assert_eq!(state.connection_error.as_deref(), Some("timed out"));
+
+        set_radio_stage(&mut state, ConnectionStage::Playing);
+        assert_eq!(state.connection_error, None);
+        assert_eq!(state.current_artist.as_deref(), Some("Radio"));
+    }
+
+    #[test]
+    fn stage_serializes_in_snake_case_for_the_frontend() {
+        let mut state = PlaybackState::default();
+        state.set_connection_stage(ConnectionStage::Reconnecting);
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["connection_stage"], "reconnecting");
+        assert_eq!(json["reconnect_attempt"], 0);
+    }
+
+    #[test]
+    fn internal_radio_updates_do_not_rebuild_the_output() {
+        assert!(!AudioEngine::command_needs_live_output(
+            &AudioCommand::RadioConnected(1)
+        ));
+        assert!(!AudioEngine::command_needs_live_output(
+            &AudioCommand::RadioFailed {
+                session_id: 1,
+                error: String::new(),
+            }
+        ));
+        assert!(AudioEngine::command_needs_live_output(
+            &AudioCommand::ReconnectRadio {
+                station_id: "s".to_string(),
+                url: "https://example.invalid/live".to_string(),
+                name: "S".to_string(),
+                attempt: 1,
+            }
+        ));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -503,6 +610,21 @@ impl AudioEngine {
     pub fn new(db: DbPool) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        // The UI reads PlaybackState by polling, so nothing else consumes
+        // engine events. Drain them here (logging errors) so the unbounded
+        // channel does not grow for the lifetime of the app.
+        {
+            let drain: Receiver<AudioEvent> = event_rx.clone();
+            let _ = std::thread::Builder::new()
+                .name("audio-event-drain".to_string())
+                .spawn(move || {
+                    while let Ok(event) = drain.recv() {
+                        if let AudioEvent::Error(message) = event {
+                            log::warn!("audio engine: {message}");
+                        }
+                    }
+                });
+        }
         let state = Arc::new(Mutex::new(PlaybackState::default()));
         let queue_snapshot = Arc::new(Mutex::new(QueueSnapshot::default()));
         let queue_owner_session = Arc::new(QueueSessionOwner::default());
@@ -915,6 +1037,7 @@ impl AudioEngine {
         let mut s = state.lock();
         s.is_playing = desired_playing;
         s.is_buffering = false;
+        s.set_connection_stage(ConnectionStage::Playing);
         s.can_seek = can_seek;
         s.current_recording_id = Some(entry.recording_id.clone());
         s.current_station_id = None;
@@ -972,7 +1095,7 @@ impl AudioEngine {
         s.current_recording_id = None;
         s.current_station_id = Some(station_id.to_string());
         s.current_title = Some(name.to_string());
-        s.current_artist = Some("Radio".to_string());
+        set_radio_stage(&mut s, ConnectionStage::Playing);
         s.current_album_art = None;
         s.current_source_url = Some(url.to_string());
         s.position_ms = 0;
@@ -1079,6 +1202,11 @@ impl AudioEngine {
             s.source = Some(entry.source.clone());
             s.is_playing = false;
             s.is_buffering = false;
+            s.set_connection_stage(if entry.file_path.is_some() {
+                ConnectionStage::Playing
+            } else {
+                ConnectionStage::Buffering
+            });
             s.can_seek = false;
             let state_clone = s.clone();
             drop(s);
@@ -1163,7 +1291,6 @@ impl AudioEngine {
                         Arc::clone(&playback_session),
                         session_id,
                         256 * 1024,
-                        false,
                         event_tx.clone(),
                         format!("Track {}", queued_entry.title),
                     ) {
@@ -1225,6 +1352,7 @@ impl AudioEngine {
         let mut s = state.lock();
         s.is_playing = true;
         s.is_buffering = false;
+        s.set_connection_stage(ConnectionStage::Playing);
         s.can_seek = true;
         s.current_recording_id = Some(entry.recording_id.clone());
         s.current_station_id = None;
@@ -1287,6 +1415,9 @@ impl AudioEngine {
         // with backoff before giving up; attempts reset after stable playback.
         let mut radio_reconnect_attempts: u32 = 0;
         let mut radio_reconnect_due: Option<Instant> = None;
+        // True while the current radio session is a reconnect, so a failed
+        // reopen schedules the next attempt instead of giving up at once.
+        let mut radio_session_is_reconnect = false;
         let mut radio_started_at: Option<Instant> = None;
         let mut last_position_update = Instant::now();
         let mut playback_kind = PlaybackKind::Idle;
@@ -1296,6 +1427,9 @@ impl AudioEngine {
         loop {
             // Process commands
             let received = cmd_rx.recv_timeout(Duration::from_millis(50));
+            // Set when the hook below rebuilt the output for this command, so
+            // ResetOutput does not rebuild it a second time.
+            let mut output_rebuilt_this_turn = false;
             if output_needs_reset {
                 if let Ok(command) = &received {
                     if Self::command_needs_live_output(command) {
@@ -1312,8 +1446,14 @@ impl AudioEngine {
                             PlayEndReason::Stopped,
                         );
                         awaiting_source = false;
+                        let rebuild_started = Instant::now();
                         if Self::reopen_output(&mut output_stream, &mut sink, &event_tx) {
                             output_needs_reset = false;
+                            output_rebuilt_this_turn = true;
+                            log::info!(
+                                "audio output rebuilt in {}ms",
+                                rebuild_started.elapsed().as_millis()
+                            );
                         }
                         if resume_queue {
                             // The paused track's decoded audio died with the old
@@ -1404,6 +1544,7 @@ impl AudioEngine {
                                     let mut s = state.lock();
                                     s.is_playing = true;
                                     s.is_buffering = false;
+                                    s.set_connection_stage(ConnectionStage::Playing);
                                     s.can_seek = true;
                                     s.current_recording_id = Some(recording_id);
                                     s.current_station_id = None;
@@ -1495,6 +1636,7 @@ impl AudioEngine {
                             let mut s = state.lock();
                             s.is_playing = desired_playing;
                             s.is_buffering = false;
+                            s.set_connection_stage(ConnectionStage::Playing);
                             s.can_seek = can_seek;
                             s.current_recording_id = Some(entry.recording_id.clone());
                             s.current_station_id = None;
@@ -1545,43 +1687,138 @@ impl AudioEngine {
                     );
                     queue_owner_session.mark_ready(queue.session_id(), &entry.recording_id);
                 }
-                Ok(AudioCommand::PlayUrl(station_id, url, name)) => {
+                Ok(command @ (AudioCommand::PlayUrl(..) | AudioCommand::ReconnectRadio { .. })) => {
+                    let started = Instant::now();
+                    let (station_id, url, name, reconnect_attempt) = match command {
+                        AudioCommand::PlayUrl(station_id, url, name) => {
+                            (station_id, url, name, None)
+                        }
+                        AudioCommand::ReconnectRadio {
+                            station_id,
+                            url,
+                            name,
+                            attempt,
+                        } => (station_id, url, name, Some(attempt)),
+                        _ => unreachable!("matched PlayUrl or ReconnectRadio"),
+                    };
+                    if reconnect_attempt.is_some() {
+                        // The listener paused, stopped or picked something
+                        // else while the backoff ran: drop the stale attempt.
+                        let still_wanted = desired_playing
+                            && last_radio_station
+                                .as_ref()
+                                .is_some_and(|(id, _, _)| *id == station_id);
+                        if !still_wanted {
+                            continue;
+                        }
+                    } else {
+                        radio_reconnect_attempts = 0;
+                    }
+                    radio_session_is_reconnect = reconnect_attempt.is_some();
                     radio_reconnect_due = None;
                     radio_started_at = None;
                     last_radio_station = Some((station_id.clone(), url.clone(), name.clone()));
-                    let session_id = Self::reset_playback_session(
+                    log::info!(
+                        "radio: {} for station {} received",
+                        match reconnect_attempt {
+                            Some(attempt) => format!("reconnect attempt {attempt}"),
+                            None => "play".to_string(),
+                        },
+                        station_id
+                    );
+
+                    // Start the connection before any bookkeeping: the old
+                    // session is invalidated first so its prepare and
+                    // download workers stop, then the network work begins
+                    // while this thread finishes the history writes.
+                    if let Some(play) = active_play.as_mut() {
+                        play.set_listening(false);
+                    }
+                    let session_id = Self::reset_source_session(
                         &sink,
                         &playback_session,
-                        &db,
                         &mut position_offset_ms,
                         &mut current_position_reports_relative,
-                        &mut active_play,
-                        awaiting_source,
-                        PlayEndReason::SourceChanged,
                     );
-                    queue.clear();
-                    Self::sync_queue_state(&queue, &queue_snapshot);
                     playback_kind = PlaybackKind::Radio;
                     awaiting_source = true;
                     desired_playing = true;
-                    active_play = Self::begin_active_play(
-                        &db,
-                        None,
-                        Some("radio"),
-                        Some(&station_id),
-                        None,
-                        false,
-                    );
 
-                    let url_clone = url.clone();
-                    let event_tx_clone = event_tx.clone();
-                    let playback_session_ref = Arc::clone(&playback_session);
-                    let cmd_tx_clone = cmd_tx.clone();
-                    let station_id_clone = station_id.clone();
-                    let name_clone = name.clone();
-                    let db_clone = db.clone();
+                    {
+                        let url = url.clone();
+                        let event_tx = event_tx.clone();
+                        let playback_session = Arc::clone(&playback_session);
+                        let cmd_tx = cmd_tx.clone();
+                        let station_id = station_id.clone();
+                        let name = name.clone();
+                        let db = db.clone();
+                        std::thread::Builder::new()
+                            .name("radio-stream-prepare".to_string())
+                            .spawn(move || {
+                                let connected_tx = cmd_tx.clone();
+                                // Only consulted when the server does not
+                                // advertise a bitrate itself.
+                                let bitrate_hint = db::queries::get_station_by_id(&db, &station_id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|station| station.bitrate)
+                                    .and_then(|kbps| u32::try_from(kbps).ok());
+                                match http_stream::prepare_live_audio_source(
+                                    url.clone(),
+                                    Arc::clone(&playback_session),
+                                    session_id,
+                                    bitrate_hint,
+                                    started,
+                                    move || {
+                                        let _ = connected_tx
+                                            .send(AudioCommand::RadioConnected(session_id));
+                                    },
+                                    event_tx.clone(),
+                                    format!("Station {}", name),
+                                ) {
+                                    Ok((source, report)) => {
+                                        let _ = cmd_tx.send(AudioCommand::PlayPreparedRadio {
+                                            station_id,
+                                            name,
+                                            url,
+                                            source,
+                                            session_id,
+                                            started,
+                                            report,
+                                        });
+                                    }
+                                    Err(err) => {
+                                        // Mark the station as failing so the next
+                                        // play attempt re-resolves its URL
+                                        // (self-heal).
+                                        let _ = db::queries::increment_station_fail_count(
+                                            &db,
+                                            &station_id,
+                                        );
+                                        if playback_session.load(Ordering::SeqCst) != session_id {
+                                            return;
+                                        }
+                                        log::warn!(
+                                            "radio: station {} failed after {}ms: {}",
+                                            station_id,
+                                            started.elapsed().as_millis(),
+                                            err
+                                        );
+                                        let _ = cmd_tx.send(AudioCommand::RadioFailed {
+                                            session_id,
+                                            error: err.clone(),
+                                        });
+                                        let _ = event_tx.send(AudioEvent::Error(format!(
+                                            "Failed to start station stream: {}",
+                                            err
+                                        )));
+                                    }
+                                }
+                            })
+                            .ok();
+                    }
 
-                    // Update state immediately to show "loading"
+                    // Show the stage right away.
                     {
                         let mut s = state.lock();
                         s.is_playing = false;
@@ -1590,9 +1827,16 @@ impl AudioEngine {
                         s.current_recording_id = None;
                         s.current_station_id = Some(station_id.clone());
                         s.current_title = Some(name);
-                        s.current_artist = Some("Radio - Connecting...".to_string());
+                        match reconnect_attempt {
+                            Some(attempt) => {
+                                set_radio_stage(&mut s, ConnectionStage::Reconnecting);
+                                s.reconnect_attempt = attempt;
+                                s.reconnect_max = RADIO_MAX_RECONNECTS;
+                            }
+                            None => set_radio_stage(&mut s, ConnectionStage::Connecting),
+                        }
                         s.current_album_art = None;
-                        s.current_source_url = Some(url.clone());
+                        s.current_source_url = Some(url);
                         s.source = Some("radio".to_string());
                         s.duration_ms = 0;
                         s.position_ms = 0;
@@ -1601,52 +1845,114 @@ impl AudioEngine {
                         emit_state_changed(&event_tx, sc);
                     }
 
-                    std::thread::Builder::new()
-                        .name("radio-stream-prepare".to_string())
-                        .spawn(move || {
-                            match http_stream::prepare_http_audio_source(
-                                url_clone.clone(),
-                                HashMap::new(),
-                                Arc::clone(&playback_session_ref),
-                                session_id,
-                                128 * 1024,
-                                true,
-                                event_tx_clone.clone(),
-                                format!("Station {}", name_clone),
-                            ) {
-                                Ok(source) => {
-                                    let _ = cmd_tx_clone.send(AudioCommand::PlayPreparedRadio(
-                                        station_id_clone,
-                                        name_clone,
-                                        url_clone,
-                                        source,
-                                        session_id,
-                                    ));
-                                }
-                                Err(err) => {
-                                    // Mark the station as failing so the next play
-                                    // attempt re-resolves its URL (self-heal).
-                                    let _ = db::queries::increment_station_fail_count(
-                                        &db_clone,
-                                        &station_id_clone,
-                                    );
-                                    if playback_session_ref.load(Ordering::SeqCst) != session_id {
-                                        return;
-                                    }
-                                    let _ =
-                                        cmd_tx_clone.send(AudioCommand::StopForError(session_id));
-                                    let _ = event_tx_clone.send(AudioEvent::Error(format!(
-                                        "Failed to start station stream: {}",
-                                        err
-                                    )));
-                                }
-                            }
-                        })
-                        .ok();
-
+                    // History and queue bookkeeping, now off the critical path.
+                    Self::finalize_active_play(
+                        &db,
+                        &mut active_play,
+                        if reconnect_attempt.is_some() {
+                            PlayEndReason::StreamEnded
+                        } else {
+                            PlayEndReason::SourceChanged
+                        },
+                    );
+                    queue.clear();
+                    Self::sync_queue_state(&queue, &queue_snapshot);
+                    active_play = Self::begin_active_play(
+                        &db,
+                        None,
+                        Some("radio"),
+                        Some(&station_id),
+                        None,
+                        false,
+                    );
                     position_offset_ms = 0;
+                    log::info!(
+                        "radio: setup on the engine thread took {}ms",
+                        started.elapsed().as_millis()
+                    );
                 }
-                Ok(AudioCommand::PlayPreparedRadio(station_id, name, url, source, session_id)) => {
+                Ok(AudioCommand::RadioConnected(session_id)) => {
+                    if playback_session.load(Ordering::SeqCst) != session_id {
+                        continue;
+                    }
+                    let mut s = state.lock();
+                    // A reconnect keeps saying "Reconnecting" until audio
+                    // flows; a first connect moves on to "Buffering".
+                    if s.connection_stage != ConnectionStage::Connecting {
+                        continue;
+                    }
+                    set_radio_stage(&mut s, ConnectionStage::Buffering);
+                    let sc = s.clone();
+                    drop(s);
+                    emit_state_changed(&event_tx, sc);
+                }
+                Ok(AudioCommand::RadioFailed { session_id, error }) => {
+                    if !Self::error_session_is_current(&playback_session, session_id) {
+                        continue;
+                    }
+                    let retry = radio_session_is_reconnect
+                        && desired_playing
+                        && radio_reconnect_attempts < RADIO_MAX_RECONNECTS
+                        && last_radio_station.is_some();
+                    if retry {
+                        // A reopen failed mid-recovery: try again after the
+                        // next backoff rather than giving up on the first miss.
+                        radio_reconnect_attempts += 1;
+                        let backoff = radio_reconnect_backoff(radio_reconnect_attempts);
+                        radio_reconnect_due = Some(Instant::now() + backoff);
+                        log::info!(
+                            "radio: reconnect failed ({}); attempt {} in {:?}",
+                            error,
+                            radio_reconnect_attempts,
+                            backoff
+                        );
+                        let mut s = state.lock();
+                        set_radio_stage(&mut s, ConnectionStage::Reconnecting);
+                        s.reconnect_attempt = radio_reconnect_attempts;
+                        s.reconnect_max = RADIO_MAX_RECONNECTS;
+                        let sc = s.clone();
+                        drop(s);
+                        emit_state_changed(&event_tx, sc);
+                        continue;
+                    }
+
+                    // Give up, but keep the station loaded so the player can
+                    // say what happened and offer Retry.
+                    radio_reconnect_due = None;
+                    radio_reconnect_attempts = 0;
+                    radio_session_is_reconnect = false;
+                    Self::reset_playback_session(
+                        &sink,
+                        &playback_session,
+                        &db,
+                        &mut position_offset_ms,
+                        &mut current_position_reports_relative,
+                        &mut active_play,
+                        awaiting_source,
+                        PlayEndReason::PlaybackError,
+                    );
+                    awaiting_source = false;
+                    desired_playing = false;
+                    playback_kind = PlaybackKind::Idle;
+                    let mut s = state.lock();
+                    s.is_playing = false;
+                    s.is_buffering = false;
+                    s.position_ms = 0;
+                    set_radio_stage(&mut s, ConnectionStage::Failed);
+                    s.connection_error = Some(error);
+                    let sc = s.clone();
+                    drop(s);
+                    emit_state_changed(&event_tx, sc);
+                }
+                Ok(AudioCommand::PlayPreparedRadio {
+                    station_id,
+                    name,
+                    url,
+                    source,
+                    session_id,
+                    started,
+                    report,
+                }) => {
                     if playback_session.load(Ordering::SeqCst) != session_id {
                         continue;
                     }
@@ -1668,6 +1974,12 @@ impl AudioEngine {
                         desired_playing,
                     );
                     radio_started_at = Some(Instant::now());
+                    log::info!(
+                        "radio: station {} started: {} | sink playing {}ms",
+                        station_id,
+                        report,
+                        started.elapsed().as_millis()
+                    );
                 }
                 Ok(AudioCommand::Interrupted) => {
                     output_needs_reset = true;
@@ -1678,13 +1990,19 @@ impl AudioEngine {
                     let _ = cmd_tx.send(AudioCommand::Pause);
                 }
                 Ok(AudioCommand::ResetOutput) => {
-                    // Already handled by the pre-match hook when a reset was
-                    // pending. Otherwise rebuild eagerly, keeping the paused
+                    // When a reset was pending, the pre-match hook already
+                    // rebuilt the output for this very command; rebuilding it
+                    // again here only delayed the Resume that iOS sends right
+                    // after. Otherwise rebuild eagerly, keeping the paused
                     // state and re-pushing it so the lock screen shows us again.
-                    if output_needs_reset {
-                        output_needs_reset = false;
-                    } else if !Self::reopen_output(&mut output_stream, &mut sink, &event_tx) {
-                        output_needs_reset = true;
+                    if !output_rebuilt_this_turn {
+                        let rebuild_started = Instant::now();
+                        output_needs_reset =
+                            !Self::reopen_output(&mut output_stream, &mut sink, &event_tx);
+                        log::info!(
+                            "audio output reset in {}ms",
+                            rebuild_started.elapsed().as_millis()
+                        );
                     }
                     let s = state.lock().clone();
                     emit_state_changed(&event_tx, s);
@@ -1713,6 +2031,7 @@ impl AudioEngine {
                         s.is_playing = false;
                         s.is_buffering = false;
                         s.position_ms = 0;
+                        set_radio_stage(&mut s, ConnectionStage::Idle);
                         let state_clone = s.clone();
                         drop(s);
                         emit_state_changed(&event_tx, state_clone);
@@ -1844,6 +2163,7 @@ impl AudioEngine {
                                 let mut s = state.lock();
                                 s.is_playing = false;
                                 s.is_buffering = true;
+                                s.set_connection_stage(ConnectionStage::Buffering);
                                 s.can_seek = true;
                                 s.position_ms = ms;
                                 let state_clone = s.clone();
@@ -2310,8 +2630,13 @@ impl AudioEngine {
                     if let Some(due) = radio_reconnect_due {
                         if Instant::now() >= due {
                             radio_reconnect_due = None;
-                            if let Some((id, url, name)) = last_radio_station.clone() {
-                                let _ = cmd_tx.send(AudioCommand::PlayUrl(id, url, name));
+                            if let Some((station_id, url, name)) = last_radio_station.clone() {
+                                let _ = cmd_tx.send(AudioCommand::ReconnectRadio {
+                                    station_id,
+                                    url,
+                                    name,
+                                    attempt: radio_reconnect_attempts,
+                                });
                             }
                         }
                     }
@@ -2385,6 +2710,7 @@ impl AudioEngine {
                             }
                         } else {
                             playback_kind = PlaybackKind::Idle;
+                            state.lock().set_connection_stage(ConnectionStage::Idle);
                         }
                     } else if playback_kind == PlaybackKind::Radio
                         && !awaiting_source
@@ -2399,15 +2725,17 @@ impl AudioEngine {
                         }
                         let can_reconnect = desired_playing
                             && last_radio_station.is_some()
-                            && radio_reconnect_attempts < 3
+                            && radio_reconnect_attempts < RADIO_MAX_RECONNECTS
                             && radio_reconnect_due.is_none();
                         if can_reconnect {
                             radio_reconnect_attempts += 1;
-                            let backoff =
-                                Duration::from_millis(900 * u64::from(radio_reconnect_attempts));
+                            let backoff = radio_reconnect_backoff(radio_reconnect_attempts);
                             radio_reconnect_due = Some(Instant::now() + backoff);
                             awaiting_source = true;
                             s.is_buffering = true;
+                            set_radio_stage(&mut s, ConnectionStage::Reconnecting);
+                            s.reconnect_attempt = radio_reconnect_attempts;
+                            s.reconnect_max = RADIO_MAX_RECONNECTS;
                             let state_clone = s.clone();
                             drop(s);
                             Self::finalize_active_play(
@@ -2425,6 +2753,9 @@ impl AudioEngine {
                             desired_playing = false;
                             s.is_playing = false;
                             s.is_buffering = false;
+                            set_radio_stage(&mut s, ConnectionStage::Failed);
+                            s.connection_error =
+                                Some("The station stopped sending audio".to_string());
                             let state_clone = s.clone();
                             drop(s);
 
@@ -2524,6 +2855,8 @@ impl AudioEngine {
             command,
             AudioCommand::Pause
                 | AudioCommand::Interrupted
+                | AudioCommand::RadioConnected(..)
+                | AudioCommand::RadioFailed { .. }
                 | AudioCommand::Stop
                 | AudioCommand::StopForError(..)
                 | AudioCommand::Seek(..)

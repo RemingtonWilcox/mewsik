@@ -48,9 +48,9 @@ export const SCENE_CATALOG: SceneInfo[] = [
 	},
 	{
 		id: 'uk-rap-drill',
-		title: 'UK rap & drill',
+		title: 'UK grime & garage',
 		eyebrow: 'London & beyond',
-		description: 'Sliding 808s, grime lineage, and the UK accent on rap radio.',
+		description: 'Grime, UK garage, and the London sound straight from the source.',
 		family: 'hiphop',
 		accent: 'from-slate-400/30 via-zinc-500/10 to-transparent'
 	},
@@ -146,7 +146,7 @@ export const SCENE_CATALOG: SceneInfo[] = [
 		id: 'synthwave',
 		title: 'Synthwave',
 		eyebrow: 'Neon & arpeggios',
-		description: 'Retrowave, outrun, and darksynth built on eighties hardware worship.',
+		description: 'Retrowave, chillwave, and vaporwave built on eighties hardware worship.',
 		family: 'electronic',
 		accent: 'from-pink-500/30 via-purple-600/10 to-transparent'
 	},

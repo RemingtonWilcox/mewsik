@@ -176,6 +176,26 @@ pub struct SearchResultItem {
     pub duration_ms: Option<i64>,
 }
 
+/// Where the current source's connection is, so the player can say what is
+/// happening instead of showing a bare spinner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionStage {
+    /// No source is open (nothing loaded, stopped, or radio paused).
+    #[default]
+    Idle,
+    /// Opening the connection; no answer from the server yet.
+    Connecting,
+    /// The server answered; filling the start buffer.
+    Buffering,
+    /// Audio is flowing (a queue track may still be paused by the user).
+    Playing,
+    /// A live stream dropped and is being reopened; see `reconnect_attempt`.
+    Reconnecting,
+    /// Gave up. The station stays loaded so the player can offer Retry.
+    Failed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackState {
     pub is_playing: bool,
@@ -193,6 +213,27 @@ pub struct PlaybackState {
     pub is_shuffle: bool,
     pub repeat_mode: String,
     pub source: Option<String>,
+    pub connection_stage: ConnectionStage,
+    /// 1-based attempt while `connection_stage` is `Reconnecting`, else 0.
+    pub reconnect_attempt: u32,
+    /// How many reconnect attempts the engine makes before giving up.
+    pub reconnect_max: u32,
+    /// Short reason while `connection_stage` is `Failed`.
+    pub connection_error: Option<String>,
+}
+
+impl PlaybackState {
+    /// Moves to `stage`, clearing the attempt counter and error that only
+    /// belong to the reconnecting and failed stages.
+    pub fn set_connection_stage(&mut self, stage: ConnectionStage) {
+        self.connection_stage = stage;
+        if stage != ConnectionStage::Reconnecting {
+            self.reconnect_attempt = 0;
+        }
+        if stage != ConnectionStage::Failed {
+            self.connection_error = None;
+        }
+    }
 }
 
 impl Default for PlaybackState {
@@ -213,6 +254,10 @@ impl Default for PlaybackState {
             is_shuffle: false,
             repeat_mode: "off".to_string(),
             source: None,
+            connection_stage: ConnectionStage::Idle,
+            reconnect_attempt: 0,
+            reconnect_max: 0,
+            connection_error: None,
         }
     }
 }

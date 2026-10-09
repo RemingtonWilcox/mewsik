@@ -239,6 +239,37 @@ fn primaryRailPoint(s: f32, railIndex: u32) -> vec3<f32> {
 // One weft draft: how many times a filament crosses between its two rails in
 // a phrase, and where the crossing pattern starts. Hashed from the phrase so
 // every phrase re-drafts the weave; knot weight and energy densify it.
+// Phrase-scale evolution shared by the hero and the camera: x = phrase index,
+// y = blend toward the next phrase over its final eighth, so changes ease in.
+fn phraseClock() -> vec2<f32> {
+	let beats = params.cloth.x / 32.0;
+	return vec2<f32>(floor(beats), smoothstep(0.875, 1.0, fract(beats)));
+}
+
+// Which primary rail leads this phrase. The centre rail leads most phrases;
+// roughly one in three hands the lead to an outer rail.
+fn heroRail(phrase: f32) -> u32 {
+	let h = hashUnit(u32(max(phrase, 0.0)) + 3u, 41u, 7u);
+	if (h < 0.66) { return 1u; }
+	return select(0u, 2u, h > 0.83);
+}
+
+fn heroWeight(instanceIndex: u32) -> f32 {
+	let clock = phraseClock();
+	let now = select(0.0, 1.0, heroRail(clock.x) == instanceIndex);
+	let next = select(0.0, 1.0, heroRail(clock.x + 1.0) == instanceIndex);
+	return mix(now, next, clock.y);
+}
+
+// A small per-phrase change of viewing angle, so long passages do not hold one
+// framing; it eases across the phrase boundary instead of cutting.
+fn phraseYaw() -> f32 {
+	let clock = phraseClock();
+	let now = hashUnit(u32(max(clock.x, 0.0)) + 5u, 53u, 3u) - 0.5;
+	let next = hashUnit(u32(max(clock.x + 1.0, 0.0)) + 5u, 53u, 3u) - 0.5;
+	return mix(now, next, clock.y) * 0.42 * params.view.w;
+}
+
 fn weftDraft(phrase: f32, index: u32) -> vec2<f32> {
 	let h = hashUnit(u32(max(phrase, 0.0)) + 1u, index + 11u, 5u);
 	let h2 = hashUnit(u32(max(phrase, 0.0)) + 1u, index + 23u, 9u);
@@ -310,7 +341,7 @@ fn viewPoint(p0: vec3<f32>) -> vec3<f32> {
 	p.x = p.x * 1.32;
 	p.y = p.y * 1.12;
 	p.z = p.z * 1.16;
-	p = rotateY(p, params.camera.x + 0.62);
+	p = rotateY(p, params.camera.x + 0.62 + phraseYaw());
 	p = rotateX(p, params.camera.y - 0.18);
 	p = rotateZ(p, params.camera.w);
 	p.x = p.x + 0.04;
@@ -360,7 +391,7 @@ fn vs_main(
 	if (instanceIndex < ${LOOM_PRIMARY_RAILS}u) {
 		kind = 0.0;
 		family = min(instanceIndex * 2u, 5u);
-		hero = select(0.0, 1.0, instanceIndex == 1u);
+		hero = heroWeight(instanceIndex);
 		role = hero;
 		radius = params.style.x * (1.5 + hero * 0.9 + bandEnergy(family) * 0.7);
 	} else if (instanceIndex < ${LOOM_PRIMARY_RAILS + LOOM_SECONDARY_RAILS}u) {

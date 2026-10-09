@@ -1,7 +1,9 @@
 <script lang="ts">
 	import * as api from '$lib/api/tauri';
 	import { useLibrary } from '$lib/state/library.svelte';
-	import { usePlayer } from '$lib/state/player.svelte';
+	import { usePlayer, displayTitle } from '$lib/state/player.svelte';
+	import StationArt from '$lib/components/station-art.svelte';
+	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
 	import Logo from '$lib/components/logo.svelte';
 	import TrackTable from '$lib/components/library/track-table.svelte';
 	import { Button } from '$lib/components/ui/button';
@@ -81,20 +83,15 @@
 	{#if player.state.current_title}
 		<Card class="overflow-hidden">
 			<CardContent class="flex flex-col gap-4 p-5 md:flex-row md:items-center">
-				{#if player.state.current_album_art}
-					<img
-						src={player.state.current_album_art}
-						alt=""
-						class="size-20 rounded-xl object-cover"
-					/>
-				{:else}
-					<div class="flex size-20 items-center justify-center rounded-xl bg-muted">
-						<Radio class="size-8 text-muted-foreground" />
-					</div>
-				{/if}
+				<StationArt
+					name={displayTitle(player.state)}
+					src={player.state.current_album_art}
+					class="size-20 rounded-xl"
+					monogramClass="text-xl"
+				/>
 				<div class="min-w-0 flex-1">
 					<p class="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">Now Playing</p>
-					<h2 class="truncate text-2xl font-semibold">{player.state.current_title}</h2>
+					<h2 class="truncate text-2xl font-semibold">{displayTitle(player.state)}</h2>
 					<p class="truncate text-sm text-muted-foreground">{player.state.current_artist ?? ''}</p>
 					<div class="mt-2 flex flex-wrap gap-2">
 						{#if player.state.source}
@@ -103,11 +100,13 @@
 						{#if player.state.duration_ms > 0}
 							<Badge variant="secondary">{Math.round(player.state.duration_ms / 60000)} min</Badge>
 						{/if}
-						{#if player.state.is_buffering}
-							<Badge variant="secondary" class="gap-1">
-								<LoaderCircle class="size-3 animate-spin" />
-								Buffering
-							</Badge>
+						{#if player.state.source === 'radio' || player.state.is_buffering}
+							<ConnectionStatus
+								playback={player.state}
+								long
+								onRetry={() => void player.retryStation()}
+								class="text-xs text-muted-foreground"
+							/>
 						{/if}
 					</div>
 				</div>

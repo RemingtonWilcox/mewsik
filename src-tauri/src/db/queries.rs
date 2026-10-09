@@ -1788,6 +1788,37 @@ pub fn update_scene_station_health(
     Ok(())
 }
 
+/// A station failed in the play path (probe and self-heal both failed).
+/// Raise every scene row for it to at least two failures, which excludes it
+/// from all shelves at once, and record when that happened.
+pub fn mark_scene_station_failed(
+    db: &DbPool,
+    station_uuid: &str,
+    checked_at: &str,
+) -> Result<usize, rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE scene_stations SET fail_count = MAX(fail_count + 1, 2), last_checked_at = ?2 WHERE station_uuid = ?1",
+        params![station_uuid, checked_at],
+    )
+}
+
+/// How the most recent play of a saved station ended, if it has one.
+pub fn last_station_play_end_reason(
+    db: &DbPool,
+    station_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT end_reason FROM play_history WHERE station_id = ?1 ORDER BY started_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query(params![station_id])?;
+    match rows.next()? {
+        Some(row) => row.get(0),
+        None => Ok(None),
+    }
+}
+
 pub fn delete_scene_station_by_uuid(
     db: &DbPool,
     station_uuid: &str,

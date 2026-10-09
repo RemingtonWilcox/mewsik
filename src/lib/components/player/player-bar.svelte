@@ -1,7 +1,15 @@
 <script lang="ts">
 	import * as api from '$lib/api/tauri';
 	import type { PlaybackWaveform } from '$lib/types';
-	import { usePlayer, formatTime } from '$lib/state/player.svelte';
+	import {
+		usePlayer,
+		formatTime,
+		connectionMessage,
+		connectionStage,
+		displayTitle
+	} from '$lib/state/player.svelte';
+	import StationArt from '$lib/components/station-art.svelte';
+	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import { useVisualizerChrome } from '$lib/state/visualizer-chrome.svelte';
 	import { Button } from '$lib/components/ui/button';
@@ -21,7 +29,6 @@
 		Volume2,
 		VolumeX,
 		ListMusic,
-		LoaderCircle,
 		Sparkles
 	} from '@lucide/svelte';
 
@@ -92,6 +99,14 @@
 		!player.state.is_buffering && player.state.can_seek && player.state.duration_ms > 0
 	);
 	let hasTimeline = $derived(hasCurrentItem && player.state.duration_ms > 0);
+	let isRadio = $derived(player.state.source === 'radio');
+	let stage = $derived(connectionStage(player.state));
+	let title = $derived(displayTitle(player.state));
+	let subtitle = $derived(
+		isRadio
+			? (connectionMessage(player.state) ?? (stage === 'playing' ? 'Live radio' : 'Radio'))
+			: (player.state.current_artist ?? '')
+	);
 	let wantsWaveform = $derived(player.state.source === 'local' && hasTimeline);
 	let showWaveform = $derived(
 		Boolean(canSeek && wantsWaveform && waveform?.peaks?.length)
@@ -199,17 +214,24 @@
 				alt="Album art"
 				class="size-14 shrink-0 rounded-md object-cover max-[640px]:size-10"
 			/>
+		{:else if hasCurrentItem}
+			<StationArt
+				name={title}
+				src={null}
+				class="size-14 rounded-md max-[640px]:size-10"
+				monogramClass="text-base max-[640px]:text-xs"
+			/>
 		{:else}
 			<div class="flex size-14 shrink-0 items-center justify-center rounded-md bg-muted max-[640px]:size-10">
 				<ListMusic class="size-6 text-muted-foreground max-[640px]:size-4" />
 			</div>
 		{/if}
 		<div class="flex min-w-0 flex-col gap-0.5">
-			<p class="truncate text-sm font-medium">
-				{player.state.current_title ?? 'Not playing'}
+			<p class="truncate text-sm font-medium" title={player.state.current_title ?? undefined}>
+				{title ?? 'Not playing'}
 			</p>
-			<p class="truncate text-xs text-muted-foreground">
-				{player.state.current_artist ?? ''}
+			<p class="truncate text-xs text-muted-foreground" data-player-subtitle>
+				{subtitle}
 			</p>
 		</div>
 	</div>
@@ -275,20 +297,22 @@
 				/>
 				<span class="text-xs tabular-nums text-muted-foreground">{formatTime(player.state.duration_ms)}</span>
 			</div>
-		{:else if player.state.source === 'radio'}
-			<div class="flex w-full items-center justify-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground max-[640px]:hidden">
-					{#if player.state.is_buffering}
-						<LoaderCircle class="size-3 animate-spin" />
-					<span>Connecting</span>
+		{:else if isRadio}
+			<div class="flex w-full min-w-0 max-w-[360px] items-center justify-center text-xs text-muted-foreground max-[640px]:hidden">
+				{#if stage === 'idle'}
+					<span class="font-medium uppercase tracking-[0.18em]">Live radio</span>
 				{:else}
-					<span>Live Radio</span>
+					<ConnectionStatus
+						playback={player.state}
+						long
+						onRetry={() => void player.retryStation()}
+						class={stage === 'playing' ? 'font-medium uppercase tracking-[0.18em]' : ''}
+					/>
 				{/if}
-				<span class="text-[10px]">No seeking</span>
 			</div>
 		{:else if player.state.is_buffering}
-			<div class="flex w-full items-center justify-center gap-2 text-xs text-muted-foreground max-[640px]:hidden">
-				<LoaderCircle class="size-3 animate-spin" />
-				<span>Buffering playback...</span>
+			<div class="flex w-full items-center justify-center text-xs text-muted-foreground max-[640px]:hidden">
+				<ConnectionStatus playback={player.state} />
 			</div>
 		{:else if hasCurrentItem}
 			<div class="flex w-full items-center justify-center gap-2 text-xs text-muted-foreground max-[640px]:hidden">

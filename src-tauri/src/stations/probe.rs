@@ -4,6 +4,9 @@
 
 use super::network::{parse_public_http_url, send_public_get};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, LOCATION};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 const STATION_PROBE_BYTES: usize = 8 * 1024;
 const STATION_PLAYLIST_DEPTH: usize = 2;
@@ -11,6 +14,102 @@ const STATION_REDIRECT_LIMIT: usize = 5;
 const MAX_GLOBAL_STATION_PROBES: usize = 8;
 static STATION_PROBE_SEMAPHORE: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_GLOBAL_STATION_PROBES);
+/// Play-path probes are user-initiated and must not queue behind a
+/// background verification pass holding every global permit. They get their
+/// own small budget instead (a superseded play can still be in flight).
+const MAX_PLAYBACK_STATION_PROBES: usize = 2;
+static PLAYBACK_PROBE_SEMAPHORE: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_PLAYBACK_STATION_PROBES);
+
+// ── Playable-URL cache ──
+//
+// A successful probe proves a URL streamed audio a moment ago. The play path
+// reuses that proof for a while so a replay, resume or a pick the background
+// verifier just checked starts without another HTTP round trip and playlist
+// unwrap. Every successful probe (health checks included) warms it; only the
+// play path reads it. Failures are never cached: they always re-probe and
+// self-heal.
+
+const PLAYABLE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const PLAYABLE_CACHE_CAPACITY: usize = 512;
+
+struct PlayableEntry {
+    resolved: String,
+    stored_at: Instant,
+}
+
+static PLAYABLE_CACHE: LazyLock<Mutex<HashMap<String, PlayableEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn cache_key(url: &str) -> String {
+    url.trim().to_string()
+}
+
+fn cache_get_at(url: &str, now: Instant) -> Option<String> {
+    let mut cache = PLAYABLE_CACHE.lock().ok()?;
+    let key = cache_key(url);
+    let fresh = cache
+        .get(&key)
+        .map(|entry| now.saturating_duration_since(entry.stored_at) < PLAYABLE_CACHE_TTL)?;
+    if !fresh {
+        cache.remove(&key);
+        return None;
+    }
+    cache.get(&key).map(|entry| entry.resolved.clone())
+}
+
+fn cache_put_at(url: &str, resolved: &str, now: Instant) {
+    let Ok(mut cache) = PLAYABLE_CACHE.lock() else {
+        return;
+    };
+    if cache.len() >= PLAYABLE_CACHE_CAPACITY {
+        cache
+            .retain(|_, entry| now.saturating_duration_since(entry.stored_at) < PLAYABLE_CACHE_TTL);
+    }
+    if cache.len() >= PLAYABLE_CACHE_CAPACITY {
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.stored_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    let entry = PlayableEntry {
+        resolved: resolved.to_string(),
+        stored_at: now,
+    };
+    // The resolved direct stream is itself playable, so key both spellings.
+    if cache_key(resolved) != cache_key(url) {
+        cache.insert(
+            cache_key(resolved),
+            PlayableEntry {
+                resolved: resolved.to_string(),
+                stored_at: now,
+            },
+        );
+    }
+    cache.insert(cache_key(url), entry);
+}
+
+/// The direct stream URL a recent successful probe of `url` resolved to.
+pub(crate) fn cached_playable_url(url: &str) -> Option<String> {
+    cache_get_at(url, Instant::now())
+}
+
+pub(crate) fn remember_playable_url(url: &str, resolved: &str) {
+    cache_put_at(url, resolved, Instant::now());
+}
+
+/// Drop a cached proof (e.g. the engine reported the stream failing).
+pub(crate) fn forget_playable_url(url: &str) {
+    if let Ok(mut cache) = PLAYABLE_CACHE.lock() {
+        let key = cache_key(url);
+        if let Some(entry) = cache.remove(&key) {
+            cache.remove(&cache_key(&entry.resolved));
+        }
+    }
+}
 
 fn normalize_content_type(content_type: &str) -> String {
     content_type
@@ -210,8 +309,28 @@ pub(crate) async fn probe_station_stream(
     initial_url: &str,
 ) -> Option<String> {
     // This is process-wide, not per Tauri invocation. Overlapping search,
-    // favorite-health and play requests therefore share one hard ceiling.
+    // favorite-health and verification requests share one hard ceiling.
     let _permit = STATION_PROBE_SEMAPHORE.acquire().await.ok()?;
+    probe_and_remember(initial_url).await
+}
+
+/// The play path's probe: same checks, its own small concurrency budget so a
+/// background verification pass never delays a user pressing play.
+pub(crate) async fn probe_station_stream_for_playback(
+    _client: &reqwest::Client,
+    initial_url: &str,
+) -> Option<String> {
+    let _permit = PLAYBACK_PROBE_SEMAPHORE.acquire().await.ok()?;
+    probe_and_remember(initial_url).await
+}
+
+async fn probe_and_remember(initial_url: &str) -> Option<String> {
+    let playable = probe_station_stream_uncached(initial_url).await?;
+    remember_playable_url(initial_url, &playable);
+    Some(playable)
+}
+
+async fn probe_station_stream_uncached(initial_url: &str) -> Option<String> {
     let mut current_url = parse_public_http_url(initial_url).ok()?;
     let mut redirect_count = 0usize;
 
@@ -409,6 +528,36 @@ mod tests {
         assert!(is_playlist_content_type("audio/x-mpegurl"));
         assert!(is_playlist_content_type("application/pls+xml; v=2"));
         assert!(!is_playlist_content_type("audio/mpeg"));
+    }
+
+    #[test]
+    fn playable_cache_hits_within_ttl_and_expires_after() {
+        let start = Instant::now();
+        let url = "https://cache-test.example/station.m3u";
+        let resolved = "https://cache-test.example/live.mp3";
+        cache_put_at(url, resolved, start);
+        assert_eq!(
+            cache_get_at(url, start + Duration::from_secs(60)).as_deref(),
+            Some(resolved)
+        );
+        // The resolved stream is cached under its own spelling too.
+        assert_eq!(
+            cache_get_at(resolved, start + Duration::from_secs(60)).as_deref(),
+            Some(resolved)
+        );
+        assert_eq!(
+            cache_get_at(url, start + PLAYABLE_CACHE_TTL + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            cache_get_at("https://cache-test.example/never", start),
+            None
+        );
+
+        cache_put_at(url, resolved, start);
+        forget_playable_url(url);
+        assert_eq!(cache_get_at(url, start), None);
+        assert_eq!(cache_get_at(resolved, start), None);
     }
 
     #[tokio::test]

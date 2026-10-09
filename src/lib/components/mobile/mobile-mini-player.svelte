@@ -1,6 +1,13 @@
 <script lang="ts">
-	import { usePlayer } from '$lib/state/player.svelte';
-	import { Play, Pause, SkipForward, Radio, LoaderCircle } from '@lucide/svelte';
+	import {
+		usePlayer,
+		connectionStage,
+		displayTitle,
+		isConnecting
+	} from '$lib/state/player.svelte';
+	import StationArt from '$lib/components/station-art.svelte';
+	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
+	import { Play, Pause, SkipForward, Square, RotateCw } from '@lucide/svelte';
 
 	const { onExpand }: { onExpand: () => void } = $props();
 	const player = usePlayer();
@@ -13,8 +20,15 @@
 		)
 	);
 
-	let title = $derived(player.state.current_title ?? 'Not playing');
-	let subtitle = $derived(player.state.current_artist ?? player.state.source ?? '');
+	let isRadio = $derived(player.state.source === 'radio');
+	let stage = $derived(connectionStage(player.state));
+	let title = $derived(displayTitle(player.state) ?? 'Not playing');
+	// Radio shows its connection stage under the name; tracks show the artist.
+	let showStage = $derived(isRadio ? stage !== 'idle' : isConnecting(stage));
+	let subtitle = $derived(
+		isRadio ? 'Radio' : (player.state.current_artist ?? player.state.source ?? '')
+	);
+	let failed = $derived(stage === 'failed');
 
 	function togglePlayback(e: Event) {
 		e.stopPropagation();
@@ -47,23 +61,26 @@
 			}
 		}}
 	>
-		<div class="relative size-12 shrink-0 overflow-hidden rounded-md bg-muted">
-			{#if player.state.current_album_art}
+		{#if player.state.current_album_art}
+			<div class="relative size-12 shrink-0 overflow-hidden rounded-md bg-muted">
 				<img
 					src={player.state.current_album_art}
 					alt=""
 					class="size-full object-cover"
 				/>
-			{:else}
-				<div class="flex size-full items-center justify-center">
-					<Radio class="size-5 text-muted-foreground" />
-				</div>
-			{/if}
-		</div>
+			</div>
+		{:else}
+			<StationArt name={title} src={null} class="size-12 rounded-md" monogramClass="text-sm" />
+		{/if}
 
 		<div class="flex min-w-0 flex-1 flex-col">
 			<span class="truncate text-sm font-medium leading-tight">{title}</span>
-			{#if subtitle}
+			{#if showStage}
+				<ConnectionStatus
+					playback={player.state}
+					class="text-xs leading-tight text-muted-foreground"
+				/>
+			{:else if subtitle}
 				<span class="truncate text-xs text-muted-foreground leading-tight">{subtitle}</span>
 			{/if}
 		</div>
@@ -73,10 +90,18 @@
 				data-mini-action
 				class="flex size-10 items-center justify-center rounded-full transition-colors hover:bg-muted active:bg-muted/60"
 				onclick={togglePlayback}
-				aria-label={player.state.is_playing ? 'Pause' : 'Play'}
+				aria-label={failed
+					? 'Retry station'
+					: player.state.is_buffering
+						? 'Stop'
+						: player.state.is_playing
+							? 'Pause'
+							: 'Play'}
 			>
-				{#if player.state.is_buffering}
-					<LoaderCircle class="size-5 animate-spin" />
+				{#if failed}
+					<RotateCw class="size-5" />
+				{:else if player.state.is_buffering}
+					<Square class="size-4 fill-current" />
 				{:else if player.state.is_playing}
 					<Pause class="size-5 fill-current" />
 				{:else}

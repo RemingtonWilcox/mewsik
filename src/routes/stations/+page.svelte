@@ -4,6 +4,7 @@
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import StationMetrics from '$lib/components/stations/station-metrics.svelte';
+	import StationArt from '$lib/components/station-art.svelte';
 	import * as api from '$lib/api/tauri';
 	import type {
 		RadioBrowserStation,
@@ -20,6 +21,8 @@
 		type CuratedCollection
 	} from '$lib/radio/curated';
 	import { SCENE_CATALOG } from '$lib/radio/scenes';
+	import { DIRECTORY_GENRES, genreTagsFor } from '$lib/radio/genres';
+	import { cleanStationName } from '$lib/radio/names';
 	import {
 		DIRECTORY_SORT_OPTIONS,
 		sortRadioStations
@@ -52,13 +55,6 @@
 
 	const player = usePlayer();
 
-	const genres = [
-		'DnB', 'Hip Hop', 'Techno', 'House', 'Jazz', 'Lo-fi',
-		'Ambient', 'Classical', 'Rock', 'Metal', 'Reggae', 'Soul',
-		'R&B', 'Pop', 'Trance', 'Chillout', 'Latin', 'Blues',
-		'News', 'Talk Radio', 'Sports'
-	];
-
 	let query = $state('');
 	let searchMode = $state<'name' | 'tag'>('name');
 	let results = $state<RadioBrowserStation[]>([]);
@@ -76,8 +72,9 @@
 	let searchHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 	let discoverHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 	let probedUrls = $state<Set<string>>(new Set());
-	let failedFavicons = $state<Set<string>>(new Set());
-	let loadedFavicons = $state<Set<string>>(new Set());
+	// Stations that failed in the play path this session. The backend has
+	// already taken them off the shelves; this drops the card immediately.
+	let deadStationIds = $state<Set<string>>(new Set());
 	let selectedCollectionId = $state<CuratedCollection['id']>('night-drive');
 	let editorPicksOpen = $state(false);
 	let stationView = $state<'discover' | 'favorites' | 'directory'>('discover');
@@ -122,30 +119,53 @@
 	// frontend copy so chips render without a cache (or without a backend).
 	const scenes = $derived<SceneInfo[]>(feed.scenes.length > 0 ? feed.scenes : SCENE_CATALOG);
 	const sceneById = $derived(new Map(scenes.map((scene) => [scene.id, scene] as const)));
+	// Shelves as shown: dead picks dropped, and a shelf only survives while it
+	// can still lead with a verified pick (the backend orders verified first).
+	const visibleShelves = $derived.by<StationShelf[]>(() =>
+		feed.shelves.flatMap((shelf) => {
+			const items = shelf.items.filter((pick) => !isPickHidden(pick));
+			return items.length > 0 && items[0].verified ? [{ ...shelf, items }] : [];
+		})
+	);
 	const feedSceneIds = $derived(
-		new Set(feed.shelves.flatMap((shelf) => (shelf.sceneId ? [shelf.sceneId] : [])))
+		new Set(visibleShelves.flatMap((shelf) => (shelf.sceneId ? [shelf.sceneId] : [])))
 	);
 	const standaloneScenes = $derived(
 		scenes.filter((scene) => sceneExpansions[scene.id] && !feedSceneIds.has(scene.id))
 	);
-	const heroShelf = $derived<StationShelf | null>(feed.shelves[0] ?? null);
+	// The hero is the first verified pick in feed order that no local check
+	// has flagged. Unverified stations never take the hero.
+	const heroChoice = $derived.by(() => {
+		for (const shelf of visibleShelves) {
+			const pick = shelf.items.find(
+				(item) => item.verified && discoverHealthByUrl[item.station.url] !== 'stale'
+			);
+			if (pick) return { shelf, pick };
+		}
+		return null;
+	});
+	const heroShelf = $derived<StationShelf | null>(heroChoice?.shelf ?? null);
 	const heroPick = $derived<StationPick>(
-		heroShelf?.items[0] ?? {
+		heroChoice?.pick ?? {
 			station: curatedStations[0],
 			sceneId: null,
 			reason: 'Editor pick while the live feed fills',
 			score: 0,
 			bailRate: 0,
-			plays: 0
+			plays: 0,
+			verified: false,
+			lastCheckedAt: null
 		}
 	);
-	// Health probes are limited to the first 12 picks on screen, in feed order.
+	const heroName = $derived(cleanStationName(heroPick.station.name));
+	// Verified picks were probed by the backend. Local probes cover only the
+	// first 12 unverified picks on screen, in feed order.
 	const probeTargetStations = $derived.by(() => {
 		const seen = new Set<string>();
 		const stations: RadioBrowserStation[] = [];
-		for (const shelf of feed.shelves) {
+		for (const shelf of visibleShelves) {
 			for (const pick of shelf.items) {
-				if (seen.has(pick.station.url)) continue;
+				if (pick.verified || seen.has(pick.station.url)) continue;
 				seen.add(pick.station.url);
 				stations.push(pick.station);
 				if (stations.length >= MAX_LOCAL_DIRECTORY_PROBES) return stations;
@@ -154,7 +174,7 @@
 		return stations;
 	});
 	const showFeedSkeleton = $derived(
-		feedLoading || (feed.status === 'refreshing' && feed.shelves.length === 0)
+		feedLoading || (feed.status === 'refreshing' && visibleShelves.length === 0)
 	);
 	const cacheAgeLabel = $derived.by(() => {
 		if (feed.cacheAgeSeconds === null) {
@@ -198,11 +218,16 @@
 		return () => clearTimeout(timer);
 	});
 
+	// Keyed by the URL list itself (URLs never contain spaces): probe results
+	// reshape the shelves as dead picks drop out, and an unchanged list must
+	// not re-trigger probing.
+	const probeTargetKey = $derived(probeTargetStations.map((station) => station.url).join(' '));
+
 	$effect(() => {
 		if (stationView !== 'discover') return;
-		const stations = probeTargetStations;
-		if (stations.length === 0) return;
-		untrack(() => void verifyDiscoverPicks(stations.map((station) => station.url)));
+		const key = probeTargetKey;
+		if (!key) return;
+		untrack(() => void verifyDiscoverPicks(key.split(' ')));
 	});
 
 	$effect(() => {
@@ -315,24 +340,17 @@
 		return [station.country, stream].filter(Boolean).join(' · ');
 	}
 
-	function stationMonogram(station: RadioBrowserStation): string {
-		const letter = station.name.trim().replace(/^[^a-z0-9]+/i, '').charAt(0);
-		return (letter || station.name.charAt(0) || '?').toUpperCase();
+	function stationKey(station: RadioBrowserStation): string {
+		return (station.stationuuid || station.url).toLowerCase();
 	}
 
-	function stationFavicon(station: RadioBrowserStation): string | null {
-		const favicon = station.favicon?.trim();
-		if (!favicon || !favicon.startsWith('https://') || failedFavicons.has(favicon)) return null;
-		return favicon;
+	// A pick is hidden once it failed to play or a local probe found it dead.
+	function isPickHidden(pick: StationPick): boolean {
+		return deadStationIds.has(stationKey(pick.station)) || discoverHealthByUrl[pick.station.url] === 'dead';
 	}
 
-	function markFaviconFailed(favicon: string) {
-		failedFavicons = new Set([...failedFavicons, favicon]);
-	}
-
-	function markFaviconLoaded(favicon: string) {
-		if (loadedFavicons.has(favicon)) return;
-		loadedFavicons = new Set([...loadedFavicons, favicon]);
+	function markStationDead(station: RadioBrowserStation) {
+		deadStationIds = new Set([...deadStationIds, stationKey(station)]);
 	}
 
 	function mergeDirectoryStats(stations: RadioBrowserStation[]) {
@@ -396,11 +414,14 @@
 	}
 
 	async function verifyDiscoverPicks(urls: string[]) {
-		const pending = [...new Set(urls)].slice(0, MAX_LOCAL_DIRECTORY_PROBES);
+		const pending = [...new Set(urls)]
+			.filter((url) => !probedUrls.has(url))
+			.slice(0, MAX_LOCAL_DIRECTORY_PROBES);
 		if (pending.length === 0) return;
 		probedUrls = new Set([...probedUrls, ...pending]);
 		try {
 			const verified = await api.verifyStationUrls(pending);
+			if (verified.length === 0) return;
 			// Results are keyed by URL, so a late batch can only add information.
 			discoverHealthByUrl = {
 				...discoverHealthByUrl,
@@ -452,12 +473,15 @@
 		if (!searchQuery) return;
 		searching = true;
 		try {
+			// A genre (chip label or a typed genre word) maps to the real tags
+			// stations use, queried together; anything else is a tag lookup.
+			const genreTags = genreTagsFor(searchQuery);
+			const tagSearch = genreTags
+				? api.searchRadioStationsByTags(genreTags, sort)
+				: api.searchRadioStations(searchQuery, 'tag', sort);
 			const groups = mode === 'tag'
-				? [await api.searchRadioStations(searchQuery, 'tag', sort)]
-				: await Promise.all([
-					api.searchRadioStations(searchQuery, 'name', sort),
-					api.searchRadioStations(searchQuery, 'tag', sort)
-				]);
+				? [await tagSearch]
+				: await Promise.all([api.searchRadioStations(searchQuery, 'name', sort), tagSearch]);
 			const nextResults = sortRadioStations(Array.from(
 				new Map(groups.flat().map((station) => [station.stationuuid || station.url, station])).values()
 			), sort).slice(0, 30);
@@ -538,14 +562,26 @@
 				await stopPlaying();
 				return;
 			}
-			const stationId = await api.playStationSearchResult(station);
+			// The player shows "Connecting to …" right away while the stream check runs.
+			const stationId = await player.playStation(
+				{ name: cleanStationName(station.name), url: station.url },
+				() => api.playStationSearchResult(station)
+			);
 			searchStationIds = {
 				...searchStationIds,
 				[station.stationuuid || station.url]: stationId,
 				[station.url]: stationId
 			};
-			if (requestId === stationPlayRequest) toast.success(`Playing: ${station.name}`);
 		} catch (error) {
+			if (api.isStationUnavailableError(error)) {
+				// The backend marked it failed; drop the card now and let the
+				// hero move on to the next verified pick.
+				markStationDead(station);
+				if (requestId === stationPlayRequest) {
+					toast.error(`${cleanStationName(station.name)} is off the air. Removed from picks.`);
+				}
+				return;
+			}
 			if (requestId === stationPlayRequest && !String(error).includes('superseded')) {
 				toast.error(`Failed to play station: ${error}`);
 			}
@@ -559,8 +595,10 @@
 				await stopPlaying();
 				return;
 			}
-			await api.playStation(station.id, station.url, station.name);
-			if (requestId === stationPlayRequest) toast.success(`Playing: ${station.name}`);
+			await player.playStation(
+				{ id: station.id, name: cleanStationName(station.name), url: station.url },
+				() => api.playStation(station.id, station.url, station.name)
+			);
 		} catch (error) {
 			if (requestId === stationPlayRequest && !String(error).includes('superseded')) {
 				toast.error(`Failed to play station: ${error}`);
@@ -604,7 +642,7 @@
 				station.bitrate ?? undefined,
 				station.stationuuid
 			);
-			toast.success(`Saved "${station.name}" to favorites`);
+			toast.success(`Saved "${cleanStationName(station.name)}" to favorites`);
 			await loadFavorites();
 		} catch {
 			savedStationIds = new Set([...savedStationIds].filter((id) => id !== key));
@@ -625,7 +663,7 @@
 			savedStationIds = new Set(
 				[...savedStationIds].filter((key) => key !== station.url && key !== station.radio_browser_id)
 			);
-			toast.success(`Removed "${station.name}" from favorites`);
+			toast.success(`Removed "${cleanStationName(station.name)}" from favorites`);
 			await loadFavorites();
 		} catch {
 			toast.error('Failed to remove station');
@@ -650,9 +688,10 @@
 
 	type PickHealth = StationHealthResult['status'] | 'checking' | 'unknown';
 
-	function pickHealth(station: RadioBrowserStation): PickHealth {
+	function pickHealth(station: RadioBrowserStation, verified = false): PickHealth {
 		const status = discoverHealthByUrl[station.url];
 		if (status) return status;
+		if (verified) return 'ok';
 		return probedUrls.has(station.url) ? 'checking' : 'unknown';
 	}
 
@@ -662,7 +701,7 @@
 			case 'stale': return 'Connection issue';
 			case 'dead': return 'Couldn’t connect';
 			case 'checking': return 'Checking stream';
-			default: return 'Not tested locally';
+			default: return 'Not checked yet';
 		}
 	}
 
@@ -940,37 +979,23 @@
 
 	{#if stationView === 'discover'}
 
-	{#snippet stationArt(station: RadioBrowserStation, accent: string, sizeClass: string)}
-		{@const favicon = stationFavicon(station)}
-		<div class={`${sizeClass} relative flex shrink-0 items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/30 font-semibold text-white/85`} aria-hidden="true">
-			<div class={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accent}`}></div>
-			<span class="relative">{stationMonogram(station)}</span>
-			{#if favicon}
-				<img
-					src={favicon}
-					alt=""
-					class={`absolute inset-0 size-full object-cover transition-opacity ${loadedFavicons.has(favicon) ? 'opacity-100' : 'opacity-0'}`}
-					loading="lazy"
-					decoding="async"
-					onload={() => markFaviconLoaded(favicon)}
-					onerror={() => markFaviconFailed(favicon)}
-				/>
-			{/if}
-		</div>
-	{/snippet}
-
 	{#snippet pickCard(pick: StationPick, accent: string, railCard: boolean)}
 		{@const station = pick.station}
-		{@const health = pickHealth(station)}
+		{@const health = pickHealth(station, pick.verified)}
 		<article
 			class={`group relative flex min-w-0 flex-col overflow-hidden rounded-xl border border-border/70 bg-background/70 p-3.5 transition duration-300 hover:-translate-y-0.5 hover:border-white/20 hover:shadow-xl hover:shadow-black/15 ${railCard ? 'w-[72vw] max-w-[300px] shrink-0 snap-start lg:w-auto lg:max-w-none' : ''}`}
 		>
 			<div class={`pointer-events-none absolute inset-x-0 top-0 h-16 bg-gradient-to-b ${accent}`}></div>
 			<div class="relative flex items-start gap-3">
-				{@render stationArt(station, accent, 'size-12 text-lg')}
+				<StationArt
+					name={cleanStationName(station.name)}
+					src={station.favicon}
+					class="size-12 rounded-lg border border-white/10"
+					monogramClass="text-base"
+				/>
 				<div class="min-w-0 flex-1">
 					<div class="flex min-w-0 items-center gap-2">
-						<p class="truncate text-sm font-semibold text-white">{station.name}</p>
+						<p class="truncate text-sm font-semibold text-white">{cleanStationName(station.name)}</p>
 						<span class={`size-2 shrink-0 rounded-full ${pickHealthDotClass(health)}`} title={pickHealthLabel(health)}></span>
 					</div>
 					<p class="mt-0.5 truncate text-[11px] text-white/45">{stationMeta(station)}</p>
@@ -983,7 +1008,7 @@
 				</p>
 				<div class="flex shrink-0 items-center gap-1.5">
 					{#if isStationSaved(station)}
-						<span class="flex size-8 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary" title="Saved to favorites" aria-label={`${station.name} is saved`}>
+						<span class="flex size-8 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary" title="Saved to favorites" aria-label={`${cleanStationName(station.name)} is saved`}>
 							<Check class="size-3.5" />
 						</span>
 					{:else}
@@ -991,7 +1016,7 @@
 							class="flex size-8 items-center justify-center rounded-full border border-white/10 bg-black/15 text-white/55 transition hover:border-primary/30 hover:text-primary"
 							onclick={() => saveToFavorites(station)}
 							title="Save to favorites"
-							aria-label={`Save ${station.name}`}
+							aria-label={`Save ${cleanStationName(station.name)}`}
 						>
 							<Heart class="size-3.5" />
 						</button>
@@ -999,7 +1024,7 @@
 					<button
 						class="flex size-9 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/10 transition hover:scale-105 hover:bg-primary/90 active:scale-95"
 						onclick={() => playSearchResult(station)}
-						aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}
+						aria-label={isSearchStationActive(station) ? `Stop ${cleanStationName(station.name)}` : `Play ${cleanStationName(station.name)}`}
 					>
 						{#if isSearchStationActive(station)}
 							{#if player.state.is_buffering}
@@ -1027,11 +1052,11 @@
 					</div>
 				{:else if expansion.status === 'error'}
 					<p class="px-1 py-4 text-sm text-destructive">Couldn’t load the full {scene?.title ?? sceneId} list.</p>
-				{:else if expansion.items.length === 0}
+				{:else if expansion.items.filter((pick) => !isPickHidden(pick)).length === 0}
 					<p class="px-1 py-4 text-sm text-muted-foreground">No cached stations for {scene?.title ?? sceneId} yet. Refresh picks once the desktop app can reach radio-browser.info.</p>
 				{:else}
 					<div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-						{#each expansion.items as pick (pick.station.stationuuid || pick.station.url)}
+						{#each expansion.items.filter((pick) => !isPickHidden(pick)) as pick (pick.station.stationuuid || pick.station.url)}
 							{@render pickCard(pick, sceneAccent(sceneId), false)}
 						{/each}
 					</div>
@@ -1040,7 +1065,7 @@
 		{/if}
 	{/snippet}
 
-	{@const heroHealth = pickHealth(heroPick.station)}
+	{@const heroHealth = pickHealth(heroPick.station, heroPick.verified)}
 	<section class="relative isolate overflow-hidden rounded-2xl border border-white/10 bg-[#101817] px-5 py-5 shadow-xl shadow-black/20 sm:px-7 sm:py-6" aria-labelledby="hero-heading">
 		<div class="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_78%_22%,rgba(74,222,128,0.17),transparent_31%),radial-gradient(circle_at_16%_110%,rgba(34,211,238,0.12),transparent_40%)]"></div>
 		<div class="pointer-events-none absolute -right-8 -top-16 size-64 rounded-full border border-primary/10"></div>
@@ -1051,9 +1076,17 @@
 					<Sparkles class="size-3.5" />
 					{heroShelf ? heroShelf.title : 'Live radio'} · {cacheAgeLabel}
 				</div>
-				<h2 id="hero-heading" class="text-balance text-2xl font-semibold leading-tight tracking-[-0.025em] text-white sm:text-3xl">
-					{heroPick.station.name}
-				</h2>
+				<div class="flex items-center gap-3">
+					<StationArt
+						name={cleanStationName(heroPick.station.name)}
+						src={heroPick.station.favicon}
+						class="size-14 rounded-xl border border-white/10 lg:hidden"
+						monogramClass="text-lg"
+					/>
+					<h2 id="hero-heading" class="min-w-0 text-balance text-2xl font-semibold leading-tight tracking-[-0.025em] text-white sm:text-3xl">
+						{heroName}
+					</h2>
+				</div>
 				<p class="mt-2 max-w-xl text-sm leading-6 text-white/62">{heroPick.reason}</p>
 				<p class="mt-1 text-xs text-white/40">{stationMeta(heroPick.station)}</p>
 				<div class="mt-4 flex flex-col gap-2 min-[420px]:flex-row">
@@ -1067,10 +1100,10 @@
 							{:else}
 								<Square class="mr-2 size-4 fill-current" />
 							{/if}
-							Stop {heroPick.station.name}
+							Stop {heroName}
 						{:else}
 							<Play class="mr-2 size-4 fill-current" />
-							Play {heroPick.station.name}
+							Play {heroName}
 						{/if}
 					</Button>
 					<Button
@@ -1093,9 +1126,14 @@
 					</span>
 				</div>
 				<div class="mt-5 flex items-center gap-4">
-					{@render stationArt(heroPick.station, sceneAccent(heroPick.sceneId), 'size-12 text-xl')}
+					<StationArt
+						name={cleanStationName(heroPick.station.name)}
+						src={heroPick.station.favicon}
+						class="size-12 rounded-lg border border-white/10"
+						monogramClass="text-lg"
+					/>
 					<div class="min-w-0">
-						<p class="truncate font-medium text-white">{heroPick.station.name}</p>
+						<p class="truncate font-medium text-white">{heroName}</p>
 						<p class="mt-1 truncate text-xs text-white/45">
 							{heroPick.sceneId ? sceneTitle(heroPick.sceneId) : (heroShelf?.subtitle ?? 'Editor pick')}
 						</p>
@@ -1168,7 +1206,7 @@
 				</section>
 			{/each}
 		</div>
-	{:else if feed.shelves.length === 0}
+	{:else if visibleShelves.length === 0}
 		<Card class="border-dashed">
 			<CardContent class="flex flex-col items-center gap-4 py-12 text-center">
 				<div class="flex size-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
@@ -1187,7 +1225,7 @@
 			</CardContent>
 		</Card>
 	{:else}
-		{#each feed.shelves as shelf (shelf.id)}
+		{#each visibleShelves as shelf (shelf.id)}
 			{@const accent = sceneAccent(shelf.sceneId)}
 			<section id={`shelf-${shelf.id}`} class="scroll-mt-28" aria-labelledby={`shelf-${shelf.id}-heading`}>
 				<div class="mb-3 flex items-end justify-between gap-4">
@@ -1303,7 +1341,7 @@
 									<span
 										class="flex size-9 shrink-0 items-center justify-center rounded-full border border-primary/30 bg-primary/10 text-primary"
 										title="Saved to favorites"
-										aria-label={`${station.name} is saved`}
+										aria-label={`${cleanStationName(station.name)} is saved`}
 									>
 										<Check class="size-4" />
 									</span>
@@ -1312,7 +1350,7 @@
 										class="flex size-9 shrink-0 items-center justify-center rounded-full border border-white/10 bg-black/15 text-white/55 transition hover:border-primary/30 hover:text-primary"
 										onclick={() => saveToFavorites(station)}
 										title="Save to favorites"
-										aria-label={`Save ${station.name}`}
+										aria-label={`Save ${cleanStationName(station.name)}`}
 									>
 										<Heart class="size-4" />
 									</button>
@@ -1320,7 +1358,7 @@
 							</div>
 
 							<div class="relative mt-7">
-								<p class="truncate text-base font-semibold text-white">{station.name}</p>
+								<p class="truncate text-base font-semibold text-white">{cleanStationName(station.name)}</p>
 								<p class="mt-2 min-h-10 text-sm leading-5 text-muted-foreground">{station.editorial}</p>
 							</div>
 
@@ -1333,7 +1371,7 @@
 								<button
 									class="flex size-11 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg shadow-primary/10 transition hover:scale-105 hover:bg-primary/90 active:scale-95"
 									onclick={() => playSearchResult(station)}
-									aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}
+									aria-label={isSearchStationActive(station) ? `Stop ${cleanStationName(station.name)}` : `Play ${cleanStationName(station.name)}`}
 								>
 									{#if isSearchStationActive(station)}
 										{#if player.state.is_buffering}
@@ -1375,7 +1413,7 @@
 							<button
 								class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition hover:scale-105 hover:bg-primary/90 active:scale-95"
 								onclick={() => isStationActive(station.id) ? stopPlaying() : playFavorite(station)}
-								aria-label={isStationActive(station.id) ? `Stop ${station.name}` : `Play ${station.name}`}
+								aria-label={isStationActive(station.id) ? `Stop ${cleanStationName(station.name)}` : `Play ${cleanStationName(station.name)}`}
 							>
 								{#if isStationActive(station.id)}
 									{#if player.state.is_buffering}<LoaderCircle class="size-4 animate-spin" />{:else}<Square class="size-4 fill-current" />{/if}
@@ -1388,7 +1426,7 @@
 							</div>
 							<div class="min-w-0 flex-1 overflow-hidden">
 								<div class="flex min-w-0 items-center gap-2">
-									<p class="truncate text-sm font-medium">{station.name}</p>
+									<p class="truncate text-sm font-medium">{cleanStationName(station.name)}</p>
 									<span class={`size-2 shrink-0 rounded-full ${healthDotClass(health)}`} title={stationHealthLabel(station)}></span>
 									{#if isStationActive(station.id) && !player.state.is_buffering}<span class="size-2 shrink-0 animate-pulse rounded-full bg-primary"></span>{/if}
 								</div>
@@ -1397,7 +1435,7 @@
 								</p>
 								<p class={`mt-1 truncate text-[11px] ${healthTextClass(health)}`}>{stationHealthLabel(station)}</p>
 							</div>
-							<Button variant="ghost" size="icon" class="size-9 shrink-0 text-muted-foreground hover:text-destructive" onclick={() => removeFavorite(station)} title="Remove from favorites" aria-label={`Remove ${station.name} from favorites`}>
+							<Button variant="ghost" size="icon" class="size-9 shrink-0 text-muted-foreground hover:text-destructive" onclick={() => removeFavorite(station)} title="Remove from favorites" aria-label={`Remove ${cleanStationName(station.name)} from favorites`}>
 								<HeartOff class="size-4" />
 							</Button>
 						</CardContent>
@@ -1460,9 +1498,9 @@
 
 		{#if query.trim().length <= 1}
 			<div class="flex gap-2 overflow-x-auto pb-2 sm:flex-wrap sm:overflow-visible">
-				{#each genres as genre}
-					<button class="shrink-0 rounded-full border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary" onclick={() => searchGenre(genre)}>
-						{genre}
+				{#each DIRECTORY_GENRES as genre (genre.label)}
+					<button class="shrink-0 rounded-full border border-border bg-card px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/10 hover:text-primary" onclick={() => searchGenre(genre.label)} title={genre.tags.join(', ')}>
+						{genre.label}
 					</button>
 				{/each}
 			</div>
@@ -1480,7 +1518,7 @@
 						{@const health = resultHealth(station)}
 						<Card class={`overflow-hidden transition-colors hover:border-border hover:bg-muted/40 ${health === 'dead' ? 'border-red-500/15 bg-red-500/[0.025]' : ''}`}>
 							<CardContent class="flex min-w-0 items-center gap-3 p-3">
-								<button class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition hover:scale-105 hover:bg-primary/90 active:scale-95" onclick={() => playSearchResult(station)} aria-label={isSearchStationActive(station) ? `Stop ${station.name}` : `Play ${station.name}`}>
+								<button class="flex size-10 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition hover:scale-105 hover:bg-primary/90 active:scale-95" onclick={() => playSearchResult(station)} aria-label={isSearchStationActive(station) ? `Stop ${cleanStationName(station.name)}` : `Play ${cleanStationName(station.name)}`}>
 									{#if isSearchStationActive(station)}
 										{#if player.state.is_buffering}<LoaderCircle class="size-4 animate-spin" />{:else}<Square class="size-4 fill-current" />{/if}
 									{:else}<Play class="size-4 fill-current pl-0.5" />{/if}
@@ -1490,7 +1528,7 @@
 								</div>
 								<div class="min-w-0 flex-1 overflow-hidden">
 									<div class="flex min-w-0 items-center gap-2">
-										<p class="truncate text-sm font-medium">{station.name}</p>
+										<p class="truncate text-sm font-medium">{cleanStationName(station.name)}</p>
 										<span class={`size-2 shrink-0 rounded-full ${healthDotClass(health)}`} title={resultHealthLabel(station)}></span>
 									</div>
 									<p class="mt-0.5 truncate text-xs text-muted-foreground">{[snapshot.country, snapshot.language, snapshot.codec, directorySort !== 'quality' && snapshot.bitrate ? `${snapshot.bitrate} kbps` : null].filter(Boolean).join(' · ')}</p>
@@ -1500,12 +1538,12 @@
 									{/if}
 								</div>
 								{#if isStationSaved(station)}
-									<span class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-primary/10 px-2.5 text-[11px] font-medium text-primary" title="Saved to favorites" aria-label={`${station.name} is saved`}>
+									<span class="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full bg-primary/10 px-2.5 text-[11px] font-medium text-primary" title="Saved to favorites" aria-label={`${cleanStationName(station.name)} is saved`}>
 										<Check class="size-3.5" />
 										<span class="hidden sm:inline">Saved</span>
 									</span>
 								{:else}
-									<Button variant="ghost" size="icon" class="size-9 shrink-0 text-muted-foreground" onclick={() => saveToFavorites(station)} title="Save to favorites" aria-label={`Save ${station.name}`}>
+									<Button variant="ghost" size="icon" class="size-9 shrink-0 text-muted-foreground" onclick={() => saveToFavorites(station)} title="Save to favorites" aria-label={`Save ${cleanStationName(station.name)}`}>
 										<Heart class="size-4" />
 									</Button>
 								{/if}

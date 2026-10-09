@@ -214,6 +214,7 @@ pub fn run() {
             // Stations
             commands::stations::search_radio_stations,
             commands::stations::search_radio_stations_advanced,
+            commands::stations::search_radio_stations_by_tags,
             commands::stations::browse_radio_stations,
             commands::stations::get_radio_station_details,
             commands::stations::save_station,

@@ -181,7 +181,23 @@ export interface PlaybackState {
 	is_shuffle: boolean;
 	repeat_mode: RepeatMode;
 	source: SourceType | null;
+	/** Where the source's connection is. Optional: older runtimes omit it. */
+	connection_stage?: ConnectionStage;
+	/** 1-based attempt while reconnecting, else 0. */
+	reconnect_attempt?: number;
+	/** Attempts the engine makes before giving up. */
+	reconnect_max?: number;
+	/** Short reason while the stage is `failed`. */
+	connection_error?: string | null;
 }
+
+export type ConnectionStage =
+	| 'idle'
+	| 'connecting'
+	| 'buffering'
+	| 'playing'
+	| 'reconnecting'
+	| 'failed';
 
 export interface PlaybackWaveform {
 	recording_id: string;
