@@ -15,7 +15,10 @@ import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 
 const label = process.argv[2] ?? process.env.LOOM_SHOT_DIR ?? 'matrix';
-const outDir = `output/loom-${label}`;
+// VIS_ENGINE=mk1|mk2|signal|loom captures another engine with the same matrix.
+const engine = process.env.VIS_ENGINE ?? 'loom';
+const seed = process.env.VIS_SEED ?? 'loom-audit';
+const outDir = `output/${engine}-${label}`;
 const baseURL = 'http://127.0.0.1:5173';
 
 const CASES = [
@@ -62,7 +65,7 @@ try {
 	const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
 	for (const { profile, stage } of CASES) {
 		await page.goto(
-			`${baseURL}/visualizer-test?engine=loom&profile=${profile}&stage=${stage}&seed=loom-audit&chrome=0`
+			`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&stage=${stage}&seed=${seed}&chrome=0`
 		);
 		await page.getByLabel('Loom audio visualizer').waitFor({ state: 'attached', timeout: 15_000 });
 		const ready = await page
