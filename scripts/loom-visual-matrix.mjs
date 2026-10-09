@@ -18,6 +18,14 @@ const label = process.argv[2] ?? process.env.LOOM_SHOT_DIR ?? 'matrix';
 // VIS_ENGINE=mk1|mk2|signal|loom captures another engine with the same matrix.
 const engine = process.env.VIS_ENGINE ?? 'loom';
 const seed = process.env.VIS_SEED ?? 'loom-audit';
+// Each engine labels its canvas and readiness attribute differently.
+const ENGINE_CANVAS = {
+	mk1: ['Prism audio visualizer', 'data-prism-ready'],
+	mk2: ['Soma audio visualizer', 'data-mk2-ready'],
+	signal: ['Signal audio visualizer', 'data-signal-ready'],
+	loom: ['Loom audio visualizer', 'data-loom-ready']
+};
+const [canvasLabel, readyAttribute] = ENGINE_CANVAS[engine] ?? ENGINE_CANVAS.loom;
 const outDir = `output/${engine}-${label}`;
 const baseURL = 'http://127.0.0.1:5173';
 
@@ -67,14 +75,15 @@ try {
 		await page.goto(
 			`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&stage=${stage}&seed=${seed}&chrome=0`
 		);
-		await page.getByLabel('Loom audio visualizer').waitFor({ state: 'attached', timeout: 15_000 });
+		await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 15_000 });
 		const ready = await page
 			.waitForFunction(
-				() =>
-					document
-						.querySelector('canvas[aria-label="Loom audio visualizer"]')
-						?.getAttribute('data-loom-ready') === 'true',
-				null,
+				([label, attribute]) => {
+					const canvas = document.querySelector(`canvas[aria-label="${label}"]`);
+					// Engines without a readiness attribute count as ready once mounted.
+					return !!canvas && (!canvas.hasAttribute(attribute) || canvas.getAttribute(attribute) === 'true');
+				},
+				[canvasLabel, readyAttribute],
 				{ timeout: 15_000 }
 			)
 			.then(() => true)

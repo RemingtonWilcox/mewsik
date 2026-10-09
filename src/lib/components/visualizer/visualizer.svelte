@@ -5,902 +5,115 @@
 		FixedFrameScheduler,
 		PRISM_FRAME_RATE,
 		PRISM_MAX_INTERNAL_PIXELS,
-		prismBackingSize,
-		prismEventUnit
+		prismBackingSize
 	} from '$lib/visualizer/prism/runtime';
+	import {
+		PRISM_BIN_COUNT,
+		PRISM_BLOOM_DOWN_WGSL,
+		PRISM_BLUR_H_WGSL,
+		PRISM_BLUR_V_WGSL,
+		PRISM_CATHEDRAL_WGSL,
+		PRISM_COMPOSITE_WGSL,
+		PRISM_FEEDBACK_WGSL,
+		PRISM_NEBULAE_WGSL,
+		PRISM_ROSE_WGSL,
+		PRISM_UNIFORM_BYTES,
+		PRISM_UNIFORM_FLOATS,
+		PRISM_UNIFORM_OFFSETS as O,
+		PRISM_VORONOI_WGSL
+	} from '$lib/visualizer/prism/shaders';
+	import {
+		prismComposition,
+		prismFamily,
+		prismPaletteRoles,
+		type PrismComposition,
+		type PrismFamily,
+		type Rgb
+	} from '$lib/visualizer/prism/composition';
 
 	const vis = useVisualizer();
 
+	const BINS_BYTES = PRISM_BIN_COUNT * 4;
+	/** Rose radii per second that a section's re-leading wave travels. */
+	const TRANSITION_SPEED = 0.78;
+	/** The wave keeps going past the rose so the wall re-cuts its voussoirs too. */
+	const TRANSITION_END = 2.4;
+	const RENDER_PASSES = 8;
+
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
+	let ready = $state(false);
+	let hudSection = $state('intro');
+	let hudFold = $state(8);
 	let raf = 0;
 	let unsub: (() => void) | null = null;
 	let running = false;
-
-	const BIN_COUNT = 64;
+	let initVersion = 0;
+	let initializing = false;
 	const frameScheduler = new FixedFrameScheduler();
 
-	// Smoothed feature envelopes — two-pole(ish) so audio drives parameters of
-	// parameters rather than mapping 1:1 to geometry. Per the research: "amateur:
-	// radius = bass; pro: bass nudges a target an envelope eases toward over
-	// 200-800ms". Attack faster than release for punch + sustain.
-	const smoothed = {
-		bins: new Float32Array(BIN_COUNT),
+	// ── Render-rate state. Audio only ever moves targets that these envelopes
+	// ease toward; nothing in the shader reads a raw analyzer value.
+	const bins = new Float32Array(PRISM_BIN_COUNT);
+	const env = {
 		bass: 0,
 		mid: 0,
 		treble: 0,
 		centroid: 0.5,
 		rms: 0,
-		flash: 0,
-		rotation: 0, // accumulated rotation (driven by mid)
-		// Chroma is circular (C wraps to B → C), so we smooth its (cos, sin)
-		// unit vector and recover the angle. Avoids a 11/12→0 snap on key shifts.
-		chromaX: 1,
-		chromaY: 0,
-		chromaStrength: 0,
-		bpmNorm: 0
+		energy: 0,
+		impact: 0,
+		growth: 0,
+		backlight: 0,
+		air: 0.8,
+		rings: 0,
+		spiral: 0,
+		petals: 1,
+		silence: 1,
+		quietFor: 0,
+		sunX: 0,
+		sunY: 0.1,
+		sunPower: 0.6,
+		packetStrength: 0,
+		rotation: 0,
+		previousRotation: 0
+	};
+	const palette = {
+		hero: [0.3, 0.02, 0.04] as Rgb,
+		support: [0.01, 0.2, 0.22] as Rgb,
+		accent: [0.4, 0.2, 0.03] as Rgb,
+		field: [0.02, 0.05, 0.2] as Rgb
 	};
 
-	// Prism now shares the same deterministic per-source journey as Soma and
-	// Signal. A real A -> B -> A source sequence still has distinct epochs, while
-	// returning to A restores A's visual identity instead of rolling a new world.
 	let songSeed = 0.5;
+	let seedSalt = 0;
 	let rendererSourceEpoch = -1;
-	let onsetEventIndex = 0;
-	let onsetLatched = false;
+	let lastBeatCount = -1;
+	let lastSection = '';
+	let familyVisits: Record<PrismFamily, number> = { quiet: 0, verse: 0, rise: 0, peak: 0, drift: 0 };
+	let compA: PrismComposition = prismComposition('quiet', 0.5, 0);
+	let compB: PrismComposition = compA;
+	let pendingComp: PrismComposition | null = null;
+	let transitionFront = TRANSITION_END;
+	let transitionGlow = 0;
+	let feedbackResetFrames = 2;
+	let frameIndex = 0;
 
-	// Onset event roulette — each onset has a chance to trigger a brief surprise
-	// (trail clear, palette jump, etc.). Its sequence is seeded by the musical
-	// journey, so identical source/onset sequences make identical choices.
-	let onsetEventStrip = 0;
-	let onsetEventPalJump = 0;
-
-	function lerp(a: number, b: number, t: number) {
-		return a + (b - a) * t;
+	function clamp(value: number, low: number, high: number) {
+		return Math.min(high, Math.max(low, value));
 	}
 
-	// Uniform layout — 24 f32s = 96 bytes, multiple of 16 for std140-ish alignment.
-	const UNIFORM_FLOATS = 24;
-	const UNIFORM_BYTES = UNIFORM_FLOATS * 4;
-	const BINS_BYTES = BIN_COUNT * 4;
-
-	const COMMON_WGSL = /* wgsl */ `
-struct Uniforms {
-	resolutionX: f32,
-	resolutionY: f32,
-	time: f32,
-	bass: f32,
-	mid: f32,
-	treble: f32,
-	centroid: f32,
-	rms: f32,
-	flash: f32,
-	bloomThreshold: f32,
-	feedbackFade: f32,
-	feedbackRotation: f32,
-	feedbackZoom: f32,
-	blurDirX: f32,
-	blurDirY: f32,
-	beatPhase: f32,
-	chromaKey: f32,
-	chromaStrength: f32,
-	bpmNorm: f32,
-	songSeed: f32,   // 0..1, shared deterministic journey seed
-	palJump: f32,    // brief palette T jump from onset roulette
-	sceneWeight: f32, // 0..1, scales scene output for top-2 blend rendering
-	longPhase: f32,  // shared song-scale phase; survives renderer remounts
-	sectionEnergy: f32,
-};
-
-fn fullscreenVS(idx: u32) -> vec4<f32> {
-	var pos = array<vec2<f32>, 6>(
-		vec2<f32>(-1.0, -1.0),
-		vec2<f32>( 1.0, -1.0),
-		vec2<f32>(-1.0,  1.0),
-		vec2<f32>(-1.0,  1.0),
-		vec2<f32>( 1.0, -1.0),
-		vec2<f32>( 1.0,  1.0)
-	);
-	return vec4<f32>(pos[idx], 0.0, 1.0);
-}
-
-// 1D value noise — used as a slow organic modulator on structural parameters
-// so they drift in real time rather than being deterministic functions of audio.
-// Cheap, smooth, good enough for "alive" feel.
-fn snoise(t: f32) -> f32 {
-	let i = floor(t);
-	let f = t - i;
-	let u = f * f * (3.0 - 2.0 * f);
-	let h0 = fract(sin(i * 12.9898) * 43758.5453);
-	let h1 = fract(sin((i + 1.0) * 12.9898) * 43758.5453);
-	return mix(h0, h1, u);
-}
-
-// 4-stop iridescence: deep indigo → teal → copper-gold → magenta → loop.
-// Picked stops, not RGB cosines — the cosine ramp is the rookie palette.
-fn iridescent(t: f32) -> vec3<f32> {
-	let s = fract(t);
-	let indigo  = vec3<f32>(0.08, 0.04, 0.32);
-	let teal    = vec3<f32>(0.07, 0.55, 0.62);
-	let gold    = vec3<f32>(0.94, 0.55, 0.18);
-	let magenta = vec3<f32>(0.78, 0.18, 0.66);
-	let x = s * 4.0;
-	if (x < 1.0) { return mix(indigo,  teal,    smoothstep(0.0, 1.0, x)); }
-	if (x < 2.0) { return mix(teal,    gold,    smoothstep(0.0, 1.0, x - 1.0)); }
-	if (x < 3.0) { return mix(gold,    magenta, smoothstep(0.0, 1.0, x - 2.0)); }
-	return mix(magenta, indigo, smoothstep(0.0, 1.0, x - 3.0));
-}
-`;
-
-	const SCENE_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> bins: array<f32, ${BIN_COUNT}>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-fn hash21(p: vec2<f32>) -> f32 {
-	let h = dot(p, vec2<f32>(127.1, 311.7));
-	return fract(sin(h) * 43758.5453);
-}
-
-fn rot(a: f32) -> mat2x2<f32> {
-	let c = cos(a);
-	let s = sin(a);
-	return mat2x2<f32>(c, -s, s, c);
-}
-
-// Truchet variant A: two diagonal arcs per cell (classic).
-fn truchet_arcs(p: vec2<f32>) -> f32 {
-	let cell = floor(p);
-	let local = fract(p) - 0.5;
-	let h = hash21(cell);
-	let r = 0.5;
-	if (h < 0.5) {
-		let d1 = abs(length(local - vec2<f32>(-0.5, -0.5)) - r);
-		let d2 = abs(length(local - vec2<f32>( 0.5,  0.5)) - r);
-		return min(d1, d2);
-	}
-	let d1 = abs(length(local - vec2<f32>(-0.5,  0.5)) - r);
-	let d2 = abs(length(local - vec2<f32>( 0.5, -0.5)) - r);
-	return min(d1, d2);
-}
-
-// Truchet variant B: all four corner arcs (denser cross-weave).
-fn truchet_cross(p: vec2<f32>) -> f32 {
-	let local = fract(p) - 0.5;
-	let r = 0.5;
-	let d1 = abs(length(local - vec2<f32>(-0.5, -0.5)) - r);
-	let d2 = abs(length(local - vec2<f32>( 0.5,  0.5)) - r);
-	let d3 = abs(length(local - vec2<f32>(-0.5,  0.5)) - r);
-	let d4 = abs(length(local - vec2<f32>( 0.5, -0.5)) - r);
-	return min(min(d1, d2), min(d3, d4));
-}
-
-// Truchet variant C: straight diagonal slash, random direction (X-grid feel).
-fn truchet_diag(p: vec2<f32>) -> f32 {
-	let cell = floor(p);
-	let local = fract(p) - 0.5;
-	let h = hash21(cell);
-	if (h < 0.5) {
-		return abs(local.x - local.y);
-	}
-	return abs(local.x + local.y);
-}
-
-// Truchet variant D: nested concentric rings (mandala feel).
-fn truchet_rings(p: vec2<f32>) -> f32 {
-	let cell = floor(p);
-	let local = fract(p) - 0.5;
-	let h = hash21(cell);
-	let r = length(local);
-	let baseR = 0.16 + h * 0.16;
-	let d1 = abs(r - baseR);
-	let d2 = abs(r - baseR * 1.9);
-	let d3 = abs(r - baseR * 2.7);
-	return min(d1, min(d2, d3));
-}
-
-// Variant dispatcher — songSeed quantized picks one tile generator per track.
-// Same kaleidoscope framework, fundamentally different texture per song.
-fn truchet(p: vec2<f32>, variant: i32) -> f32 {
-	if (variant == 0) { return truchet_arcs(p); }
-	if (variant == 1) { return truchet_cross(p); }
-	if (variant == 2) { return truchet_diag(p); }
-	return truchet_rings(p);
-}
-
-// Hyperbolic-style radial warp toward the unit disk. Points near r=0 are
-// unchanged; near r=1 they stretch to infinity. Mimics the Poincaré recession
-// without the full Möbius transform machinery.
-fn hyperbolicWarp(p: vec2<f32>, depth: f32) -> vec2<f32> {
-	let r = length(p);
-	if (r < 1e-4) { return p; }
-	let dir = p / r;
-	let rWarped = -log(max(1.0 - clamp(r, 0.0, 0.985), 1e-3)) * depth;
-	return dir * rWarped;
-}
-
-fn kaleidoscope(p: vec2<f32>, sides: f32) -> vec2<f32> {
-	let r = length(p);
-	var a = atan2(p.y, p.x);
-	let seg = 6.28318530718 / sides;
-	a = abs(a - round(a / seg) * seg);
-	return vec2<f32>(cos(a), sin(a)) * r;
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = (frag.xy - 0.5 * res) / res.y;
-	let rEye = length(uv);
-
-	// Tighter disk — falloff from 0.92 to 0.55. Brings the visible window in
-	// from the corners (no more wide-angle stretch artifact at the rim).
-	let diskMask = smoothstep(0.92, 0.55, rEye);
-	if (diskMask < 1e-3) {
-		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+	function approach(current: number, target: number, rate: number, dt: number) {
+		return current + (target - current) * (1 - Math.exp(-rate * dt));
 	}
 
-	// Hyperbolic radial warp — reduced depth so structure stays legible at
-	// the edges rather than stretching out into infinity.
-	let warpDepth = 0.85 + u.mid * 0.12;
-	var p = hyperbolicWarp(uv, warpDepth);
-
-	// Slow drift — feedback handles "breathing"; scene rotates slowly via mid.
-	p = rot(u.feedbackRotation * 0.6) * p;
-
-	// Kaleidoscope fold count — audio sets the *target*, but a slow noise drift
-	// wanders ±2 around it so the symmetry isn't deterministically tied to the
-	// current audio frame. The visual evolves on its own timescale.
-	let driftSlow = snoise(u.longPhase * 0.42 + u.songSeed * 31.0);
-	let kalSidesRaw = 4.0 + floor(
-		u.centroid * 5.0 + u.bpmNorm * 1.5 + u.sectionEnergy * 1.5
-			+ (driftSlow - 0.5) * 4.0
-	) * 2.0;
-	let kalSides = clamp(kalSidesRaw, 4.0, 18.0);
-	let kal = kaleidoscope(p, kalSides);
-
-	// Beat pulse — sharp punch at phase=0, decays toward 0.5. Drives both a
-	// per-beat brightness lift on the edges and a subtle scale punch so the
-	// whole geometry breathes on tempo. This is what makes the visual feel
-	// locked to the music instead of just reactive.
-	let beatPulse = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 4.0);
-
-	// Tile scale evolves organically — audio target plus slow noise drift.
-	let scaleDrift = snoise(u.longPhase * 0.31 + u.songSeed * 71.0);
-	let tileScale = 2.5 + u.bpmNorm * 0.72 - u.chromaStrength * 0.34
-		+ u.bass * 0.2 + u.sectionEnergy * 0.38 + scaleDrift * 0.8;
-	let scalePunch = 1.0 - beatPulse * 0.12;
-	// Per-song seed shifts the tile-grid origin. Continuous variant morphing:
-	// we pick a "current" and "next" variant and BLEND between them over time
-	// (variantPhase oscillates 0→1→0 with ~12s period, modulated by noise).
-	// Result: same kaleidoscope framework but textures continuously mutate
-	// across (arcs / cross / diag / rings) rather than locking to one per song.
-	let variantClock = u.longPhase * 0.64 + u.songSeed * 23.0;
-	let variantA = i32(floor(variantClock)) - i32(floor(variantClock / 4.0)) * 4;
-	let variantB = (variantA + 1) - ((variantA + 1) / 4) * 4;
-	let variantPhase = smoothstep(0.0, 1.0, variantClock - floor(variantClock));
-	let seedShift = vec2<f32>(u.songSeed * 17.3, u.songSeed * 23.7);
-	let q = kal * tileScale * scalePunch + seedShift;
-	let dA = truchet(q, variantA);
-	let dB = truchet(q, variantB);
-	let d = mix(dA, dB, variantPhase);
-
-	// Thin glowing edges — two falloffs (inner sharp + outer haze).
-	let innerEdge = smoothstep(0.022, 0.0, d);
-	let outerEdge = smoothstep(0.16, 0.0, d) * 0.35;
-	let edge = innerEdge + outerEdge;
-
-	// Bin-indexed pulse: each kaleidoscope arm samples a different FFT bin,
-	// so spectrum reads as the LEFT/RIGHT/UP/DOWN structure of the geometry.
-	let arm = atan2(kal.y, kal.x) / 6.28318530718 + 0.5; // 0..1
-	let binIdx = i32(floor(arm * f32(${BIN_COUNT})));
-	let binIdxClamped = clamp(binIdx, 0i, ${BIN_COUNT - 1}i);
-	let binV = bins[binIdxClamped];
-
-	// Distance from origin in kaleidoscope space — for radial palette indexing.
-	let kalR = length(kal);
-
-	// Palette rotation — chroma + centroid + song seed + slow noise drift, so
-	// the palette wanders organically across the cycle instead of sitting in a
-	// fixed zone.
-	let palDrift = snoise(u.longPhase * 0.24 + u.songSeed * 113.0);
-	let keyBias = u.chromaKey * u.chromaStrength;
-	let timbreBias = u.centroid * 0.7 * (1.0 - u.chromaStrength * 0.6);
-	let palT = keyBias + timbreBias + kalR * 0.15 + u.longPhase * 0.032
-		+ u.songSeed * 0.5 + palDrift * 0.35 + u.palJump;
-	let colA = iridescent(palT);
-	let colB = iridescent(palT + 0.5); // complementary stripe for the outer haze
-
-	// Sharper beat-snap clarity: a tighter beat curve (exp 8 instead of 4)
-	// means the edges punch HARD at the beat and fall back to a quieter
-	// baseline between. The visualizer has a clarity rhythm, not constant spam.
-	let beatPunch = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 8.0);
-
-	// HDR composition — quieter base + bigger on-beat lift gives the "insane
-	// moment" rhythm. Outer haze suppressed so it doesn't fill the negative space.
-	var col = vec3<f32>(0.0);
-	col = col + colA * innerEdge * (0.7 + binV * 1.1 + u.bass * 0.3 + beatPunch * 1.2);
-	col = col + colB * outerEdge * (0.25 + u.rms * 0.2 + beatPunch * 0.25);
-
-	// (Onset no longer adds a global iridescent overlay — that read as a cheap
-	// centered strobe. Onset now affects palette + scale via uniforms upstream.)
-
-	// Soft disk vignette so the tiling fades into the void, not a hard circle.
-	col = col * diskMask;
-
-	return vec4<f32>(col * u.sceneWeight, 1.0);
-}
-`;
-
-	// Preset 2: 3D volumetric raymarched flythrough through a lattice of luminous
-	// columns. Camera moves forward + yaws + bobs; volumetric fog accumulates
-	// iridescent color near column surfaces. No central focus, no kaleidoscopic
-	// symmetry — gives a completely different read from preset 1.
-	const CATHEDRAL_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> bins: array<f32, ${BIN_COUNT}>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-fn hash13(p: vec3<f32>) -> f32 {
-	var q = fract(p * vec3<f32>(0.1031, 0.1030, 0.0973));
-	q = q + dot(q, q.yzx + 33.33);
-	return fract((q.x + q.y) * q.z);
-}
-
-// SDF: nearest infinite vertical column in a 2D lattice in the X/Z plane.
-// Per-song seed offsets the lattice origin and biases the hash so the column
-// layout itself is genuinely different each track, not just the camera path.
-fn columnsDE(p: vec3<f32>, period: f32, radiusBase: f32, seed: f32) -> f32 {
-	let seedOffset = vec2<f32>(seed * 50.0, seed * 73.0);
-	let shifted = p.xz + seedOffset;
-	let cellXZ = round(shifted / period) * period;
-	let local = shifted - cellXZ;
-	let h = hash13(vec3<f32>(cellXZ.x, seed * 100.0, cellXZ.y));
-	let radius = radiusBase + h * 0.06;
-	return length(local) - radius;
-}
-
-// Procedural Point-Of-Interest in the lattice. SongSeed seeds the positions
-// so each track gets its own set of random spots the camera will investigate.
-fn poi(idx: i32, seed: f32) -> vec3<f32> {
-	let fi = f32(idx);
-	let h1 = hash13(vec3<f32>(fi * 17.3, seed * 137.1, fi * 31.7));
-	let h2 = hash13(vec3<f32>(fi * 47.1, seed * 217.5, fi * 13.9));
-	let h3 = hash13(vec3<f32>(fi * 23.7, seed * 311.7, fi * 71.3));
-	let theta = h1 * 6.28318;
-	let r = 1.5 + h2 * 3.0; // radial offset from forward axis
-	let yOff = (h3 - 0.5) * 1.8; // vertical bob
-	return vec3<f32>(cos(theta) * r, yOff, sin(theta) * r);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = (frag.xy - 0.5 * res) / res.y;
-
-	let t = u.time;
-
-	// Procedural orbital flythrough — the camera ORBITS each POI in turn
-	// (visible lateral + rotational motion) while a slow forward drift carries
-	// the whole scene through the lattice. Long dwells so each POI gets a real
-	// moment of inspection rather than a frantic flyby.
-	let POI_DURATION = 13.0;
-	let POI_COUNT = 4;
-	let seededT = t + u.songSeed * 47.0;
-	let cycleT = seededT / POI_DURATION;
-	let idxF = floor(cycleT);
-	let phase = cycleT - idxF;
-
-	let idxA = i32(idxF) - i32(idxF / f32(POI_COUNT)) * POI_COUNT;
-	let idxB = (idxA + 1) - ((idxA + 1) / POI_COUNT) * POI_COUNT;
-	let poiA = poi(idxA, u.songSeed);
-	let poiB = poi(idxB, u.songSeed);
-
-	// Active POI = blends from A → B near the end of each window, creating
-	// a smooth "handoff" between targets rather than a snap.
-	let handoff = smoothstep(0.65, 1.0, phase);
-	let activePOI = mix(poiA, poiB, handoff);
-
-	// Slow forward drift — about 1/3 of previous speed, so audio adds reactivity
-	// ON TOP of a calm baseline instead of frantic motion overwhelming everything.
-	let speedDrift = snoise(t * 0.025 + u.songSeed * 73.0);
-	let baseSpeed = 0.04 + u.bass * 0.10 + u.bpmNorm * 0.06 + speedDrift * 0.03;
-	let driftZ = seededT * baseSpeed;
-
-	// Calmer orbit. Lower base orbit speed; noise drift dampened so the camera
-	// breathes around the POI rather than whipping past it.
-	let radiusDrift = snoise(t * 0.03 + u.songSeed * 29.0);
-	let speedDrift2 = snoise(t * 0.04 + u.songSeed * 53.0);
-	let orbitRadius = 2.3 + u.mid * 0.4 + radiusDrift * 0.6;
-	let orbitSpeed = 0.12 + u.mid * 0.14 + u.bpmNorm * 0.08 + speedDrift2 * 0.15;
-	let orbitAngle = seededT * orbitSpeed;
-	let orbitOffset = vec3<f32>(
-		cos(orbitAngle) * orbitRadius,
-		sin(orbitAngle * 0.43) * orbitRadius * 0.35,
-		sin(orbitAngle) * orbitRadius
-	);
-
-	// Bass shake — very subtle, just a hint of bass-driven micro-motion.
-	let bassShake = vec3<f32>(
-		sin(t * 17.0),
-		cos(t * 13.0),
-		sin(t * 19.0)
-	) * u.bass * 0.025;
-
-	let camPos = activePOI + orbitOffset + bassShake + vec3<f32>(0.0, 0.0, driftZ);
-
-	// Look directly AT the active POI (offset slightly forward so we always
-	// see "through" the orbit center into the depth). This is the key — the
-	// camera ALWAYS faces a specific point, so its rotation becomes visible
-	// rather than hiding in a static forward-axis view.
-	let lookTarget = activePOI + vec3<f32>(0.0, 0.0, driftZ + 0.4);
-	let toTarget = lookTarget - camPos;
-	let forward = normalize(toTarget);
-	let worldUp = vec3<f32>(0.0, 1.0, 0.0);
-	let right = normalize(cross(forward, worldUp));
-	let upVec = cross(right, forward);
-	// Narrower FOV than 1.4 (less fisheye). Onset = brief zoom punch.
-	let fovScale = 1.8 - u.flash * 0.4;
-	let rayDir = normalize(uv.x * right + uv.y * upVec + forward * fovScale);
-
-	// Same per-song palette mapping as preset 1 — strongly tonal locks color
-	// to the key; atonal falls back to centroid. Wider rotation than before so
-	// different stations actually show different palette quadrants.
-	let keyBias = u.chromaKey * u.chromaStrength;
-	let timbreBias = u.centroid * 0.6 * (1.0 - u.chromaStrength * 0.6);
-	let beatPulse = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 4.0);
-
-	// Column lattice geometry varies with music character:
-	// • Bass widens the spacing (open cathedral) and thickens columns.
-	// • Treble narrows it (dense forest of thin spires).
-	// • Slow songs get sparser layouts; fast songs get more verticals per frame.
-	let period = 1.4 + u.bass * 0.9 - u.treble * 0.35 + u.bpmNorm * 0.3;
-	let radiusBase = 0.04 + u.bass * 0.06;
-
-	// Volumetric raymarch — accumulate iridescent fog density inversely related
-	// to distance from columns. No surface shading; pure volumetric.
-	var col = vec3<f32>(0.0);
-	var p = camPos;
-	var depth = 0.0;
-	let MAX_STEPS = 96;
-	let MAX_DEPTH = 28.0;
-
-	for (var i: i32 = 0; i < MAX_STEPS; i = i + 1) {
-		if (depth > MAX_DEPTH) { break; }
-		let d = columnsDE(p, period, radiusBase, u.songSeed);
-		let stepSize = max(d * 0.55, 0.045);
-		// Density falls off exponentially from the column surface; beat punches it.
-		let density = exp(-d * 7.5) * (0.5 + beatPulse * 0.5);
-		// Palette indexed by chroma/centroid bias + spatial depth + organic drift +
-		// onset palette-jump roulette.
-		let palDrift = snoise(t * 0.03 + u.songSeed * 97.0);
-		let palT = keyBias + timbreBias + depth * 0.06 + length(p.xz) * 0.04 + t * 0.01 + palDrift * 0.3 + u.palJump;
-		let glow = iridescent(palT);
-		// Distance fog so far cells fade — gives true depth perception.
-		let fog = exp(-depth * 0.085);
-		// Per-step bin lookup: each ray-march step pulls a different FFT bin
-		// keyed by depth+angle, so column glow shimmers with the spectrum.
-		// (Also keeps the bins binding live in the auto pipeline layout.)
-		let cellAngle = atan2(p.z, p.x) / 6.28318530718 + 0.5;
-		let binIdxCath = clamp(i32((fract(depth * 0.12 + cellAngle)) * f32(${BIN_COUNT})), 0i, ${BIN_COUNT - 1}i);
-		let binBoost = bins[binIdxCath] * 0.7;
-		col = col + glow * density * fog * 0.055 * (1.0 + u.bass * 0.4 + binBoost);
-		p = p + rayDir * stepSize;
-		depth = depth + stepSize;
+	function approachRgb(current: Rgb, target: Rgb, rate: number, dt: number) {
+		for (let i = 0; i < 3; i++) current[i] = approach(current[i], target[i], rate, dt);
 	}
 
-	// Treble sparkles — screen-space high-frequency noise, gated by treble.
-	let sparkSeed = uv * 26.0 + vec2<f32>(t * 0.6, -t * 0.4);
-	let sparkH = fract(sin(dot(sparkSeed, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-	let spark = smoothstep(0.94 - u.treble * 0.18, 0.99, sparkH);
-	col = col + iridescent(u.centroid + 0.35) * spark * (0.5 + u.treble * 0.7);
-
-	// Onset chromatic burst.
-	col = col + iridescent(u.centroid + 0.6) * u.flash * 0.55;
-
-	return vec4<f32>(col * u.sceneWeight, 1.0);
-}
-`;
-
-	// Preset 3: Voronoi caustic field. No kaleidoscope, no 3D — organic cell
-	// boundaries with refractive UV warp gives a flowing "submerged temple
-	// caustic" look. Reads ambient/textural; auto-pick lands here for slow,
-	// atonal, treble-rich music.
-	const VORONOI_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> bins: array<f32, ${BIN_COUNT}>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-	let q = vec2<f32>(
-		dot(p, vec2<f32>(127.1, 311.7)),
-		dot(p, vec2<f32>(269.5, 183.3))
-	);
-	return fract(sin(q) * 43758.5453);
-}
-
-// Worley/voronoi — returns (F1 distance, F2-F1 edge proximity, cell hash).
-// Animated cell points so the field shimmers organically.
-fn voronoi(p: vec2<f32>, t: f32) -> vec3<f32> {
-	let cell = floor(p);
-	let f = fract(p);
-	var d1 = 1e10;
-	var d2 = 1e10;
-	var bestHash = 0.0;
-	for (var y: i32 = -1; y <= 1; y = y + 1) {
-		for (var x: i32 = -1; x <= 1; x = x + 1) {
-			let offset = vec2<f32>(f32(x), f32(y));
-			let h2 = hash22(cell + offset);
-			let pointOff = offset + 0.5 + 0.45 * sin(t * 0.35 + h2 * 6.28318);
-			let v = pointOff - f;
-			let d = dot(v, v);
-			if (d < d1) {
-				d2 = d1;
-				d1 = d;
-				bestHash = h2.x;
-			} else if (d < d2) {
-				d2 = d;
-			}
-		}
+	function finite(value: number, fallback = 0) {
+		return Number.isFinite(value) ? value : fallback;
 	}
-	return vec3<f32>(sqrt(d1), sqrt(d2) - sqrt(d1), bestHash);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = (frag.xy - 0.5 * res) / res.y;
-	let t = u.time;
-	let beatPulse = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 4.0);
-
-	// Refractive caustic warp — sample a slow voronoi at lower scale and use its
-	// gradient to displace the main UV. Gives a flowing rippled-water shimmer.
-	let warpInput = uv * 1.2 + vec2<f32>(t * 0.08, -t * 0.06);
-	let warpV = voronoi(warpInput, t * 0.6);
-	let warpAmount = 0.06 + u.treble * 0.10;
-	let warp = vec2<f32>(
-		sin(warpV.z * 6.28318 + t * 0.5),
-		cos(warpV.z * 6.28318 + t * 0.5)
-	) * warpAmount * warpV.y;
-
-	// Organic noise drift on cell scale and edge width — so even at constant
-	// audio levels the field is alive and shifting, not locked in one density.
-	let scaleDrift = snoise(t * 0.04 + u.songSeed * 89.0);
-	let scale = 2.0 + u.bass * 1.6 + u.bpmNorm * 0.7 + scaleDrift * 1.4;
-	let p = uv * scale + warp + vec2<f32>(t * 0.05, t * 0.03) + vec2<f32>(u.songSeed * 30.0, u.songSeed * 47.0);
-	let v = voronoi(p, t);
-
-	// Edge brightness near cell boundaries; cell-center fill.
-	let edgeDrift = snoise(t * 0.07 + u.songSeed * 41.0);
-	let edgeWidth = 0.035 + u.treble * 0.08 + edgeDrift * 0.04;
-	let edge = smoothstep(edgeWidth, 0.0, v.y);
-	let fill = smoothstep(0.7, 0.1, v.x);
-	// Per-cell spectrum reaction: each cell samples a FFT bin by hash, so the
-	// edge intensity flickers with specific frequencies. (Also keeps the bins
-	// binding alive in the auto-derived pipeline layout — Chrome prunes it
-	// otherwise and the lab page errors.)
-	let binIdx = clamp(i32(v.z * f32(${BIN_COUNT})), 0i, ${BIN_COUNT - 1}i);
-	let binBoost = bins[binIdx] * 0.55;
-
-	// Palette indexed by cell hash + chroma/centroid + song seed + slow drift.
-	let palDrift = snoise(t * 0.025 + u.songSeed * 67.0);
-	let keyBias = u.chromaKey * u.chromaStrength;
-	let timbreBias = u.centroid * 0.55 * (1.0 - u.chromaStrength * 0.6);
-	let palT = v.z * 0.55 + keyBias + timbreBias + u.songSeed * 0.4 + t * 0.01 + palDrift * 0.3 + u.palJump;
-	let cellCol = iridescent(palT);
-	let edgeCol = iridescent(palT + 0.35);
-
-	var col = vec3<f32>(0.0);
-	col = col + cellCol * fill * (0.5 + u.rms * 0.5 + beatPulse * 0.3 + binBoost);
-	col = col + edgeCol * edge * (1.0 + beatPulse * 0.45 + u.treble * 0.5 + binBoost * 0.6);
-
-	// Onset chromatic burst.
-	col = col + iridescent(u.centroid + 0.5) * u.flash * 0.5;
-
-	// Soft vignette — lighter than the kaleidoscope's disk so the field reads
-	// as a wide expanse rather than a focused window.
-	let vig = smoothstep(1.4, 0.4, length(uv));
-	col = col * (0.55 + 0.45 * vig);
-
-	return vec4<f32>(col * u.sceneWeight, 1.0);
-}
-`;
-
-	// Preset 4: Nebulae Flow — multi-octave FBM clouds with audio-displaced flow
-	// field. No symmetry, no cells, no center. Iridescent gas drifting in a
-	// directional flow that bends with bass/onset. Fits atmospheric/melodic/
-	// ambient music; reads completely differently from the other three presets.
-	const NEBULAE_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> bins: array<f32, ${BIN_COUNT}>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-fn hash21n(p: vec2<f32>) -> f32 {
-	return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453);
-}
-
-fn noise2n(p: vec2<f32>) -> f32 {
-	let i = floor(p);
-	let f = p - i;
-	let u = f * f * (3.0 - 2.0 * f);
-	let a = hash21n(i);
-	let b = hash21n(i + vec2<f32>(1.0, 0.0));
-	let c = hash21n(i + vec2<f32>(0.0, 1.0));
-	let d = hash21n(i + vec2<f32>(1.0, 1.0));
-	return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-}
-
-fn fbm(p_in: vec2<f32>, octaves: i32) -> f32 {
-	var p = p_in;
-	var sum = 0.0;
-	var amp = 0.5;
-	for (var i: i32 = 0; i < 6; i = i + 1) {
-		if (i >= octaves) { break; }
-		sum = sum + amp * (noise2n(p) - 0.5);
-		p = p * 2.07 + vec2<f32>(7.3, 11.1);
-		amp = amp * 0.5;
-	}
-	return sum;
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = (frag.xy - 0.5 * res) / res.y;
-	let t = u.time;
-
-	// Flow direction rotates very slowly with song seed + time. Noise wobble
-	// damped so the field doesn't whip around its own axis.
-	let flowAngle = t * 0.018 + u.songSeed * 6.28 + snoise(t * 0.01 + u.songSeed * 41.0) * 0.8;
-	let flowDir = vec2<f32>(cos(flowAngle), sin(flowAngle));
-
-	// Flow speed about 1/3 of previous — clouds drift instead of streaming past.
-	let flowSpeed = 0.04 + u.bass * 0.10 + u.bpmNorm * 0.06;
-	let scaleDrift = snoise(t * 0.02 + u.songSeed * 73.0);
-	let scale = 1.2 + u.bpmNorm * 0.2 + scaleDrift * 0.3;
-
-	// Base sample position drifts with flow.
-	let p = uv * scale - flowDir * t * flowSpeed + vec2<f32>(u.songSeed * 17.0);
-
-	// Two FBM layers: warp + main density.
-	let warp = vec2<f32>(fbm(p + 5.0, 4), fbm(p - 7.0, 4)) * (0.5 + u.bass * 0.7);
-	let layer1 = fbm(p + warp, 5);
-	// Density mask — only show cloud where layer1 is positive enough.
-	let density = smoothstep(-0.05, 0.35, layer1);
-	let highlight = smoothstep(0.15, 0.55, layer1);
-
-	// Treble adds high-frequency noise on top — like dust particles.
-	let detail = fbm(p * 6.0 + warp * 2.0, 3);
-	let dust = smoothstep(0.25, 0.45, detail) * u.treble * 0.8;
-
-	// Per-cloud spectrum reaction — sample a FFT bin keyed by spatial position
-	// so different patches of the nebula react to different frequencies.
-	// (Also keeps the bins binding live for the pipeline layout — Chrome
-	// prunes it otherwise and the lab page errors.)
-	let binIdxNebula = clamp(i32(fract(layer1 + u.songSeed) * f32(${BIN_COUNT})), 0i, ${BIN_COUNT - 1}i);
-	let binBoost = bins[binIdxNebula] * 0.5;
-
-	// Palette — chroma + centroid + slow noise + onset palJump.
-	let palDrift = snoise(t * 0.025 + u.songSeed * 137.0);
-	let keyBias = u.chromaKey * u.chromaStrength;
-	let timbreBias = u.centroid * 0.6 * (1.0 - u.chromaStrength * 0.6);
-	let palT = keyBias + timbreBias + layer1 * 0.25 + u.songSeed * 0.4 + t * 0.008 + palDrift * 0.3 + u.palJump;
-	let cloudCol = iridescent(palT);
-	let highCol = iridescent(palT + 0.35);
-
-	let beatPunch = pow(0.5 + 0.5 * cos(u.beatPhase * 6.28318530718), 6.0);
-
-	var col = vec3<f32>(0.0);
-	col = col + cloudCol * density * (0.5 + u.rms * 0.5 + beatPunch * 0.3 + binBoost * 0.8);
-	col = col + highCol * highlight * (0.7 + u.bass * 0.4 + beatPunch * 0.5 + binBoost);
-	col = col + iridescent(u.centroid + 0.4) * dust;
-
-	// Wide soft vignette — keeps the field expansive, doesn't trap the eye.
-	let vig = smoothstep(1.8, 0.5, length(uv));
-	col = col * (0.55 + 0.45 * vig);
-
-	return vec4<f32>(col * u.sceneWeight, 1.0);
-}
-`;
-
-	const FEEDBACK_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var sceneTex: texture_2d<f32>;
-@group(0) @binding(3) var feedbackPrev: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = frag.xy / res;
-	let centered = uv - 0.5;
-
-	// Warp the prev-feedback sample. feedbackZoom <1.0 samples FROM closer to
-	// center and paints further out → trails drift outward, which is the
-	// "breathing" we actually want (the previous build inverted this and
-	// trails pulled inward, creating a centered hot-spot blob).
-	let theta = u.feedbackRotation * 0.04;
-	let zoom = u.feedbackZoom;
-	let c = cos(theta);
-	let s = sin(theta);
-	let rotated = vec2<f32>(
-		centered.x * c - centered.y * s,
-		centered.x * s + centered.y * c
-	) * zoom;
-	let prevUv = rotated + 0.5;
-
-	let prev = textureSample(feedbackPrev, samp, prevUv).rgb;
-	let scene = textureSample(sceneTex, samp, uv).rgb;
-
-	// Max-blend with fade: the brightest of (decayed prev, current scene) wins.
-	// Trails dim cleanly without accumulating to white — fixes the cream-saturation
-	// blow-out where additive blending pushed every pixel past the bloom threshold.
-	let trail = prev * u.feedbackFade;
-	return vec4<f32>(max(trail, scene), 1.0);
-}
-`;
-
-	const BLOOM_DOWN_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var srcTex: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let halfRes = vec2<f32>(u.resolutionX, u.resolutionY) * 0.5;
-	let uv = frag.xy / halfRes;
-	let texel = 1.0 / vec2<f32>(u.resolutionX, u.resolutionY);
-
-	// 4-tap downsample of full-res source into half-res target.
-	var c = vec3<f32>(0.0);
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0, -1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0, -1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>(-1.0,  1.0) * texel).rgb;
-	c = c + textureSample(srcTex, samp, uv + vec2<f32>( 1.0,  1.0) * texel).rgb;
-	c = c * 0.25;
-
-	// HDR threshold — only values above threshold bloom; soft knee.
-	let bright = max(c.r, max(c.g, c.b));
-	let knee = max(0.0, bright - u.bloomThreshold);
-	let factor = knee / max(1e-4, bright);
-	return vec4<f32>(c * factor, 1.0);
-}
-`;
-
-	const BLOOM_BLUR_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var srcTex: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let halfRes = vec2<f32>(u.resolutionX, u.resolutionY) * 0.5;
-	let uv = frag.xy / halfRes;
-	let texel = 1.0 / halfRes;
-	let dir = vec2<f32>(u.blurDirX, u.blurDirY) * texel;
-
-	// 9-tap Gaussian (separable, unrolled — WGSL array indexing with dynamic
-	// index isn't free across drivers).
-	var c = textureSample(srcTex, samp, uv).rgb * 0.227027;
-	c = c + (textureSample(srcTex, samp, uv + dir * 1.0).rgb + textureSample(srcTex, samp, uv - dir * 1.0).rgb) * 0.1945946;
-	c = c + (textureSample(srcTex, samp, uv + dir * 2.0).rgb + textureSample(srcTex, samp, uv - dir * 2.0).rgb) * 0.1216216;
-	c = c + (textureSample(srcTex, samp, uv + dir * 3.0).rgb + textureSample(srcTex, samp, uv - dir * 3.0).rgb) * 0.054054;
-	c = c + (textureSample(srcTex, samp, uv + dir * 4.0).rgb + textureSample(srcTex, samp, uv - dir * 4.0).rgb) * 0.016216;
-	return vec4<f32>(c, 1.0);
-}
-`;
-
-	const COMPOSITE_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var samp: sampler;
-@group(0) @binding(2) var feedbackTex: texture_2d<f32>;
-@group(0) @binding(3) var bloomTex: texture_2d<f32>;
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
-
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let uv = frag.xy / res;
-	let centered = uv - 0.5;
-	let r2 = dot(centered, centered);
-
-	// Subtle barrel distortion (lens curvature).
-	let barrel = 1.0 + r2 * 0.06;
-	let warped = 0.5 + centered * barrel;
-
-	// Chromatic aberration — RGB channels offset radially, scaled by r² so it
-	// pushes harder at the edges; onset flashes ramp it up.
-	let caAmt = (0.0028 + r2 * 0.012) * (1.0 + u.flash * 1.8);
-	let dir = normalize(centered + vec2<f32>(1e-4, 1e-4));
-
-	let rUv = warped + dir * caAmt;
-	let gUv = warped;
-	let bUv = warped - dir * caAmt;
-
-	let r = textureSample(feedbackTex, samp, rUv).r;
-	let g = textureSample(feedbackTex, samp, gUv).g;
-	let b = textureSample(feedbackTex, samp, bUv).b;
-	var col = vec3<f32>(r, g, b);
-
-	// Bloom only adds glow on the brightest pixels (per higher threshold).
-	// Lower weight keeps the rest of the frame graphic + dark instead of washed.
-	let bloom = textureSample(bloomTex, samp, warped).rgb;
-	col = col + bloom * 0.4;
-
-	// Radial vignette — softer floor so the visual keeps mid-tones instead of
-	// crushing the whole frame at the rim. The earlier 0.45 floor was killing
-	// half the dynamic range before tone-map.
-	let vig = smoothstep(1.3, 0.45, length(centered) * 1.4);
-	col = col * (0.62 + 0.38 * vig);
-
-	// ACES-fit tone map — punchier highlights/shadows than Reinhard, holds
-	// saturation better on bright edges. Final contrast lift around mid-gray.
-	let aA = 2.51;
-	let aB = 0.03;
-	let aC = 2.43;
-	let aD = 0.59;
-	let aE = 0.14;
-	col = clamp((col * (aA * col + aB)) / (col * (aC * col + aD) + aE), vec3<f32>(0.0), vec3<f32>(1.0));
-	col = max((col - 0.5) * 1.10 + 0.5, vec3<f32>(0.0));
-
-	// Blue-noise-ish dither — kills banding in dark gradients, the rookie tell.
-	let h = fract(sin(dot(frag.xy, vec2<f32>(12.9898, 78.233)) + u.time) * 43758.5453);
-	col = col + (h - 0.5) / 255.0;
-
-	return vec4<f32>(col, 1.0);
-}
-`;
 
 	type Targets = {
 		scene: GPUTexture;
@@ -913,6 +126,17 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		height: number;
 	};
 
+	type BindGroups = {
+		scenes: GPUBindGroup[];
+		/** Indexed by the parity of the frame being read. */
+		feedback: [GPUBindGroup, GPUBindGroup];
+		/** Indexed by the parity of the frame just written. */
+		bloomDown: [GPUBindGroup, GPUBindGroup];
+		blurH: GPUBindGroup;
+		blurV: GPUBindGroup;
+		composite: [GPUBindGroup, GPUBindGroup];
+	};
+
 	type GPU = {
 		device: GPUDevice;
 		context: GPUCanvasContext;
@@ -922,266 +146,260 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		binsBuf: GPUBuffer;
 		uniformData: Float32Array;
 		pipelines: {
-			scenes: GPURenderPipeline[]; // one per preset
+			scenes: GPURenderPipeline[];
 			feedback: GPURenderPipeline;
 			bloomDown: GPURenderPipeline;
-			bloomBlur: GPURenderPipeline;
+			blurH: GPURenderPipeline;
+			blurV: GPURenderPipeline;
 			composite: GPURenderPipeline;
 		};
 		targets: Targets | null;
-		// Bind groups depend on targets — rebuilt on resize.
-		bindGroups: {
-			scenes: GPUBindGroup[]; // one per preset (same buffers, different pipeline layouts)
-			// feedback ping-pong: bg[i] reads feedback[i] and writes feedback[1-i]
-			feedback: [GPUBindGroup, GPUBindGroup];
-			bloomDown: [GPUBindGroup, GPUBindGroup];
-			bloomBlurH: GPUBindGroup; // reads bloom[0], writes bloom[1]
-			bloomBlurV: GPUBindGroup; // reads bloom[1], writes bloom[0]
-			composite: [GPUBindGroup, GPUBindGroup]; // reads feedback[0]/[1] + bloom[0]
-		} | null;
-		frame: number;
+		bindGroups: BindGroups | null;
+		parity: 0 | 1;
 	};
 
 	let gpu: GPU | null = null;
 
-	function createTarget(device: GPUDevice, w: number, h: number, format: GPUTextureFormat) {
+	function createTarget(device: GPUDevice, label: string, w: number, h: number) {
 		return device.createTexture({
+			label,
 			size: { width: Math.max(1, w), height: Math.max(1, h) },
-			format,
+			format: 'rgba16float',
 			usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT
 		});
 	}
 
-	function buildTargets(device: GPUDevice, w: number, h: number, hdr: GPUTextureFormat): Targets {
-		const halfW = Math.max(1, Math.floor(w / 2));
-		const halfH = Math.max(1, Math.floor(h / 2));
-		const scene = createTarget(device, w, h, hdr);
-		const fA = createTarget(device, w, h, hdr);
-		const fB = createTarget(device, w, h, hdr);
-		const bA = createTarget(device, halfW, halfH, hdr);
-		const bB = createTarget(device, halfW, halfH, hdr);
-		return {
-			scene,
-			sceneView: scene.createView(),
-			feedback: [fA, fB],
-			feedbackView: [fA.createView(), fB.createView()],
-			bloom: [bA, bB],
-			bloomView: [bA.createView(), bB.createView()],
-			width: w,
-			height: h
-		};
-	}
-
-	function disposeTargets(t: Targets) {
+	function disposeTargets(t: Targets | null) {
+		if (!t) return;
 		t.scene.destroy();
-		t.feedback[0].destroy();
-		t.feedback[1].destroy();
-		t.bloom[0].destroy();
-		t.bloom[1].destroy();
-	}
-
-	function buildBindGroups(g: GPU) {
-		if (!g.targets) return null;
-		const t = g.targets;
-		const { device, pipelines, uniformBuf, binsBuf, sampler } = g;
-
-		const scenes = pipelines.scenes.map((pipeline) =>
-			device.createBindGroup({
-				layout: pipeline.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: { buffer: binsBuf } }
-				]
-			})
-		);
-
-		const makeFeedback = (prevIdx: 0 | 1) =>
-			device.createBindGroup({
-				layout: pipelines.feedback.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: t.sceneView },
-					{ binding: 3, resource: t.feedbackView[prevIdx] }
-				]
-			});
-
-		const makeBloomDown = (srcIdx: 0 | 1) =>
-			device.createBindGroup({
-				layout: pipelines.bloomDown.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: t.feedbackView[srcIdx] }
-				]
-			});
-
-		const makeBloomBlur = (srcIdx: 0 | 1) =>
-			device.createBindGroup({
-				layout: pipelines.bloomBlur.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: t.bloomView[srcIdx] }
-				]
-			});
-
-		const makeComposite = (fIdx: 0 | 1) =>
-			device.createBindGroup({
-				layout: pipelines.composite.getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuf } },
-					{ binding: 1, resource: sampler },
-					{ binding: 2, resource: t.feedbackView[fIdx] },
-					{ binding: 3, resource: t.bloomView[0] }
-				]
-			});
-
-		return {
-			scenes,
-			feedback: [makeFeedback(0), makeFeedback(1)] as [GPUBindGroup, GPUBindGroup],
-			bloomDown: [makeBloomDown(0), makeBloomDown(1)] as [GPUBindGroup, GPUBindGroup],
-			bloomBlurH: makeBloomBlur(0),
-			bloomBlurV: makeBloomBlur(1),
-			composite: [makeComposite(0), makeComposite(1)] as [GPUBindGroup, GPUBindGroup]
-		};
-	}
-
-	async function initGpu(c: HTMLCanvasElement): Promise<GPU | null> {
-		const gpuApi = navigator.gpu;
-		if (!gpuApi) {
-			errorMsg = 'WebGPU not available in this WebView2 build.';
-			return null;
-		}
-		const adapter = await gpuApi.requestAdapter();
-		if (!adapter) {
-			errorMsg = 'No WebGPU adapter found.';
-			return null;
-		}
-		const device = (await adapter.requestDevice()) as GPUDevice;
-
-		const context = c.getContext('webgpu') as unknown as GPUCanvasContext;
-		if (!context) {
-			errorMsg = 'WebGPU canvas context unavailable.';
-			return null;
-		}
-		const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
-		context.configure({ device, format, alphaMode: 'opaque' });
-
-		const hdr: GPUTextureFormat = 'rgba16float';
-
-		const mkPipeline = (code: string, targetFormat: GPUTextureFormat) => {
-			const module = device.createShaderModule({ code });
-			return device.createRenderPipeline({
-				layout: 'auto',
-				vertex: { module, entryPoint: 'vs_main' },
-				fragment: { module, entryPoint: 'fs_main', targets: [{ format: targetFormat }] },
-				primitive: { topology: 'triangle-list' }
-			});
-		};
-
-		// Scene pipelines use additive blend so two scene passes per frame sum into
-		// sceneTex: out = sceneA * weightA + sceneB * weightB (weight multiplied
-		// inside each shader before output). Yields continuous preset blending.
-		const mkScenePipeline = (code: string) => {
-			const module = device.createShaderModule({ code });
-			return device.createRenderPipeline({
-				layout: 'auto',
-				vertex: { module, entryPoint: 'vs_main' },
-				fragment: {
-					module,
-					entryPoint: 'fs_main',
-					targets: [
-						{
-							format: hdr,
-							blend: {
-								color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
-								alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
-							}
-						}
-					]
-				},
-				primitive: { topology: 'triangle-list' }
-			});
-		};
-
-		const pipelines = {
-			scenes: [
-				mkScenePipeline(SCENE_WGSL),
-				mkScenePipeline(CATHEDRAL_WGSL),
-				mkScenePipeline(VORONOI_WGSL),
-				mkScenePipeline(NEBULAE_WGSL)
-			],
-			feedback: mkPipeline(FEEDBACK_WGSL, hdr),
-			bloomDown: mkPipeline(BLOOM_DOWN_WGSL, hdr),
-			bloomBlur: mkPipeline(BLOOM_BLUR_WGSL, hdr),
-			composite: mkPipeline(COMPOSITE_WGSL, format)
-		};
-
-		const sampler = device.createSampler({
-			magFilter: 'linear',
-			minFilter: 'linear',
-			addressModeU: 'clamp-to-edge',
-			addressModeV: 'clamp-to-edge'
-		});
-
-		const uniformBuf = device.createBuffer({
-			size: UNIFORM_BYTES,
-			usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
-		});
-		const binsBuf = device.createBuffer({
-			size: BINS_BYTES,
-			usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-		});
-
-		const g: GPU = {
-			device,
-			context,
-			format,
-			sampler,
-			uniformBuf,
-			binsBuf,
-			uniformData: new Float32Array(UNIFORM_FLOATS),
-			pipelines,
-			targets: null,
-			bindGroups: null,
-			frame: 0
-		};
-
-		return g;
+		for (const texture of t.feedback) texture.destroy();
+		for (const texture of t.bloom) texture.destroy();
 	}
 
 	function ensureTargets(g: GPU, w: number, h: number) {
 		if (g.targets && g.targets.width === w && g.targets.height === h) return;
-		if (g.targets) disposeTargets(g.targets);
-		g.targets = buildTargets(g.device, w, h, 'rgba16float');
-		g.bindGroups = buildBindGroups(g);
+		disposeTargets(g.targets);
+		const { device, pipelines, uniformBuf, binsBuf, sampler } = g;
+		const halfW = Math.max(1, Math.floor(w / 2));
+		const halfH = Math.max(1, Math.floor(h / 2));
+		const scene = createTarget(device, 'Prism scene', w, h);
+		const feedback: [GPUTexture, GPUTexture] = [
+			createTarget(device, 'Prism feedback A', w, h),
+			createTarget(device, 'Prism feedback B', w, h)
+		];
+		const bloom: [GPUTexture, GPUTexture] = [
+			createTarget(device, 'Prism bloom A', halfW, halfH),
+			createTarget(device, 'Prism bloom B', halfW, halfH)
+		];
+		const t: Targets = {
+			scene,
+			sceneView: scene.createView(),
+			feedback,
+			feedbackView: [feedback[0].createView(), feedback[1].createView()],
+			bloom,
+			bloomView: [bloom[0].createView(), bloom[1].createView()],
+			width: w,
+			height: h
+		};
+		g.targets = t;
+
+		const uniform = { binding: 0, resource: { buffer: uniformBuf } };
+		const samplerEntry = { binding: 1, resource: sampler };
+		const bind = (pipeline: GPURenderPipeline, label: string, views: GPUTextureView[]) =>
+			device.createBindGroup({
+				label,
+				layout: pipeline.getBindGroupLayout(0),
+				entries: [
+					uniform,
+					samplerEntry,
+					...views.map((view, index) => ({ binding: 2 + index, resource: view }))
+				]
+			});
+		g.bindGroups = {
+			scenes: pipelines.scenes.map((pipeline, index) =>
+				device.createBindGroup({
+					label: `Prism scene ${index}`,
+					layout: pipeline.getBindGroupLayout(0),
+					entries: [uniform, { binding: 1, resource: { buffer: binsBuf } }]
+				})
+			),
+			feedback: [
+				bind(pipelines.feedback, 'Prism feedback reads A', [t.sceneView, t.feedbackView[0]]),
+				bind(pipelines.feedback, 'Prism feedback reads B', [t.sceneView, t.feedbackView[1]])
+			],
+			bloomDown: [
+				bind(pipelines.bloomDown, 'Prism bloom prefilter A', [t.feedbackView[0]]),
+				bind(pipelines.bloomDown, 'Prism bloom prefilter B', [t.feedbackView[1]])
+			],
+			blurH: bind(pipelines.blurH, 'Prism bloom blur H', [t.bloomView[0]]),
+			blurV: bind(pipelines.blurV, 'Prism bloom blur V', [t.bloomView[1]]),
+			composite: [
+				bind(pipelines.composite, 'Prism present A', [t.feedbackView[0], t.bloomView[0]]),
+				bind(pipelines.composite, 'Prism present B', [t.feedbackView[1], t.bloomView[0]])
+			]
+		};
+		// Fresh history textures are undefined; never let a stale trail bleed in.
+		feedbackResetFrames = 2;
+	}
+
+	async function initGpu(c: HTMLCanvasElement): Promise<GPU> {
+		const gpuApi = navigator.gpu;
+		if (!gpuApi) throw new Error('Prism needs WebGPU, but this WebView does not expose it.');
+		const adapter = await gpuApi.requestAdapter();
+		if (!adapter) throw new Error('No compatible WebGPU adapter was found.');
+		const device = (await adapter.requestDevice()) as GPUDevice;
+		let context: GPUCanvasContext | null = null;
+		let uniformBuf: GPUBuffer | null = null;
+		let binsBuf: GPUBuffer | null = null;
+		try {
+			context = c.getContext('webgpu') as unknown as GPUCanvasContext | null;
+			if (!context) throw new Error('The WebGPU canvas context could not be created.');
+			const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
+			context.configure({ device, format, alphaMode: 'opaque' });
+
+			const sources: [string, string][] = [
+				['Prism rose', PRISM_ROSE_WGSL],
+				['Prism cathedral (lab)', PRISM_CATHEDRAL_WGSL],
+				['Prism voronoi (lab)', PRISM_VORONOI_WGSL],
+				['Prism nebulae (lab)', PRISM_NEBULAE_WGSL],
+				['Prism feedback', PRISM_FEEDBACK_WGSL],
+				['Prism bloom prefilter', PRISM_BLOOM_DOWN_WGSL],
+				['Prism bloom blur H', PRISM_BLUR_H_WGSL],
+				['Prism bloom blur V', PRISM_BLUR_V_WGSL],
+				['Prism presentation', PRISM_COMPOSITE_WGSL]
+			];
+			const modules = sources.map(([label, code]) => device.createShaderModule({ label, code }));
+			await Promise.all(
+				modules.map(async (module, index) => {
+					const info = await module.getCompilationInfo();
+					const errors = info.messages.filter((message) => message.type === 'error');
+					if (errors.length) {
+						const detail = errors
+							.map((message) => `${message.lineNum}:${message.linePos} ${message.message}`)
+							.join(' | ');
+						throw new Error(`${sources[index][0]} shader failed to compile: ${detail}`);
+					}
+				})
+			);
+			const pipeline = (label: string, module: GPUShaderModule, targetFormat: GPUTextureFormat) =>
+				device.createRenderPipelineAsync({
+					label,
+					layout: 'auto',
+					vertex: { module, entryPoint: 'vs_main' },
+					fragment: { module, entryPoint: 'fs_main', targets: [{ format: targetFormat }] },
+					primitive: { topology: 'triangle-list' }
+				});
+			const hdr: GPUTextureFormat = 'rgba16float';
+			const built = await Promise.all([
+				pipeline('Prism rose pipeline', modules[0], hdr),
+				pipeline('Prism cathedral pipeline', modules[1], hdr),
+				pipeline('Prism voronoi pipeline', modules[2], hdr),
+				pipeline('Prism nebulae pipeline', modules[3], hdr),
+				pipeline('Prism feedback pipeline', modules[4], hdr),
+				pipeline('Prism bloom prefilter pipeline', modules[5], hdr),
+				pipeline('Prism blur H pipeline', modules[6], hdr),
+				pipeline('Prism blur V pipeline', modules[7], hdr),
+				pipeline('Prism presentation pipeline', modules[8], format)
+			]);
+
+			uniformBuf = device.createBuffer({
+				size: PRISM_UNIFORM_BYTES,
+				usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+			});
+			binsBuf = device.createBuffer({
+				size: BINS_BYTES,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
+			const state: GPU = {
+				device,
+				context,
+				format,
+				sampler: device.createSampler({
+					magFilter: 'linear',
+					minFilter: 'linear',
+					addressModeU: 'clamp-to-edge',
+					addressModeV: 'clamp-to-edge'
+				}),
+				uniformBuf,
+				binsBuf,
+				uniformData: new Float32Array(PRISM_UNIFORM_FLOATS),
+				pipelines: {
+					scenes: built.slice(0, 4),
+					feedback: built[4],
+					bloomDown: built[5],
+					blurH: built[6],
+					blurV: built[7],
+					composite: built[8]
+				},
+				targets: null,
+				bindGroups: null,
+				parity: 0
+			};
+			void device.lost.then((info) => {
+				if (gpu?.device !== device) return;
+				errorMsg = `The graphics device was lost${info.message ? `: ${info.message}` : '.'}`;
+				ready = false;
+				gpu = null;
+			});
+			return state;
+		} catch (error) {
+			uniformBuf?.destroy();
+			binsBuf?.destroy();
+			try {
+				context?.unconfigure();
+			} catch {
+				// A failed configure may also make unconfigure unavailable.
+			}
+			device.destroy();
+			throw error;
+		}
+	}
+
+	function destroyGpuState(state: GPU | null) {
+		if (!state) return;
+		disposeTargets(state.targets);
+		state.uniformBuf.destroy();
+		state.binsBuf.destroy();
+		try {
+			state.context.unconfigure();
+		} catch {
+			// The device may already be lost.
+		}
+		state.device.destroy();
 	}
 
 	function teardownGpu() {
 		frameScheduler.reset();
-		if (!gpu) return;
-		try {
-			if (gpu.targets) disposeTargets(gpu.targets);
-			gpu.uniformBuf.destroy();
-			gpu.binsBuf.destroy();
-			gpu.device.destroy?.();
-		} catch {
-			// Device may already be lost; ignore.
-		}
+		const state = gpu;
 		gpu = null;
+		ready = false;
+		destroyGpuState(state);
 	}
 
-	function loop(now: number) {
-		if (!running) return;
-		raf = requestAnimationFrame(loop);
-		if (!canvas || !gpu) return;
-		const frameDt = frameScheduler.next(now);
-		if (frameDt === null) return;
+	function writeVec4(u: Float32Array, offset: number, a: number, b: number, c: number, d: number) {
+		u[offset] = a;
+		u[offset + 1] = b;
+		u[offset + 2] = c;
+		u[offset + 3] = d;
+	}
 
-		// Prism owns several full-resolution HDR feedback surfaces. Keep their
-		// combined cost predictable on high-DPI and 4K displays with one absolute
-		// backing-pixel ceiling while the CSS canvas continues to fill the window.
+	function writeShape(u: Float32Array, offset: number, comp: PrismComposition) {
+		writeVec4(u, offset, comp.petalWidth, comp.petalReach, comp.cellScale, comp.outerLit);
+	}
+
+	/** Start (or queue) the outward re-leading wave toward a new composition. */
+	function requestComposition(next: PrismComposition) {
+		if (transitionFront >= TRANSITION_END) {
+			compB = next;
+			transitionFront = 0;
+			transitionGlow = 1;
+		} else {
+			pendingComp = next;
+		}
+	}
+
+	function renderFrame(g: GPU, now: number, dt: number) {
+		if (!canvas) return;
 		const { width: w, height: h } = prismBackingSize(
 			canvas.clientWidth,
 			canvas.clientHeight,
@@ -1191,347 +409,353 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			canvas.width = w;
 			canvas.height = h;
 		}
-		ensureTargets(gpu, w, h);
-		if (!gpu.bindGroups || !gpu.targets) return;
+		ensureTargets(g, w, h);
+		const t = g.targets;
+		const bg = g.bindGroups;
+		if (!t || !bg) return;
 
-		// ── Feature smoothing
-		// Read one freshness-checked snapshot for the entire rendered frame. When
-		// native delivery stalls, every target below eases back toward silence.
-		const frameNow = now;
-		const feat = vis.getLatest(frameNow);
+		// One freshness-checked snapshot for the whole frame. Sample on the
+		// feature clock, not the rAF timestamp: a frame published earlier in this
+		// same vsync carries a later performance.now() than the rAF start time,
+		// and a negative age would read as silence.
+		const sampleAt = Math.max(now, performance.now());
+		const feat = vis.getLatest(sampleAt);
+		const journey = vis.getJourney(sampleAt);
 		const response = VISUALIZER_RESPONSE_PROFILES.mk1[vis.response];
-		const responseMotion = response.motion;
-		const responseImpact = response.impact;
-		const journey = vis.getJourney(frameNow);
+		const directed = journey.director;
+		const spectrum = journey.spectrum;
+		const clock = directed.clock;
+		const sectionNow = directed.section;
+		const family = prismFamily(sectionNow);
+
 		if (journey.sourceEpoch !== rendererSourceEpoch) {
 			rendererSourceEpoch = journey.sourceEpoch;
 			songSeed = journey.seed;
-			onsetEventIndex = 0;
-			onsetLatched = false;
-			onsetEventStrip = 0;
-			onsetEventPalJump = 0;
+			seedSalt = Math.floor(clamp(songSeed, 0, 1) * 65_535);
+			familyVisits = { quiet: 0, verse: 0, rise: 0, peak: 0, drift: 0 };
+			lastSection = sectionNow;
+			compA = prismComposition(family, songSeed, 0);
+			compB = compA;
+			pendingComp = null;
+			transitionFront = TRANSITION_END;
+			transitionGlow = 0;
+			env.rings = compA.rings;
+			env.spiral = compA.spiral;
+			env.petals = compA.petals;
+			env.air = compA.air;
+			env.silence = feat ? 0 : 1;
+			env.quietFor = feat ? 0 : 0.5;
+			env.packetStrength = 0;
+			lastBeatCount = -1;
+			const roles = prismPaletteRoles(
+				directed.context.keyPitchClass,
+				directed.context.keyMode === 'minor',
+				directed.context.keyConfidence,
+				directed.palette.baseHue,
+				family
+			);
+			palette.hero = [...roles.hero];
+			palette.support = [...roles.support];
+			palette.accent = [...roles.accent];
+			palette.field = [...roles.field];
+			feedbackResetFrames = 2;
 		}
-		const incoming = feat?.bins ?? [];
-		const attack = 0.55;
-		const release = 0.16;
-		for (let i = 0; i < BIN_COUNT; i++) {
-			const target = incoming[i] ?? 0;
-			const tt = target > smoothed.bins[i] ? attack : release;
-			smoothed.bins[i] = lerp(smoothed.bins[i], target, tt);
-		}
-		const spectrum = journey.spectrum;
-		const directed = journey.director;
-		smoothed.bass = lerp(smoothed.bass, feat ? spectrum.bass : 0, 0.28);
-		smoothed.mid = lerp(smoothed.mid, feat ? spectrum.mid : 0, 0.22);
-		smoothed.treble = lerp(smoothed.treble, feat ? spectrum.treble : 0, 0.42);
-		smoothed.centroid = lerp(smoothed.centroid, spectrum.centroid, 0.04);
-		smoothed.rms = lerp(smoothed.rms, feat?.rms ?? 0, 0.22);
-		const onsetNow =
-			feat !== null &&
-			(feat.onset || spectrum.novelty > 0.58 || journey.signal.impact > 0.78);
-		if (onsetNow && !onsetLatched) {
-			smoothed.flash = responseImpact;
-			// Onset roulette: each onset rolls for one of N organic events.
-			// 30% chance: trail clear (feedback fade momentarily drops).
-			// 30% chance: palette jump (color phase suddenly shifts and decays back).
-			// 40% chance: nothing special — keeps onsets feeling unpredictable.
-			const roll = prismEventUnit(songSeed, rendererSourceEpoch, onsetEventIndex, 0);
-			if (roll < 0.3) onsetEventStrip = 1.0;
-			else if (roll < 0.6) {
-				onsetEventPalJump =
-					(prismEventUnit(songSeed, rendererSourceEpoch, onsetEventIndex, 1) - 0.5) * 0.6;
+
+		// ── Section choreography: each section family re-leads the window.
+		if (sectionNow !== lastSection) {
+			const previousFamily = prismFamily(lastSection);
+			lastSection = sectionNow;
+			if (family !== previousFamily) {
+				familyVisits[family] += 1;
+				requestComposition(prismComposition(family, songSeed, familyVisits[family]));
 			}
-			onsetEventIndex += 1;
 		}
-		onsetLatched = onsetNow;
-		smoothed.flash *= 0.9;
-		onsetEventStrip *= 0.85;
-		onsetEventPalJump *= 0.92;
+		if (transitionFront < TRANSITION_END) {
+			transitionFront = Math.min(TRANSITION_END, transitionFront + dt * TRANSITION_SPEED);
+			if (transitionFront >= TRANSITION_END) {
+				compA = compB;
+				transitionGlow = 0;
+				if (pendingComp) {
+					compB = pendingComp;
+					pendingComp = null;
+					transitionFront = 0;
+					transitionGlow = 1;
+				}
+			}
+		}
+		const activeComp = compB;
 
-		// Circular chroma smoothing — atan2-recover so key changes glide rather
-		// than snap from index 11 → 0.
-		const directedKey =
-			directed.context.keyConfidence > 0.1
-				? directed.context.keyPitchClass
-				: journey.signal.key;
-		const chromaAngle = directedKey * 2 * Math.PI;
-		smoothed.chromaX = lerp(smoothed.chromaX, Math.cos(chromaAngle), 0.05);
-		smoothed.chromaY = lerp(smoothed.chromaY, Math.sin(chromaAngle), 0.05);
-		smoothed.chromaStrength = lerp(
-			smoothed.chromaStrength,
-			Math.max(feat?.chroma_strength ?? 0, directed.context.keyConfidence),
-			0.06
+		// ── Envelopes
+		const incoming = feat?.bins ?? [];
+		const binMix = 1 - Math.exp(-dt / 0.07);
+		for (let i = 0; i < PRISM_BIN_COUNT; i++) {
+			const target = clamp(finite(incoming[i] ?? 0), 0, 1);
+			bins[i] += (target - bins[i]) * (target > bins[i] ? Math.min(1, binMix * 2.5) : binMix);
+		}
+		const rmsTarget = clamp(finite(feat?.rms ?? 0), 0, 1);
+		env.rms = approach(env.rms, rmsTarget, rmsTarget > env.rms ? 14 : 5, dt);
+		if (!feat || rmsTarget < 0.009) env.quietFor += dt;
+		else env.quietFor = 0;
+		const quiet = env.quietFor > 0.45;
+		env.silence = approach(env.silence, quiet ? 1 : 0, quiet ? 3 : 10, dt);
+		env.bass = approach(env.bass, feat ? spectrum.bass : 0, 9, dt);
+		env.mid = approach(env.mid, feat ? spectrum.mid : 0, 7, dt);
+		env.treble = approach(env.treble, feat ? spectrum.treble : 0, 12, dt);
+		env.centroid = approach(env.centroid, spectrum.centroid, 2.5, dt);
+		const sectionEnergy = clamp(finite(directed.context.sectionEnergy), 0, 1);
+		const energyTarget = clamp(
+			directed.energy * 0.6 + sectionEnergy * 0.25 + env.rms * 0.15,
+			0,
+			1
 		);
-		const chromaKeySmoothed =
-			(Math.atan2(smoothed.chromaY, smoothed.chromaX) / (2 * Math.PI) + 1) % 1;
+		env.energy = approach(env.energy, energyTarget, 3, dt);
 
-		// BPM normalized to 0..1 across 60..180 BPM, slowly smoothed.
-		const bpmRaw = directed.clock.tempoBpm;
-		const bpmNormTarget = bpmRaw > 0 ? Math.max(0, Math.min(1, (bpmRaw - 60) / 120)) : 0;
-		smoothed.bpmNorm = lerp(smoothed.bpmNorm, bpmNormTarget, 0.02);
+		const impactTarget = feat
+			? clamp(clock.beatPulse * (0.35 + directed.bassPunch * 0.75) + spectrum.novelty * 0.3, 0, 1)
+			: 0;
+		env.impact = approach(env.impact, impactTarget * response.impact, impactTarget > env.impact ? 30 : 6, dt);
 
-		// Rotation rate is non-monotonic — a slow oscillator on top of the audio
-		// rate. Direction reverses ~1×/min, speed varies, sometimes pauses.
-		// This kills the "always clockwise loop" feel and reads as alive.
-		// The source timeline belongs to the shared journey, so every slow Prism
-		// oscillator resumes at the same posture after switching engines.
+		// Organism: cells divide as a phrase builds and as the section climbs,
+		// then fold back and re-draft when the next phrase begins.
+		const phrasePos = clamp(finite(clock.phrasePos), 0, 1);
+		const phraseIndex = Math.max(0, Math.floor(finite(clock.phraseIndex)));
+		const growthTarget =
+			clamp(
+				0.08 +
+					sectionEnergy * 0.32 +
+					directed.drop.buildProgress * 0.22 +
+					phrasePos * 0.38 +
+					directed.density * 0.12,
+				0,
+				1
+			) *
+			(1 - env.silence * 0.6);
+		env.growth = approach(env.growth, growthTarget, 0.9, dt);
+
+		const lightTarget =
+			(activeComp.light * (0.55 + env.energy * 0.6) + directed.drop.anticipation * 0.12) *
+			(1 - env.silence * 0.72);
+		env.backlight = approach(env.backlight, lightTarget, 1.4, dt);
+		env.rings = approach(env.rings, activeComp.rings, 1.2, dt);
+		env.spiral = approach(env.spiral, activeComp.spiral, 1.2, dt);
+		env.petals = approach(env.petals, activeComp.petals, 1.2, dt);
+		env.air = approach(env.air, activeComp.air * (1 - env.silence * 0.4), 0.8, dt);
+
+		// Beat light: strength is latched as each beat starts and then carried
+		// through the facets by the shader over the beat's own phase.
+		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex)));
+		if (beatCount !== lastBeatCount) {
+			const isDownbeat = Math.floor(finite(clock.beatIndex)) === 0;
+			env.packetStrength = feat
+				? clamp(
+						(0.3 + directed.bassPunch * 0.7 + env.energy * 0.35 + (isDownbeat ? 0.25 : 0)) *
+							response.impact *
+							(1 - env.silence),
+						0,
+						1.6
+					)
+				: 0;
+			lastBeatCount = beatCount;
+		}
+
+		// Sun behind the glass wanders to a new phrase-chosen place, slowly.
+		const sunAngle = ((Math.imul(phraseIndex + 1, 0x9e3779b1) ^ seedSalt) >>> 0) / 0x1_0000_0000;
+		const sunTargetX = Math.cos(sunAngle * Math.PI * 2) * 0.2;
+		const sunTargetY = 0.06 + Math.sin(sunAngle * Math.PI * 2) * 0.15;
+		env.sunX = approach(env.sunX, sunTargetX, 0.14, dt);
+		env.sunY = approach(env.sunY, sunTargetY, 0.14, dt);
+		env.sunPower = approach(env.sunPower, 0.45 + env.energy * 0.7, 0.8, dt);
+
+		// Palette roles glide with harmony; the drift family leans cooler.
+		const roles = prismPaletteRoles(
+			directed.context.keyPitchClass,
+			directed.context.keyMode === 'minor',
+			directed.context.keyConfidence,
+			directed.palette.baseHue,
+			family
+		);
+		approachRgb(palette.hero, roles.hero, 0.7, dt);
+		approachRgb(palette.support, roles.support, 0.7, dt);
+		approachRgb(palette.accent, roles.accent, 0.7, dt);
+		approachRgb(palette.field, roles.field, 0.7, dt);
+
+		// The rose turns with the shared trace phase (music-driven, stops in
+		// silence) plus a slow seeded sway; switching engines resumes the pose.
 		const tSec = journey.timelineSeconds;
-		const rotOsc = Math.sin(tSec * 0.07 + songSeed * 6.28) * 0.7 + Math.sin(tSec * 0.023 + songSeed * 11.0) * 0.5;
-		// Rotation now belongs to the shared song journey rather than this mounted
-		// component's lifetime. Switching engines and returning to Prism resumes the
-		// same choreography instead of visibly restarting its clockwise loop.
-		smoothed.rotation =
-			journey.signal.tracePhase * 0.12 * responseMotion +
-			rotOsc * (0.18 + smoothed.mid * 0.2) * responseMotion;
+		const turnSign = songSeed > 0.5 ? 1 : -1;
+		const sway =
+			Math.sin(tSec * 0.041 + songSeed * 6.28) * 0.05 + Math.sin(tSec * 0.017 + songSeed * 11) * 0.04;
+		env.previousRotation = env.rotation;
+		env.rotation = (journey.signal.tracePhase * 0.22 * turnSign + sway) * response.motion;
+		const rotationDelta = clamp(env.rotation - env.previousRotation, -0.02, 0.02);
+		const driftX =
+			(Math.sin(tSec * 0.043 + songSeed * 9) * 0.011 + Math.sin(tSec * 0.019 + 1.3) * 0.007) *
+			response.motion;
+		const driftY = Math.cos(tSec * 0.031 + songSeed * 4) * 0.006 * response.motion;
 
-		// Audio-conditional post params. Tuned for clarity over smear — feedback
-		// punctuates, doesn't blanket; bloom only bites the brightest edges.
-		// onsetEventStrip momentarily slashes feedback fade → trail snap-clears
-		// on a randomly-chosen subset of onsets ("surprise moments of clarity").
-		const bloomThreshold = 1.7 - smoothed.rms * 0.25 + response.bloomThresholdOffset;
-		const feedbackFade = Math.max(
-			0.5,
-			Math.min(
-				0.9,
-				0.78 + smoothed.bass * 0.08 - onsetEventStrip * 0.22 + response.feedbackFadeOffset
-			)
-		);
-		const feedbackZoom = 1 - (0.003 + smoothed.bass * 0.005) * responseMotion;
+		// Post: trails shorten on impact and in silence; the bloom knee drops
+		// with energy so peaks glow and quiet sections stay graphic.
+		const feedbackFade =
+			feedbackResetFrames > 0
+				? 0
+				: clamp(
+						(0.86 + env.energy * 0.05 - env.impact * 0.08 + response.feedbackFadeOffset) *
+							(1 - env.silence * 0.3),
+						0.4,
+						0.95
+					);
+		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
+		const feedbackZoom = 1 - (0.0012 + env.bass * 0.0022) * response.motion;
+		const bloomThreshold = 0.82 - env.energy * 0.18 + response.bloomThresholdOffset;
+		const aberration = 1 + env.impact * 1.5;
 
-		// Beat phase taken raw — we want the snap, not a smoothed drift.
-		const beatPhase = directed.clock.beatPhase;
-
-		// Prism's production identity stays on its refined hyperbolic scene.
-		// The lab can still inspect the other generators, with a clamped index and
-		// an honest HUD label instead of the old ignored auto-score scaffolding.
+		// Lab-only preset override; production is always the rose.
 		const selectedPreset = Math.max(0, Math.min(3, vis.forcedPreset >= 0 ? vis.forcedPreset : 0));
 		if (vis.preset !== selectedPreset) vis.setPreset(selectedPreset);
 
-		// ── Upload uniforms (bins go separately)
-		const u = gpu.uniformData;
+		// ── Uniforms
+		const u = g.uniformData;
 		u[0] = w;
 		u[1] = h;
 		u[2] = tSec;
-		u[3] = smoothed.bass;
-		u[4] = smoothed.mid;
-		u[5] = smoothed.treble;
-		u[6] = smoothed.centroid;
-		u[7] = smoothed.rms;
-		u[8] = smoothed.flash;
+		u[3] = env.bass;
+		u[4] = env.mid;
+		u[5] = env.treble;
+		u[6] = env.centroid;
+		u[7] = env.rms;
+		u[8] = env.impact;
 		u[9] = bloomThreshold;
 		u[10] = feedbackFade;
-		u[11] = smoothed.rotation;
+		u[11] = env.rotation;
 		u[12] = feedbackZoom;
-		// blur dir set per-pass; default H
 		u[13] = 1;
 		u[14] = 0;
-		u[15] = beatPhase;
-		u[16] = chromaKeySmoothed;
-		u[17] = smoothed.chromaStrength;
-		u[18] = smoothed.bpmNorm;
+		u[15] = clamp(finite(clock.beatPhase), 0, 1);
+		u[16] = clamp(finite(directed.context.keyPitchClass), 0, 1);
+		u[17] = clamp(finite(directed.context.keyConfidence), 0, 1);
+		u[18] = clamp((finite(clock.tempoBpm) - 60) / 120, 0, 1);
 		u[19] = songSeed;
-		u[20] = onsetEventPalJump * responseImpact;
-		// u[21] = sceneWeight — set per scene pass below.
+		u[20] = 0;
 		u[21] = 1;
 		u[22] = journey.signal.tracePhase;
-		u[23] = directed.context.sectionEnergy;
+		u[23] = sectionEnergy;
+		writeVec4(u, O.comp, compA.fold, compB.fold, transitionFront, transitionGlow * Math.min(1, (TRANSITION_END - transitionFront) * 2));
+		writeShape(u, O.shapeA, compA);
+		writeShape(u, O.shapeB, compB);
+		writeVec4(u, O.organism, env.growth, phraseIndex, phrasePos, seedSalt);
+		writeVec4(u, O.light, env.backlight, env.packetStrength, clamp(finite(clock.beatPhase), 0, 1), beatCount);
+		writeVec4(u, O.modes, env.rings, env.spiral, env.petals, family === 'drift' ? 1 : 0);
+		writeVec4(u, O.sun, env.sunX, env.sunY, env.sunPower, env.air);
+		writeVec4(u, O.heroCol, ...palette.hero, 0);
+		writeVec4(u, O.supportCol, ...palette.support, 0);
+		writeVec4(u, O.accentCol, ...palette.accent, 0);
+		writeVec4(u, O.fieldCol, ...palette.field, 0);
+		writeVec4(u, O.post, feedbackFade, feedbackZoom, bloomThreshold, aberration);
+		writeVec4(u, O.env, driftX, driftY, env.silence, env.rotation);
+		writeVec4(u, O.bands, env.bass, env.mid, env.treble, env.impact);
+		writeVec4(u, O.motion, rotationDelta, frameIndex % 60, env.energy, 0);
+		frameIndex += 1;
 
-		// ── Single dominant preset (no top-2 blend). Cross-fading two distinct
-		// generators produced visible overlay/competition instead of evolution.
-		// Whichever preset has the highest score wins; transitions snap at the
-		// score boundary (but slow smoothing makes the snap a rare event).
-		let sceneIdxA = selectedPreset;
-		const sceneIdxB = sceneIdxA;
-		const weightA = 1;
-		const weightB = 0;
+		g.device.queue.writeBuffer(g.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
+		g.device.queue.writeBuffer(g.binsBuf, 0, bins.buffer, bins.byteOffset, bins.byteLength);
 
-		gpu.device.queue.writeBuffer(gpu.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
-		gpu.device.queue.writeBuffer(
-			gpu.binsBuf,
-			0,
-			smoothed.bins.buffer,
-			smoothed.bins.byteOffset,
-			smoothed.bins.byteLength
+		hudSection = directed.section;
+		hudFold = compB.fold;
+
+		// ── Render graph: scene → feedback → prefilter → 2× (H, V) blur → present
+		const encoder = g.device.createCommandEncoder({ label: 'Prism frame' });
+		const fullscreen = (
+			label: string,
+			view: GPUTextureView,
+			pipeline: GPURenderPipeline,
+			bindGroup: GPUBindGroup,
+			vertices: number
+		) => {
+			const pass = encoder.beginRenderPass({
+				label,
+				colorAttachments: [
+					{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }
+				]
+			});
+			pass.setPipeline(pipeline);
+			pass.setBindGroup(0, bindGroup);
+			pass.draw(vertices);
+			pass.end();
+		};
+		const previous = g.parity;
+		const next: 0 | 1 = previous === 0 ? 1 : 0;
+		fullscreen(
+			'Prism scene',
+			t.sceneView,
+			g.pipelines.scenes[selectedPreset],
+			bg.scenes[selectedPreset],
+			6
 		);
-
-		// ── Render graph
-		const prev = (gpu.frame % 2) as 0 | 1;
-		const next = (1 - prev) as 0 | 1;
-		const t = gpu.targets;
-		const bg = gpu.bindGroups;
-
-		const encoder = gpu.device.createCommandEncoder();
-
-		// 1a. Top scene (clears sceneTex, additive blend with weightA)
-		u[21] = weightA;
-		gpu.device.queue.writeBuffer(gpu.uniformBuf, 21 * 4, u.buffer, u.byteOffset + 21 * 4, 4);
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.sceneView,
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.scenes[sceneIdxA]);
-			pass.setBindGroup(0, bg.scenes[sceneIdxA]);
-			pass.draw(6);
-			pass.end();
+		fullscreen('Prism feedback', t.feedbackView[next], g.pipelines.feedback, bg.feedback[previous], 3);
+		fullscreen('Prism bloom prefilter', t.bloomView[0], g.pipelines.bloomDown, bg.bloomDown[next], 3);
+		for (let round = 0; round < 2; round++) {
+			fullscreen('Prism bloom blur H', t.bloomView[1], g.pipelines.blurH, bg.blurH, 3);
+			fullscreen('Prism bloom blur V', t.bloomView[0], g.pipelines.blurV, bg.blurV, 3);
 		}
+		fullscreen(
+			'Prism present',
+			g.context.getCurrentTexture().createView(),
+			g.pipelines.composite,
+			bg.composite[next],
+			3
+		);
+		g.device.queue.submit([encoder.finish()]);
+		g.parity = next;
+	}
 
-		// 1b. Second scene (loads sceneTex, additive blend with weightB on top).
-		// Skipped when weightB is negligible (single-preset dominance / forced mode).
-		if (weightB > 0.001 && sceneIdxB !== sceneIdxA) {
-			u[21] = weightB;
-			gpu.device.queue.writeBuffer(gpu.uniformBuf, 21 * 4, u.buffer, u.byteOffset + 21 * 4, 4);
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.sceneView,
-						loadOp: 'load',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.scenes[sceneIdxB]);
-			pass.setBindGroup(0, bg.scenes[sceneIdxB]);
-			pass.draw(6);
-			pass.end();
+	function loop(now: number) {
+		if (!running) return;
+		raf = requestAnimationFrame(loop);
+		if (!canvas || !gpu) return;
+		const frameDt = frameScheduler.next(now);
+		if (frameDt === null) return;
+		try {
+			renderFrame(gpu, now, clamp(frameDt, 0.001, 0.25));
+		} catch (error) {
+			errorMsg = error instanceof Error ? error.message : String(error);
+			teardownGpu();
 		}
-
-		// 2. Feedback: read feedback[prev] + sceneTex → feedback[next]
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.feedbackView[next],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.feedback);
-			pass.setBindGroup(0, bg.feedback[prev]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// 3. Bloom downsample: read feedback[next] → bloom[0]
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.bloomView[0],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.bloomDown);
-			pass.setBindGroup(0, bg.bloomDown[next]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// 4. Bloom blur H: bloom[0] → bloom[1]. Need updated blur dir uniform.
-		u[13] = 1;
-		u[14] = 0;
-		gpu.device.queue.writeBuffer(gpu.uniformBuf, 13 * 4, u.buffer, u.byteOffset + 13 * 4, 8);
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.bloomView[1],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.bloomBlur);
-			pass.setBindGroup(0, bg.bloomBlurH);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// 5. Bloom blur V: bloom[1] → bloom[0]
-		u[13] = 0;
-		u[14] = 1;
-		gpu.device.queue.writeBuffer(gpu.uniformBuf, 13 * 4, u.buffer, u.byteOffset + 13 * 4, 8);
-		{
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view: t.bloomView[0],
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.bloomBlur);
-			pass.setBindGroup(0, bg.bloomBlurV);
-			pass.draw(6);
-			pass.end();
-		}
-
-		// 6. Composite: feedback[next] + bloom[0] → swap chain
-		{
-			const view = gpu.context.getCurrentTexture().createView();
-			const pass = encoder.beginRenderPass({
-				colorAttachments: [
-					{
-						view,
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
-						loadOp: 'clear',
-						storeOp: 'store'
-					}
-				]
-			});
-			pass.setPipeline(gpu.pipelines.composite);
-			pass.setBindGroup(0, bg.composite[next]);
-			pass.draw(6);
-			pass.end();
-		}
-
-		gpu.device.queue.submit([encoder.finish()]);
-		gpu.frame++;
-
 	}
 
 	// The visualizer component is mounted once in the layout; the canvas inside
-	// is conditionally rendered. Each time `vis.active` flips on we get a fresh
-	// canvas element — the GPU state (device, context, pipeline) is bound to a
-	// specific canvas, so it must be torn down and rebuilt across remounts or
-	// the second open paints to a dead surface (black screen).
+	// is conditionally rendered. Each fresh canvas gets fresh GPU state, and a
+	// stale initialization is destroyed rather than adopted.
 	$effect(() => {
-		if (!canvas) {
+		const targetCanvas = canvas;
+		if (!targetCanvas) {
+			initVersion += 1;
+			initializing = false;
 			teardownGpu();
 			return;
 		}
-		if (gpu) return;
+		if (gpu || initializing) return;
+		const version = ++initVersion;
+		initializing = true;
 		errorMsg = null;
-		const initFor = canvas;
-		initGpu(initFor)
-			.then((g) => {
-				if (!g) return;
-				if (canvas !== initFor) {
-					try {
-						g.uniformBuf.destroy();
-						g.binsBuf.destroy();
-						g.device.destroy?.();
-					} catch {}
+		ready = false;
+		initGpu(targetCanvas)
+			.then((state) => {
+				if (version !== initVersion || canvas !== targetCanvas) {
+					destroyGpuState(state);
 					return;
 				}
-				gpu = g;
+				gpu = state;
+				frameScheduler.reset();
+				feedbackResetFrames = 2;
+				ready = true;
 			})
-			.catch((e) => {
-				errorMsg = e instanceof Error ? e.message : String(e);
+			.catch((error) => {
+				if (version !== initVersion) return;
+				errorMsg = error instanceof Error ? error.message : String(error);
+				ready = false;
+			})
+			.finally(() => {
+				if (version === initVersion) initializing = false;
 			});
 	});
 
@@ -1549,6 +773,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 
 	onDestroy(() => {
 		running = false;
+		initVersion += 1;
 		cancelAnimationFrame(raf);
 		if (unsub) {
 			unsub();
@@ -1566,6 +791,10 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			aria-label="Prism audio visualizer"
 			data-prism-frame-rate={PRISM_FRAME_RATE}
 			data-prism-max-internal-pixels={PRISM_MAX_INTERNAL_PIXELS}
+			data-prism-render-passes={RENDER_PASSES}
+			data-prism-section={hudSection}
+			data-prism-fold={hudFold}
+			data-prism-ready={String(ready)}
 		></canvas>
 		{#if errorMsg}
 			<div class="pointer-events-none absolute left-6 top-6 z-20 max-w-md text-xs text-red-300/80">

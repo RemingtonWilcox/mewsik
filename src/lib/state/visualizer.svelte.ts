@@ -32,6 +32,10 @@ export type AudioFeatures = AudioFeatureFrame;
 // scheduling jitter, but stop treating it as live audio quickly when playback
 // pauses, buffers, or the analyzer stops emitting.
 export const AUDIO_FEATURE_FRESHNESS_MS = 250;
+// requestAnimationFrame timestamps mark the start of the frame, so a feature
+// published later in the same frame looks slightly in the future. Accept
+// that instead of reading a fresh frame as silence.
+export const AUDIO_FEATURE_CLOCK_SKEW_MS = 50;
 export const JOURNEY_NULL_TICK_MS = 1000 / 60;
 const JOURNEY_NULL_CATCHUP_LIMIT_MS = JOURNEY_NULL_TICK_MS * 4;
 
@@ -42,7 +46,7 @@ function featureClockNow(): number {
 // Available presets — keep in sync with shader pipelines in visualizer.svelte.
 export const PRESET_COUNT = 4;
 export const PRESET_NAMES = [
-	'hyperbolic kaleidoscope',
+	'obsidian rose',
 	'cathedral flythrough',
 	'voronoi caustics',
 	'nebulae flow'
@@ -168,7 +172,7 @@ class VisualizerState {
 		const frame = this.latestFrame;
 		if (!frame || this.latestFrameAt === null) return null;
 		const age = now - this.latestFrameAt;
-		return age >= 0 && age <= AUDIO_FEATURE_FRESHNESS_MS ? frame : null;
+		return age >= -AUDIO_FEATURE_CLOCK_SKEW_MS && age <= AUDIO_FEATURE_FRESHNESS_MS ? frame : null;
 	}
 
 	/**

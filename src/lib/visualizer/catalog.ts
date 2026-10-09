@@ -20,7 +20,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		name: 'Prism',
 		subtitle: 'Rhythmic geometry',
 		role: 'Impact',
-		description: 'Crisp mirrored architecture that turns beats and harmony into immediate motion.',
+		description: 'An obsidian rose window; beats travel as light through jewel glass.',
 		accent: '#e9d5ff',
 		accentMuted: 'rgba(216, 180, 254, 0.46)'
 	},
