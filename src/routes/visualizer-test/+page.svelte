@@ -69,6 +69,11 @@
 	let activeProfile = $derived(SOMA_LAB_PROFILES[activeProfileId]);
 	let activeStage = $derived(getSomaLabStage(activeProfile, activeStageId));
 	let profileStartedAt = 0;
+	// Song mode (?song=1) plays whole tracks back to back, moving to the next
+	// profile at the end without resetting the performance, the way a radio
+	// stream runs for hours. Used to judge visual variety over time.
+	let songMode = $state(false);
+	let songTracks = 0;
 	let activePositionMs = 0;
 	let profileFrameSerial = 0;
 	let installedLabApi: MewsikLabApi | null = null;
@@ -100,6 +105,8 @@
 		url.searchParams.set('stage', activeStageId);
 		url.searchParams.set('seed', labSeed);
 		url.searchParams.set('chrome', chromeVisible ? '1' : '0');
+		if (songMode) url.searchParams.set('song', '1');
+		else url.searchParams.delete('song');
 		replaceState(url, {});
 	}
 
@@ -147,8 +154,9 @@
 		labSeed = normalizeSeed(seed);
 		demoMode = true;
 		labProfileReady = false;
-		activePositionMs = stage.atMs;
+		activePositionMs = songMode ? 0 : stage.atMs;
 		profileStartedAt = performance.now();
+		songTracks = 0;
 		setActiveScore(profile.score);
 		setScorePlayback(activePositionMs, false);
 		// Reset through null so selecting the same URL state is a real replay while
@@ -166,9 +174,33 @@
 		return true;
 	}
 
-	function publishProfileFrame(now: number) {
+	function advanceSong(now: number) {
 		const elapsedMs = Math.max(0, now - profileStartedAt);
-		activePositionMs = Math.min(activeStage.endMs - 1, activeStage.atMs + elapsedMs);
+		const durationMs = Math.max(1, activeProfile.score.duration_ms);
+		if (elapsedMs >= durationMs) {
+			const index = SOMA_LAB_PROFILE_IDS.indexOf(activeProfileId);
+			activeProfileId = SOMA_LAB_PROFILE_IDS[(index + 1) % SOMA_LAB_PROFILE_IDS.length];
+			profileStartedAt = now;
+			songTracks += 1;
+			setActiveScore(SOMA_LAB_PROFILES[activeProfileId].score);
+			activePositionMs = 0;
+		} else {
+			activePositionMs = elapsedMs;
+		}
+		const profile = SOMA_LAB_PROFILES[activeProfileId];
+		const stage =
+			profile.stages.find((candidate) => activePositionMs >= candidate.startMs && activePositionMs < candidate.endMs) ??
+			profile.stages[profile.stages.length - 1];
+		if (stage.id !== activeStageId) activeStageId = stage.id;
+	}
+
+	function publishProfileFrame(now: number) {
+		if (songMode) {
+			advanceSong(now);
+		} else {
+			const elapsedMs = Math.max(0, now - profileStartedAt);
+			activePositionMs = Math.min(activeStage.endMs - 1, activeStage.atMs + elapsedMs);
+		}
 		setScorePlayback(activePositionMs, false);
 		vis.setLatest(activeProfile.frameAt(activePositionMs, labSeed), now);
 		profileFrameSerial += 1;
@@ -268,6 +300,7 @@
 			? (requestedEngine as VisualizerEngine)
 			: vis.engine;
 		chromeVisible = params.get('chrome') !== '0';
+		songMode = params.get('song') === '1';
 		const requestedProfile = getSomaLabProfile(params.get('profile'));
 		labSeed = normalizeSeed(params.get('seed'));
 		vis.active = true;
@@ -331,6 +364,7 @@
 	data-lab-seed={labSeed}
 	data-lab-ready={labReady && (!demoMode || labProfileReady)}
 	data-lab-chrome={chromeVisible}
+	data-lab-song={songMode}
 >
 	{#if chromeVisible}
 		<div
