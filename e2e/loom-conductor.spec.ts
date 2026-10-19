@@ -568,4 +568,262 @@ test.describe('Loom harmony conductor', () => {
 		// No scene holds for more than eight phrases (two minutes at 128 bpm).
 		expect(result.longestHold).toBeLessThanOrEqual(8);
 	});
+
+	test('the light budget normalises every look and keeps the hierarchy', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const look = await import('/src/lib/visualizer/loom/look.ts');
+			const exposure = await import('/src/lib/visualizer/loom/exposure.ts');
+			const linear = (hex: string) => {
+				const v = Number.parseInt(hex.slice(1), 16);
+				return [16, 8, 0].map((shift) => Math.pow(((v >> shift) & 0xff) / 255, 2.2)) as [number, number, number];
+			};
+			const out = exposure.createLoomExposure();
+			let invalid = 0;
+			let hierarchyBroken = 0;
+			const raw: number[] = [];
+			const normalised: number[] = [];
+			const env = { sky: 0.3, fog: 0.2, walls: 0, floorMirror: 1 };
+			for (const family of look.LOOM_PALETTES) {
+				for (const material of look.LOOM_MATERIALS) {
+					for (const grammar of look.LOOM_GRAMMARS) {
+						for (const tone of look.LOOM_TONES) {
+							const input = {
+								hero: linear(family.hero),
+								support: linear(family.support),
+								weft: linear(family.weft),
+								haze: linear(family.haze),
+								glow: linear(family.glow),
+								material,
+								density: grammar.density,
+								strandCount: grammar.strands[1],
+								tone,
+								env
+							};
+							exposure.resolveLoomExposure(input, out);
+							for (const value of Object.values(out)) if (!Number.isFinite(value)) invalid += 1;
+							const heroValue = exposure.loomColourIntensity(input.hero) * out.heroGain;
+							const supportValue = exposure.loomColourIntensity(input.support) * out.supportGain;
+							if (supportValue > heroValue + 1e-6) hierarchyBroken += 1;
+							if (tone.name !== 'glow') continue;
+							// Fibre light at rest: colour x material, before and after the budget.
+							const materialLight = exposure.loomMaterialLight(material);
+							const colour = exposure.loomColourIntensity(input.hero);
+							raw.push(colour * materialLight * (1 + grammar.density));
+							normalised.push(
+								colour * out.heroGain * materialLight * out.litGain * (1 + grammar.density * out.chorusGlow)
+							);
+						}
+					}
+				}
+			}
+			const spread = (list: number[]) => Math.max(...list) / Math.min(...list);
+			const at = (density: number, strands: number, tone = look.LOOM_TONES[0]) =>
+				({
+					...exposure.resolveLoomExposure(
+						{
+							hero: [1, 0.3, 0.05],
+							support: [0.2, 0.4, 1],
+							weft: [1, 0.9, 0.3],
+							haze: [0.08, 0.03, 0.12],
+							glow: [1, 0.4, 0.2],
+							material: look.LOOM_MATERIALS[0],
+							density,
+							strandCount: strands,
+							tone,
+							env
+						},
+						exposure.createLoomExposure()
+					)
+				}) as Record<string, number>;
+			const sparse = at(0.35, 0.2);
+			const dense = at(0.95, 1);
+			const ink = at(0.5, 0.5, look.LOOM_TONES.find((t) => t.name === 'ink'));
+			const glow = at(0.5, 0.5);
+			return {
+				invalid,
+				hierarchyBroken,
+				rawSpread: spread(raw),
+				normalisedSpread: spread(normalised),
+				denser: {
+					chorusWidth: dense.chorusWidth < sparse.chorusWidth,
+					chorusGlow: dense.chorusGlow < sparse.chorusGlow,
+					trail: dense.trailOffset < sparse.trailOffset,
+					bloom: dense.bloomWeight < sparse.bloomWeight,
+					knee: dense.bloomThresholdOffset > sparse.bloomThresholdOffset
+				},
+				inkBloom: ink.bloomWeight < glow.bloomWeight * 0.3,
+				bounded: [sparse, dense, ink, glow].every(
+					(o) => o.bloomWeight <= 0.7 && o.litGain <= 1.12 && o.heroGain <= 1.25 && o.trailOffset <= 0.02
+				)
+			};
+		});
+		expect(result.invalid).toBe(0);
+		expect(result.hierarchyBroken).toBe(0);
+		// Raw looks differ by more than 4x in fibre light; the budget holds them
+		// within about 2x of each other.
+		expect(result.rawSpread).toBeGreaterThan(4);
+		expect(result.normalisedSpread).toBeLessThan(result.rawSpread * 0.5);
+		expect(result.normalisedSpread).toBeLessThan(2.4);
+		expect(result.denser).toEqual({ chorusWidth: true, chorusGlow: true, trail: true, bloom: true, knee: true });
+		expect(result.inkBloom).toBe(true);
+		expect(result.bounded).toBe(true);
+	});
+
+	test('choice morphs never snap, even when targets arrive mid-morph', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const { LoomChoiceMorph } = await import('/src/lib/visualizer/loom/look.ts');
+			// Options sit on a line; a snap shows as a large step of the blend.
+			const values = [0, 10, -7, 4, 13, -2];
+			const morph = new LoomChoiceMorph(3);
+			const dt = 1 / 60;
+			let value = 0;
+			let maxStep = 0;
+			let target = 0;
+			const targets: number[] = [];
+			for (let frame = 0; frame < 60 * 120; frame += 1) {
+				// Retarget at irregular, often very short intervals.
+				if (frame % 37 === 0 || frame % 101 === 0) target = (target + 1 + (frame % 4)) % values.length;
+				targets.push(target);
+				const view = morph.update(target, dt);
+				const next = values[view.from] + (values[view.to] - values[view.from]) * view.mix;
+				if (frame > 0) maxStep = Math.max(maxStep, Math.abs(next - value));
+				value = next;
+			}
+			for (let frame = 0; frame < 60 * 10; frame += 1) morph.update(target, dt);
+			const settled = morph.update(target, dt);
+			return { maxStep, settled: settled.to === target && settled.mix === 1 && !morph.moving };
+		});
+		// Largest gap between options is 20; a 3 s smoothstep morph rushed 2.4x
+		// moves at most about 20 * 1.5 * 2.4 / 3 / 60 = 0.4 per frame.
+		expect(result.maxStep).toBeLessThan(0.45);
+		expect(result.settled).toBe(true);
+	});
+
+	test('a track change carries the picture on instead of cutting', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const { VisualizerJourneyRuntime } = await import('/src/lib/visualizer/journey.ts');
+			const runtime = new VisualizerJourneyRuntime(0.4, 0);
+			const features = (i: number) => ({
+				bins: Array.from({ length: 64 }, (_, k) => (k < 12 ? 0.85 : 0.45)),
+				rms: 0.55,
+				peak: 0.9,
+				centroid: 0.45,
+				onset: i % 28 === 0,
+				bass: 0.75,
+				mid: 0.5,
+				treble: 0.35,
+				sample_rate: 48000,
+				bpm: 128,
+				beat_phase: (i % 28) / 28,
+				chroma_key: 0.3,
+				chroma_strength: 0.6
+			});
+			runtime.resetSource('song-a', 0);
+			let now = 0;
+			for (let i = 0; i < 60 * 40; i += 1) {
+				now += 1000 / 60;
+				runtime.advance(features(i), now);
+			}
+			const read = (s: any) => ({
+				tension: s.loom.tension,
+				openness: s.loom.openness,
+				curl: s.loom.curl,
+				braid: s.loom.braid,
+				cameraDistance: s.loom.cameraDistance,
+				cameraPitch: s.loom.cameraPitch,
+				cameraYaw: s.loom.cameraYaw,
+				torus: s.loom.topologyWeights.torus,
+				knot: s.loom.topologyWeights.knot,
+				frameScale: s.loom.look.frameScale,
+				camDistance: s.loom.look.camDistance,
+				heroGain: s.loom.look.exposure.heroGain,
+				grammarTo: s.loom.look.grammarTo,
+				identity: s.loom.look.identity
+			});
+			const before = read(runtime.advance(features(0), (now += 1000 / 60)));
+			runtime.resetSource('song-b', now);
+			const after = read(runtime.advance(features(1), (now += 1000 / 60)));
+			const deltas: Record<string, number> = {};
+			for (const key of Object.keys(before) as Array<keyof typeof before>) {
+				deltas[key] = Math.abs((after[key] as number) - (before[key] as number));
+			}
+			return { deltas };
+		});
+		for (const [key, delta] of Object.entries(result.deltas)) {
+			expect(delta, key).toBeLessThan(0.03);
+		}
+		// The strand hashes are seeded from the journey, not the song.
+		expect(result.deltas.identity).toBe(0);
+	});
+
+	test('pacing: long sections still move the scene and tones and framings rotate', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const look = await import('/src/lib/visualizer/loom/look.ts');
+			const l = new look.LoomLook('long-sections');
+			const sections = ['intro', 'verse', 'chorus', 'bridge', 'outro'];
+			const scenes: string[] = [];
+			const tones = new Set<string>();
+			const compositions = new Set<string>();
+			const environments = new Set<string>();
+			for (let phrase = 0; phrase < 240; phrase += 1) {
+				// Twelve-phrase sections: three minutes each at 128 bpm.
+				const section = sections[Math.floor(phrase / 12) % sections.length] + Math.floor(phrase / 12);
+				let frame: any;
+				for (let i = 0; i < 30; i += 1) {
+					frame = l.advance({
+						phraseIndex: phrase,
+						sectionKey: section,
+						energy: 0.3 + 0.5 * Math.abs(Math.sin(phrase * 0.2)),
+						mode: 0.2,
+						key: 0.4,
+						dt: 1 / 4
+					});
+				}
+				const n = frame.names;
+				scenes.push(`${n.grammar}|${n.palette}|${n.camera}|${n.tone}|${n.composition}`);
+				tones.add(n.tone);
+				compositions.add(n.composition);
+				environments.add(n.environment);
+			}
+			let longest = 0;
+			let run = 0;
+			for (let i = 0; i < scenes.length; i += 1) {
+				run = i > 0 && scenes[i] === scenes[i - 1] ? run + 1 : 1;
+				longest = Math.max(longest, run);
+			}
+			return {
+				longest,
+				tones: tones.size,
+				compositions: compositions.size,
+				environments: environments.size,
+				toneCount: look.LOOM_TONES.length,
+				compositionCount: look.LOOM_COMPOSITIONS.length
+			};
+		});
+		// Camera holds at most three phrases (maxHold), so no scene lingers past that.
+		expect(result.longest).toBeLessThanOrEqual(3);
+		expect(result.tones).toBe(result.toneCount);
+		expect(result.compositions).toBe(result.compositionCount);
+		expect(result.environments).toBe(6);
+	});
+
+	test('tone weights follow energy: loud glows, quiet draws', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const look = await import('/src/lib/visualizer/loom/look.ts');
+			const loud = look.loomToneWeights(0.95);
+			const quiet = look.loomToneWeights(0.1);
+			const ink = look.LOOM_TONES.findIndex((t) => t.name === 'ink');
+			return {
+				loudGlowLeads: loud[0] === Math.max(...loud),
+				quietInkBeatsLoud: quiet[ink] > loud[ink] * 2,
+				allPositive: [...loud, ...quiet].every((w) => w > 0)
+			};
+		});
+		expect(result).toEqual({ loudGlowLeads: true, quietInkBeatsLoud: true, allPositive: true });
+	});
 });

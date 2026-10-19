@@ -306,6 +306,39 @@ const TOPOLOGY_COUNT = LOOM_TOPOLOGY_NAMES.length;
 const BAND_ATTACK = [0.08, 0.025, 0.05, 0.075, 0.04, 0.025] as const;
 const BAND_RELEASE = [0.7, 0.28, 0.5, 0.62, 0.38, 0.25] as const;
 
+/**
+ * Slow rails a journey-owned conductor carries into the next song. Phases and
+ * their rates, transients (impact, reweave, section pulse) and the
+ * phrase/section memory are deliberately not carried: phases stay seeded per
+ * source (the renderer keeps its own continuous phases) and a new song must
+ * not open with a synthetic hit.
+ */
+const CARRY_RAILS = [
+	'tension',
+	'release',
+	'openness',
+	'dropOpenness',
+	'braid',
+	'twist',
+	'depth',
+	'curl',
+	'weftSparse',
+	'signedAsymmetry',
+	'motion',
+	'macroEnergy',
+	'tempo',
+	'key',
+	'mode',
+	'crossingOrder',
+	'harmonicSpread',
+	'spectralLean',
+	'cameraYaw',
+	'cameraPitch',
+	'cameraDistance',
+	'cameraRoll'
+] as const;
+type CarryRail = (typeof CARRY_RAILS)[number];
+
 function finite(value: number | undefined, fallback = 0): number {
 	return Number.isFinite(value) ? (value as number) : fallback;
 }
@@ -618,6 +651,7 @@ export class LoomConductor {
 		this.cameraPitch = intro.cameraPitch;
 		this.cameraDistance = intro.cameraDistance;
 		this.cameraRoll = 0;
+		this.restoreCarry();
 
 		this.output.section = 'intro';
 		writeTopology(this.output.topologyWeights, this.currentTopology);
@@ -634,28 +668,62 @@ export class LoomConductor {
 		this.output.impact = 0;
 		this.output.reweave = 0;
 		this.output.sectionPulse = 0;
-		this.output.signedAsymmetry = 0;
+		this.output.signedAsymmetry = this.signedAsymmetry;
 		this.output.motion = this.motion;
 		this.output.macroEnergy = this.macroEnergy;
 		this.output.phrase = 0;
 		this.output.phraseIndex = 0;
 		this.output.phraseVariation = 0.5;
 		this.output.tempo = this.tempo;
-		this.output.key = 0;
-		this.output.mode = 0;
-		this.output.crossingOrder = 0;
-		this.output.harmonicSpread = 0;
-		this.output.spectralLean = 0;
+		this.output.key = this.key;
+		this.output.mode = this.mode;
+		this.output.crossingOrder = this.crossingOrder;
+		this.output.harmonicSpread = this.harmonicSpread;
+		this.output.spectralLean = this.spectralLean;
 		this.output.topologyPhase = this.topologyPhase;
 		this.output.weavePhase = this.weavePhase;
 		this.output.longPhase = this.longPhase;
 		this.output.topologyRate = this.topologyRate;
 		this.output.weaveRate = this.weaveRate;
 		this.output.longRate = this.longRate;
-		this.output.cameraYaw = 0;
+		this.output.cameraYaw = this.cameraYaw;
 		this.output.cameraPitch = this.cameraPitch;
 		this.output.cameraDistance = this.cameraDistance;
-		this.output.cameraRoll = 0;
+		this.output.cameraRoll = this.cameraRoll;
+	}
+
+	/**
+	 * A journey-owned look carries the previous song's slow rails: start this
+	 * song's conductor exactly where the picture is, then let the new song's
+	 * targets pull it on with the usual time constants. No cut at a track change.
+	 */
+	private restoreCarry(): void {
+		const carry = this.look.carry;
+		if (!this.sharedLook || !carry.valid) return;
+		const rails = this as unknown as Record<CarryRail, number>;
+		CARRY_RAILS.forEach((rail, index) => {
+			const value = carry.data[index];
+			if (Number.isFinite(value)) rails[rail] = value;
+		});
+		const offset = CARRY_RAILS.length;
+		for (let i = 0; i < TOPOLOGY_COUNT; i += 1) {
+			const value = carry.data[offset + i];
+			if (Number.isFinite(value)) this.currentTopology[i] = value;
+		}
+		normalizeLoomTopologyWeightArray(this.currentTopology);
+		this.targetTopology.set(this.currentTopology);
+	}
+
+	private storeCarry(): void {
+		if (!this.sharedLook) return;
+		const carry = this.look.carry;
+		const rails = this as unknown as Record<CarryRail, number>;
+		CARRY_RAILS.forEach((rail, index) => {
+			carry.data[index] = rails[rail];
+		});
+		const offset = CARRY_RAILS.length;
+		for (let i = 0; i < TOPOLOGY_COUNT; i += 1) carry.data[offset + i] = this.currentTopology[i];
+		carry.valid = true;
 	}
 
 	update(
@@ -914,12 +982,15 @@ export class LoomConductor {
 			0.014 + this.macroEnergy * 0.042 + this.harmonicSpread * 0.014,
 			...LOOM_CONDUCTOR_LIMITS.longRate
 		);
-		this.topologyRate = approach(this.topologyRate, topologyRateTarget, 1.8, dt);
-		this.weaveRate = approach(this.weaveRate, weaveRateTarget, 1.2, dt);
-		this.longRate = approach(this.longRate, longRateTarget, 3.5, dt);
+		// Integrate with the rate the frame started with, then ease the rate:
+		// a song's phases stay a pure function of its seed and clock even when
+		// the carried rails (motion, tempo) differ from song to song.
 		this.topologyPhase += this.topologyRate * dt;
 		this.weavePhase += this.weaveRate * dt;
 		this.longPhase += this.longRate * dt;
+		this.topologyRate = approach(this.topologyRate, topologyRateTarget, 1.8, dt);
+		this.weaveRate = approach(this.weaveRate, weaveRateTarget, 1.2, dt);
+		this.longRate = approach(this.longRate, longRateTarget, 3.5, dt);
 
 		const cameraYawTarget = clamp(
 			this.crossingOrder * 0.18 +
@@ -990,6 +1061,7 @@ export class LoomConductor {
 			key: this.key,
 			dt
 		});
+		this.storeCarry();
 
 		return this.output;
 	}

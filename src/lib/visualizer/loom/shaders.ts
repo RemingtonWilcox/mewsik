@@ -58,7 +58,7 @@ struct Params {
 	form: vec4<f32>,
 	// curvature, taper, bead, swell
 	formB: vec4<f32>,
-	// frameScale, nearFade, widthScale, frameSpare
+	// frameScale, nearFade, widthScale, emissionGain
 	frame: vec4<f32>,
 	// focal, lensShiftX, lensShiftY, orbitYaw
 	lens: vec4<f32>,
@@ -86,15 +86,15 @@ struct Params {
 	envA: vec4<f32>,
 	// sky, walls, pool, horizon
 	envB: vec4<f32>,
-	// floorLine, sunX, floorAmount, envSpare
+	// floorLine, sunX, floorAmount, bloomWeight
 	envC: vec4<f32>,
 	// keyAzimuth, keyElevation, lightWarmth, fillLevel
 	light: vec4<f32>,
 	// packets, pluck, crossPulse, shuttle
 	beat: vec4<f32>,
-	// sparks, beatGain, beatSpareA, beatSpareB
+	// sparks, beatGain, litGain, chorusGlow
 	beatB: vec4<f32>,
-	// driftX, driftY, spin, trailBoost
+	// driftX, driftY, spin, paper
 	postB: vec4<f32>,
 };
 `;
@@ -198,6 +198,10 @@ struct Strand {
 	role: f32,
 	sid: f32,
 	weft: u32,
+	// Rails blend toward their upper band as the centroid rises (it used to
+	// switch family outright, which snapped the rail's shape and width).
+	familyHi: u32,
+	bandT: f32,
 };
 
 fn smoothDetail(position: f32) -> f32 {
@@ -230,6 +234,10 @@ fn bandEnergy(family: u32) -> f32 {
 	}
 }
 
+fn strandBand(st: Strand) -> f32 {
+	return mix(bandEnergy(st.family), bandEnergy(st.familyHi), st.bandT);
+}
+
 fn bandDetail(family: u32, s: f32) -> f32 {
 	let base = f32(family % 6u) * 10.5;
 	return smoothDetail(clamp((base + clamp(s, 0.0, 1.0) * 10.0) / 63.0, 0.0, 1.0));
@@ -256,11 +264,10 @@ fn taperEnv(s: f32) -> f32 {
 
 // Grammar 0, the original Loom ribbon bundle: rails sweep a coiled throat,
 // pinch into knots under tension and fan open as ghosts in silence.
-fn architecturePoint(s: f32, rail: f32, family: u32, role: f32) -> vec3<f32> {
+fn architecturePoint(s: f32, rail: f32, family: u32, role: f32, band: f32) -> vec3<f32> {
 	let q = s * 2.0 - 1.0;
 	let env = pow(max(0.0, 1.0 - q * q), 0.72);
 	let rails = compositionRails();
-	let band = bandEnergy(family);
 	let familyUnit = f32(family) / 5.0;
 	let harmonic = sin((params.harmony.z + familyUnit * 0.17 + params.shapeB.z * 0.08) * TAU);
 
@@ -539,7 +546,7 @@ fn grammarPoint(g: u32, s: f32, strand: Strand, lane: f32) -> GPoint {
 		case 11u: { out = gRings(s, lane, strand.sid); }
 		case 12u: { out = gCurtain(s, lane); }
 		default: {
-			let p = architecturePoint(s, lane * 1.08, strand.family, strand.role);
+			let p = architecturePoint(s, lane * 1.08, strand.family, strand.role, strandBand(strand));
 			out = GPoint(p, vec3<f32>(0.0, 0.28, 0.96), vec3<f32>(0.0, 0.96, -0.28), 0.0, 0.0);
 		}
 	}
@@ -633,7 +640,9 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.kind = 0.0;
 		st.lane = (f32(instanceIndex) - 1.0) * 0.6666667;
 		st.laneB = st.lane;
-		st.family = min(instanceIndex * 2u + select(0u, 1u, params.audioB.w > 0.56), 5u);
+		st.family = min(instanceIndex * 2u, 5u);
+		st.familyHi = min(instanceIndex * 2u + 1u, 5u);
+		st.bandT = smoothstep(0.5, 0.62, params.audioB.w);
 		st.role = 0.0;
 		st.sid = hashUnit(instanceIndex, 71u, 3u);
 		st.weft = 0u;
@@ -644,6 +653,8 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.lane = (f32(pairA) - 1.0) * 0.6666667;
 		st.laneB = f32(pairA) * 0.6666667;
 		st.family = min(pairA * 2u, 5u);
+		st.familyHi = st.family;
+		st.bandT = 0.0;
 		st.role = 0.0;
 		st.sid = hashUnit(sub, 73u, 5u);
 		st.weft = sub;
@@ -655,6 +666,8 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.lane = -1.0 + (f32(rev) + 0.5) / 8.0;
 		st.laneB = st.lane;
 		st.family = k % 6u;
+		st.familyHi = st.family;
+		st.bandT = 0.0;
 		st.role = f32(k & 1u);
 		st.sid = f32(k & 1u) * 0.6 + hashUnit(k, 79u, 7u) * 0.4;
 		st.weft = k;
@@ -680,7 +693,7 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 		p = p + g.n * weftLift * (0.055 + params.shapeB.z * 0.03) * env;
 	}
 
-	let band = bandEnergy(st.family);
+	let band = strandBand(st);
 	let familyUnit = f32(st.family) / 5.0;
 	let sw = fract(s);
 	let q = sw * 2.0 - 1.0;
@@ -766,7 +779,7 @@ fn vs_main(
 
 	let kind = st.kind;
 	let family = st.family;
-	let band = bandEnergy(family);
+	let band = strandBand(st);
 	let familyUnit = f32(family % 6u) / 5.0;
 	let rails = compositionRails();
 	let q = s * 2.0 - 1.0;
@@ -783,13 +796,15 @@ fn vs_main(
 	var visible = 1.0;
 	if (kind == 0.0) {
 		hero = heroWeight(instanceIndex);
-		radius = params.style.x * (1.5 + hero * 0.9 + band * 0.7);
+		// Hierarchy: the hero rail is clearly the thickest line in the frame.
+		radius = params.style.x * (1.22 + hero * 1.2 + band * 0.6);
 	} else if (kind == 1.0) {
 		radius = params.style.x * 0.55 * (0.5 + band * 0.2) * (1.0 - params.cloth.z * 0.6);
 	} else {
 		let k = f32(instanceIndex - FIRST_CHORUS);
 		visible = smoothstep(k, k + 1.0, params.topo.w * 16.0);
-		radius = params.style.x * (0.62 + band * 0.4) * visible * params.materialD.z;
+		// chorusLevel is the light budget's chorus width: thin when the grammar is dense.
+		radius = params.style.x * (0.56 + band * 0.34) * visible * params.materialD.z;
 	}
 	radius = radius * profile;
 
@@ -820,9 +835,10 @@ fn vs_main(
 	let packet = exp(-pow(fract(s) - fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + st.role * 0.13), 2.0) * 95.0);
 	var emission = 0.16 + band * 0.3 + packet * params.pulse.x * 0.9 * packetsW;
 	if (kind == 0.0) {
-		emission = (0.6 + hero * 0.4) + band * (0.8 + hero * 0.5) + packet * params.pulse.x * 5.0 * packetsW + params.pulse.w * 0.35;
+		emission = (0.42 + hero * 0.62) + band * (0.62 + hero * 0.6) + packet * params.pulse.x * 4.2 * packetsW + params.pulse.w * 0.3;
 	} else if (kind == 2.0) {
-		emission = 0.32 + band * 0.55 + packet * params.pulse.x * 2.6 * packetsW + params.pulse.w * 0.18;
+		// Chorus strands are structure: their glow comes from the light budget.
+		emission = (0.3 + band * 0.5 + packet * params.pulse.x * 2.2 * packetsW + params.pulse.w * 0.15) * params.beatB.w;
 	}
 	// Crossing pulses: where the weft passes over a thread, beats flash.
 	let crossAngle = weftAngle(s, st.weft + select(0u, 1u, kind == 0.0 && instanceIndex == 2u));
@@ -836,7 +852,7 @@ fn vs_main(
 	let spark = select(0.0, 1.0, sparkSeed > 0.95) * pow(max(0.0, sin(s * 157.0 + st.sid * 13.7 - params.view.z * 11.0)), 40.0)
 		* (params.beatB.x * (0.3 + params.audioB.z * 1.2 + params.pulse.x * 1.6) + params.materialD.y * params.audioB.z * 0.25)
 		* select(1.0, 0.5, kind == 2.0);
-	emission = emission * params.style.z * (1.0 - params.style.w * 0.8);
+	emission = emission * params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
 	// Beats read as a colour event, not only a brightness event: the packet
 	// shifts toward the weft colour as it travels.
 	let packetMix = clamp(packet * params.pulse.x * 1.6 * packetsW, 0.0, 1.0) * select(0.5, 1.0, kind == 0.0);
@@ -847,7 +863,7 @@ fn vs_main(
 	let supportC = params.supportTint.rgb * params.supportTint.w;
 	let weftC = params.weftTint.rgb * params.weftTint.w;
 	var base = mix(supportC, heroC, hero);
-	var value = 0.42 + hero * 0.1 + band * 0.34 + params.macroRails.x * 0.12;
+	var value = 0.36 + hero * 0.2 + band * 0.3 + params.macroRails.x * 0.1;
 	if (kind == 1.0) {
 		base = weftC;
 		value = value * (0.9 + rails.w * 0.15);
@@ -907,7 +923,9 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let hero = select(0.0, in.dataA.w, kind == 0.0);
 	// Striations crawl along the rail a quarter period per beat, so tempo is
 	// visible on the surface; the hero carries the strongest pattern.
-	let stripePhase = in.dataA.x * select(360.0, 620.0, isSecondary) - params.cloth.x * 1.5707963;
+	// Coarse enough to resolve at Loom's pixel cap: finer striations alias into
+	// shimmering noise on thin strands.
+	let stripePhase = in.dataA.x * select(190.0, 330.0, isSecondary) - params.cloth.x * 1.5707963;
 	let stripeAmount = clamp((0.015 + hero * 0.075) * matC.y + max(0.0, matC.y - 2.0) * 0.09, 0.0, 0.62);
 	let striation = (1.0 - stripeAmount) + stripeAmount * cos(stripePhase);
 
@@ -943,14 +961,24 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let backLight = body * pow(max(dot(-view, keyLight), 0.0) * 0.5 + 0.5, 3.0) * rim * matC.z * 0.6;
 	let sparkle = vec3<f32>(1.0, 0.96, 0.92) * in.dataC.z * 2.4;
 
+	// Matte tones (low emission gain) also quieten the rim, so they read as lit
+	// sculpture instead of outlined glow.
+	let glowSurface = 0.4 + 0.6 * clamp(params.frame.w * 1.4, 0.0, 1.0);
 	var lit = body * (0.13 + diffuseKey * 0.58 * keyColor + diffuseFill * 0.22 * fillColor) * striation * detailShade * matA.x
-		+ rimColor * rim * (0.17 + params.style.z * 0.14) * matB.x
+		+ rimColor * rim * (0.17 + params.style.z * 0.14) * matB.x * glowSurface
 		+ keyColor * specular * 0.18 * matA.y
 		+ keyColor * aniso * select(0.10, 0.24, !isSecondary) * matA.w
 		+ body * sheen * 0.32 * matC.x
 		+ emissive + whiteCore + crossingGlow + mirror + backLight + sparkle;
 	lit = mix(lit, lit * 0.7, select(0.0, 0.3, isSecondary));
-	lit = lit * select(1.0, 0.92, isChorus);
+	lit = lit * select(1.0, 0.92, isChorus) * params.beatB.z;
+	// Ink on paper: the fibre becomes a deep coloured line, shaded by the key
+	// light, with a thin cool sheen; the paper room is composited around it.
+	let paper = params.postB.w;
+	let ink = in.color * (0.1 + diffuseKey * 0.3 + diffuseFill * 0.08) * striation * mix(1.0, 0.6, hero)
+		+ keyColor * (specular * 0.05 + aniso * 0.03) + rimColor * rim * 0.025;
+	lit = mix(lit, ink, paper);
+	// Alpha is coverage: the composite inks the paper room with it.
 	return vec4<f32>(lit, 1.0);
 }
 `;
@@ -1005,10 +1033,12 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let previousUv = rotated + 0.5 + vec2<f32>(-0.0006 + params.postB.x, params.postB.y) * params.view.w;
 	let edge = min(min(previousUv.x, previousUv.y), min(1.0 - previousUv.x, 1.0 - previousUv.y));
 	let border = smoothstep(0.0, 0.03, edge);
-	let previous = textureSampleLevel(previousTexture, sceneSampler, previousUv, 0.0).rgb;
-	let scene = textureSampleLevel(sceneTexture, sceneSampler, in.uv, 0.0).rgb;
+	let previous = textureSampleLevel(previousTexture, sceneSampler, previousUv, 0.0);
+	let scene = textureSampleLevel(sceneTexture, sceneSampler, in.uv, 0.0);
 	let trail = previous * params.post.x * border;
-	return vec4<f32>(max(trail, scene), 1.0);
+	// rgb: light trail; a: coverage trail (ink for the paper tone), kept
+	// shorter than the light so ink never bleeds into a halo.
+	return max(vec4<f32>(trail.rgb, trail.a * 0.8), scene);
 }
 `;
 
@@ -1102,11 +1132,14 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let warped = 0.5 + centered * (1.0 + r2 * 0.05);
 	let caAmount = (0.0011 + r2 * 0.008) * params.post.w;
 	let direction = normalize(centered + vec2<f32>(1e-4, 1e-4));
+	let centreTap = textureSampleLevel(feedbackTexture, sceneSampler, warped, 0.0);
 	let scene = vec3<f32>(
 		textureSampleLevel(feedbackTexture, sceneSampler, warped + direction * caAmount, 0.0).r,
-		textureSampleLevel(feedbackTexture, sceneSampler, warped, 0.0).g,
+		centreTap.g,
 		textureSampleLevel(feedbackTexture, sceneSampler, warped - direction * caAmount, 0.0).b
 	);
+	let coverage = clamp(centreTap.a, 0.0, 1.0);
+	let paper = clamp(params.postB.w, 0.0, 1.0);
 	let bloom = textureSampleLevel(bloomTexture, sceneSampler, warped, 0.0).rgb;
 
 	// Environment. uv.y grows downward, so p.y is flipped to read "up is
@@ -1167,8 +1200,9 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		sin(p.x * 38.0 + time * 1.7 + p.y * 22.0) * 0.0025
 	) * rippleAmount;
 	let mirroredUv = vec2<f32>(warped.x, 2.0 * (0.5 - floorLine) - warped.y) + ripple;
+	let mirroredTap = textureSampleLevel(feedbackTexture, sceneSampler, mirroredUv, 0.0);
 	let reflection = mix(
-		textureSampleLevel(feedbackTexture, sceneSampler, mirroredUv, 0.0).rgb,
+		mirroredTap.rgb,
 		textureSampleLevel(bloomTexture, sceneSampler, mirroredUv, 0.0).rgb,
 		0.55
 	);
@@ -1195,11 +1229,30 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	background = background + (wallReflection * 0.5 + haze * 0.2) * wallFade
 		+ glow * 0.04 * exp(-pow((abs(p.x) - wallX) * 90.0, 2.0)) * params.envB.y * (1.0 - smoothstep(0.3, 0.55, abs(p.y)));
 
+	// Paper room (ink tone): a pale sheet tinted by the family, lit from one
+	// side, with the instrument's ink shadow on the floor. Light on dark and
+	// dark on light are the same composite, crossfaded.
+	let paperTint = mix(vec3<f32>(0.84, 0.78, 0.68), colorPeakPost(params.hazeTint.rgb) * 0.8, 0.2);
+	let paperLight = 0.82 + 0.18 * smoothstep(-0.7, 0.7, p.y + p.x * 0.35);
+	var paperRoom = paperTint * paperLight * 0.74 + glow * 0.02;
+	paperRoom = paperRoom * (1.0 - floorMask * reflectionFade * clamp(mirroredTap.a, 0.0, 1.0) * 0.3);
+	paperRoom = paperRoom * (1.0 - floorMask * 0.08) + paperTint * 0.04 * exp(-pow(above * 30.0, 2.0)) * floorAmount;
+	let room = mix(background, paperRoom, paper);
+
 	let vignette = 1.0 - smoothstep(0.54, 1.14, distance);
 	let exposure = (0.94 + energy * 0.2) * params.deepTint.w;
-	var color = (background + scene + bloom * (1.0 + params.style.z * 0.3)) * exposure * (0.70 + vignette * 0.30);
+	// Light budget: bloom is an accent whose weight follows how bright the look is.
+	let bloomTerm = bloom * params.envC.w * (1.0 + params.style.z * 0.3);
+	let inked = room * (1.0 - coverage * paper * 0.94);
+	var color = (inked + scene + bloomTerm) * exposure * (0.70 + vignette * 0.30);
 	color = aces(color);
 	color = max((color - 0.5) * 1.14 + 0.5, vec3<f32>(0.0));
+	// Soft shoulder: highlights keep their gradation instead of flattening
+	// into clipped plateaus; only the hottest cores reach the ceiling.
+	let shoulderStart = 0.86;
+	let shoulderRange = 0.125;
+	let over = max(color - vec3<f32>(shoulderStart), vec3<f32>(0.0));
+	color = min(color, vec3<f32>(shoulderStart)) + (1.0 - exp(-over / shoulderRange)) * shoulderRange;
 	color = color + (ign(in.uv * resolution, fract(params.view.z) * 60.0) - 0.5) * (1.3 / 255.0);
 	return vec4<f32>(color, 1.0);
 }

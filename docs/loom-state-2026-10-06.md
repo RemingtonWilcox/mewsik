@@ -1,9 +1,78 @@
-# Loom: current state (updated 2026-10-18, visual-variety pass)
+# Loom: current state (updated 2026-10-19, form / variety / continuity pass)
 
 Read this before `docs/loom-redesign-2026-07-16.md` (superseded "Instrument"
 cloth design). `docs/loom-visualizer-handoff.md` is still accurate for the
 conductor's reactive rails, journey, lab, tests and packaging; this file
 describes the renderer and the long-listen look layer.
+
+## What changed on 2026-10-19
+
+Owner (2026-10-19): Loom felt the least varied, "super overexposed and kind of
+noisy ... a noisy blob of bright color rather than ... any sort of definitive
+figure or form", and visualizers must never jump-cut. Reactivity to BPM and
+notes was kept exactly.
+
+**Light budget (`loom/exposure.ts`, pure, tested).** `resolveLoomExposure()`
+turns the resolved look into gains every frame (`frame.look.exposure`):
+per-role colour gains from each colour's clipping intensity (peak channel with
+a whiteness penalty), so a white-hot family is not twice as bright as a deep
+one, and the support can never out-value the hero whatever the role order;
+a material gain from `loomMaterialLight()` (neon and molten glass emit about
+twice what silk does); a `busy` term from the grammar's new `density` and the
+chorus strand count, which thins and quietens chorus strands (never below
+about two pixels: thinner aliases into noise), shortens trails and raises the
+bloom knee; bloom weight follows how bright the look is (bloom is an accent,
+0.04..0.7); room haze is normalised per family. The composite also has a soft
+shoulder above 0.86 so highlights keep gradation instead of clipping into
+plateaus. Hierarchy: the hero rail is thicker (1.22 + 1.2 x hero) and brighter
+than the support rails; chorus emission comes from the budget.
+
+**Tones (value structure).** New genome axis `tone` (section scale, chance 0.5,
+maxHold 3, tau 10 s, rush only 1.3x, energy-weighted with `loomToneWeights`: loud passages
+favour glow, quiet ones the drawn tones): `glow` (light on dark, the old
+look), `graphic` (matte lit sculpture, quiet rim), `ink` (dark on light: a
+pale paper room, threads as deep coloured ink; scene alpha is coverage, kept
+through the feedback trail and used by the composite), `mono` (palette
+collapsed onto the hero hue in value steps) and `dusk` (mid-key room).
+**Compositions** (`composition` axis, phrase scale): centre, left/right
+third, monument, small-in-space, high-horizon.
+
+**Pacing.** grammar maxHold 2, camera chance 0.5 + maxHold 3 phrases, material
+chance 0.55 + maxHold 2, environment moved from era to section scale (chance
+0.4, maxHold 3). New axes are appended, so earlier axes keep their seeded walks.
+
+**No jump cuts.**
+- The cut at a track change had five causes, all fixed: (1) the journey builds
+  a new `LoomConductor` per song, which restarted every rail at the intro
+  profile; the shared `LoomLook` now carries the slow rails (`look.carry`,
+  `CARRY_RAILS` in conductor.ts) and the new conductor starts from them
+  (phases stay seeded per source; the conductor integrates phase with the
+  frame's starting rate so they stay exactly per-source); (2) the renderer
+  re-seeded the strand hash from the song seed, re-rolling every strand; it
+  now uses `look.identity`, stable for the whole journey; (3) the renderer
+  snapped its pose to the new conductor and reset sway; (4) it cleared the
+  feedback trail (now only on resize); (5) it snapped the beat conveyor to
+  the new song's phrase anchor, which re-rolled hero hand-offs, weft drafts
+  and phrase yaw; a whole-beat `beatOffset` now absorbs the jump (also on
+  seeks), staying beat-locked.
+- `LoomChoiceMorph` replaces the genome's choice crossfade for every Loom axis:
+  the genome retargets from wherever its crossfade got to, which jumps when
+  two boundaries land inside one crossfade. A Loom morph in flight always
+  finishes (2.4x faster when a newer target waits), then starts the next one
+  from exactly where it ended.
+- Rails no longer switch frequency family when the centroid crosses 0.56
+  (that snapped rail width and oscillation); they blend the band energy.
+- Silence glides (tau about 0.6 to 0.9 s) instead of relighting the room in
+  under 0.1 s when the next song starts.
+- The paper uniform is the tone's paper weight squared, so a light-to-dark
+  crossfade lifts out of and settles back into the dark slowly (a linear 6 s
+  fade read as a cut to the detector's brightness-normalised metric).
+- Verified both ways: plain song mode (one journey, scores swapped) and
+  `VIS_NEW_SOURCE=1` (every track a real new source: new seed, `continueWith`,
+  conductor rebuilt).
+
+New QA attributes: `data-loom-tone`, `data-loom-composition`; `?loomLook=`
+accepts `tone=` and `composition=`.
 
 ## What changed on 2026-10-18
 
@@ -49,20 +118,23 @@ visualizer-loom.svelte ── packs rails + look into 36 uniform vec4s ── sh
 
 | axis | kind | scale | options / step | chance | memory | tau |
 |---|---|---|---|---|---|---|
-| grammar | choice | section | 13 | 0.85 | 6 | 3.2 s |
-| palette | choice | section | 36 | 0.8 | 12 | 4.5 s |
+| grammar | choice | section (maxHold 2) | 13 | 0.85 | 6 | 3.6 s |
+| palette | choice | section (maxHold 2) | 36 | 0.8 | 12 | 4.5 s |
 | roles | choice | phrase | 6 (hero/support/weft permutations) | 0.2 | 2 | 3.5 s |
-| camera | choice | phrase | 7 | 0.42 | 3 | 4.5 s |
-| material | choice | section | 7 | 0.45 | 3 | 3.5 s |
-| environment | choice | era | 6 | 1 | 3 | 6 s |
+| camera | choice | phrase (maxHold 3) | 7 | 0.5 | 3 | 4.5 s |
+| material | choice | section (maxHold 2) | 7 | 0.55 | 3 | 3.5 s |
+| environment | choice | section (maxHold 3) | 6 | 0.4 | 3 | 6 s |
 | beatForm | choice | section | 5 | 0.55 | 2 | 2 s |
 | thickness | choice | phrase | 4 | 0.25 | 2 | 3 s |
 | twist, crossings, spread, curvature, framing, hueDrift | continuous | phrase | step 0.12 to 0.3 | 0.4 to 0.7 | | 3 to 6 s |
 | strands, symmetry, scale, lightAzimuth, bloom, drift | continuous | section | step 0.25 to 0.4 | | | 4 to 5 s |
 | lightWarmth, trail, vivid | continuous | era | step 0.35 to 0.4 | | | 6 to 7 s |
+| tone | choice | section (maxHold 3, energy weights) | 5 | 0.5 | 1 | 10 s |
+| composition | choice | phrase (maxHold 5) | 6 | 0.3 | 2 | 5 s |
 
-`variationSpaceSize(LOOM_LOOK_AXES)` = 1.1e15 (choices alone: 13 x 36 x 6 x 7
-x 7 x 6 x 5 x 4 = 1.65e7).
+`variationSpaceSize(LOOM_LOOK_AXES)` = 3.3e16 (choices alone: 13 x 36 x 6 x 7
+x 7 x 6 x 5 x 4 x 5 x 6 = 5e8). Every choice is rendered through a
+`LoomChoiceMorph`, not the genome's own crossfade (see 2026-10-19).
 
 ## Topology grammars (shaders.ts `grammarPoint`)
 
@@ -146,14 +218,24 @@ conveyor), swelling.
 36 vec4 groups (144 floats): the original 14 reactive groups plus 22 look
 groups (`topo`, `form`, `formB`, `frame`, `lens`, six colour tints, four
 material groups, three environment groups, `light`, `beat`, `beatB`,
-`postB`). Declared once in `uniform-layout.ts`, mirrored by the WGSL `Params`
+`postB`). The former spare slots now carry the light budget and tone:
+`emissionGain` (frame.w), `bloomWeight` (envC.w), `litGain` and `chorusGlow`
+(beatB.zw), `paper` (postB.w); the tint `*Gain` slots and `chorusLevel` carry
+the budget's role gains and chorus width. Declared once in `uniform-layout.ts`, mirrored by the WGSL `Params`
 comments; `e2e/loom-uniform-contract.spec.ts` checks both and the float count.
 
 ## Knobs that matter
 
 - How often things change: `chance` per axis in `LOOM_LOOK_AXES`.
-- Trail length: `feedbackFade` base `0.86 + trail * 0.05 + material.trail`.
-- Bloom: `bloomThreshold` `0.75 - energy * 0.2 + (0.5 - bloom) * 0.14`.
+- Exposure: `resolveLoomExposure()` in exposure.ts (role targets
+  `HERO/SUPPORT/WEFT_TARGET`, material and busy terms), the per-grammar
+  `density` in `LOOM_GRAMMARS`, and the composite shoulder (0.86 / 0.125).
+- Trail length: `feedbackFade` base `0.86 + trail * 0.05 + material.trail +
+  exposure.trailOffset`, capped at 0.93.
+- Bloom: `bloomThreshold` `0.75 - energy * 0.2 + (0.5 - bloom) * 0.14 +
+  exposure.bloomThresholdOffset`; weight `exposure.bloomWeight`.
+- Value structure: `LOOM_TONES` and `loomToneWeights()`; ink paper colour in
+  the composite (`paperTint`).
 - Framing: `LOOM_GRAMMARS[].scale`, camera `distance` / `focal`, and
   `viewPoint()` scale `1.32 / 1.12 / 1.16`.
 - Room brightness: haze lift in the composite (`haze` mix toward its own
@@ -167,6 +249,15 @@ comments; `e2e/loom-uniform-contract.spec.ts` checks both and the float count.
   with no section labels, every grammar / camera / material / environment /
   beat form is visited, colours glide, beats alone never move the look, no
   scene holds longer than eight phrases.
+- Same file, 2026-10-19: the light budget normalises all 16k palette x
+  material x grammar x tone looks to within about 2x (raw spread > 4x) and
+  never lets the support out-value the hero; denser grammars get thinner,
+  quieter chorus, shorter trails and less bloom; `LoomChoiceMorph` never
+  steps more than its rate allows under rapid retargets; a journey track
+  change moves no rail, framing or gain by more than 0.03 and keeps the
+  strand identity; twelve-phrase sections still change the scene within
+  three phrases and visit every tone and composition; tone weights follow
+  energy.
 - `e2e/loom-uniform-contract.spec.ts`: 144 floats.
 
 ## Lab
@@ -183,4 +274,7 @@ Time-lapse: `VIS_ENGINE=loom VIS_MINUTES=8 VIS_EVERY=10 node scripts/visual-time
 - Section-ordinal warm-up is a heuristic; it does not reproduce what a long
   listen would have reached by that point in a song.
 - Materials read clearly at rest; at drops bloom and trails still dominate
-  surface shading.
+  surface shading (less so with the light budget).
+- The beat offset after a track change keeps the conveyor beat-locked but not
+  phrase-aligned, so hero hand-offs and weft re-drafts can land a few beats
+  off the new song's phrase grid until the next fresh mount.

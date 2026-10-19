@@ -23,7 +23,7 @@ export const LOOM_UNIFORM_GROUPS = [
 	['topo', ['topoFrom', 'topoTo', 'topoMix', 'strandCount']],
 	['form', ['formTwist', 'crossDensity', 'spread', 'symmetry']],
 	['formB', ['curvature', 'taper', 'bead', 'swell']],
-	['frame', ['frameScale', 'nearFade', 'widthScale', 'frameSpare']],
+	['frame', ['frameScale', 'nearFade', 'widthScale', 'emissionGain']],
 	['lens', ['focal', 'lensShiftX', 'lensShiftY', 'orbitYaw']],
 	['heroTint', ['heroR', 'heroG', 'heroB', 'heroGain']],
 	['supportTint', ['supportR', 'supportG', 'supportB', 'supportGain']],
@@ -37,11 +37,11 @@ export const LOOM_UNIFORM_GROUPS = [
 	['materialD', ['iridescence', 'glint', 'chorusLevel', 'pale']],
 	['envA', ['floorMirror', 'ripple', 'fog', 'stars']],
 	['envB', ['sky', 'walls', 'pool', 'horizon']],
-	['envC', ['floorLine', 'sunX', 'floorAmount', 'envSpare']],
+	['envC', ['floorLine', 'sunX', 'floorAmount', 'bloomWeight']],
 	['light', ['keyAzimuth', 'keyElevation', 'lightWarmth', 'fillLevel']],
 	['beat', ['packets', 'pluck', 'crossPulse', 'shuttle']],
-	['beatB', ['sparks', 'beatGain', 'beatSpareA', 'beatSpareB']],
-	['postB', ['driftX', 'driftY', 'spin', 'trailBoost']]
+	['beatB', ['sparks', 'beatGain', 'litGain', 'chorusGlow']],
+	['postB', ['driftX', 'driftY', 'spin', 'paper']]
 ] as const;
 
 export const LOOM_UNIFORM_FLOATS = LOOM_UNIFORM_GROUPS.length * 4;
