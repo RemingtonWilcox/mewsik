@@ -187,16 +187,23 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'mk2');
 		await expect(host).toHaveAttribute('data-engine-name', 'Soma');
 		await expect(page.getByRole('radio', { name: 'Soma' })).toHaveAttribute('aria-checked', 'true');
-		// TODO(soma-rewrite): Soma's renderer is being rebuilt; once it lands,
-		// update these data-mk2-* expectations to the new renderer's attributes.
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-render-passes',
 			'8'
 		);
+		// 47 vec4 slots in the rebuilt organism renderer.
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'384'
+			'752'
 		);
+		// The species is reported once the GPU renderer is running.
+		if (await hasUsableWebGpu(page)) {
+			await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
+				'data-soma-species',
+				/medusa|siphonophore|ctenophore|radiolarian|cuttlefish|nudibranch|mycelial bloom|polyp colony|anglerfish|salp chain|cell colony|pyrosome/,
+				{ timeout: 15_000 }
+			);
+		}
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',
 			/seed|sprout|winding|bloom|shedding|dormancy/

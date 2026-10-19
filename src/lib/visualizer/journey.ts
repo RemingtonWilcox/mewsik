@@ -153,7 +153,7 @@ export class VisualizerJourneyRuntime {
 		// bands, flatness, novelty, and centroid in this transaction.
 		const director = this.director.update(features, timelineSeconds, spectrum);
 		const signal = this.signalConductor.update(director, spectrum, dt);
-		const mk2 = this.mk2Conductor.update(director, signal, spectrum, dt);
+		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal);
 		const loom = this.loomConductor.update(director, spectrum, dt);
 		this.updatedAtMs = now;
 		this.snapshot = {

@@ -8,9 +8,30 @@ export interface SomaQualityProfile {
 	readonly maxPixels: number;
 	readonly frameRate: number;
 	readonly raymarchSteps: number;
+	/** Fraction of the backing size the raymarched scene renders at before upscaling. */
+	readonly sceneScale: number;
+	/** Soft self-shadow steps toward the key light; 0 keeps only ambient occlusion. */
+	readonly shadowSteps: number;
+	/** Steps through the translucent body that gather light from the organs. */
+	readonly interiorSteps: number;
+	/** 3D grid cells walked per pixel for the near and mid particle field. */
+	readonly particleCells: number;
 }
 
 export const SOMA_MAX_PIXEL_RATIO = 1.5;
+
+/** Raymarched scene size inside a backing size (each side at least one pixel). */
+export function somaSceneSize(
+	backingWidth: number,
+	backingHeight: number,
+	quality: SomaQualityTier | SomaQualityProfile = 'balanced'
+): { width: number; height: number } {
+	const profile = typeof quality === 'string' ? SOMA_QUALITY_PROFILES[quality] : quality;
+	return {
+		width: Math.max(1, Math.round(safeDimension(backingWidth) * profile.sceneScale)),
+		height: Math.max(1, Math.round(safeDimension(backingHeight) * profile.sceneScale))
+	};
+}
 
 /**
  * Choose a whole-number display-vsync divisor for a quality target. Rendering
@@ -34,21 +55,33 @@ export const SOMA_QUALITY_PROFILES = {
 		scale: 0.68,
 		maxPixels: 1280 * 720,
 		frameRate: 40,
-		raymarchSteps: 46
+		raymarchSteps: 56,
+		sceneScale: 0.5,
+		shadowSteps: 0,
+		interiorSteps: 5,
+		particleCells: 10
 	},
 	balanced: {
 		tier: 'balanced',
 		scale: 0.84,
 		maxPixels: 1600 * 900,
 		frameRate: 50,
-		raymarchSteps: 56
+		raymarchSteps: 72,
+		sceneScale: 0.6,
+		shadowSteps: 6,
+		interiorSteps: 7,
+		particleCells: 14
 	},
 	ultra: {
 		tier: 'ultra',
 		scale: 1,
 		maxPixels: 1920 * 1080,
 		frameRate: 60,
-		raymarchSteps: 64
+		raymarchSteps: 88,
+		sceneScale: 0.72,
+		shadowSteps: 10,
+		interiorSteps: 9,
+		particleCells: 18
 	}
 } as const satisfies Record<SomaQualityTier, SomaQualityProfile>;
 
