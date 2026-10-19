@@ -38,6 +38,8 @@
 
 	type MewsikLabApi = {
 		select(profile: string, stage?: string, seed?: string): boolean;
+		/** Change the music without a new source, like a station changing genre. */
+		swap(profile: string, stage?: string): boolean;
 		settle(frames?: number): Promise<LabSnapshot>;
 		snapshot(): LabSnapshot;
 	};
@@ -173,6 +175,20 @@
 		const profile = SOMA_LAB_PROFILES[profileValue];
 		if (stage && !profile.stages.some((candidate) => candidate.id === stage)) return false;
 		applyProfileSelection(profileValue, stage, seed ?? labSeed);
+		return true;
+	}
+
+	function swapFromLabApi(profileValue: string, stageValue?: string): boolean {
+		if (!isSomaLabProfileId(profileValue)) return false;
+		const profile = SOMA_LAB_PROFILES[profileValue];
+		if (stageValue && !profile.stages.some((candidate) => candidate.id === stageValue)) return false;
+		const stage = getSomaLabStage(profile, stageValue);
+		activeProfileId = profile.id;
+		activeStageId = stage.id;
+		activePositionMs = songMode ? 0 : stage.atMs;
+		profileStartedAt = performance.now();
+		setActiveScore(profile.score);
+		setScorePlayback(activePositionMs, false);
 		return true;
 	}
 
@@ -315,6 +331,7 @@
 		applyProfileSelection(requestedProfile.id, params.get('stage') ?? undefined, labSeed, false);
 		installedLabApi = {
 			select: selectFromLabApi,
+			swap: swapFromLabApi,
 			settle: settleProfile,
 			snapshot: makeLabSnapshot
 		};

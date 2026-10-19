@@ -75,6 +75,9 @@ export type VariationInput = {
 export type ChoiceState = { from: number; to: number; mix: number };
 
 const SECTION_FALLBACK_PHRASES = 6;
+/** After a shift, glides run this many times faster, easing back over SHIFT_RECOVER_S. */
+const SHIFT_SPEEDUP = 3.5;
+const SHIFT_RECOVER_S = 4;
 const ERA_SECTIONS = 4;
 const ERA_FALLBACK_PHRASES = 24;
 
@@ -137,6 +140,9 @@ export class VariationGenome {
 	private phrasesSinceEra = 0;
 	private sectionsSinceEra = 0;
 	private mutationCount = 0;
+	private shiftEvents = 0;
+	/** 1 = authored glide speed; > 1 right after a shift. */
+	private speed = 1;
 
 	constructor(axes: readonly VariationAxis[], seed: number | string = 0) {
 		const names = new Set<string>();
@@ -162,6 +168,8 @@ export class VariationGenome {
 		this.phrasesSinceEra = 0;
 		this.sectionsSinceEra = 0;
 		this.mutationCount = 0;
+		this.shiftEvents = 0;
+		this.speed = 1;
 		this.axes.forEach((axis, index) => {
 			const r = unit(this.seed, index, 0, 0x5eed);
 			if (axis.kind === 'continuous') {
@@ -229,8 +237,10 @@ export class VariationGenome {
 			this.mutate('era', this.eraEvents, energy);
 		}
 
+		const speed = this.speed;
+		if (this.speed > 1) this.speed = Math.max(1, this.speed - (dt * (SHIFT_SPEEDUP - 1)) / SHIFT_RECOVER_S);
 		for (const state of this.continuous.values()) {
-			const k = 1 - Math.exp(-dt / Math.max(0.05, state.axis.tau));
+			const k = 1 - Math.exp((-dt * speed) / Math.max(0.05, state.axis.tau));
 			if (state.axis.wrap) {
 				const range = state.axis.max - state.axis.min;
 				let delta = (state.target - state.current) % range;
@@ -242,12 +252,59 @@ export class VariationGenome {
 			}
 		}
 		for (const state of this.choices.values()) {
-			if (state.mix < 1) state.mix = Math.min(1, state.mix + dt / Math.max(0.05, state.axis.tau));
+			if (state.mix < 1) state.mix = Math.min(1, state.mix + (dt * speed) / Math.max(0.05, state.axis.tau));
 			if (state.mix >= 1 && state.pending !== null) {
 				this.startCrossfade(state, state.pending);
 				state.pending = null;
 			}
 		}
+	}
+
+	/**
+	 * The music changed character (new genre, new tempo, new station): move
+	 * now instead of waiting for the next boundary. Phrase and section axes
+	 * mutate at once with bigger steps and likelier option changes, era axes
+	 * too when `strength` >= 0.75, and every glide runs SHIFT_SPEEDUP times
+	 * faster for a few seconds so the new look lands in ~2 s. Nothing jumps:
+	 * values still glide and choices still crossfade.
+	 */
+	shift(strength: number, energy = 0.6): void {
+		const s = Math.min(1, Math.max(0, Number.isFinite(strength) ? strength : 0));
+		if (s <= 0) return;
+		const e = Math.min(1, Math.max(0, Number.isFinite(energy) ? energy : 0.6));
+		this.shiftEvents += 1;
+		const boost = { step: 1 + s * 1.2, chance: 0.45 + s * 0.5 };
+		this.mutate('phrase', this.shiftEvents, e, boost, 4);
+		this.mutate('section', this.shiftEvents, e, boost, 5);
+		if (s >= 0.75) this.mutate('era', this.shiftEvents, e, boost, 6);
+		// The shift counts as a fresh boundary: no natural section or era
+		// change piles on right behind it.
+		this.phrasesSinceSection = 0;
+		if (s >= 0.75) {
+			this.phrasesSinceEra = 0;
+			this.sectionsSinceEra = 0;
+		}
+		this.speed = Math.max(this.speed, 1 + (SHIFT_SPEEDUP - 1) * s);
+	}
+
+	/**
+	 * Move a continuous axis's target part of the way toward a 0..1 position
+	 * in its range, for parameters the music's character should steer (speed
+	 * from tempo, roughness from noise). Glides like any other change.
+	 */
+	pull(name: string, target01: number, amount: number): void {
+		const state = this.continuous.get(name);
+		if (!state) throw new Error(`Unknown continuous variation axis "${name}"`);
+		const a = Math.min(1, Math.max(0, Number.isFinite(amount) ? amount : 0));
+		const t = Math.min(1, Math.max(0, Number.isFinite(target01) ? target01 : 0.5));
+		const axis = state.axis;
+		const goal = axis.min + t * (axis.max - axis.min);
+		state.target += (goal - state.target) * a;
+	}
+
+	/** Glide speed multiplier, > 1 for a few seconds after a shift. */
+	get glideSpeed(): number {
+		return this.speed;
 	}
 
 	/**
@@ -363,19 +420,26 @@ export class VariationGenome {
 		return axis.min + ((((value - axis.min) % range) + range) % range);
 	}
 
-	private mutate(scale: VariationScale, event: number, energy: number): void {
-		const scaleId = scale === 'phrase' ? 1 : scale === 'section' ? 2 : 3;
+	private mutate(
+		scale: VariationScale,
+		event: number,
+		energy: number,
+		boost: { step: number; chance: number } | null = null,
+		salt = 0
+	): void {
+		const scaleId = (scale === 'phrase' ? 1 : scale === 'section' ? 2 : 3) + salt * 3;
 		this.axes.forEach((axis, index) => {
 			if (axis.scale !== scale) return;
 			const gate = unit(this.seed, index, event, scaleId * 7 + 1);
 			if (axis.kind === 'continuous') {
-				if (gate > (axis.chance ?? 1)) return;
+				if (gate > Math.max(axis.chance ?? 1, boost?.chance ?? 0)) return;
 				const state = this.continuous.get(axis.name)!;
 				const range = axis.max - axis.min;
 				// Signed jump, bolder with energy, never tiny (a mutation that is
 				// invisible is wasted variety).
 				const r = unit(this.seed, index, event, scaleId * 7 + 2) * 2 - 1;
-				const magnitude = (0.35 + 0.65 * Math.abs(r)) * axis.step * (0.7 + energy * 0.6);
+				const magnitude =
+					Math.min(0.5, (0.35 + 0.65 * Math.abs(r)) * axis.step * (0.7 + energy * 0.6) * (boost?.step ?? 1));
 				let next = state.target + Math.sign(r || 1) * magnitude * range;
 				if (axis.wrap) {
 					next = this.wrapValue(axis, next);
@@ -391,7 +455,7 @@ export class VariationGenome {
 				const state = this.choices.get(axis.name)!;
 				state.held += 1;
 				const forced = axis.maxHold !== undefined && state.held >= axis.maxHold;
-				if (gate > axis.chance && !forced) return;
+				if (gate > Math.max(axis.chance, boost?.chance ?? 0) && !forced) return;
 				const memory = Math.min(axis.memory ?? 1, axis.options - 1);
 				const recent = state.history.slice(-memory);
 				if (state.pending !== null) recent.push(state.pending);
