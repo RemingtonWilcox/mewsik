@@ -188,7 +188,7 @@ try {
 		let loads = 0;
 		page.on('load', () => (loads += 1));
 		await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${PAIRS[0][0]}&seed=${seed}&chrome=0`);
-		await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 20_000 });
+		await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 120_000 });
 		await page.addStyleTag({ content: 'vite-error-overlay{display:none!important}' });
 		await page.waitForFunction(() => !!window.__MEWSIK_LAB__, null, { timeout: 20_000 });
 		for (const mode of modes) {

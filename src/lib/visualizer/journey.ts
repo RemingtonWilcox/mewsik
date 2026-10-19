@@ -163,9 +163,9 @@ export class VisualizerJourneyRuntime {
 		// Character before the conductors, so any of them can answer a shift
 		// in the same tick it fires.
 		const character = this.characterTracker.update(director, spectrum, dt);
-		const signal = this.signalConductor.update(director, spectrum, dt);
-		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal);
-		const loom = this.loomConductor.update(director, spectrum, dt);
+		const signal = this.signalConductor.update(director, spectrum, dt, character);
+		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal, character);
+		const loom = this.loomConductor.update(director, spectrum, dt, character);
 		this.updatedAtMs = now;
 		this.snapshot = {
 			director,

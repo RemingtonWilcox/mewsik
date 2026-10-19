@@ -8,6 +8,7 @@ import type {
 	SignalSpectrumProfile
 } from '$lib/visualizer/signal/spectrum';
 import { LoomLook, type LoomLookFrame } from '$lib/visualizer/loom/look';
+import type { MusicCharacter } from '$lib/visualizer/character';
 
 export type LoomSeed = SignalSeed;
 
@@ -729,7 +730,9 @@ export class LoomConductor {
 	update(
 		frame: VisualDirectorFrame,
 		spectrum: SignalSpectrumProfile,
-		dtSeconds: number
+		dtSeconds: number,
+		// What kind of music is playing; a new shiftSerial means it just changed.
+		_character?: Readonly<MusicCharacter> | null
 	): Readonly<LoomConductorFrame> {
 		const dt = safeDt(dtSeconds);
 		const profile = SECTION_PROFILES[frame.section] ?? SECTION_PROFILES.intro;

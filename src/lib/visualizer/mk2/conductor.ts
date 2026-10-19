@@ -9,6 +9,7 @@ import type { VisualDirectorFrame, VisualizerSection } from '$lib/visualizer/dir
 import { signalSeedWord, type SignalConductorFrame, type SignalSeed } from '$lib/visualizer/signal/conductor';
 import type { SignalSpectrumProfile } from '$lib/visualizer/signal/spectrum';
 import { somaLifecycleTarget } from './look';
+import type { MusicCharacter } from '$lib/visualizer/character';
 
 export type Mk2Seed = SignalSeed;
 
@@ -108,7 +109,9 @@ export class Mk2Conductor {
 		frame: VisualDirectorFrame,
 		spectrum: Readonly<SignalSpectrumProfile>,
 		dtSeconds: number,
-		signal?: Readonly<SignalConductorFrame> | null
+		signal?: Readonly<SignalConductorFrame> | null,
+		// What kind of music is playing; a new shiftSerial means it just changed.
+		_character?: Readonly<MusicCharacter> | null
 	): Readonly<Mk2ConductorFrame> {
 		const dt = clamp(finite(dtSeconds, 1 / 60), 1 / 1000, 0.25);
 		const silent = frame.silence;

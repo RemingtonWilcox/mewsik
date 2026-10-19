@@ -1,5 +1,6 @@
 import type { VisualDirectorFrame, VisualizerSection } from '$lib/visualizer/director/types';
 import type { SignalSpectrumProfile } from './spectrum';
+import type { MusicCharacter } from '$lib/visualizer/character';
 
 export type SignalSeed = number | string;
 
@@ -449,7 +450,9 @@ export class SignalConductor {
 	update(
 		frame: VisualDirectorFrame,
 		spectrum: SignalSpectrumProfile,
-		dtSeconds: number
+		dtSeconds: number,
+		// What kind of music is playing; a new shiftSerial means it just changed.
+		_character?: Readonly<MusicCharacter> | null
 	): Readonly<SignalConductorFrame> {
 		const dt = safeDt(dtSeconds);
 		const section = getSignalSectionProfile(frame.section);
