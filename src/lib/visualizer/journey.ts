@@ -14,6 +14,7 @@ import {
 } from '$lib/visualizer/signal/conductor';
 import { Mk2Conductor, type Mk2ConductorFrame } from '$lib/visualizer/mk2/conductor';
 import { LoomConductor, type LoomConductorFrame } from '$lib/visualizer/loom/conductor';
+import { LoomLook } from '$lib/visualizer/loom/look';
 
 /**
  * Atomic live view of one journey tick. Nested controller outputs and typed
@@ -61,6 +62,11 @@ export class VisualizerJourneyRuntime {
 	private epochAtMs: number;
 	private updatedAtMs: number | null = null;
 	private director = createVisualDirector();
+	// Looks outlive sources: a new song continues the picture instead of
+	// restarting it, and renderer remounts resume where they left off.
+	private readonly looks = new Map<string, unknown>();
+	private readonly loomLook = new LoomLook(0);
+	private loomLookSeeded = false;
 	private spectrumTracker = new SignalSpectrumTracker();
 	private signalConductor: SignalConductor;
 	private mk2Conductor: Mk2Conductor;
@@ -73,7 +79,23 @@ export class VisualizerJourneyRuntime {
 		this.epochAtMs = safeNow(nowMs);
 		this.signalConductor = new SignalConductor(this.seed);
 		this.mk2Conductor = new Mk2Conductor(this.seed);
-		this.loomConductor = new LoomConductor(this.seed);
+		this.loomConductor = new LoomConductor(this.seed, this.continueLoomLook());
+	}
+
+	/** Per-engine look state created once per session; see VisualizerState.persistentLook. */
+	persistentLook<T>(key: string, create: () => T): T {
+		if (!this.looks.has(key)) this.looks.set(key, create());
+		return this.looks.get(key) as T;
+	}
+
+	/** The shared Loom look: hard-seeded for the first source, reseeded after. */
+	private continueLoomLook(): LoomLook {
+		if (this.loomLookSeeded) this.loomLook.continueWith(this.seed);
+		else {
+			this.loomLook.reset(this.seed);
+			this.loomLookSeeded = true;
+		}
+		return this.loomLook;
 	}
 
 	get sourceIdentity(): string | null {
@@ -105,7 +127,7 @@ export class VisualizerJourneyRuntime {
 		this.spectrumTracker = new SignalSpectrumTracker();
 		this.signalConductor = new SignalConductor(this.seed);
 		this.mk2Conductor = new Mk2Conductor(this.seed);
-		this.loomConductor = new LoomConductor(this.seed);
+		this.loomConductor = new LoomConductor(this.seed, this.continueLoomLook());
 		this.snapshot = null;
 		return true;
 	}
@@ -131,7 +153,7 @@ export class VisualizerJourneyRuntime {
 		// bands, flatness, novelty, and centroid in this transaction.
 		const director = this.director.update(features, timelineSeconds, spectrum);
 		const signal = this.signalConductor.update(director, spectrum, dt);
-		const mk2 = this.mk2Conductor.update(director, signal, spectrum, dt);
+		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal);
 		const loom = this.loomConductor.update(director, spectrum, dt);
 		this.updatedAtMs = now;
 		this.snapshot = {

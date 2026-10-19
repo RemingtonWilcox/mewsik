@@ -115,6 +115,14 @@ export class SignalVariation {
 		this.genome = new VariationGenome(SIGNAL_VARIATION_AXES, `signal:${seed}`);
 	}
 
+	/** Carry the current look into a new source: keep the scene, change future draws. */
+	continueWith(seed: number | string): void {
+		this.genome.reseed(`signal:${seed}`);
+		this.lastPhrase = null;
+		this.candidateSection = null;
+		this.candidateAge = 0;
+	}
+
 	reset(seed: number | string): void {
 		this.genome.reset(`signal:${seed}`);
 		this.sceneIndex = 0;
@@ -212,8 +220,14 @@ let cached: { seed: number; epoch: number; variation: SignalVariation } | null =
 
 export function signalVariationFor(seed: number, epoch: number): SignalVariation {
 	if (cached && cached.seed === seed && cached.epoch === epoch) return cached.variation;
-	const variation = cached?.variation ?? new SignalVariation(seed);
-	variation.reset(seed);
-	cached = { seed, epoch, variation };
-	return variation;
+	if (!cached) {
+		const variation = new SignalVariation(seed);
+		variation.reset(seed);
+		cached = { seed, epoch, variation };
+		return variation;
+	}
+	// A new source continues the picture instead of restarting it.
+	cached.variation.continueWith(seed);
+	cached = { seed, epoch, variation: cached.variation };
+	return cached.variation;
 }

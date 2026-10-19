@@ -1,227 +1,271 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
-	import { ChevronLeft, ChevronRight, EyeOff, X } from '@lucide/svelte';
+	import { onDestroy, onMount, tick } from 'svelte';
+	import { EyeOff, X } from '@lucide/svelte';
 	import VisualizerMk1 from './visualizer.svelte';
 	import VisualizerMk2 from './visualizer-mk2.svelte';
 	import VisualizerSignal from './visualizer-signal.svelte';
 	import VisualizerLoom from './visualizer-loom.svelte';
+	import EngineSwitcher from './overlay/engine-switcher.svelte';
+	import NowPlaying from './overlay/now-playing.svelte';
 	import {
-		PRESET_NAMES,
 		VISUALIZER_CATALOG,
-		VISUALIZER_RESPONSE_LABELS,
-		VISUALIZER_RESPONSES,
 		adjacentVisualizer,
 		useVisualizer,
-		type VisualizerJourneySnapshot,
-		type VisualizerResponse
+		type VisualizerEngine
 	} from '$lib/state/visualizer.svelte';
 	import { useVisualizerChrome } from '$lib/state/visualizer-chrome.svelte';
+	import { usePlayer } from '$lib/state/player.svelte';
+
+	// Full-screen visualizer: the picture is the product. Controls (engine
+	// choice, now playing, exit) appear on activity and fade on idle. Only the
+	// engine component is keyed on state; nothing about the chrome remounts it.
+
+	const SWIPE_MIN_PX = 48;
+	const SWIPE_MAX_MS = 700;
+	// After a click/tap dismisses the chrome, the pointer must travel this far
+	// before movement counts as activity again (click jitter is not intent).
+	const WAKE_AFTER_DISMISS_PX = 24;
+	const ENGINE_FLASH_MS = 1400;
 
 	const vis = useVisualizer();
-	const visualizerChrome = useVisualizerChrome();
+	const chrome = useVisualizerChrome();
+	const player = usePlayer();
 
 	let engineHydrated = $state(false);
-	let detailsOpen = $state(false);
-	let keyboardFocusMode = true;
-	let hudSection = $state('intro');
-	let hudForm = $state('seed');
-	let hudTopology = $state('torus');
-	let hudTempo = $state(0);
-	let hudContext = $state<'live' | 'score'>('live');
-	let telemetryTimer: ReturnType<typeof setInterval> | null = null;
-	let wasActive = false;
 	let hostElement = $state<HTMLDivElement | null>(null);
 	let chromeElement = $state<HTMLDivElement | null>(null);
-	let visualizerOpener: HTMLElement | null = null;
+	let opener: HTMLElement | null = null;
+	let lastOutsideFocus: HTMLElement | null = null;
+	let wasActive = false;
 
 	let identity = $derived(VISUALIZER_CATALOG[vis.engine]);
-	let previousEngine = $derived(adjacentVisualizer(vis.engine, -1));
-	let nextEngine = $derived(adjacentVisualizer(vis.engine, 1));
 
-	function dominantLifecycleForm(journey: VisualizerJourneySnapshot['mk2']): string {
-		const forms = [
-			['seed', journey.seedForm],
-			['sprout', journey.sproutForm],
-			['winding', journey.windingForm],
-			['bloom', journey.bloomForm],
-			['shedding', journey.sheddingForm],
-			['dormancy', journey.dormancyForm]
-		] as const;
-		let dominant: (typeof forms)[number] = forms[0];
-		for (const form of forms) if (form[1] > dominant[1]) dominant = form;
-		return dominant[0];
-	}
+	// The engine name shown briefly in the middle when it changes while the
+	// controls are hidden, so a swipe or arrow press is never a silent change.
+	let flashEngine = $state<VisualizerEngine | null>(null);
+	let flashTimer: ReturnType<typeof setTimeout> | null = null;
 
-	function dominantLoomTopology(journey: VisualizerJourneySnapshot['loom']): string {
-		const forms = Object.entries(journey.topologyWeights) as [
-			keyof VisualizerJourneySnapshot['loom']['topologyWeights'],
-			number
-		][];
-		let dominant = forms[0];
-		for (const form of forms) if (form[1] > dominant[1]) dominant = form;
-		return dominant[0];
-	}
+	let swipe: { id: number; x: number; y: number; t: number } | null = null;
+	let suppressStageClick = false;
+	let dismissedAt: { x: number; y: number } | null = null;
 
-	function refreshTelemetry() {
-		if (!vis.active) return;
-		const journey = vis.getJourney();
-		hudSection = journey.director.section;
-		hudForm = dominantLifecycleForm(journey.mk2);
-		hudTopology = dominantLoomTopology(journey.loom);
-		hudTempo = journey.director.clock.tempoBpm;
-		hudContext = journey.director.context.source;
-	}
-
-	function hideControls() {
-		detailsOpen = false;
-		visualizerChrome.setHold('details', false);
-		visualizerChrome.lockHidden();
-		queueMicrotask(() => hostElement?.focus({ preventScroll: true }));
-	}
-
-	function handleChromeFocusIn() {
-		visualizerChrome.wake();
-		visualizerChrome.setHold('engine-focus', keyboardFocusMode);
-	}
-
-	function handleChromeFocusOut(event: FocusEvent) {
-		const chrome = event.currentTarget;
-		if (
-			chrome instanceof HTMLElement &&
-			event.relatedTarget instanceof Node &&
-			chrome.contains(event.relatedTarget)
-		) return;
-		visualizerChrome.setHold('engine-focus', false);
-	}
-
-	function handleChromePointerDown() {
-		// Pointer clicks may leave focus on a rail button, but should not pin the
-		// chrome forever. The next real keyboard event restores focus-hold mode.
-		keyboardFocusMode = false;
-		visualizerChrome.setHold('engine-focus', false);
-	}
-
-	function handleStagePointerMove(event: PointerEvent) {
-		if (event.pointerType === 'touch') return;
-		// Reaching the stage proves the pointer is no longer over either control
-		// surface. Explicitly clear hover holds as a guard against WebView/DOM
-		// transitions that occasionally omit pointerleave and otherwise pin chrome.
-		visualizerChrome.setHold('engine-pointer', false);
-		visualizerChrome.setHold('player-pointer', false);
-		visualizerChrome.wake();
-	}
-
-	function toggleStageControls() {
-		if (detailsOpen) {
-			detailsOpen = false;
-			visualizerChrome.setHold('details', false);
-			visualizerChrome.wake();
-			return;
+	function selectEngine(engine: VisualizerEngine) {
+		if (engine === vis.engine) return;
+		const focusWasOnSwitcher =
+			document.activeElement instanceof HTMLElement &&
+			document.activeElement.matches('[data-engine-option]');
+		vis.setEngine(engine);
+		chrome.wake();
+		if (!chrome.visible) {
+			flashEngine = engine;
+			if (flashTimer) clearTimeout(flashTimer);
+			flashTimer = setTimeout(() => (flashEngine = null), ENGINE_FLASH_MS);
+		} else {
+			flashEngine = null;
 		}
-		if (visualizerChrome.visible) hideControls();
-		else visualizerChrome.revealExplicitly();
-	}
-
-	function toggleDetails() {
-		if (detailsOpen) {
-			detailsOpen = false;
-			visualizerChrome.setHold('details', false);
-			visualizerChrome.wake();
-			return;
+		if (focusWasOnSwitcher) {
+			void tick().then(() =>
+				chromeElement
+					?.querySelector<HTMLElement>(`[data-engine-option="${engine}"]`)
+					?.focus({ preventScroll: true })
+			);
 		}
-		visualizerChrome.revealExplicitly();
-		detailsOpen = true;
-		visualizerChrome.setHold('details', true);
 	}
 
 	function cycleEngine(direction: 1 | -1) {
-		vis.setEngine(adjacentVisualizer(vis.engine, direction));
-		refreshTelemetry();
-		visualizerChrome.wake();
+		selectEngine(adjacentVisualizer(vis.engine, direction));
 	}
 
-	function setResponse(response: VisualizerResponse) {
-		vis.setResponse(response);
-		visualizerChrome.wake();
+	function focusables(): HTMLElement[] {
+		if (!chromeElement) return [];
+		return Array.from(
+			chromeElement.querySelectorAll<HTMLElement>('button:not([disabled]):not([tabindex="-1"])')
+		);
 	}
 
-	function isInteractiveEvent(event: KeyboardEvent): boolean {
-		return event.composedPath().some((node) => {
-			if (!(node instanceof HTMLElement)) return false;
-			return node.matches(
-				'input, textarea, select, [contenteditable="true"], [role="slider"], [role="textbox"]'
-			);
-		});
-	}
-
-	function handleKeydown(event: KeyboardEvent) {
-		if (!vis.active) return;
-		keyboardFocusMode = true;
-		if (document.activeElement instanceof Node && chromeElement?.contains(document.activeElement)) {
-			visualizerChrome.setHold('engine-focus', true);
+	/** Keep Tab inside the overlay, and let Tab bring hidden controls back. */
+	async function handleTab(event: KeyboardEvent) {
+		event.preventDefault();
+		if (!chrome.visible) {
+			chrome.reveal();
+			await tick();
+			focusables()[0]?.focus({ preventScroll: true });
+			return;
 		}
+		const items = focusables();
+		if (items.length === 0) return;
+		const index = items.indexOf(document.activeElement as HTMLElement);
+		const next =
+			index === -1
+				? event.shiftKey
+					? items.length - 1
+					: 0
+				: (index + (event.shiftKey ? -1 : 1) + items.length) % items.length;
+		items[next].focus({ preventScroll: true });
+	}
+
+	function isTextEntry(event: KeyboardEvent): boolean {
+		return event
+			.composedPath()
+			.some(
+				(node) =>
+					node instanceof HTMLElement &&
+					node.matches('input, textarea, select, [contenteditable="true"], [role="textbox"]')
+			);
+	}
+
+	function handleWindowFocusIn(event: FocusEvent) {
+		if (vis.active || !(event.target instanceof HTMLElement)) return;
+		lastOutsideFocus = event.target;
+	}
+
+	function handleWindowKeydown(event: KeyboardEvent) {
+		if (!vis.active) return;
 		if (event.key === 'Escape') {
 			event.preventDefault();
 			vis.close();
 			return;
 		}
-		if (isInteractiveEvent(event)) return;
-		if (event.ctrlKey || event.metaKey || event.altKey || event.shiftKey || event.repeat) return;
-
+		if (isTextEntry(event)) return;
+		if (event.key === 'Tab') {
+			void handleTab(event);
+			return;
+		}
+		if (event.ctrlKey || event.metaKey || event.altKey) return;
 		if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
 			event.preventDefault();
-			cycleEngine(event.key === 'ArrowRight' ? 1 : -1);
+			if (!event.repeat) cycleEngine(event.key === 'ArrowRight' ? 1 : -1);
 			return;
 		}
-		if (event.key.toLowerCase() === 'h') {
+		if (event.key === 'h' || event.key === 'H') {
 			event.preventDefault();
-			if (visualizerChrome.visible) hideControls();
-			else visualizerChrome.revealExplicitly();
+			if (!event.repeat) chrome.toggleLock();
 			return;
 		}
-		if (event.key.toLowerCase() === 'i') {
-			event.preventDefault();
-			toggleDetails();
+		if (event.key !== 'Shift') chrome.wake();
+	}
+
+	// Space on the picture plays/pauses here, and is stopped before the app's
+	// window-level shortcut so playback toggles exactly once. Space on a
+	// focused control keeps its native meaning (press that control).
+	function handleHostKeydown(event: KeyboardEvent) {
+		if (event.key !== ' ' || event.target !== hostElement) return;
+		if (event.ctrlKey || event.metaKey || event.altKey) return;
+		event.preventDefault();
+		event.stopPropagation();
+		chrome.wake();
+		if (!event.repeat) void player.togglePlay();
+	}
+
+	function handleStagePointerDown(event: PointerEvent) {
+		if (event.pointerType === 'mouse') return;
+		swipe = { id: event.pointerId, x: event.clientX, y: event.clientY, t: performance.now() };
+	}
+
+	function handleStagePointerUp(event: PointerEvent) {
+		const start = swipe;
+		swipe = null;
+		if (!start || start.id !== event.pointerId) return;
+		const dx = event.clientX - start.x;
+		const dy = event.clientY - start.y;
+		if (
+			Math.abs(dx) >= SWIPE_MIN_PX &&
+			Math.abs(dx) > Math.abs(dy) * 1.5 &&
+			performance.now() - start.t <= SWIPE_MAX_MS
+		) {
+			suppressStageClick = true;
+			cycleEngine(dx < 0 ? 1 : -1);
 		}
+	}
+
+	function handleStagePointerMove(event: PointerEvent) {
+		if (event.pointerType !== 'mouse') return;
+		// Reaching the picture proves the pointer has left every control surface;
+		// clearing here guards against a missed pointerleave pinning the chrome.
+		chrome.setHold('engines-pointer', false);
+		chrome.setHold('playback-pointer', false);
+		if (dismissedAt) {
+			if (Math.hypot(event.clientX - dismissedAt.x, event.clientY - dismissedAt.y) < WAKE_AFTER_DISMISS_PX) {
+				return;
+			}
+			dismissedAt = null;
+		}
+		chrome.wake();
+	}
+
+	function handleStageClick(event: MouseEvent) {
+		if (suppressStageClick) {
+			suppressStageClick = false;
+			return;
+		}
+		if (chrome.mode === 'locked-hidden' || !chrome.visible) {
+			dismissedAt = null;
+			chrome.reveal();
+			return;
+		}
+		dismissedAt = { x: event.clientX, y: event.clientY };
+		chrome.dismiss();
+	}
+
+	function surfacePointer(hold: 'engines-pointer' | 'playback-pointer', held: boolean) {
+		return (event: PointerEvent) => {
+			if (event.pointerType === 'touch') return;
+			chrome.setHold(hold, held);
+		};
+	}
+
+	function handleChromeFocusIn() {
+		chrome.setHold('focus', true);
+	}
+
+	function handleChromeFocusOut(event: FocusEvent) {
+		if (event.relatedTarget instanceof Node && chromeElement?.contains(event.relatedTarget)) return;
+		chrome.setHold('focus', false);
 	}
 
 	onMount(() => {
 		vis.hydrateEngine();
 		engineHydrated = true;
-		refreshTelemetry();
-		telemetryTimer = setInterval(refreshTelemetry, 250);
 	});
 
 	$effect(() => {
 		const active = vis.active;
 		if (active && !wasActive) {
-			visualizerOpener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-			detailsOpen = false;
-			keyboardFocusMode = true;
-			visualizerChrome.activate();
-			queueMicrotask(() => {
-				hostElement?.focus({ preventScroll: true });
-			});
-		} else if (!active) {
-			visualizerChrome.deactivate();
-			if (wasActive && visualizerOpener?.isConnected) {
-				const opener = visualizerOpener;
-				queueMicrotask(() => opener.focus({ preventScroll: true }));
-			}
-			visualizerOpener = null;
+			// Opening makes the rest of the app inert, which drops focus to <body>
+			// before this runs; the last focus seen outside the overlay is the opener.
+			opener = lastOutsideFocus?.isConnected ? lastOutsideFocus : null;
+			flashEngine = null;
+			dismissedAt = null;
+			chrome.activate();
+			void tick().then(() => hostElement?.focus({ preventScroll: true }));
+		} else if (!active && wasActive) {
+			chrome.deactivate();
+			const restore = opener;
+			opener = null;
+			if (restore?.isConnected) void tick().then(() => restore.focus({ preventScroll: true }));
 		}
 		wasActive = active;
 	});
 
+	// Hidden controls are inert; never leave focus stranded on <body>.
+	$effect(() => {
+		if (chrome.visible || !vis.active || !hostElement) return;
+		const focused = document.activeElement;
+		if (!focused || focused === document.body || chromeElement?.contains(focused)) {
+			hostElement.focus({ preventScroll: true });
+		}
+	});
+
 	onDestroy(() => {
-		visualizerChrome.deactivate();
-		if (telemetryTimer) clearInterval(telemetryTimer);
+		chrome.deactivate();
+		if (flashTimer) clearTimeout(flashTimer);
 	});
 </script>
 
 <svelte:window
-	onkeydown={handleKeydown}
-	onblur={() => visualizerChrome.blur()}
+	onkeydown={handleWindowKeydown}
+	onfocusin={handleWindowFocusIn}
+	onblur={() => chrome.blur()}
 />
 
 {#if vis.active && engineHydrated}
@@ -229,14 +273,15 @@
 		bind:this={hostElement}
 		class="outline-none"
 		tabindex="-1"
-		role="region"
-		aria-label={`${identity.name} visualizer overlay`}
+		role="dialog"
+		aria-modal="true"
+		aria-label={`${identity.name} visualizer`}
 		data-visualizer-host
 		data-render-engine={vis.engine}
 		data-engine-name={identity.name}
-		data-visualizer-response={vis.response}
-		data-controls-visible={visualizerChrome.visible}
-		data-controls-mode={visualizerChrome.mode}
+		data-controls-visible={chrome.visible}
+		data-controls-mode={chrome.mode}
+		onkeydown={handleHostKeydown}
 	>
 		{#if vis.engine === 'mk1'}
 			<VisualizerMk1 />
@@ -248,147 +293,124 @@
 			<VisualizerLoom />
 		{/if}
 
-		<button
-			type="button"
-			class="fixed inset-0 z-[104] cursor-default border-0 bg-transparent p-0"
-			aria-label={detailsOpen
-				? 'Close visualizer details'
-				: visualizerChrome.visible
-					? 'Hide visualizer controls'
-					: 'Show visualizer controls'}
+		<!-- The picture itself: pointer-only (H and Tab are the keyboard routes). -->
+		<div
+			class={`fixed inset-0 z-[104] touch-none select-none ${chrome.visible ? 'cursor-default' : 'cursor-none'}`}
+			aria-hidden="true"
+			data-visualizer-stage
 			onpointermove={handleStagePointerMove}
-			onclick={toggleStageControls}
-		></button>
+			onpointerdown={handleStagePointerDown}
+			onpointerup={handleStagePointerUp}
+			onpointercancel={() => (swipe = null)}
+			onclick={handleStageClick}
+		></div>
 
+		<!-- Where the switcher sits, so the eye finds the name in the same place. -->
+		{#if flashEngine && !chrome.visible}
+			<p
+				class="pointer-events-none fixed inset-x-0 top-[max(1.75rem,calc(env(safe-area-inset-top)+0.75rem))] z-[105] text-center text-xs font-medium tracking-[0.32em] text-white/80 uppercase sm:top-[max(2rem,calc(env(safe-area-inset-top)+0.75rem))] [text-shadow:0_2px_18px_rgba(0,0,0,0.85)] motion-safe:animate-[visualizer-flash_1.4s_ease-out_forwards]"
+				aria-hidden="true"
+				data-visualizer-engine-flash
+			>
+				{VISUALIZER_CATALOG[flashEngine].name}
+			</p>
+		{/if}
+
+		<!-- Chrome. Pointer presses never take focus here, so Space keeps meaning
+		     play/pause after a click; keyboard focus still reaches every control. -->
 		<div
 			bind:this={chromeElement}
-			class={`pointer-events-none fixed inset-x-3 z-[106] mx-auto flex max-w-[26rem] flex-col items-center transition-opacity duration-[250ms] sm:inset-x-6 ${visualizerChrome.visible ? 'opacity-100' : 'opacity-0'}`}
-			style="top: max(0.75rem, env(safe-area-inset-top));"
+			class={`visualizer-chrome pointer-events-none fixed inset-0 z-[106] flex flex-col justify-between transition-opacity duration-300 ease-out motion-reduce:transition-none ${chrome.visible ? 'opacity-100' : 'opacity-0'}`}
 			role="group"
 			aria-label="Visualizer controls"
-			aria-hidden={!visualizerChrome.visible}
-			inert={!visualizerChrome.visible}
-			onpointerenter={() => visualizerChrome.setHold('engine-pointer', true)}
-			onpointerleave={() => visualizerChrome.setHold('engine-pointer', false)}
-			onpointerdown={handleChromePointerDown}
+			aria-hidden={!chrome.visible}
+			inert={!chrome.visible}
+			data-visualizer-chrome
+			onmousedown={(event) => event.preventDefault()}
+			onpointerdown={() => chrome.wake()}
 			onfocusin={handleChromeFocusIn}
 			onfocusout={handleChromeFocusOut}
 		>
-			<nav
-				class={`relative flex h-10 w-full items-center overflow-hidden rounded-xl border border-white/15 bg-black/65 shadow-2xl shadow-black/30 backdrop-blur-xl ${visualizerChrome.visible ? 'pointer-events-auto' : 'pointer-events-none'}`}
-				aria-label="Visualizer engines"
+			<header
+				class="grid grid-cols-[1fr_auto_1fr] items-start gap-3 px-4 pt-[max(1rem,env(safe-area-inset-top))] max-sm:grid-cols-[minmax(0,1fr)_auto] sm:px-6 sm:pt-[max(1.25rem,env(safe-area-inset-top))]"
 			>
+				<div class="max-sm:hidden"></div>
+				<!-- svelte-ignore a11y_no_static_element_interactions (hover hold only) -->
 				<div
-					class="pointer-events-none absolute inset-x-0 top-0 h-px"
-					style={`background: linear-gradient(90deg, transparent, ${identity.accentMuted}, ${identity.accent}, ${identity.accentMuted}, transparent);`}
-				></div>
-				<button
-					type="button"
-					class="grid h-10 w-10 shrink-0 place-items-center text-white/65 transition hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white"
-					aria-label={`Previous visualizer: ${VISUALIZER_CATALOG[previousEngine].name}`}
-					onclick={() => cycleEngine(-1)}
+					class="pointer-events-auto min-w-0"
+					onpointerenter={surfacePointer('engines-pointer', true)}
+					onpointerleave={surfacePointer('engines-pointer', false)}
 				>
-					<ChevronLeft size={17} strokeWidth={1.7} />
-				</button>
-
-				<button
-					type="button"
-					class="flex min-w-0 flex-1 items-baseline gap-2 self-stretch border-x border-white/10 px-3 text-left transition hover:bg-white/[0.06] focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white"
-					aria-label={`${identity.name}: ${identity.subtitle}. ${detailsOpen ? 'Hide' : 'Show'} details`}
-					aria-expanded={detailsOpen}
-					aria-controls="visualizer-details"
-					onclick={toggleDetails}
+					<EngineSwitcher engine={vis.engine} onSelect={selectEngine} />
+				</div>
+				<!-- svelte-ignore a11y_no_static_element_interactions (hover hold only) -->
+				<div
+					class="pointer-events-auto flex items-center justify-end gap-1.5 justify-self-end"
+					onpointerenter={surfacePointer('engines-pointer', true)}
+					onpointerleave={surfacePointer('engines-pointer', false)}
 				>
-					<span class="self-center truncate text-xs font-medium tracking-[0.1em] text-white">
-						{identity.name.toUpperCase()}
-					</span>
-					<span class="self-center truncate font-mono text-[9px] uppercase tracking-[0.13em] text-white/35">
-						{identity.subtitle}
-					</span>
-				</button>
+					<button
+						type="button"
+						class="grid size-10 place-items-center rounded-full border border-white/10 bg-black/45 text-white/65 shadow-lg shadow-black/30 backdrop-blur-xl transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white/80 motion-reduce:transition-none max-sm:hidden"
+						aria-label="Hide controls"
+						aria-keyshortcuts="H"
+						title="Hide controls (H)"
+						onclick={() => chrome.lock()}
+					>
+						<EyeOff class="size-4" strokeWidth={1.75} />
+					</button>
+					<button
+						type="button"
+						class="grid size-10 place-items-center rounded-full border border-white/10 bg-black/45 text-white/75 shadow-lg shadow-black/30 backdrop-blur-xl transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-white/80 motion-reduce:transition-none"
+						aria-label="Exit visualizer"
+						aria-keyshortcuts="Escape"
+						title="Exit (Esc)"
+						onclick={() => vis.close()}
+					>
+						<X class="size-[18px]" strokeWidth={1.75} />
+					</button>
+				</div>
+			</header>
 
-				<button
-					type="button"
-					class="grid h-10 w-10 shrink-0 place-items-center text-white/65 transition hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white"
-					aria-label={`Next visualizer: ${VISUALIZER_CATALOG[nextEngine].name}`}
-					onclick={() => cycleEngine(1)}
+			<footer
+				class="flex justify-center px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6 sm:pb-[max(1.5rem,env(safe-area-inset-bottom))]"
+			>
+				<!-- svelte-ignore a11y_no_static_element_interactions (hover hold only) -->
+				<div
+					class="pointer-events-auto flex w-full max-w-[26rem] justify-center"
+					onpointerenter={surfacePointer('playback-pointer', true)}
+					onpointerleave={surfacePointer('playback-pointer', false)}
 				>
-					<ChevronRight size={17} strokeWidth={1.7} />
-				</button>
-
-				<div class="h-4 w-px bg-white/10"></div>
-				<button
-					type="button"
-					class="grid h-10 w-9 shrink-0 place-items-center text-white/50 transition hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white"
-					aria-label="Hide visualizer controls"
-					onclick={hideControls}
-				>
-					<EyeOff size={15} strokeWidth={1.7} />
-				</button>
-				<button
-					type="button"
-					class="grid h-10 w-10 shrink-0 place-items-center text-white/50 transition hover:bg-white/10 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white"
-					aria-label="Close visualizer"
-					onclick={() => vis.close()}
-				>
-					<X size={16} strokeWidth={1.7} />
-				</button>
-			</nav>
-
-			{#if detailsOpen}
-				<section
-					id="visualizer-details"
-					aria-label={`${identity.name} visualizer details`}
-					class="pointer-events-auto mt-2 w-full rounded-xl border border-white/15 bg-black/70 p-4 shadow-2xl shadow-black/30 backdrop-blur-xl sm:p-5"
-				>
-					<div class="flex items-start justify-between gap-5">
-						<div>
-							<p class="font-mono text-[10px] uppercase tracking-[0.2em]" style={`color: ${identity.accent};`}>
-								{identity.name} / {identity.role}
-							</p>
-							<p class="mt-1 text-sm text-white/55">{identity.description}</p>
-						</div>
-					</div>
-
-					<div class="mt-4 flex flex-wrap gap-x-3 gap-y-1 border-y border-white/10 py-3 font-mono text-[10px] uppercase tracking-[0.15em] text-white/45">
-						<span class="text-white/70">{hudSection}</span>
-						<span aria-hidden="true">·</span>
-						<span>{hudTempo > 30 ? `${Math.round(hudTempo)} bpm` : 'tempo seeking'}</span>
-						<span aria-hidden="true">·</span>
-						{#if vis.engine === 'mk1'}
-							<span>{PRESET_NAMES[vis.preset] ?? 'kaleidoscope'}</span>
-						{:else if vis.engine === 'mk2'}
-							<span>{hudForm}</span>
-						{:else if vis.engine === 'signal'}
-							<span>{hudContext}</span>
-						{:else}
-							<span>{hudTopology}</span>
-						{/if}
-					</div>
-
-					<div class="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-						<p class="font-mono text-[10px] uppercase tracking-[0.18em] text-white/40">Response</p>
-						<div class="grid grid-cols-3 overflow-hidden rounded-lg border border-white/15" role="group" aria-label="Visualizer response">
-							{#each VISUALIZER_RESPONSES as response}
-								<button
-									type="button"
-									class={`min-h-10 border-l border-white/10 px-4 font-mono text-[10px] uppercase tracking-[0.15em] transition first:border-l-0 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white ${vis.response === response ? 'bg-white text-black' : 'text-white/55'}`}
-									aria-pressed={vis.response === response}
-									onclick={() => setResponse(response)}
-								>
-									{VISUALIZER_RESPONSE_LABELS[response]}
-								</button>
-							{/each}
-						</div>
-					</div>
-
-					<p class="mt-4 hidden font-mono text-[10px] uppercase tracking-[0.13em] text-white/30 sm:block">
-						← → change visual · I details · H hide controls · Esc close
-					</p>
-				</section>
-			{/if}
+					<NowPlaying />
+				</div>
+			</footer>
 		</div>
 
-		<p class="sr-only" aria-live="polite">{identity.name} visualizer selected.</p>
+		<p class="sr-only" aria-live="polite">{identity.name}: {identity.subtitle}</p>
 	</div>
 {/if}
+
+<style>
+	/* Large, far-away screens (a 3840-wide monitor at 100% scaling) get
+	   proportionally larger chrome; everything else keeps the small type. */
+	@media (min-width: 2400px) {
+		.visualizer-chrome {
+			zoom: 1.3;
+		}
+	}
+
+	@keyframes -global-visualizer-flash {
+		0% {
+			opacity: 0;
+		}
+		15% {
+			opacity: 1;
+		}
+		70% {
+			opacity: 1;
+		}
+		100% {
+			opacity: 0;
+		}
+	}
+</style>

@@ -172,25 +172,28 @@ export class SignalFigureEngine {
 		for (let i = 0; i < steps; i += 1) this.stepLorenz(rho, 10, beta, 0.0095);
 	}
 
-	private ratio(index: number, majorWeight: number, out: [number, number]) {
+	/**
+	 * Integer XY ratio for one table entry. Major and minor tables are never
+	 * mixed numerically (a fractional ratio would tear the closed figure open);
+	 * familyPoint blends the two finished curves instead.
+	 */
+	private ratio(index: number, major: boolean, out: [number, number]) {
 		const i = clamp(Math.round(index), 0, 7);
-		const ma = MAJOR_RATIOS[i];
-		const mi = MINOR_RATIOS[i];
-		out[0] = mi[0] + (ma[0] - mi[0]) * (majorWeight > 0.5 ? 1 : 0);
-		out[1] = mi[1] + (ma[1] - mi[1]) * (majorWeight > 0.5 ? 1 : 0);
+		const table = major ? MAJOR_RATIOS[i] : MINOR_RATIOS[i];
+		out[0] = table[0];
+		out[1] = table[1];
 		return out;
 	}
 
 	private readonly ratioScratch: [number, number] = [1, 1];
 
 	/** One family at one table index; writes a roughly unit-sized 3D point. */
-	private raw(family: number, u: number, index: number, input: SignalFigureInput, phase: number, out: Vec3) {
+	private raw(family: number, u: number, index: number, input: SignalFigureInput, phase: number, out: Vec3, major = true) {
 		const t = u * TAU;
-		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
 		switch (family) {
 			case 1: {
 				// Harmonograph: two pendulums per axis with damping.
-				const [rx, ry] = this.ratio(index, majorWeight, this.ratioScratch);
+				const [rx, ry] = this.ratio(index, major, this.ratioScratch);
 				const turns = (5 + input.p1 * 6) / Math.max(rx, ry);
 				const tt = u * turns * TAU;
 				const env = Math.exp(-u * (1.1 + input.p2 * 2.2));
@@ -227,7 +230,7 @@ export class SignalFigureEngine {
 			case 4: {
 				// Phase portrait: bass partials on X, mid partials on Y, with a
 				// delay-embedded echo so the loop opens and closes with the mix.
-				const [rx, ry] = this.ratio(index, majorWeight, this.ratioScratch);
+				const [rx, ry] = this.ratio(index, major, this.ratioScratch);
 				let x = 0;
 				let y = 0;
 				let z = 0;
@@ -268,13 +271,25 @@ export class SignalFigureEngine {
 				return;
 			}
 			case 6: {
-				// Polar loop: the spectrum mirrored into a closed outline.
-				const lobes = 1 + Math.floor(input.p1 * 2.99);
+				// Polar loop: the spectrum mirrored into a closed outline. The lobe
+				// count glides: the outlines at the two neighbouring whole counts
+				// are blended, so a new lobe grows instead of popping in.
+				const lobeCount = 1 + clamp(input.p1, 0, 1) * 2;
+				const lobesLo = Math.floor(lobeCount);
+				const lobeMix = smooth(lobeCount - lobesLo);
 				const theta = t + phase * 0.06;
-				const position = Math.abs(((u * lobes) % 1) * 2 - 1);
-				const level =
-					smoothDetail(input.detail, position) * 0.9 +
-					(position < 0.3 ? input.sub * 0.5 + input.kick * 0.3 : position < 0.65 ? input.mids * 0.5 + input.body * 0.2 : input.presence * 0.4 + input.air * 0.4);
+				const low = input.sub * 0.5 + input.kick * 0.3;
+				const mid = input.mids * 0.5 + input.body * 0.2;
+				const high = input.presence * 0.4 + input.air * 0.4;
+				const levelAt = (lobes: number) => {
+					const position = Math.abs(((u * lobes) % 1) * 2 - 1);
+					// Band zones crossfade too, so the outline has no seams.
+					const lowMid = low + (mid - low) * smooth(clamp((position - 0.24) / 0.12, 0, 1));
+					const zone = lowMid + (high - lowMid) * smooth(clamp((position - 0.59) / 0.12, 0, 1));
+					return smoothDetail(input.detail, position) * 0.9 + zone;
+				};
+				let level = levelAt(lobesLo);
+				if (lobeMix > 0.001) level += (levelAt(lobesLo + 1) - level) * lobeMix;
 				const r = 0.5 + 0.48 * Math.tanh(level * 1.3);
 				out[0] = r * Math.cos(theta);
 				out[1] = r * Math.sin(theta);
@@ -294,7 +309,7 @@ export class SignalFigureEngine {
 			}
 			default: {
 				// Lissajous with the conductor's continuous forms.
-				const [rx, ry] = this.ratio(index, majorWeight, this.ratioScratch);
+				const [rx, ry] = this.ratio(index, major, this.ratioScratch);
 				let x = Math.sin(rx * t + phase);
 				let y = Math.sin(ry * t);
 				let z = Math.sin((rx + ry) * t + phase * 0.61 + 1.3);
@@ -310,8 +325,13 @@ export class SignalFigureEngine {
 				z += (oz - z) * ellipse * 0.7;
 				x *= 1 + ribbon * 0.42;
 				y *= 1 - ribbon * 0.3;
-				const petals = Math.floor(3 + input.complexity * 4);
-				const rose = 1 + rosette * (0.12 + input.tension * 0.14) * Math.cos(petals * t + phase * 1.3);
+				// Petal count glides between whole counts so the figure stays closed.
+				const petals = 3 + clamp(input.complexity, 0, 1) * 4;
+				const petalsLo = Math.floor(petals);
+				const petalMix = smooth(petals - petalsLo);
+				const petalA = Math.cos(petalsLo * t + phase * 1.3);
+				const petalB = Math.cos((petalsLo + 1) * t + phase * 1.3);
+				const rose = 1 + rosette * (0.12 + input.tension * 0.14) * (petalA + (petalB - petalA) * petalMix);
 				out[0] = x * rose;
 				out[1] = y * rose;
 				out[2] = z;
@@ -321,18 +341,19 @@ export class SignalFigureEngine {
 
 	private readonly a: Vec3 = [0, 0, 0];
 	private readonly b: Vec3 = [0, 0, 0];
+	private readonly e: Vec3 = [0, 0, 0];
 
 	/** Family point with the harmony index blended between neighbours. */
-	private familyPoint(family: number, u: number, input: SignalFigureInput, phase: number, out: Vec3) {
+	private indexedPoint(family: number, u: number, input: SignalFigureInput, phase: number, major: boolean, out: Vec3) {
 		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
 		// Lissajous-like families use the conductor complexity directly; table
 		// families shift two entries darker in minor keys.
 		const index = clamp(input.complexity, 0, 1) * 5 + (family === 0 || family === 1 || family === 4 ? 0 : (1 - majorWeight) * 2);
 		const i0 = Math.floor(index);
 		const f = smooth(index - i0);
-		this.raw(family, u, i0, input, phase, this.a);
+		this.raw(family, u, i0, input, phase, this.a, major);
 		if (f > 0.001 && family !== 5 && family !== 6) {
-			this.raw(family, u, i0 + 1, input, phase, this.b);
+			this.raw(family, u, i0 + 1, input, phase, this.b, major);
 			out[0] = this.a[0] + (this.b[0] - this.a[0]) * f;
 			out[1] = this.a[1] + (this.b[1] - this.a[1]) * f;
 			out[2] = this.a[2] + (this.b[2] - this.a[2]) * f;
@@ -343,14 +364,38 @@ export class SignalFigureEngine {
 		}
 	}
 
+	/**
+	 * Families built on the interval table (Lissajous, harmonograph, phase
+	 * plot) cross from the minor to the major table by blending the two
+	 * finished curves through a soft band around a neutral key, never by
+	 * switching table at a threshold.
+	 */
+	private familyPoint(family: number, u: number, input: SignalFigureInput, phase: number, out: Vec3) {
+		const usesTable = family === 0 || family === 1 || family === 4;
+		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
+		const toMajor = usesTable ? smooth(clamp((majorWeight - 0.3) / 0.4, 0, 1)) : 1;
+		this.indexedPoint(family, u, input, phase, toMajor > 0.001, out);
+		if (toMajor <= 0.001 || toMajor >= 0.999) return;
+		const majorX = out[0];
+		const majorY = out[1];
+		const majorZ = out[2];
+		this.indexedPoint(family, u, input, phase, false, this.e);
+		out[0] = this.e[0] + (majorX - this.e[0]) * toMajor;
+		out[1] = this.e[1] + (majorY - this.e[1]) * toMajor;
+		out[2] = this.e[2] + (majorZ - this.e[2]) * toMajor;
+	}
+
 	private readonly c: Vec3 = [0, 0, 0];
 	private readonly d: Vec3 = [0, 0, 0];
 
+	/**
+	 * Family morph: both families are sampled at the same curve parameter and
+	 * blended point for point, so the old figure flows into the new one. The
+	 * caller's mix is already eased (see SignalChoiceMorph).
+	 */
 	private evaluateRaw(input: SignalFigureInput, phase: number, out: Float32Array) {
-		const mix = smooth(clamp(input.familyMix, 0, 1));
-		const blend = input.familyFrom !== input.familyTo && mix < 0.999;
-		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
-		void majorWeight;
+		const mix = clamp(input.familyMix, 0, 1);
+		const blend = input.familyFrom !== input.familyTo && mix < 1;
 		for (let i = 0; i < SIGNAL_FIGURE_POINTS; i += 1) {
 			const u = i / SIGNAL_FIGURE_SEGMENTS;
 			this.familyPoint(input.familyTo, u, input, phase, this.c);
@@ -367,7 +412,7 @@ export class SignalFigureEngine {
 	}
 
 	private tiltFor(input: SignalFigureInput) {
-		const mix = smooth(clamp(input.familyMix, 0, 1));
+		const mix = clamp(input.familyMix, 0, 1);
 		return FAMILY_TILT[input.familyFrom] + (FAMILY_TILT[input.familyTo] - FAMILY_TILT[input.familyFrom]) * mix;
 	}
 
@@ -393,7 +438,10 @@ export class SignalFigureEngine {
 			y *= sy;
 			const detail = smoothDetail(input.detail, (u * 2 + ripplePhase) % 1);
 			const length = Math.hypot(x, y) + 1e-4;
-			const ripple = detail * rippleGain + Math.sin(u * TAU * 41 + input.phase * 3) * input.air * 0.006;
+			// Radial ripple, faded out at the centre: a curve passing through the
+			// origin would otherwise flip its push direction in one step.
+			const centreFade = smooth(clamp(length / 0.12, 0, 1));
+			const ripple = (detail * rippleGain + Math.sin(u * TAU * 41 + input.phase * 3) * input.air * 0.006) * centreFade;
 			x += (x / length) * ripple;
 			y += (y / length) * ripple;
 			const cy = Math.cos(yawAngle * tiltFactor);

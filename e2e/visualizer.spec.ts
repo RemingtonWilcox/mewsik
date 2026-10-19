@@ -18,16 +18,92 @@ async function expectVisualizerChrome(
 	visible: boolean,
 	timeout = 4_000
 ) {
-	const expected = String(visible);
 	await expect
-		.poll(
-			async () => ({
-				host: await page.locator('[data-visualizer-host]').getAttribute('data-controls-visible'),
-				player: await page.locator('[data-player-bar]').getAttribute('data-visualizer-chrome-visible')
-			}),
-			{ timeout }
-		)
-		.toEqual({ host: expected, player: expected });
+		.poll(() => page.locator('[data-visualizer-host]').getAttribute('data-controls-visible'), {
+			timeout
+		})
+		.toBe(String(visible));
+}
+
+/** A minimal native runtime so the overlay has something playing. */
+async function installPlaybackMock(
+	page: import('@playwright/test').Page,
+	playback: Record<string, unknown>
+) {
+	await page.addInitScript((initial) => {
+		type Invocation = { command: string; args: Record<string, unknown> };
+		const runtime = window as Window & {
+			__PLAYBACK_INVOCATIONS__?: Invocation[];
+			__SET_PLAYBACK__?: (patch: Record<string, unknown>) => void;
+		};
+		runtime.__PLAYBACK_INVOCATIONS__ = [];
+		const state: Record<string, unknown> = {
+			is_playing: false,
+			is_buffering: false,
+			can_seek: false,
+			current_recording_id: null,
+			current_title: null,
+			current_artist: null,
+			current_album_art: null,
+			current_source_url: null,
+			current_station_id: null,
+			position_ms: 0,
+			duration_ms: 0,
+			volume: 1,
+			is_shuffle: false,
+			repeat_mode: 'off',
+			source: null,
+			connection_stage: 'playing',
+			reconnect_attempt: 0,
+			reconnect_max: 0,
+			connection_error: null,
+			...initial
+		};
+		runtime.__SET_PLAYBACK__ = (patch) => Object.assign(state, patch);
+		(window as any).__TAURI_INTERNALS__ = {
+			invoke: async (command: string, args: Record<string, unknown> = {}) => {
+				runtime.__PLAYBACK_INVOCATIONS__?.push({ command, args });
+				switch (command) {
+					case 'get_playback_state':
+						return { ...state };
+					case 'pause':
+						state.is_playing = false;
+						return null;
+					case 'resume':
+						state.is_playing = true;
+						return null;
+					case 'get_play_stats':
+						return { total_plays: 0, total_time_ms: 0, unique_tracks: 0 };
+					case 'request_track_analysis':
+						return 'unavailable';
+					case 'plugin:event|listen':
+						return 1;
+					case 'get_playback_waveform':
+					case 'next_track':
+					case 'prev_track':
+					case 'plugin:event|unlisten':
+					case 'start_sidecar':
+						return null;
+					default:
+						return [];
+				}
+			},
+			transformCallback: () => 1,
+			unregisterCallback: () => undefined
+		};
+		(window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => undefined };
+	}, playback);
+}
+
+async function invocations(page: import('@playwright/test').Page, command: string) {
+	return page.evaluate(
+		(name) =>
+			(
+				(window as Window & { __PLAYBACK_INVOCATIONS__?: Array<{ command: string }> })
+					.__PLAYBACK_INVOCATIONS__ ?? []
+			).filter((entry) => entry.command === name).length,
+		command
+	);
 }
 
 async function hasUsableWebGpu(page: import('@playwright/test').Page) {
@@ -76,33 +152,58 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByText(/Loom · harmonic weave/).last()).toBeVisible();
 	});
 
-	test('named production rail uses arrows, retires V, persists response, and Escape closes', async ({ page }) => {
+	test('the overlay names four engines; arrows, clicks and Escape route them', async ({ page }) => {
 		await page.addInitScript(() => {
 			localStorage.setItem('mewsik.visualizer.engine', 'auto');
 		});
 		await page.goto('/');
-		await page.getByRole('button', { name: 'Visualizer' }).click();
+		const opener = page.getByRole('button', { name: 'Visualizer' });
+		await opener.click();
 
+		const host = page.locator('[data-visualizer-host]');
 		await expectProductionEngine(page, 'mk1');
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute('data-engine-name', 'Prism');
-		await expect(page.getByRole('button', { name: 'Close visualizer' })).toBeVisible();
+		await expect(host).toHaveAttribute('data-engine-name', 'Prism');
+		await expect(host).toBeFocused();
 		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
+		// The visualizer owns playback while open; the bar stays mounted but inert.
+		await expect(page.locator('[data-player-bar]')).toHaveAttribute('inert', '');
+		await expect(page.locator('[data-player-bar]')).toHaveAttribute('aria-hidden', 'true');
+
+		const engines = page.getByRole('radiogroup', { name: 'Visualizer' }).getByRole('radio');
+		await expect(engines).toHaveText(['Prism', 'Soma', 'Signal', 'Loom']);
+		await expect(page.getByRole('radio', { name: 'Prism' })).toHaveAttribute('aria-checked', 'true');
+		await expect(page.getByRole('button', { name: 'Exit visualizer' })).toBeVisible();
+
+		// No developer telemetry and no response switch in the listener-facing chrome.
+		const chromeText = await page.locator('[data-visualizer-chrome]').innerText();
+		expect(chromeText).not.toMatch(/\bbpm\b|tempo|seed|topology|section|calm|surge/i);
+
 		await page.keyboard.press('Control+k');
 		await expect(page.getByPlaceholder('Search songs, artists, albums...')).toHaveCount(0);
-
 		await page.keyboard.press('v');
 		await expectProductionEngine(page, 'mk1');
+
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk2');
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute('data-engine-name', 'Soma');
+		await expect(host).toHaveAttribute('data-engine-name', 'Soma');
+		await expect(page.getByRole('radio', { name: 'Soma' })).toHaveAttribute('aria-checked', 'true');
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-render-passes',
 			'8'
 		);
+		// 47 vec4 slots in the rebuilt organism renderer.
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'384'
+			'752'
 		);
+		// The species is reported once the GPU renderer is running.
+		if (await hasUsableWebGpu(page)) {
+			await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
+				'data-soma-species',
+				/medusa|siphonophore|ctenophore|radiolarian|cuttlefish|nudibranch|mycelial bloom|polyp colony|anglerfish|salp chain|cell colony|pyrosome/,
+				{ timeout: 15_000 }
+			);
+		}
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-form',
 			/seed|sprout|winding|bloom|shedding|dormancy/
@@ -113,14 +214,8 @@ test.describe('visualizer engine roster', () => {
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'loom');
 		const loomCanvas = page.getByLabel('Loom audio visualizer');
-		await expect(loomCanvas).toHaveAttribute(
-			'data-loom-render-passes',
-			'8'
-		);
-		await expect(loomCanvas).toHaveAttribute(
-			'data-loom-topology',
-			/torus|helix|saddle|knot|cage/
-		);
+		await expect(loomCanvas).toHaveAttribute('data-loom-render-passes', '8');
+		await expect(loomCanvas).toHaveAttribute('data-loom-topology', /torus|helix|saddle|knot|cage/);
 		if (await hasUsableWebGpu(page)) {
 			await expect(loomCanvas).toHaveAttribute('data-loom-ready', 'true', { timeout: 15_000 });
 			await expect(page.getByText('Loom unavailable', { exact: true })).toHaveCount(0);
@@ -129,201 +224,242 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'mk1');
 		await page.keyboard.press('ArrowLeft');
 		await expectProductionEngine(page, 'loom');
-		await page.keyboard.press('ArrowLeft');
+
+		// A click picks an engine directly, without stealing focus from the picture.
+		await page.mouse.move(400, 400);
+		await page.getByRole('radio', { name: 'Signal' }).click();
 		await expectProductionEngine(page, 'signal');
-		await page.getByRole('button', { name: /Signal: Phosphor score\. Show details/ }).click();
-		await page.getByRole('button', { name: 'Calm', exact: true }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'still'
-		);
-		await expect
-			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
-			.toBe('still');
+		await expect(host).toBeFocused();
+
 		await page.keyboard.press('Escape');
-		await expect(page.locator('[data-visualizer-host]')).toHaveCount(0);
-		await expect(page.getByRole('button', { name: 'Close visualizer' })).toHaveCount(0);
+		await expect(host).toHaveCount(0);
 		await expect(page.locator('[data-app-content]')).not.toHaveAttribute('inert', '');
-	});
-
-	test('engine and playback chrome share one fast idle clock and interaction holds', async ({ page }) => {
-		await page.goto('/');
-		const opener = page.getByRole('button', { name: 'Visualizer' });
-		await opener.click();
-		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
-		await expect(page.locator('[data-app-content]')).toHaveAttribute('inert', '');
-		// The opener can leave the synthetic browser pointer sitting over the
-		// player bar, which correctly holds chrome open. Move onto the stage so
-		// this assertion measures the idle clock instead of pointer-hover state.
-		await page.mouse.move(160, 280);
-		await expectVisualizerChrome(page, true);
-		await expectVisualizerChrome(page, false);
-
-		// A Window-level event is not enough; wake events must come from an app surface.
-		await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointermove')));
-		await page.waitForTimeout(200);
-		await expectVisualizerChrome(page, false, 1_500);
-
-		// Activity over the actual visualizer surface wakes both layers together.
-		await page.mouse.move(160, 280);
-		await expectVisualizerChrome(page, true);
-
-		// A stationary pointer over either control surface keeps both available.
-		const playerBar = page.locator('[data-player-bar]');
-		await playerBar.hover();
-		await page.waitForTimeout(2_500);
-		await expectVisualizerChrome(page, true, 1_500);
-		await page.mouse.move(160, 280);
-		await expectVisualizerChrome(page, false);
-
-		// Genuine keyboard focus is also a hold, unlike focus left by a pointer click.
-		await page.mouse.move(180, 300);
-		await expectVisualizerChrome(page, true);
-		const title = page.getByRole('button', { name: /Prism: Rhythmic geometry\. Show details/ });
-		await title.focus();
-		await expect(title).toBeFocused();
-		await page.waitForTimeout(2_500);
-		await expectVisualizerChrome(page, true, 1_500);
-
-		await page.keyboard.press('Escape');
+		await expect(page.locator('[data-player-bar]')).not.toHaveAttribute('inert', '');
+		await expect(page.locator('[data-player-bar]')).not.toHaveAttribute('aria-hidden', 'true');
 		await expect(opener).toBeFocused();
 	});
 
-	test('manual Hide stays locked until H, I, or a stage click explicitly reveals it', async ({ page }) => {
+	test('chrome fades on idle, wakes on activity, and holds under hover and keyboard focus', async ({
+		page
+	}) => {
 		await page.goto('/');
-		const opener = page.getByRole('button', { name: 'Visualizer' });
-		await opener.click();
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		const chrome = page.locator('[data-visualizer-chrome]');
+		// The opener can leave the synthetic pointer over a control surface;
+		// move onto the picture so this measures the idle clock.
+		await page.mouse.move(160, 280);
+		await expectVisualizerChrome(page, true);
+		await expectVisualizerChrome(page, false);
+		await expect(chrome).toHaveAttribute('inert', '');
+		await expect(chrome).toHaveAttribute('aria-hidden', 'true');
 
-		const host = page.locator('[data-visualizer-host]');
-		await page
-			.getByRole('navigation', { name: 'Visualizer engines' })
-			.getByRole('button', { name: 'Hide visualizer controls', exact: true })
-			.click();
-		await expect(host).toHaveAttribute('data-controls-mode', 'locked-hidden');
+		// A window-level event is not activity; movement over the picture is.
+		await page.evaluate(() => window.dispatchEvent(new PointerEvent('pointermove')));
+		await page.waitForTimeout(200);
+		await expectVisualizerChrome(page, false, 1_500);
+		await page.mouse.move(180, 300);
+		await expectVisualizerChrome(page, true);
+		await expect(chrome).not.toHaveAttribute('inert', '');
+
+		// A pointer resting on either control surface holds the chrome.
+		await page.locator('[data-visualizer-now-playing]').hover();
+		await page.waitForTimeout(2_800);
+		await expectVisualizerChrome(page, true, 1_000);
+		await page.getByRole('radio', { name: 'Prism' }).hover();
+		await page.waitForTimeout(2_800);
+		await expectVisualizerChrome(page, true, 1_000);
+		// Hover previews an engine's one-line description.
+		await page.getByRole('radio', { name: 'Loom' }).hover();
+		await expect(page.locator('[data-engine-caption]')).toHaveText(/Ribbons of light/);
+		await page.mouse.move(160, 280);
+		await expect(page.locator('[data-engine-caption]')).toHaveText(/rose window/);
 		await expectVisualizerChrome(page, false);
 
-		// Ordinary movement and engine keyboard routes must not defeat the lock.
+		// Tab brings hidden controls back with focus on the current engine, and
+		// keyboard focus inside the controls holds them; Tab stays in the overlay.
+		await page.keyboard.press('Tab');
+		await expectVisualizerChrome(page, true);
+		await expect(page.getByRole('radio', { name: 'Prism' })).toBeFocused();
+		await page.waitForTimeout(2_800);
+		await expectVisualizerChrome(page, true, 1_000);
+		await page.keyboard.press('ArrowRight');
+		await expectProductionEngine(page, 'mk2');
+		await expect(page.getByRole('radio', { name: 'Soma' })).toBeFocused();
+		await page.keyboard.press('Shift+Tab');
+		await expect(page.getByRole('button', { name: 'Exit visualizer' })).toBeFocused();
+		await page.keyboard.press('Tab');
+		await expect(page.getByRole('radio', { name: 'Soma' })).toBeFocused();
+
+		await page.keyboard.press('Escape');
+		await expect(page.getByRole('button', { name: 'Visualizer' })).toBeFocused();
+	});
+
+	test('H and Hide lock the chrome away; H, a click on the picture, or Tab bring it back', async ({
+		page
+	}) => {
+		await page.goto('/');
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		const host = page.locator('[data-visualizer-host]');
+
+		await page.getByRole('button', { name: 'Hide controls' }).click();
+		await expect(host).toHaveAttribute('data-controls-mode', 'locked-hidden');
+		await expectVisualizerChrome(page, false);
+		await expect(host).toBeFocused();
+
+		// Movement and engine changes cannot defeat the lock; the new engine's
+		// name flashes briefly instead.
 		await page.mouse.move(80, 180);
 		await page.mouse.move(360, 420);
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk2');
+		await expect(page.locator('[data-visualizer-engine-flash]')).toHaveText('Soma');
 		await page.waitForTimeout(350);
 		await expectVisualizerChrome(page, false, 500);
 
-		await page.keyboard.press('i');
+		await page.keyboard.press('h');
 		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
 		await expectVisualizerChrome(page, true);
-		await expect(page.getByRole('region', { name: 'Soma visualizer details' })).toBeVisible();
-		await page.keyboard.press('i');
-
 		await page.keyboard.press('h');
 		await expect(host).toHaveAttribute('data-controls-mode', 'locked-hidden');
 		await expectVisualizerChrome(page, false);
-		await page.keyboard.press('h');
+
+		await page.mouse.click(400, 400);
 		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
 		await expectVisualizerChrome(page, true);
 
-		await page.keyboard.press('h');
-		await page.getByRole('button', { name: 'Show visualizer controls' }).click();
+		// A click on a visible picture dismisses the chrome without locking it:
+		// click jitter does not bring it back, real movement does.
+		await page.mouse.click(400, 400);
+		await expectVisualizerChrome(page, false, 1_000);
 		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
+		await page.mouse.move(404, 403);
+		await page.waitForTimeout(200);
+		await expectVisualizerChrome(page, false, 500);
+		await page.mouse.move(520, 470);
 		await expectVisualizerChrome(page, true);
 
-		await page.keyboard.press('Escape');
-		await expect(opener).toBeFocused();
+		await page.keyboard.press('h');
+		await expectVisualizerChrome(page, false);
+		await page.keyboard.press('Tab');
+		await expect(host).toHaveAttribute('data-controls-mode', 'auto');
+		await expectVisualizerChrome(page, true);
 	});
 
-	test('response mode repairs invalid storage and hydrates across a reload', async ({ page }) => {
-		await page.addInitScript(() => {
-			if (sessionStorage.getItem('response-seeded')) return;
-			sessionStorage.setItem('response-seeded', 'true');
-			localStorage.setItem('mewsik.visualizer.response', 'maximum-chaos');
+	test('engine stays mounted while the chrome shows, hides, and is hovered', async ({ page }) => {
+		await page.goto('/');
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		const canvas = page.getByLabel('Prism audio visualizer');
+		await expect(canvas).toHaveCount(1);
+		await canvas.evaluate((element) => ((element as HTMLElement).dataset.mountProbe = 'first'));
+
+		await page.mouse.move(200, 300);
+		await page.getByRole('radio', { name: 'Loom' }).hover();
+		await page.locator('[data-visualizer-now-playing]').hover();
+		await page.keyboard.press('h');
+		await page.keyboard.press('h');
+		await page.mouse.click(400, 400);
+		await page.mouse.click(400, 400);
+		await page.keyboard.press('Tab');
+		// Choosing the engine that is already showing is not a switch.
+		await page.getByRole('radio', { name: 'Prism' }).click();
+
+		await expect(canvas).toHaveAttribute('data-mount-probe', 'first');
+		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute('data-render-engine', 'mk1');
+	});
+
+	test('now playing reads the shared player and its controls drive it', async ({ page }) => {
+		await installPlaybackMock(page, {
+			source: 'local',
+			is_playing: true,
+			can_seek: true,
+			current_recording_id: 'track-1',
+			current_title: 'Teardrop',
+			current_artist: 'Massive Attack',
+			position_ms: 60_000,
+			duration_ms: 240_000
 		});
 		await page.goto('/');
 		await page.getByRole('button', { name: 'Visualizer' }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'flow'
-		);
-		await expect
-			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
-			.toBe('flow');
+		const nowPlaying = page.getByRole('region', { name: 'Now playing' });
+		await expect(nowPlaying).toContainText('Teardrop');
+		await expect(nowPlaying).toContainText('Massive Attack');
+		await expect(nowPlaying.locator('[data-station-art="generated"]')).toBeVisible();
+		await expect(nowPlaying.getByRole('button', { name: 'Pause' })).toBeVisible();
 
-		await page.keyboard.press('i');
-		await page.getByRole('button', { name: 'Surge', exact: true }).click();
-		await page.keyboard.press('Escape');
-		await page.reload();
-		await page.getByRole('button', { name: 'Visualizer' }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'surge'
+		// Space on the picture toggles playback exactly once.
+		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
+		await page.keyboard.press(' ');
+		await expect.poll(() => invocations(page, 'pause')).toBe(1);
+		await page.waitForTimeout(300);
+		expect(await invocations(page, 'pause')).toBe(1);
+		expect(await invocations(page, 'resume')).toBe(0);
+
+		await page.mouse.move(300, 300);
+		await nowPlaying.getByRole('button', { name: 'Next', exact: true }).click();
+		await expect.poll(() => invocations(page, 'next_track')).toBe(1);
+		await nowPlaying.getByRole('button', { name: 'Previous', exact: true }).click();
+		await expect.poll(() => invocations(page, 'prev_track')).toBe(1);
+		// Pointer presses never take focus, so Space still means play/pause.
+		await expect(page.locator('[data-visualizer-host]')).toBeFocused();
+
+		await page.evaluate(() =>
+			(window as Window & { __SET_PLAYBACK__?: (patch: Record<string, unknown>) => void })
+				.__SET_PLAYBACK__?.({
+					source: 'radio',
+					current_recording_id: null,
+					current_station_id: 'station-1',
+					current_source_url: 'https://radio.example/live',
+					current_title: 'RADIO X :: Hip Hop, Rap, Trap, Techno, House | www.radiox.com [128kbps]',
+					current_artist: null,
+					is_playing: true,
+					can_seek: false,
+					duration_ms: 0,
+					position_ms: 0,
+					connection_stage: 'playing'
+				})
 		);
+		await expect(nowPlaying.getByText('RADIO X', { exact: true })).toBeVisible();
+		await expect(nowPlaying.getByText('Live')).toBeVisible();
+		await expect(nowPlaying.getByRole('button', { name: 'Next favorite station' })).toBeVisible();
+		await expect(nowPlaying.getByRole('button', { name: 'Previous favorite station' })).toBeVisible();
 	});
 
-	test('response profiles preserve Flow and scale Calm through Surge monotonically', async ({ page }) => {
+	test('touch: a swipe switches engine and a tap toggles the chrome', async ({ browser }) => {
+		const context = await browser.newContext({
+			hasTouch: true,
+			viewport: { width: 1024, height: 768 }
+		});
+		const page = await context.newPage();
 		await page.goto('/');
-		const profiles = await page.evaluate(async () => {
-			const modulePath = '/src/lib/visualizer/catalog.ts';
-			const { VISUALIZER_RESPONSE_PROFILES } = await import(modulePath);
-			return VISUALIZER_RESPONSE_PROFILES;
-		});
+		await page.getByRole('button', { name: 'Visualizer' }).click();
+		const host = page.locator('[data-visualizer-host]');
+		await expect(host).toHaveAttribute('data-render-engine', 'mk1');
 
-		expect(profiles.mk1.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			bloomThresholdOffset: 0,
-			feedbackFadeOffset: 0
-		});
-		expect(profiles.mk2.flow).toEqual({ motion: 1, impact: 1, fog: 1, shafts: 1 });
-		expect(profiles.signal.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			persistenceOffset: 0,
-			stroke: 1,
-			saturation: 1
-		});
-		expect(profiles.loom.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			width: 1,
-			glow: 1,
-			bloomThresholdOffset: 0,
-			feedbackFadeOffset: 0
-		});
+		const swipe = (fromX: number, toX: number) =>
+			page.locator('[data-visualizer-stage]').evaluate(
+				(stage, [from, to]) => {
+					const init = { pointerId: 7, pointerType: 'touch', isPrimary: true, bubbles: true };
+					stage.dispatchEvent(new PointerEvent('pointerdown', { ...init, clientX: from, clientY: 400 }));
+					stage.dispatchEvent(
+						new PointerEvent('pointermove', { ...init, clientX: (from + to) / 2, clientY: 404 })
+					);
+					stage.dispatchEvent(new PointerEvent('pointerup', { ...init, clientX: to, clientY: 408 }));
+					stage.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: to, clientY: 408 }));
+				},
+				[fromX, toX]
+			);
 
-		for (const rail of ['motion', 'impact'] as const) {
-			expect(profiles.mk1.still[rail]).toBeLessThan(profiles.mk1.flow[rail]);
-			expect(profiles.mk1.flow[rail]).toBeLessThan(profiles.mk1.surge[rail]);
-			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
-			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
-			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
-			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
-			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
-			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
-		}
-		for (const rail of ['fog', 'shafts'] as const) {
-			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
-			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
-		}
-		for (const rail of ['persistenceOffset', 'stroke', 'saturation'] as const) {
-			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
-			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
-		}
-		for (const rail of ['width', 'glow'] as const) {
-			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
-			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
-		}
-		expect(profiles.mk1.still.feedbackFadeOffset).toBeLessThan(
-			profiles.mk1.flow.feedbackFadeOffset
-		);
-		expect(profiles.mk1.flow.feedbackFadeOffset).toBeLessThan(
-			profiles.mk1.surge.feedbackFadeOffset
-		);
-		expect(profiles.mk1.still.bloomThresholdOffset).toBeGreaterThan(
-			profiles.mk1.flow.bloomThresholdOffset
-		);
-		expect(profiles.mk1.flow.bloomThresholdOffset).toBeGreaterThan(
-			profiles.mk1.surge.bloomThresholdOffset
-		);
+		await swipe(700, 300);
+		await expectProductionEngine(page, 'mk2');
+		await swipe(300, 700);
+		await expectProductionEngine(page, 'mk1');
+		await expectVisualizerChrome(page, true);
+
+		await page.touchscreen.tap(500, 400);
+		await expectVisualizerChrome(page, false, 1_000);
+		await page.touchscreen.tap(500, 400);
+		await expectVisualizerChrome(page, true, 1_000);
+		await context.close();
 	});
 
 	test('legacy and unknown engines migrate to supported renderers', async ({ browser }) => {

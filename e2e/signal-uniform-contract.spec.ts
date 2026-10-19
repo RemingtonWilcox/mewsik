@@ -368,3 +368,345 @@ test.describe('Signal instrument coupling', () => {
 		expect(result.inGamut).toBe(true);
 	});
 });
+
+test.describe('Signal continuity', () => {
+	test('choice morphs finish before retargeting, reverse in place and stagger', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const { SignalChoiceMorph } = await import('/src/lib/visualizer/signal/continuity.ts');
+			// Weight of each option on screen: from takes 1 - mix, to takes mix.
+			const weights = (state: { from: number; to: number; mix: number }) => {
+				const out = [0, 0, 0, 0];
+				out[state.from] += 1 - state.mix;
+				out[state.to] += state.mix;
+				return out;
+			};
+			const dt = 1 / 60;
+			const morph = new SignalChoiceMorph(4, 0);
+			morph.update(0, dt);
+			let previous = weights(morph.update(0, dt));
+			let maxStep = 0;
+			let maxStepAtRetarget = 0;
+			const run = (target: number, frames: number, retarget = false) => {
+				for (let frame = 0; frame < frames; frame += 1) {
+					const next = weights(morph.update(target, dt));
+					const step = Math.max(...next.map((w, i) => Math.abs(w - previous[i])));
+					maxStep = Math.max(maxStep, step);
+					if (retarget && frame === 0) maxStepAtRetarget = step;
+					previous = next;
+				}
+			};
+			run(1, 60); // a morph 0 -> 1 is a quarter of the way through
+			run(2, 1, true); // the genome changes its mind mid-morph
+			run(2, 60);
+			const stillHeadingToOne = morph.state().to === 1;
+			run(2, 400); // the first morph finishes, then 1 -> 2 runs
+			const reachedTwo = morph.state().to === 2 && morph.state().mix === 1;
+			// Reversal: start 2 -> 3, then go back to 2 half way.
+			run(3, 120);
+			const before = weights(morph.state());
+			run(2, 1, true);
+			const reverseStep = maxStepAtRetarget;
+			const after = previous;
+			run(2, 400);
+			const backOnTwo = morph.state().to === 2 && morph.state().mix === 1;
+
+			// Stagger: a delayed axis holds still until its delay has passed.
+			const delayed = new SignalChoiceMorph(2, 1.5);
+			delayed.update(0, dt);
+			let heldFrames = 0;
+			for (let frame = 0; frame < 300; frame += 1) {
+				const state = delayed.update(3, dt);
+				if (state.to === 0 || state.mix === 0) heldFrames += 1;
+			}
+			return {
+				maxStep,
+				maxStepAtRetarget,
+				stillHeadingToOne,
+				reachedTwo,
+				reverseStep,
+				reverseDelta: Math.max(...before.map((w, i) => Math.abs(w - after[i]))),
+				backOnTwo,
+				heldSeconds: heldFrames * dt,
+				delayedArrived: delayed.state().to === 3 && delayed.state().mix === 1
+			};
+		});
+		// A 4 s quintic morph moves at most ~1.9 / 4 of the weight per second.
+		expect(result.maxStep).toBeLessThan(0.01);
+		expect(result.maxStepAtRetarget).toBeLessThan(0.01);
+		expect(result.stillHeadingToOne).toBe(true);
+		expect(result.reachedTwo).toBe(true);
+		expect(result.reverseStep).toBeLessThan(0.01);
+		expect(result.reverseDelta).toBeLessThan(0.01);
+		expect(result.backOnTwo).toBe(true);
+		expect(result.heldSeconds).toBeGreaterThan(1.4);
+		expect(result.delayedArrived).toBe(true);
+	});
+
+	test('a figure family change morphs through intermediate curves', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const figures = await import('/src/lib/visualizer/signal/figures.ts');
+			const detail = new Float32Array(64).map((_, i) => Math.sin(i * 0.3) * 0.4);
+			const base = {
+				phase: 1.7,
+				complexity: 0.45,
+				mode: 1,
+				p1: 0.4,
+				p2: 0.6,
+				ellipse: 0.2,
+				lissajous: 0.5,
+				ribbon: 0.2,
+				rosette: 0.1,
+				tension: 0.3,
+				release: 0.4,
+				spread: 0.05,
+				sub: 0.5,
+				kick: 0.6,
+				body: 0.4,
+				mids: 0.5,
+				presence: 0.3,
+				air: 0.2,
+				spectralMotion: 0.3,
+				energy: 0.6,
+				detail,
+				yaw: 0.3,
+				tilt: 0.4,
+				roll: 0.1,
+				partner: 0,
+				// dt 0 freezes the attractor so every evaluation is comparable.
+				dt: 0,
+				pace: 1
+			};
+			const curve = (input: Record<string, unknown>) => {
+				const engine = new figures.SignalFigureEngine();
+				const points = engine.evaluate(input as never);
+				return Array.from({ length: figures.SIGNAL_FIGURE_POINTS }, (_, i) => [points[i * 4], points[i * 4 + 1]]);
+			};
+			const distance = (a: number[][], b: number[][]) =>
+				a.reduce((sum, p, i) => sum + Math.hypot(p[0] - b[i][0], p[1] - b[i][1]), 0) / a.length;
+			const pairs = [
+				[2, 7],
+				[5, 0],
+				[6, 3],
+				[1, 4]
+			];
+			return pairs.map(([from, to]) => {
+				const pureFrom = curve({ ...base, familyFrom: from, familyTo: from, familyMix: 1 });
+				const pureTo = curve({ ...base, familyFrom: to, familyTo: to, familyMix: 1 });
+				const steps: number[][][] = [];
+				for (let k = 0; k <= 40; k += 1) {
+					steps.push(curve({ ...base, familyFrom: from, familyTo: to, familyMix: k / 40 }));
+				}
+				const stepSizes = steps.slice(1).map((c, k) => distance(c, steps[k]));
+				const mean = stepSizes.reduce((a, b) => a + b, 0) / stepSizes.length;
+				const middle = steps[20];
+				return {
+					pair: `${from}->${to}`,
+					startsAtFrom: distance(steps[0], pureFrom),
+					endsAtTo: distance(steps[40], pureTo),
+					span: distance(pureFrom, pureTo),
+					middleFromBoth: Math.min(distance(middle, pureFrom), distance(middle, pureTo)),
+					worstStepRatio: Math.max(...stepSizes) / Math.max(mean, 1e-9)
+				};
+			});
+		});
+		for (const pair of result) {
+			expect(pair.startsAtFrom, pair.pair).toBeLessThan(1e-5);
+			expect(pair.endsAtTo, pair.pair).toBeLessThan(1e-5);
+			// Half way is a genuinely new curve, not either end.
+			expect(pair.middleFromBoth, pair.pair).toBeGreaterThan(pair.span * 0.2);
+			// No step of the morph is a jump.
+			expect(pair.worstStepRatio, pair.pair).toBeLessThan(2.5);
+		}
+	});
+
+	test('figure parameters that used to round (lobes, petals, key mode) glide', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const figures = await import('/src/lib/visualizer/signal/figures.ts');
+			const detail = new Float32Array(64).map((_, i) => Math.cos(i * 0.21) * 0.5);
+			const base = {
+				phase: 0.9,
+				complexity: 0.3,
+				mode: 1,
+				p1: 0.5,
+				p2: 0.4,
+				ellipse: 0.1,
+				lissajous: 0.2,
+				ribbon: 0.1,
+				rosette: 0.6,
+				tension: 0.8,
+				release: 0.2,
+				spread: 0.05,
+				sub: 0.6,
+				kick: 0.5,
+				body: 0.6,
+				mids: 0.4,
+				presence: 0.7,
+				air: 0.5,
+				spectralMotion: 0.2,
+				energy: 0.6,
+				detail,
+				yaw: 0.2,
+				tilt: 0.3,
+				roll: 0.1,
+				partner: 0,
+				dt: 0,
+				pace: 1
+			};
+			const curve = (input: Record<string, unknown>) => {
+				const points = new figures.SignalFigureEngine().evaluate(input as never);
+				return Array.from(points.slice(0, figures.SIGNAL_FIGURE_POINTS * 4));
+			};
+			const sweep = (family: number, key: string, from: number, to: number, extra: Record<string, number>, steps: number) => {
+				const input = { ...base, ...extra, familyFrom: family, familyTo: family, familyMix: 1 };
+				let previous = curve({ ...input, [key]: from });
+				let worst = 0;
+				for (let k = 1; k <= steps; k += 1) {
+					const value = from + ((to - from) * k) / steps;
+					const next = curve({ ...input, [key]: value });
+					let d = 0;
+					for (let i = 0; i < figures.SIGNAL_FIGURE_POINTS; i += 1) {
+						d = Math.max(d, Math.hypot(next[i * 4] - previous[i * 4], next[i * 4 + 1] - previous[i * 4 + 1]));
+					}
+					worst = Math.max(worst, d);
+					previous = next;
+				}
+				return worst;
+			};
+			// A continuous family halves its worst step when the sweep is twice as
+			// fine; a threshold (a rounded lobe count, a table switch) does not.
+			const worstStep = (family: number, key: string, from: number, to: number, extra: Record<string, number> = {}) => {
+				const coarse = sweep(family, key, from, to, extra, 300);
+				const fine = sweep(family, key, from, to, extra, 600);
+				return { coarse, ratio: fine / Math.max(coarse, 1e-9) };
+			};
+			return {
+				polarLobes: worstStep(6, 'p1', 0.2, 0.8),
+				lissajousPetals: worstStep(0, 'complexity', 0.1, 0.9),
+				// High complexity reaches the table entries where major and minor differ.
+				lissajousMode: worstStep(0, 'mode', -1, 1, { complexity: 0.9 }),
+				harmonographMode: worstStep(1, 'mode', -1, 1, { complexity: 0.9 }),
+				phasePlotMode: worstStep(4, 'mode', -1, 1, { complexity: 0.9 })
+			};
+		});
+		for (const [name, worst] of Object.entries(result)) {
+			expect(worst.coarse, name).toBeLessThan(0.08);
+			expect(worst.ratio, name).toBeLessThan(0.6);
+		}
+	});
+
+	test('a layout change moves panels and traces continuously', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const layouts = await import('/src/lib/visualizer/signal/layouts.ts');
+			const { SignalChoiceMorph } = await import('/src/lib/visualizer/signal/continuity.ts');
+			const aspect = 1.6;
+			const out = layouts.createSignalLayout();
+			const check = (from: number, to: number) => {
+				const a = layouts.buildSignalLayout(from, aspect);
+				const b = layouts.buildSignalLayout(to, aspect);
+				const morph = new SignalChoiceMorph(7.5, 0.6);
+				morph.update(from, 1 / 60);
+				let previous = { ...a };
+				let worst = 0;
+				let worstKey = '';
+				let midFaceX = Number.NaN;
+				let fractionalRepeat = false;
+				for (let frame = 0; frame < 60 * 10; frame += 1) {
+					const state = morph.update(to, 1 / 60);
+					const layoutFrom = layouts.buildSignalLayout(state.from, aspect);
+					const layoutTo = layouts.buildSignalLayout(state.to, aspect);
+					const now = layouts.lerpSignalLayout(layoutFrom, layoutTo, state.mix, out);
+					for (const key of Object.keys(now) as (keyof typeof now)[]) {
+						const range = Math.abs(b[key] - a[key]);
+						if (range < 1e-9) continue;
+						const step = Math.abs(now[key] - previous[key]) / range;
+						if (step > worst) {
+							worst = step;
+							worstKey = key;
+						}
+					}
+					if (Math.abs(state.mix - 0.5) < 0.01) midFaceX = now.faceAX;
+					if (now.faceARepeat % 1 > 0.05 && now.faceARepeat % 1 < 0.95) fractionalRepeat = true;
+					previous = { ...now };
+				}
+				return {
+					worst,
+					worstKey,
+					arrived: Object.keys(b).every((key) => Math.abs(previous[key as 'figAX'] - b[key as 'figAX']) < 1e-9),
+					midBetween: Math.min(a.faceAX, b.faceAX) - 1e-9 <= midFaceX && midFaceX <= Math.max(a.faceAX, b.faceAX) + 1e-9,
+					fractionalRepeat
+				};
+			};
+			return { benchToBank: check(0, 4), tunnelToRadar: check(5, 7), dualToConstruction: check(2, 1) };
+		});
+		for (const [name, run] of Object.entries(result)) {
+			// 7.5 s quintic morph at 60 fps: at most ~0.42 % of the way per frame.
+			expect(run.worst, `${name} ${run.worstKey}`).toBeLessThan(0.006);
+			expect(run.arrived, name).toBe(true);
+			expect(run.midBetween, name).toBe(true);
+		}
+		// The strip bank grows through fractional strip counts the shader blends.
+		expect(result.benchToBank.fractionalRepeat).toBe(true);
+	});
+
+	test('conductor rails carry across a new source and resume after a remount', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const continuity = await import('/src/lib/visualizer/signal/continuity.ts');
+			const carry = new continuity.SignalCarry(5);
+			const dt = 1 / 60;
+			const seen: number[] = [];
+			for (let frame = 0; frame < 120; frame += 1) {
+				carry.advance(dt);
+				seen.push(carry.apply('channels', 3.6));
+			}
+			const passThrough = seen.every((value) => value === 3.6);
+			// New song: the rebuilt conductor starts its rails from intro values.
+			carry.rebase();
+			let worstStep = 0;
+			let previous = seen[seen.length - 1];
+			let atTwoSeconds = 0;
+			for (let frame = 0; frame < 60 * 6; frame += 1) {
+				carry.advance(dt);
+				const raw = 1 + Math.min(1, frame / 600) * 0.4;
+				const value = carry.apply('channels', raw);
+				worstStep = Math.max(worstStep, Math.abs(value - previous));
+				previous = value;
+				if (frame === 120) atTwoSeconds = value;
+			}
+			const settled = Math.abs(previous - (1 + Math.min(1, (60 * 6 - 1) / 600) * 0.4)) < 1e-9;
+			const memoryA = continuity.signalRendererMemory();
+			const memoryB = continuity.signalRendererMemory();
+			return {
+				passThrough,
+				worstStep,
+				atTwoSeconds,
+				settled,
+				active: carry.active,
+				sameMemory: memoryA === memoryB && memoryA.figure === memoryB.figure && memoryA.terrainRows === memoryB.terrainRows
+			};
+		});
+		expect(result.passThrough).toBe(true);
+		// A 2.6 drop in channels spread over five seconds, never in one frame.
+		expect(result.worstStep).toBeLessThan(0.03);
+		expect(result.atTwoSeconds).toBeGreaterThan(2);
+		expect(result.settled).toBe(true);
+		expect(result.active).toBe(false);
+		expect(result.sameMemory).toBe(true);
+	});
+
+	test('the horizon blends two bench rigs and ripples a new surface down its rows', async ({ page }) => {
+		await page.goto('/');
+		const source = await page.evaluate(async () => {
+			const shaders = await import('/src/lib/visualizer/signal/shaders.ts');
+			return shaders.SIGNAL_SCENE_WGSL;
+		});
+		expect(source).toContain('surfaceRig(0u)');
+		expect(source).toContain('surfaceRig(1u)');
+		expect(source).toContain('params.cameraB');
+		expect(source).toContain('fn surfaceMix(age: f32)');
+	});
+});

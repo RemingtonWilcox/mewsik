@@ -283,3 +283,295 @@ test.describe('Prism render foundations', () => {
 		expect(result.floats).toBe(24 + result.vecFields.length * 4);
 	});
 });
+
+// Prism never cuts: every discrete change is a crossfade, a morph or a
+// dissolve, and a new song or a remount carries the picture on.
+test.describe('Prism continuity', () => {
+	test('every discrete axis is crossfaded or morphed', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const continuity = await import('/src/lib/visualizer/prism/continuity.ts');
+			const choices = prism.PRISM_AXES.filter((axis: { kind: string }) => axis.kind === 'choice').map(
+				(axis: { name: string }) => axis.name
+			);
+			const covered = [...continuity.PRISM_FOLLOWED_CHOICES, ...continuity.PRISM_MORPHED_CHOICES];
+			const source = await (await fetch('/src/lib/components/visualizer/visualizer.svelte?raw')).text();
+			return { choices: choices.sort(), covered: [...covered].sort(), source };
+		});
+		expect(result.covered).toEqual(result.choices);
+		// The renderer reads followed axes through their followers, never raw.
+		expect(result.source).not.toMatch(/genome\.choice\('(palette|roles|guest|camera|beatForm|environment)'\)/);
+	});
+
+	test('a choice retargeted mid-fade never drops a half-shown option', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const { ChoiceFollower } = await import('/src/lib/visualizer/prism/continuity.ts');
+			const dt = 1 / 60;
+			const tau = 3;
+			const weights = (s: { from: number; to: number; mix: number }) => {
+				const w = [0, 0, 0, 0];
+				w[s.from] += 1 - s.mix;
+				w[s.to] += s.mix;
+				return w;
+			};
+			const follower = new ChoiceFollower(0);
+			// The genome target over time: 0 -> 1, then 2 while 1 is half in,
+			// then straight back to 1, then 3.
+			const plan: [number, number][] = [
+				[1, 60],
+				[2, 40],
+				[1, 30],
+				[3, 600]
+			];
+			let previous = weights(follower.state());
+			let maxStep = 0;
+			for (const [target, frames] of plan) {
+				for (let frame = 0; frame < frames; frame += 1) {
+					const now = weights(follower.update(target, tau, dt));
+					maxStep = Math.max(maxStep, ...now.map((value, index) => Math.abs(value - previous[index])));
+					previous = now;
+				}
+			}
+			// Reversal is exact: returning to the outgoing option mid-fade keeps the frame.
+			const reverse = new ChoiceFollower(0);
+			for (let i = 0; i < 50; i += 1) reverse.update(1, tau, dt);
+			const before = weights(reverse.state());
+			const after = weights(reverse.update(0, tau, 0));
+			return { maxStep, end: follower.state(), before, after };
+		});
+		// Smoothstep at the hurried rate peaks at 1.5 x 1.8 / (tau x 60) per frame.
+		expect(result.maxStep).toBeLessThan(0.02);
+		expect(result.end).toEqual({ from: 1, to: 3, mix: 1 });
+		result.before.forEach((value: number, index: number) => expect(result.after[index]).toBeCloseTo(value, 6));
+	});
+
+	test('the mosaic re-draft glides through phrase-clock jumps', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const { MosaicDraft } = await import('/src/lib/visualizer/prism/continuity.ts');
+			const draft = new MosaicDraft();
+			const dt = 1 / 60;
+			let maxStep = 0;
+			let previous = 0;
+			const sample = () => {
+				const position = draft.phrase + draft.mix;
+				maxStep = Math.max(maxStep, Math.abs(position - previous));
+				previous = position;
+			};
+			// Three natural 8-second phrases.
+			for (let phrase = 0; phrase < 3; phrase += 1) {
+				for (let frame = 0; frame < 480; frame += 1) {
+					draft.update(phrase, frame / 480, dt);
+					sample();
+				}
+			}
+			const natural = draft.phrase;
+			// A new song mid-phrase: the clock restarts at phrase 0, position 0.
+			for (let frame = 0; frame < 200; frame += 1) {
+				draft.update(3, 0.3 + frame / 2000, dt);
+				sample();
+			}
+			draft.continueSource();
+			for (let frame = 0; frame < 300; frame += 1) {
+				draft.update(0, frame / 1000, dt);
+				sample();
+			}
+			// A phrase position re-sync without an index change.
+			for (let frame = 0; frame < 120; frame += 1) {
+				draft.update(0, frame < 60 ? 0.95 : 0.1, dt);
+				sample();
+			}
+			return { maxStep, natural, final: draft.phrase };
+		});
+		expect(result.natural).toBeGreaterThanOrEqual(2);
+		expect(result.final).toBeGreaterThan(result.natural);
+		// Never more than a hair of a re-draft per frame at 60 fps.
+		expect(result.maxStep).toBeLessThan(0.03);
+	});
+
+	test('structure morphs start and end invisible and never jump a pixel', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const c = await import('/src/lib/visualizer/prism/continuity.ts');
+			const live = { petalWidth: 0.7, petalReach: 0.6, tracery: 0.5, cusp: 0.5, sprinkle: 0.5 };
+			const structure = (grammar: number) => ({
+				grammar,
+				fold: prism.prismFold(grammar, 2),
+				mosaic: 1,
+				cellScale: 18,
+				tiers: 0.5,
+				outline: 0
+			});
+			const morph = new c.StructureMorph(structure(0), 'verse', live, 1234);
+			const dt = 1 / 60;
+			const radii = [0, 0.3, 0.8, 1, 1.6, 2.2, 3.2];
+			const keys = [0, 0.25, 0.5, 0.75, 1];
+			const weightsNow = () => {
+				const { front, globalMix } = morph.uniforms();
+				return radii.flatMap((rn) =>
+					keys.map((key) => (morph.morphing ? c.prismMorphWeight(front, rn, key, globalMix) : 1))
+				);
+			};
+			morph.update(structure(4), 'verse', live, dt);
+			const started = morph.morphing;
+			const first = weightsNow();
+			const saltChanged = morph.a.salt !== morph.b.salt;
+			let previous = first;
+			let maxStep = 0;
+			let frames = 0;
+			let queuedWaited = true;
+			let endedOnB = false;
+			let nextFromB = false;
+			while (frames < 2000) {
+				const bBefore = JSON.stringify({ ...morph.b, petalWidth: 0, petalReach: 0, outerLit: 0 });
+				// A third structure arrives mid-morph: it must wait its turn.
+				morph.update(structure(frames > 30 ? 6 : 4), 'verse', live, dt);
+				frames += 1;
+				if (morph.serial !== 1) {
+					// The first morph finished and the queued one began on the same
+					// frame: it starts from the window that was on screen.
+					nextFromB = JSON.stringify({ ...morph.a, petalWidth: 0, petalReach: 0, outerLit: 0 }) === bBefore;
+					endedOnB = Math.min(...previous) > 0.999;
+					break;
+				}
+				if (morph.b.grammar !== 4) queuedWaited = false;
+				const now = weightsNow();
+				maxStep = Math.max(maxStep, ...now.map((value, index) => Math.abs(value - previous[index])));
+				previous = now;
+			}
+			return {
+				started,
+				first: Math.max(...first),
+				last: Math.min(...previous),
+				maxStep,
+				seconds: frames * dt,
+				saltChanged,
+				queuedWaited,
+				endedOnB,
+				nextFromB,
+				nextStarted: morph.morphing && morph.b.grammar === 6 && Math.max(...weightsNow()) === 0
+			};
+		});
+		expect(result.started).toBe(true);
+		expect(result.first).toBe(0);
+		expect(result.last).toBeGreaterThan(0.999);
+		// No pixel crosses more than a few percent of the way in one frame.
+		expect(result.maxStep).toBeLessThan(0.06);
+		expect(result.seconds).toBeGreaterThan(2.5);
+		expect(result.seconds).toBeLessThan(5);
+		expect(result.saltChanged).toBe(true);
+		expect(result.queuedWaited).toBe(true);
+		expect(result.endedOnB).toBe(true);
+		expect(result.nextFromB).toBe(true);
+		expect(result.nextStarted).toBe(true);
+	});
+
+	test('the rose turn, clock and camera side carry through a source reset', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const { PrismMotion } = await import('/src/lib/visualizer/prism/continuity.ts');
+			const motion = new PrismMotion(0.8);
+			const dt = 1 / 60;
+			let trace = 0;
+			let maxTurn = 0;
+			let maxClockStep = 0;
+			let rotation = motion.rotation;
+			let clock = motion.clock;
+			for (let frame = 0; frame < 1200; frame += 1) {
+				trace += dt * 0.2;
+				if (frame === 600) {
+					// The next song: the shared trace phase restarts, the turn preference flips.
+					trace = 0;
+					motion.continueSource(0.2);
+				}
+				motion.update({ tracePhase: trace, dt, motion: 1, energy: 0.6, silence: 0 });
+				maxTurn = Math.max(maxTurn, Math.abs(motion.rotation - rotation));
+				maxClockStep = Math.max(maxClockStep, motion.clock - clock);
+				rotation = motion.rotation;
+				clock = motion.clock;
+			}
+			const sides = Array.from({ length: 201 }, (_, i) => -1 + i / 100);
+			const yaws = sides.map((side) => prism.prismCameraRegime(1, side, 0.3, 0, 0).yaw);
+			const yawStep = Math.max(...yaws.slice(1).map((yaw: number, i: number) => Math.abs(yaw - yaws[i])));
+			return { maxTurn, maxClockStep, clock: motion.clock, turn: motion.turn, yawStep };
+		});
+		expect(result.maxTurn).toBeLessThan(0.002);
+		expect(result.maxClockStep).toBeLessThan(0.02);
+		expect(result.clock).toBeCloseTo(20, 1);
+		// The turn eases toward the new song's direction instead of flipping.
+		expect(result.turn).toBeLessThan(1);
+		expect(result.turn).toBeGreaterThan(-1);
+		// Receding camera: the side swings through square-on, no flip at zero.
+		expect(result.yawStep).toBeLessThan(0.05);
+	});
+
+	test('a new source keeps the composition and a remount resumes it', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const c = await import('/src/lib/visualizer/prism/continuity.ts');
+			const { VariationGenome } = await import('/src/lib/visualizer/variation.ts');
+			type Run = {
+				motion: InstanceType<typeof c.PrismMotion>;
+				draft: InstanceType<typeof c.MosaicDraft>;
+				morph: InstanceType<typeof c.StructureMorph>;
+				resyncBeat: boolean;
+			};
+			const state = { genome: new VariationGenome(prism.PRISM_AXES, 0.5), epoch: -1, run: null as Run | null };
+			let creates = 0;
+			const create = (): Run => {
+				creates += 1;
+				return {
+					motion: new c.PrismMotion(0.3),
+					draft: new c.MosaicDraft(),
+					morph: new c.StructureMorph(
+						prism.prismStructure(state.genome, 'verse'),
+						'verse',
+						prism.prismLive(state.genome),
+						99
+					),
+					resyncBeat: false
+				};
+			};
+			const step = (phraseIndex: number, section: string) => {
+				const run = state.run!;
+				state.genome.advance({ phraseIndex, sectionKey: section, energy: 0.6, dt: 1 / 30 });
+				run.morph.update(prism.prismStructure(state.genome, 'verse'), 'verse', prism.prismLive(state.genome), 1 / 30);
+				run.draft.update(phraseIndex, 0.5, 1 / 30);
+			};
+			const first = c.prismEnterSource(state, 1, 0.3, create);
+			for (let phrase = 0; phrase < 20; phrase += 1) for (let f = 0; f < 60; f += 1) step(phrase, `s${phrase >> 2}`);
+			const shown = () => `${prism.prismStructureKey(state.run!.morph.b)}:${state.run!.morph.b.salt}`;
+			const before = { b: shown(), draft: state.run!.draft.phrase };
+			const runBefore = state.run;
+			const second = c.prismEnterSource(state, 2, 0.9, create);
+			// The new song's first frame: its phrase clock restarts at zero.
+			step(0, 'intro');
+			const after = { b: shown(), draft: state.run!.draft.phrase };
+			const resync = state.run!.resyncBeat;
+			const third = c.prismEnterSource(state, 2, 0.9, create);
+			return {
+				first,
+				second,
+				third,
+				creates,
+				sameRun: runBefore === state.run,
+				keptStructure: before.b === after.b,
+				keptDraft: before.draft === after.draft,
+				resync
+			};
+		});
+		expect(result.first).toBe('reset');
+		expect(result.second).toBe('continue');
+		expect(result.third).toBe('resume');
+		expect(result.creates).toBe(1);
+		expect(result.sameRun).toBe(true);
+		expect(result.keptStructure).toBe(true);
+		expect(result.keptDraft).toBe(true);
+		expect(result.resync).toBe(true);
+	});
+});

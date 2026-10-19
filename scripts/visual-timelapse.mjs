@@ -10,6 +10,8 @@
 //   VIS_PROFILE  first track profile               (default club128)
 //   VIS_MINUTES  how long to run                   (default 4)
 //   VIS_EVERY    seconds between frames            (default 8)
+//   VIS_NEW_SOURCE=1  every track is a new source, like songs in the app
+//                (default: tracks continue one source, like a radio stream)
 //   VIS_BASE_URL dev server                        (default http://127.0.0.1:5173)
 //                Use a separate, non-watching server when other people or
 //                agents are editing files: HMR reloads restart the lab and
@@ -67,7 +69,7 @@ try {
 		loads += 1;
 		if (loads > 1) console.warn(`WARNING: page reloaded (${loads - 1}x); frames after this restarted the song and genome`);
 	});
-	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&seed=${seed}&song=1&chrome=0`);
+	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&seed=${seed}&song=1${process.env.VIS_NEW_SOURCE === '1' ? '&newsource=1' : ''}&chrome=0`);
 	await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 20_000 });
 	await page.waitForFunction(
 		([labelText, attribute]) => {

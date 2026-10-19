@@ -372,7 +372,9 @@ test('an up-to-date release stays quiet and only rechecks on explicit request', 
 	await page.goto('/settings');
 
 	const updateCard = page.getByTestId('app-updates');
-	await expect(updateCard.getByText('You’re up to date')).toBeVisible();
+	// The settings route can compile cold on a slow CI runner; give the first
+	// render the same allowance the other route-entry checks get.
+	await expect(updateCard.getByText('You’re up to date')).toBeVisible({ timeout: 15_000 });
 	await expect(page.getByTestId('update-available-notice')).toHaveCount(0);
 	await expect(updateCommands(page)).resolves.toEqual([
 		'get_release_runtime_info',

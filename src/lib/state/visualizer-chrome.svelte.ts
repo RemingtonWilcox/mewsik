@@ -1,29 +1,18 @@
-export const VISUALIZER_CHROME_IDLE_MS = 2200;
-
-export type VisualizerChromeMode = 'auto' | 'locked-hidden';
-export type VisualizerChromeHold =
-	| 'engine-pointer'
-	| 'engine-focus'
-	| 'player-pointer'
-	| 'player-focus'
-	| 'player-drag'
-	| 'details';
-
-const TRANSIENT_HOLDS = new Set<VisualizerChromeHold>([
-	'engine-pointer',
-	'engine-focus',
-	'player-pointer',
-	'player-focus',
-	'player-drag'
-]);
+export const VISUALIZER_CHROME_IDLE_MS = 2400;
 
 /**
- * One visibility clock for every control surface over the visualizer.
- *
- * `locked-hidden` is deliberately different from ordinary idle hiding: mouse
- * movement cannot undo an explicit Hide action. It takes another explicit
- * action (H, I, or a stage click) to return to automatic behavior.
+ * `auto`: chrome shows on activity and fades after a short idle.
+ * `locked-hidden`: the listener asked for a clean picture (H or the Hide
+ * button). Activity cannot bring chrome back; only another explicit action
+ * (H again, a tap/click on the picture, or Tab) does.
  */
+export type VisualizerChromeMode = 'auto' | 'locked-hidden';
+
+/** Reasons the chrome must not idle out: a pointer resting on a control
+ * surface, or keyboard focus inside the controls. */
+export type VisualizerChromeHold = 'engines-pointer' | 'playback-pointer' | 'focus';
+
+/** One visibility clock for every control drawn over the visualizer. */
 class VisualizerChromeState {
 	visible = $state(true);
 	mode = $state<VisualizerChromeMode>('auto');
@@ -38,19 +27,16 @@ class VisualizerChromeState {
 		this.hideTimer = null;
 	}
 
-	private scheduleHide(delay = VISUALIZER_CHROME_IDLE_MS) {
+	private scheduleHide() {
 		this.clearTimer();
 		if (!this.active || this.mode === 'locked-hidden' || this.holds.size > 0) return;
 		this.hideTimer = setTimeout(() => {
 			this.hideTimer = null;
-			if (this.active && this.mode === 'auto' && this.holds.size === 0) {
-				this.visible = false;
-			}
-		}, delay);
+			if (this.active && this.mode === 'auto' && this.holds.size === 0) this.visible = false;
+		}, VISUALIZER_CHROME_IDLE_MS);
 	}
 
 	activate() {
-		this.clearTimer();
 		this.holds.clear();
 		this.active = true;
 		this.mode = 'auto';
@@ -63,15 +49,44 @@ class VisualizerChromeState {
 		this.holds.clear();
 		this.active = false;
 		this.mode = 'auto';
-		// Outside the visualizer, the normal player bar is always present.
 		this.visible = true;
 	}
 
-	/** Wake automatic chrome. Intentionally does nothing after a manual hide. */
+	/** Activity: show and restart the idle clock. Ignored while locked. */
 	wake() {
 		if (!this.active || this.mode === 'locked-hidden') return;
 		this.visible = true;
 		this.scheduleHide();
+	}
+
+	/** Hide now but stay automatic, so the next activity brings chrome back. */
+	dismiss() {
+		if (!this.active || this.mode === 'locked-hidden') return;
+		this.clearTimer();
+		this.holds.clear();
+		this.visible = false;
+	}
+
+	/** Hide and stay hidden until an explicit reveal. */
+	lock() {
+		if (!this.active) return;
+		this.clearTimer();
+		this.holds.clear();
+		this.mode = 'locked-hidden';
+		this.visible = false;
+	}
+
+	/** Explicitly show, leaving any lock. */
+	reveal() {
+		if (!this.active) return;
+		this.mode = 'auto';
+		this.visible = true;
+		this.scheduleHide();
+	}
+
+	toggleLock() {
+		if (this.mode === 'locked-hidden' || !this.visible) this.reveal();
+		else this.lock();
 	}
 
 	setHold(hold: VisualizerChromeHold, held: boolean) {
@@ -83,31 +98,15 @@ class VisualizerChromeState {
 			this.clearTimer();
 			return;
 		}
-
-		this.holds.delete(hold);
+		if (!this.holds.delete(hold)) return;
 		this.scheduleHide();
 	}
 
-	lockHidden() {
-		if (!this.active) return;
-		this.clearTimer();
-		this.holds.clear();
-		this.mode = 'locked-hidden';
-		this.visible = false;
-	}
-
-	revealExplicitly() {
-		if (!this.active) return;
-		this.mode = 'auto';
-		this.visible = true;
-		this.scheduleHide();
-	}
-
-	/** Hide when the app loses focus without treating focus return as activity. */
+	/** The window lost focus: fade without counting the return as activity. */
 	blur() {
 		if (!this.active) return;
 		this.clearTimer();
-		for (const hold of TRANSIENT_HOLDS) this.holds.delete(hold);
+		this.holds.clear();
 		if (this.mode === 'auto') this.visible = false;
 	}
 }

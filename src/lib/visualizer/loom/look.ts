@@ -12,6 +12,12 @@
 // `LoomLookFrame` is one reused object the renderer packs into uniforms.
 
 import { VariationGenome, variationSpaceSize, type VariationAxis } from '$lib/visualizer/variation';
+import {
+	createLoomExposure,
+	resolveLoomExposure,
+	type LoomExposure,
+	type LoomExposureInput
+} from '$lib/visualizer/loom/exposure';
 
 // ---------------------------------------------------------------------------
 // Topology grammars. Each is a parametric surface the strands are laid on (see
@@ -23,22 +29,28 @@ export type LoomGrammar = {
 	strands: readonly [number, number];
 	/** Overall framing scale for this grammar. */
 	scale: number;
+	/**
+	 * 0..1 how crowded the grammar reads at full strand count. Feeds the light
+	 * budget (exposure.ts): dense grammars get thinner, quieter chorus strands,
+	 * shorter trails and less bloom so the figure never dissolves into a blob.
+	 */
+	density: number;
 };
 
 export const LOOM_GRAMMARS: readonly LoomGrammar[] = [
-	{ name: 'ribbon', strands: [0, 0.3], scale: 1 },
-	{ name: 'canopy', strands: [0.55, 1], scale: 0.84 },
-	{ name: 'tunnel', strands: [0.6, 1], scale: 0.8 },
-	{ name: 'helix-tower', strands: [0.25, 0.75], scale: 0.88 },
-	{ name: 'mobius', strands: [0.45, 1], scale: 0.86 },
-	{ name: 'peacock', strands: [0.6, 1], scale: 0.86 },
-	{ name: 'braid', strands: [0, 0.5], scale: 0.88 },
-	{ name: 'string-hyperboloid', strands: [0.65, 1], scale: 0.86 },
-	{ name: 'saddle-lattice', strands: [0.6, 1], scale: 0.84 },
-	{ name: 'thread-galaxy', strands: [0.5, 1], scale: 0.72 },
-	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9 },
-	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86 },
-	{ name: 'aurora-curtain', strands: [0.65, 1], scale: 0.8 }
+	{ name: 'ribbon', strands: [0, 0.3], scale: 1, density: 0.35 },
+	{ name: 'canopy', strands: [0.4, 0.85], scale: 0.82, density: 0.85 },
+	{ name: 'tunnel', strands: [0.4, 0.85], scale: 0.78, density: 0.95 },
+	{ name: 'helix-tower', strands: [0.25, 0.7], scale: 0.88, density: 0.55 },
+	{ name: 'mobius', strands: [0.4, 0.9], scale: 0.86, density: 0.6 },
+	{ name: 'peacock', strands: [0.45, 0.9], scale: 0.86, density: 0.7 },
+	{ name: 'braid', strands: [0, 0.5], scale: 0.88, density: 0.45 },
+	{ name: 'string-hyperboloid', strands: [0.5, 0.9], scale: 0.84, density: 0.75 },
+	{ name: 'saddle-lattice', strands: [0.45, 0.9], scale: 0.82, density: 0.8 },
+	{ name: 'thread-galaxy', strands: [0.35, 0.8], scale: 0.72, density: 0.9 },
+	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9, density: 0.45 },
+	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86, density: 0.55 },
+	{ name: 'aurora-curtain', strands: [0.45, 0.85], scale: 0.8, density: 0.85 }
 ];
 
 // ---------------------------------------------------------------------------
@@ -218,15 +230,70 @@ export const LOOM_THICKNESS = [
 ] as const;
 
 // ---------------------------------------------------------------------------
+// Tones: the value structure of a scene, which is what the eye reads first.
+// Palettes alone all read as saturated neon on a dark room; tones change how
+// light sits in the frame (light on dark, matte sculpture, ink on paper,
+// monochrome, mid-key dusk) so scenes differ before any colour is read.
+
+export type LoomTone = {
+	name: string;
+	/** Multiplies the fibre emission (glow vs lit surface). */
+	emission: number;
+	/** Multiplies the key/fill diffuse light (matte tones are lit, not glowing). */
+	diffuse: number;
+	/** 0 light on dark .. 1 ink on a pale paper room (dark on light). */
+	paper: number;
+	/** Lifts the room toward a mid-key haze. */
+	room: number;
+	/** Collapses the palette onto the hero hue in value steps. */
+	mono: number;
+	/** Bloom weight multiplier. */
+	bloom: number;
+	/** Feedback trail offset (negative = shorter). */
+	trail: number;
+};
+
+export const LOOM_TONES: readonly LoomTone[] = [
+	{ name: 'glow', emission: 1, diffuse: 1, paper: 0, room: 0, mono: 0, bloom: 1, trail: 0 },
+	{ name: 'graphic', emission: 0.4, diffuse: 1.8, paper: 0, room: 0, mono: 0, bloom: 0.3, trail: -0.07 },
+	{ name: 'ink', emission: 0.1, diffuse: 1.1, paper: 1, room: 0, mono: 0, bloom: 0.1, trail: -0.04 },
+	{ name: 'mono', emission: 0.78, diffuse: 1.15, paper: 0, room: 0, mono: 1, bloom: 0.75, trail: 0 },
+	{ name: 'dusk', emission: 0.5, diffuse: 1.25, paper: 0, room: 1, mono: 0, bloom: 0.5, trail: -0.03 }
+];
+
+/** Tone pick weights by musical energy: loud passages glow, quiet ones draw. */
+export function loomToneWeights(energy: number, out: number[] = []): number[] {
+	const e = clamp01(energy);
+	out[0] = 1.2 + e * 2.6; // glow
+	out[1] = 1.3 - e * 0.5; // graphic
+	out[2] = Math.max(0.15, 1.25 - e * 1.3); // ink
+	out[3] = 0.9 + e * 0.3; // mono
+	out[4] = Math.max(0.2, 1.2 - e * 0.9); // dusk
+	return out;
+}
+
+// Compositions: where the figure sits and how much negative space it gets.
+export type LoomComposition = { name: string; scale: number; shiftX: number; shiftY: number };
+
+export const LOOM_COMPOSITIONS: readonly LoomComposition[] = [
+	{ name: 'centre', scale: 1, shiftX: 0, shiftY: 0 },
+	{ name: 'left-third', scale: 0.8, shiftX: -0.2, shiftY: 0.02 },
+	{ name: 'right-third', scale: 0.8, shiftX: 0.2, shiftY: -0.02 },
+	{ name: 'monument', scale: 1.12, shiftX: 0, shiftY: -0.05 },
+	{ name: 'small-in-space', scale: 0.72, shiftX: 0.1, shiftY: 0.08 },
+	{ name: 'high-horizon', scale: 0.86, shiftX: -0.06, shiftY: -0.12 }
+];
+
+// ---------------------------------------------------------------------------
 // The genome.
 
 export const LOOM_LOOK_AXES: readonly VariationAxis[] = [
-	{ kind: 'choice', name: 'grammar', options: LOOM_GRAMMARS.length, scale: 'section', chance: 0.85, memory: 6, tau: 3.2 },
+	{ kind: 'choice', name: 'grammar', options: LOOM_GRAMMARS.length, scale: 'section', chance: 0.85, memory: 6, maxHold: 2, tau: 3.6 },
 	{ kind: 'choice', name: 'palette', options: LOOM_PALETTES.length, scale: 'section', chance: 0.8, memory: 12, maxHold: 2, tau: 4.5 },
 	{ kind: 'choice', name: 'roles', options: LOOM_ROLE_ORDERS.length, scale: 'phrase', chance: 0.2, memory: 2, tau: 3.5 },
-	{ kind: 'choice', name: 'camera', options: LOOM_CAMERAS.length, scale: 'phrase', chance: 0.42, memory: 3, tau: 4.5 },
-	{ kind: 'choice', name: 'material', options: LOOM_MATERIALS.length, scale: 'section', chance: 0.45, memory: 3, tau: 3.5 },
-	{ kind: 'choice', name: 'environment', options: LOOM_ENVIRONMENTS.length, scale: 'era', chance: 1, memory: 3, tau: 6 },
+	{ kind: 'choice', name: 'camera', options: LOOM_CAMERAS.length, scale: 'phrase', chance: 0.5, memory: 3, maxHold: 3, tau: 4.5 },
+	{ kind: 'choice', name: 'material', options: LOOM_MATERIALS.length, scale: 'section', chance: 0.55, memory: 3, maxHold: 2, tau: 3.5 },
+	{ kind: 'choice', name: 'environment', options: LOOM_ENVIRONMENTS.length, scale: 'section', chance: 0.4, memory: 3, maxHold: 3, tau: 6 },
 	{ kind: 'choice', name: 'beatForm', options: LOOM_BEAT_FORMS.length, scale: 'section', chance: 0.55, memory: 2, tau: 2 },
 	{ kind: 'choice', name: 'thickness', options: LOOM_THICKNESS.length, scale: 'phrase', chance: 0.25, memory: 2, tau: 3 },
 	{ kind: 'continuous', name: 'twist', min: -1, max: 1, scale: 'phrase', step: 0.3, chance: 0.7, tau: 4 },
@@ -243,7 +310,10 @@ export const LOOM_LOOK_AXES: readonly VariationAxis[] = [
 	{ kind: 'continuous', name: 'trail', min: 0, max: 1, scale: 'era', step: 0.35, tau: 6 },
 	{ kind: 'continuous', name: 'bloom', min: 0, max: 1, scale: 'section', step: 0.3, tau: 4 },
 	{ kind: 'continuous', name: 'drift', min: -1, max: 1, scale: 'section', step: 0.4, chance: 0.5, tau: 5 },
-	{ kind: 'continuous', name: 'vivid', min: 0, max: 1, scale: 'era', step: 0.35, tau: 6 }
+	{ kind: 'continuous', name: 'vivid', min: 0, max: 1, scale: 'era', step: 0.35, tau: 6 },
+	// Appended axes keep every earlier axis's seeded walk unchanged.
+	{ kind: 'choice', name: 'tone', options: LOOM_TONES.length, scale: 'section', chance: 0.5, memory: 1, maxHold: 3, tau: 10 },
+	{ kind: 'choice', name: 'composition', options: LOOM_COMPOSITIONS.length, scale: 'phrase', chance: 0.3, memory: 2, maxHold: 5, tau: 5 }
 ];
 
 export const LOOM_LOOK_SPACE_SIZE = variationSpaceSize(LOOM_LOOK_AXES);
@@ -263,6 +333,73 @@ const SECTION_ORDER = [
 ];
 
 // ---------------------------------------------------------------------------
+// Continuity: a choice crossfade that can never snap.
+//
+// The genome retargets a choice axis from wherever its own crossfade got to
+// (`from = mix >= 0.5 ? to : from`), which lands as a jump when two boundaries
+// fall inside one crossfade (a short section, a track change, a relabel).
+// Loom keeps its own morph per axis instead: a morph in flight always
+// finishes (faster when a newer target is waiting) and the next morph starts
+// exactly where the last one ended, so the shader only ever blends two
+// neighbouring states and every value is continuous.
+
+export type LoomChoiceView = { from: number; to: number; mix: number };
+
+export class LoomChoiceMorph {
+	from: number;
+	to: number;
+	private progress = 1;
+	readonly view: LoomChoiceView;
+
+	constructor(
+		readonly tau: number,
+		initial = 0,
+		/** Speed-up while a newer target is queued behind the current morph. */
+		readonly rush = 2.4
+	) {
+		this.from = initial;
+		this.to = initial;
+		this.view = { from: initial, to: initial, mix: 1 };
+	}
+
+	/** True while a morph is in flight. */
+	get moving(): boolean {
+		return this.progress < 1;
+	}
+
+	/** Jump straight to a state (first frame only: nothing is on screen yet). */
+	snap(option: number): LoomChoiceView {
+		this.from = option;
+		this.to = option;
+		this.progress = 1;
+		return this.write();
+	}
+
+	update(target: number, dtSeconds: number): LoomChoiceView {
+		const dt = Math.max(0, Math.min(0.5, Number.isFinite(dtSeconds) ? dtSeconds : 0));
+		if (this.progress >= 1 && target !== this.to) {
+			this.from = this.to;
+			this.to = target;
+			this.progress = 0;
+		}
+		if (this.progress < 1) {
+			const rate = (1 / Math.max(0.05, this.tau)) * (target !== this.to ? this.rush : 1);
+			this.progress = Math.min(1, this.progress + dt * rate);
+			if (this.progress >= 1) this.from = this.to;
+		}
+		return this.write();
+	}
+
+	private write(): LoomChoiceView {
+		const p = this.progress;
+		this.view.from = this.from;
+		this.view.to = this.to;
+		this.view.mix = p >= 1 ? 1 : p * p * (3 - 2 * p);
+		return this.view;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Resolved frame.
 
 export type LoomLookFrame = {
@@ -270,6 +407,8 @@ export type LoomLookFrame = {
 	grammarTo: number;
 	grammarMix: number;
 	strandCount: number;
+	/** 0..1 crowding of the current grammar, blended across a morph. */
+	density: number;
 	twist: number;
 	crossings: number;
 	spread: number;
@@ -309,6 +448,18 @@ export type LoomLookFrame = {
 	trail: number;
 	bloom: number;
 	drift: number;
+	/** Tone coefficients (LOOM_TONES), crossfaded. */
+	toneEmission: number;
+	toneDiffuse: number;
+	tonePaper: number;
+	toneRoom: number;
+	toneMono: number;
+	toneBloom: number;
+	toneTrail: number;
+	/** Light budget resolved from everything above (exposure.ts). */
+	exposure: LoomExposure;
+	/** Stable per-journey identity in 0..1 (see LoomLook.identitySeed). */
+	identity: number;
 	/** Diagnostics / QA. */
 	names: {
 		grammar: string;
@@ -317,6 +468,8 @@ export type LoomLookFrame = {
 		material: string;
 		environment: string;
 		beatForm: string;
+		tone: string;
+		composition: string;
 	};
 	paletteIndex: number;
 	cameraIndex: number;
@@ -333,10 +486,22 @@ export type LoomLookContext = {
 	dt: number;
 };
 
+const CHOICE_AXES = [
+	'grammar',
+	'palette',
+	'roles',
+	'camera',
+	'material',
+	'environment',
+	'beatForm',
+	'thickness',
+	'tone',
+	'composition'
+] as const;
+type LoomChoiceAxis = (typeof CHOICE_AXES)[number];
+
 /** Optional QA override: pin choice axes to a specific option. */
-export type LoomLookOverride = Partial<
-	Record<'grammar' | 'palette' | 'roles' | 'camera' | 'material' | 'environment' | 'beatForm' | 'thickness', number>
->;
+export type LoomLookOverride = Partial<Record<LoomChoiceAxis, number>>;
 
 type Rgb = [number, number, number];
 
@@ -386,8 +551,22 @@ function hashUnit(a: number, b: number): number {
 	return (h >>> 0) / 0x100000000;
 }
 
+function seedUnit(seed: number | string): number {
+	if (typeof seed === 'number') {
+		if (!Number.isFinite(seed)) return 0.5;
+		return seed - Math.floor(seed);
+	}
+	let h = 0x811c9dc5;
+	for (const char of seed) {
+		h ^= char.codePointAt(0) ?? 0;
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}
+	return h / 0x100000000;
+}
+
 const NUMERIC_KEYS = [
 	'strandCount',
+	'density',
 	'twist',
 	'crossings',
 	'spread',
@@ -415,7 +594,14 @@ const NUMERIC_KEYS = [
 	'fillLevel',
 	'trail',
 	'bloom',
-	'drift'
+	'drift',
+	'toneEmission',
+	'toneDiffuse',
+	'tonePaper',
+	'toneRoom',
+	'toneMono',
+	'toneBloom',
+	'toneTrail'
 ] as const satisfies readonly (keyof LoomLookFrame)[];
 
 const MATERIAL_KEYS = Object.keys(LOOM_MATERIALS[0]).filter((k) => k !== 'name') as Array<
@@ -424,6 +610,7 @@ const MATERIAL_KEYS = Object.keys(LOOM_MATERIALS[0]).filter((k) => k !== 'name')
 const ENV_KEYS = Object.keys(LOOM_ENVIRONMENTS[0]).filter((k) => k !== 'name') as Array<
 	keyof Omit<LoomEnvironment, 'name'>
 >;
+const COLOUR_KEYS = ['hero', 'support', 'weft', 'deep', 'haze', 'glow'] as const;
 
 function emptyFrame(): LoomLookFrame {
 	const material = Object.fromEntries(MATERIAL_KEYS.map((k) => [k, LOOM_MATERIALS[0][k]])) as LoomLookFrame['material'];
@@ -433,6 +620,7 @@ function emptyFrame(): LoomLookFrame {
 		grammarTo: 0,
 		grammarMix: 1,
 		strandCount: 0,
+		density: LOOM_GRAMMARS[0].density,
 		twist: 0,
 		crossings: 0.5,
 		spread: 0.5,
@@ -471,20 +659,29 @@ function emptyFrame(): LoomLookFrame {
 		trail: 0,
 		bloom: 0,
 		drift: 0,
+		toneEmission: 1,
+		toneDiffuse: 1,
+		tonePaper: 0,
+		toneRoom: 0,
+		toneMono: 0,
+		toneBloom: 1,
+		toneTrail: 0,
+		exposure: createLoomExposure(),
+		identity: 0.5,
 		names: {
 			grammar: LOOM_GRAMMARS[0].name,
 			palette: LOOM_PALETTES[0].name,
 			camera: LOOM_CAMERAS[0].name,
 			material: LOOM_MATERIALS[0].name,
 			environment: LOOM_ENVIRONMENTS[0].name,
-			beatForm: LOOM_BEAT_FORMS[0]
+			beatForm: LOOM_BEAT_FORMS[0],
+			tone: LOOM_TONES[0].name,
+			composition: LOOM_COMPOSITIONS[0].name
 		},
 		paletteIndex: 0,
 		cameraIndex: 0
 	};
 }
-
-type ChoiceView = { from: number; to: number; mix: number };
 
 let globalOverride: LoomLookOverride | null = null;
 
@@ -496,45 +693,95 @@ export function setLoomLookOverride(override: LoomLookOverride | null): void {
 	globalOverride = override;
 }
 
+/** Conductor rails carried from one song to the next (see LoomConductor). */
+export type LoomRailCarry = { valid: boolean; readonly data: Float64Array };
+
 /**
- * Long-listen look for Loom. One instance lives in the Loom conductor (and so
- * in the shared journey), surviving renderer remounts and resetting only on a
- * real source change.
+ * Long-listen look for Loom. One instance lives in the shared journey, so it
+ * survives renderer remounts and carries the picture across songs: a hard
+ * reset happens only for a new journey.
  */
 export class LoomLook {
 	readonly genome: VariationGenome;
 	private warmed = false;
-	/** Palette mapping latched the moment a raw palette option became a target. */
-	private readonly paletteMap = new Map<number, number>();
-	private lastPaletteTarget = -1;
 	private orbit = 0;
 	private smoothedReady = false;
+	private identity = 0.5;
+	private readonly morphs: Record<LoomChoiceAxis, LoomChoiceMorph>;
+	/** Raw genome palette option last seen, and the family it was latched to. */
+	private paletteRaw = -1;
+	private paletteTarget = 0;
+	private readonly toneWeights: number[] = [];
 	private readonly target = emptyFrame();
 	readonly frame = emptyFrame();
 	private readonly scratch: Rgb = [0, 0, 0];
+	private readonly exposureInput: LoomExposureInput;
+	/**
+	 * The conductor's slow rails at the end of the previous song, so a new
+	 * song's conductor starts exactly where the picture is instead of at its
+	 * intro defaults (that restart was the track-change jump cut).
+	 */
+	readonly carry: LoomRailCarry = { valid: false, data: new Float64Array(40) };
 
 	constructor(seed: number | string = 0) {
 		this.genome = new VariationGenome(LOOM_LOOK_AXES, seed);
+		const tauOf = (name: string) =>
+			LOOM_LOOK_AXES.find((axis) => axis.name === name)?.tau ?? 3;
+		this.morphs = Object.fromEntries(
+			// A tone change relights the whole room (dark on light and back), so
+			// a queued tone never rushes the one in flight much.
+			CHOICE_AXES.map((name) => [name, new LoomChoiceMorph(tauOf(name), 0, name === 'tone' ? 1.3 : 2.4)])
+		) as Record<LoomChoiceAxis, LoomChoiceMorph>;
+		const f = this.frame;
+		this.exposureInput = {
+			hero: f.hero,
+			support: f.support,
+			weft: f.weft,
+			haze: f.haze,
+			glow: f.glow,
+			material: f.material,
+			density: 0,
+			strandCount: 0,
+			tone: { emission: 1, paper: 0, room: 0, bloom: 1, trail: 0 },
+			env: f.env
+		};
 		this.reset(seed);
+	}
+
+	/**
+	 * Stable per-journey identity in 0..1 (the seed of the last hard reset).
+	 * The renderer hashes per-strand detail from it, so it must not change on a
+	 * new song: a new hash would re-roll every strand at once.
+	 */
+	get identitySeed(): number {
+		return this.identity;
+	}
+
+	/** Carry the current look into a new source: only future mutations change. */
+	continueWith(seed: number | string): void {
+		this.genome.reseed(seed);
 	}
 
 	reset(seed: number | string): void {
 		this.genome.reset(seed);
+		this.identity = seedUnit(seed);
 		this.warmed = false;
-		this.paletteMap.clear();
-		this.lastPaletteTarget = -1;
+		this.paletteRaw = -1;
 		this.orbit = 0;
 		this.smoothedReady = false;
+		this.carry.valid = false;
 	}
 
 	/** Advance on one conductor tick and resolve the frame. */
 	advance(context: LoomLookContext, override?: LoomLookOverride | null): Readonly<LoomLookFrame> {
 		const energy = clamp01(context.energy);
+		let first = false;
 		if (!this.warmed) {
 			// Give each opening section its own look: walk the genome through a
 			// few virtual section boundaries, then settle so the first frame
 			// already shows the result instead of gliding in from the seed state.
 			this.warmed = true;
+			first = true;
 			const ordinal = Math.max(0, SECTION_ORDER.indexOf(context.sectionKey.split(':')[0]));
 			const steps = 1 + ordinal;
 			for (let i = 0; i < steps; i += 1) {
@@ -550,23 +797,34 @@ export class LoomLook {
 			});
 			this.genome.settle();
 		}
+		// Quiet passages lean toward drawn tones, loud ones toward glow. Weights
+		// only bias the next pick, so they never move the current scene.
+		this.genome.setWeights('tone', loomToneWeights(energy, this.toneWeights));
 		this.genome.advance({
 			phraseIndex: context.phraseIndex,
 			sectionKey: context.sectionKey,
 			energy,
 			dt: context.dt
 		});
-		this.resolve(this.target, context, override ?? globalOverride);
+		this.resolve(this.target, context, override ?? globalOverride, first);
 		this.smooth(context.dt);
+		this.budget();
+		this.frame.identity = this.identity;
 		return this.frame;
 	}
 
-	private choice(name: string, override: LoomLookOverride | null): ChoiceView {
-		const pinned = override?.[name as keyof LoomLookOverride];
-		if (pinned !== undefined && Number.isFinite(pinned)) {
-			return { from: pinned, to: pinned, mix: 1 };
-		}
-		return this.genome.choice(name);
+	private choice(
+		name: LoomChoiceAxis,
+		override: LoomLookOverride | null,
+		dt: number,
+		first: boolean,
+		target?: number
+	): LoomChoiceView {
+		const pinned = override?.[name];
+		const goal =
+			pinned !== undefined && Number.isFinite(pinned) ? pinned : (target ?? this.genome.choice(name).to);
+		const morph = this.morphs[name];
+		return first ? morph.snap(goal) : morph.update(goal, dt);
 	}
 
 	private mapPalette(raw: number, context: LoomLookContext): number {
@@ -583,25 +841,31 @@ export class LoomLook {
 		return raw;
 	}
 
-	private paletteFor(raw: number, context: LoomLookContext): number {
-		let mapped = this.paletteMap.get(raw);
-		if (mapped === undefined) {
-			mapped = this.mapPalette(raw, context);
-			this.paletteMap.set(raw, mapped);
-		}
-		return mapped;
-	}
-
-	private resolve(out: LoomLookFrame, context: LoomLookContext, override: LoomLookOverride | null): void {
+	private resolve(
+		out: LoomLookFrame,
+		context: LoomLookContext,
+		override: LoomLookOverride | null,
+		first: boolean
+	): void {
 		const g = this.genome;
-		const grammar = this.choice('grammar', override);
-		const palette = this.choice('palette', override);
-		const roles = this.choice('roles', override);
-		const camera = this.choice('camera', override);
-		const material = this.choice('material', override);
-		const environment = this.choice('environment', override);
-		const beatForm = this.choice('beatForm', override);
-		const thickness = this.choice('thickness', override);
+		const dt = context.dt;
+		// Palette families are re-mapped once, at the moment a raw option becomes
+		// the genome's target, so a crossfade never flips mid-way.
+		const rawPalette = g.choice('palette').to;
+		if (rawPalette !== this.paletteRaw) {
+			this.paletteRaw = rawPalette;
+			this.paletteTarget = this.mapPalette(rawPalette, context);
+		}
+		const grammar = this.choice('grammar', override, dt, first);
+		const palette = this.choice('palette', override, dt, first, this.paletteTarget);
+		const roles = this.choice('roles', override, dt, first);
+		const camera = this.choice('camera', override, dt, first);
+		const material = this.choice('material', override, dt, first);
+		const environment = this.choice('environment', override, dt, first);
+		const beatForm = this.choice('beatForm', override, dt, first);
+		const thickness = this.choice('thickness', override, dt, first);
+		const tone = this.choice('tone', override, dt, first);
+		const composition = this.choice('composition', override, dt, first);
 
 		out.grammarFrom = grammar.from;
 		out.grammarTo = grammar.to;
@@ -614,6 +878,7 @@ export class LoomLook {
 			lerp(gTo.strands[0], gTo.strands[1], strands),
 			grammar.mix
 		);
+		out.density = lerp(gFrom.density, gTo.density, grammar.mix);
 		out.twist = g.value('twist');
 		out.crossings = g.value('crossings');
 		out.spread = g.value('spread');
@@ -625,23 +890,21 @@ export class LoomLook {
 		out.bead = lerp(tFrom.bead, tTo.bead, thickness.mix);
 		out.swell = lerp(tFrom.swell, tTo.swell, thickness.mix);
 
+		const kFrom = LOOM_COMPOSITIONS[composition.from] ?? LOOM_COMPOSITIONS[0];
+		const kTo = LOOM_COMPOSITIONS[composition.to] ?? LOOM_COMPOSITIONS[0];
+		const compScale = lerp(kFrom.scale, kTo.scale, composition.mix);
 		const scaleAxis = g.value('scale');
-		out.frameScale = lerp(gFrom.scale, gTo.scale, grammar.mix) * (0.88 + scaleAxis * 0.24);
+		// Dense grammars sit a little smaller so they keep negative space round them.
+		out.frameScale =
+			lerp(gFrom.scale, gTo.scale, grammar.mix) * (0.88 + scaleAxis * 0.24) * compScale * (1.04 - out.density * 0.08);
 		const framing = g.value('framing');
-		out.frameShiftX = framing * 0.1;
-		out.frameShiftY = 0;
+		out.frameShiftX = framing * 0.1 + lerp(kFrom.shiftX, kTo.shiftX, composition.mix);
+		out.frameShiftY = lerp(kFrom.shiftY, kTo.shiftY, composition.mix);
 		out.frameTilt = framing * 0.06;
 
-		// Palette: latched family mapping, role permutation, key + drift hue lean.
-		// A raw option is re-mapped (from the current mode/energy/era) only at
-		// the moment it becomes the target, so a crossfade never flips mid-way.
-		if (palette.to !== this.lastPaletteTarget) {
-			this.lastPaletteTarget = palette.to;
-			if (palette.to !== palette.from) this.paletteMap.delete(palette.to);
-		}
-		const famFrom = PALETTE_RGB[this.paletteFor(palette.from, context)] ?? PALETTE_RGB[0];
-		const famToIndex = this.paletteFor(palette.to, context);
-		const famTo = PALETTE_RGB[famToIndex] ?? PALETTE_RGB[0];
+		// Palette: family crossfade, role permutation, key + drift hue lean.
+		const famFrom = PALETTE_RGB[palette.from] ?? PALETTE_RGB[0];
+		const famTo = PALETTE_RGB[palette.to] ?? PALETTE_RGB[0];
 		const orderFrom = LOOM_ROLE_ORDERS[roles.from] ?? LOOM_ROLE_ORDERS[0];
 		const orderTo = LOOM_ROLE_ORDERS[roles.to] ?? LOOM_ROLE_ORDERS[0];
 		const hueLean = Math.sin(g.value('hueDrift') * Math.PI * 2) * 0.045 + (context.key - 0.5) * 0.05;
@@ -671,11 +934,43 @@ export class LoomLook {
 		blendEnv(out.deep, 'deep');
 		blendEnv(out.haze, 'haze');
 		blendEnv(out.glow, 'glow');
-		out.paletteIndex = famToIndex;
+		out.paletteIndex = palette.to;
+
+		// Tone: value structure. Mono collapses the roles onto the hero hue in
+		// value steps; the mid-key room lifts the deep toward the haze.
+		const oFrom = LOOM_TONES[tone.from] ?? LOOM_TONES[0];
+		const oTo = LOOM_TONES[tone.to] ?? LOOM_TONES[0];
+		const tm = tone.mix;
+		out.toneEmission = lerp(oFrom.emission, oTo.emission, tm);
+		out.toneDiffuse = lerp(oFrom.diffuse, oTo.diffuse, tm);
+		out.tonePaper = lerp(oFrom.paper, oTo.paper, tm);
+		out.toneRoom = lerp(oFrom.room, oTo.room, tm);
+		out.toneMono = lerp(oFrom.mono, oTo.mono, tm);
+		out.toneBloom = lerp(oFrom.bloom, oTo.bloom, tm);
+		out.toneTrail = lerp(oFrom.trail, oTo.trail, tm);
+		if (out.toneMono > 0.001) {
+			const m = out.toneMono;
+			const h = out.hero;
+			const grey = (h[0] * 0.2126 + h[1] * 0.7152 + h[2] * 0.0722) * 1.5;
+			for (let c = 0; c < 3; c += 1) {
+				out.support[c] = lerp(out.support[c], h[c] * 0.34, m);
+				out.weft[c] = lerp(out.weft[c], lerp(h[c], grey, 0.6) * 0.62, m);
+				out.deep[c] = lerp(out.deep[c], h[c] * 0.01, m * 0.85);
+				out.haze[c] = lerp(out.haze[c], h[c] * 0.06, m * 0.85);
+				out.glow[c] = lerp(out.glow[c], h[c] * 0.55, m * 0.8);
+			}
+		}
+		if (out.toneRoom > 0.001) {
+			const r = out.toneRoom;
+			for (let c = 0; c < 3; c += 1) {
+				out.deep[c] = lerp(out.deep[c], out.haze[c] * 1.1 + out.glow[c] * 0.03, r * 0.75);
+			}
+		}
 
 		const mFrom = LOOM_MATERIALS[material.from] ?? LOOM_MATERIALS[0];
 		const mTo = LOOM_MATERIALS[material.to] ?? LOOM_MATERIALS[0];
 		for (const key of MATERIAL_KEYS) out.material[key] = lerp(mFrom[key], mTo[key], material.mix);
+		out.material.diffuse *= out.toneDiffuse;
 		const eFrom = LOOM_ENVIRONMENTS[environment.from] ?? LOOM_ENVIRONMENTS[0];
 		const eTo = LOOM_ENVIRONMENTS[environment.to] ?? LOOM_ENVIRONMENTS[0];
 		for (const key of ENV_KEYS) out.env[key] = lerp(eFrom[key], eTo[key], environment.mix);
@@ -689,7 +984,7 @@ export class LoomLook {
 		out.camRoll = lerp(cFrom.roll, cTo.roll, cm) + out.frameTilt;
 		out.focal = lerp(cFrom.focal, cTo.focal, cm);
 		out.lensShiftX = lerp(cFrom.shiftX, cTo.shiftX, cm) + out.frameShiftX;
-		out.lensShiftY = lerp(cFrom.shiftY, cTo.shiftY, cm);
+		out.lensShiftY = lerp(cFrom.shiftY, cTo.shiftY, cm) + out.frameShiftY;
 		out.floorAmount = lerp(cFrom.floor, cTo.floor, cm);
 		out.floorLine = lerp(cFrom.floorLine, cTo.floorLine, cm);
 		const orbitRate = lerp(cFrom.orbit, cTo.orbit, cm);
@@ -711,16 +1006,18 @@ export class LoomLook {
 		out.drift = drift;
 
 		out.names.grammar = gTo.name;
-		out.names.palette = LOOM_PALETTES[famToIndex]?.name ?? 'unknown';
+		out.names.palette = LOOM_PALETTES[palette.to]?.name ?? 'unknown';
 		out.names.camera = cTo.name;
 		out.names.material = mTo.name;
 		out.names.environment = eTo.name;
 		out.names.beatForm = LOOM_BEAT_FORMS[beatForm.to] ?? LOOM_BEAT_FORMS[0];
+		out.names.tone = oTo.name;
+		out.names.composition = kTo.name;
 	}
 
 	/**
-	 * A last, short glide over every resolved number, so a genome retarget in
-	 * the middle of a crossfade can never produce a visible jump.
+	 * A last, short glide over every resolved number, so nothing the genome
+	 * does can produce a visible jump.
 	 */
 	private smooth(dtSeconds: number): void {
 		const out = this.frame;
@@ -731,23 +1028,32 @@ export class LoomLook {
 		for (const key of NUMERIC_KEYS) out[key] = lerp(out[key], src[key], k);
 		for (const key of MATERIAL_KEYS) out.material[key] = lerp(out.material[key], src.material[key], k);
 		for (const key of ENV_KEYS) out.env[key] = lerp(out.env[key], src.env[key], k);
-		for (const key of ['hero', 'support', 'weft', 'deep', 'haze', 'glow'] as const) {
+		for (const key of COLOUR_KEYS) {
 			for (let c = 0; c < 3; c += 1) out[key][c] = lerp(out[key][c], src[key][c], k);
 		}
 		for (let i = 0; i < out.beat.length; i += 1) out.beat[i] = lerp(out.beat[i], src.beat[i], k);
-		// Discrete fields pass straight through.
+		// The grammar morph is continuous by construction (LoomChoiceMorph).
 		out.grammarFrom = src.grammarFrom;
 		out.grammarTo = src.grammarTo;
 		out.grammarMix = src.grammarMix;
 		out.orbit = src.orbit;
 		out.paletteIndex = src.paletteIndex;
 		out.cameraIndex = src.cameraIndex;
-		out.names.grammar = src.names.grammar;
-		out.names.palette = src.names.palette;
-		out.names.camera = src.names.camera;
-		out.names.material = src.names.material;
-		out.names.environment = src.names.environment;
-		out.names.beatForm = src.names.beatForm;
+		Object.assign(out.names, src.names);
+	}
+
+	/** Resolve the light budget from the smoothed frame, so gains glide with it. */
+	private budget(): void {
+		const f = this.frame;
+		const input = this.exposureInput;
+		input.density = f.density;
+		input.strandCount = f.strandCount;
+		input.tone.emission = f.toneEmission;
+		input.tone.paper = f.tonePaper;
+		input.tone.room = f.toneRoom;
+		input.tone.bloom = f.toneBloom;
+		input.tone.trail = f.toneTrail;
+		resolveLoomExposure(input, f.exposure);
 	}
 }
 
@@ -755,7 +1061,7 @@ export class LoomLook {
 export function parseLoomLookOverride(text: string | null | undefined): LoomLookOverride | null {
 	if (!text) return null;
 	const out: LoomLookOverride = {};
-	const limits: Record<keyof LoomLookOverride, number> = {
+	const limits: Record<LoomChoiceAxis, number> = {
 		grammar: LOOM_GRAMMARS.length,
 		palette: LOOM_PALETTES.length,
 		roles: LOOM_ROLE_ORDERS.length,
@@ -763,11 +1069,13 @@ export function parseLoomLookOverride(text: string | null | undefined): LoomLook
 		material: LOOM_MATERIALS.length,
 		environment: LOOM_ENVIRONMENTS.length,
 		beatForm: LOOM_BEAT_FORMS.length,
-		thickness: LOOM_THICKNESS.length
+		thickness: LOOM_THICKNESS.length,
+		tone: LOOM_TONES.length,
+		composition: LOOM_COMPOSITIONS.length
 	};
 	for (const part of text.split(',')) {
 		const [rawKey, rawValue] = part.split('=');
-		const key = rawKey?.trim() as keyof LoomLookOverride;
+		const key = rawKey?.trim() as LoomChoiceAxis;
 		if (!(key in limits)) continue;
 		const value = Math.floor(Number(rawValue));
 		if (Number.isFinite(value) && value >= 0 && value < limits[key]) out[key] = value;

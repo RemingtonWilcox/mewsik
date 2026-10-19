@@ -11,7 +11,6 @@
 	import StationArt from '$lib/components/station-art.svelte';
 	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
-	import { useVisualizerChrome } from '$lib/state/visualizer-chrome.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Toggle } from '$lib/components/ui/toggle';
 	import { Slider } from '$lib/components/ui/slider';
@@ -33,7 +32,6 @@
 	} from '@lucide/svelte';
 
 	const visualizer = useVisualizer();
-	const visualizerChrome = useVisualizerChrome();
 
 	import { onMount } from 'svelte';
 
@@ -45,43 +43,6 @@
 		window.addEventListener('toggle-playback', handler);
 		return () => window.removeEventListener('toggle-playback', handler);
 	});
-
-	// The visualizer rail and player bar share one idle clock. Pointer clicks can
-	// leave focus on a control, so only genuine keyboard focus pins the chrome.
-	let keyboardFocusMode = true;
-
-	function handlePlayerPointerDown() {
-		if (!visualizer.active) return;
-		keyboardFocusMode = false;
-		visualizerChrome.setHold('player-focus', false);
-		visualizerChrome.setHold('player-drag', true);
-	}
-
-	function handlePlayerPointerEnd() {
-		if (!visualizer.active) return;
-		visualizerChrome.setHold('player-drag', false);
-	}
-
-	function handlePlayerFocusIn() {
-		if (!visualizer.active) return;
-		visualizerChrome.wake();
-		visualizerChrome.setHold('player-focus', keyboardFocusMode);
-	}
-
-	function handlePlayerFocusOut(event: FocusEvent) {
-		if (!visualizer.active) return;
-		const bar = event.currentTarget;
-		if (
-			bar instanceof HTMLElement &&
-			event.relatedTarget instanceof Node &&
-			bar.contains(event.relatedTarget)
-		) return;
-		visualizerChrome.setHold('player-focus', false);
-	}
-
-	function handleWindowKeydown() {
-		keyboardFocusMode = true;
-	}
 
 	let showQueue = $state(false);
 	let prevVolume = $state(1);
@@ -175,36 +136,17 @@
 	}
 </script>
 
-<svelte:window
-	onkeydown={handleWindowKeydown}
-	onpointerup={handlePlayerPointerEnd}
-	onpointercancel={handlePlayerPointerEnd}
-/>
-
+<!-- While the visualizer is open it owns playback (its own now-playing
+     overlay); the bar stays mounted underneath the opaque engine, inert and
+     hidden from assistive tech, so nothing here remounts or refetches when the
+     listener comes back. (No visibility toggle: the buttons' transition-all
+     would animate the inherited visibility and briefly block focus return.) -->
 <div
 	data-player-bar
-	data-visualizer-chrome-visible={visualizer.active ? visualizerChrome.visible : true}
-	aria-hidden={visualizer.active && !visualizerChrome.visible}
-	inert={visualizer.active && !visualizerChrome.visible}
-	onpointerenter={() => {
-		if (visualizer.active) visualizerChrome.setHold('player-pointer', true);
-	}}
-	onpointermove={() => {
-		if (visualizer.active) visualizerChrome.wake();
-	}}
-	onpointerleave={() => {
-		if (visualizer.active) visualizerChrome.setHold('player-pointer', false);
-	}}
-	onpointerdown={handlePlayerPointerDown}
-	onfocusin={handlePlayerFocusIn}
-	onfocusout={handlePlayerFocusOut}
-	class={`fixed inset-x-0 bottom-0 grid h-[88px] grid-cols-[1fr_auto_1fr] items-center gap-4 border-t border-border bg-[oklch(0.18_0.005_285/0.97)] px-5 shadow-[0_-4px_24px_rgba(0,0,0,0.3)] backdrop-blur-sm transition-opacity duration-[250ms] max-[640px]:h-[72px] max-[640px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[640px]:gap-1 max-[640px]:px-2 ${
-		visualizer.active
-			? visualizerChrome.visible
-				? 'z-[110] opacity-100'
-				: 'pointer-events-none z-[110] opacity-0'
-			: 'z-50 opacity-100'
-	}`}
+	data-visualizer-open={visualizer.active || undefined}
+	aria-hidden={visualizer.active ? 'true' : undefined}
+	inert={visualizer.active}
+	class={`fixed inset-x-0 bottom-0 z-50 grid h-[88px] grid-cols-[1fr_auto_1fr] items-center gap-4 border-t border-border bg-[oklch(0.18_0.005_285/0.97)] px-5 shadow-[0_-4px_24px_rgba(0,0,0,0.3)] backdrop-blur-sm max-[640px]:h-[72px] max-[640px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[640px]:gap-1 max-[640px]:px-2`}
 >
 	<!-- Left: track info -->
 	<div class="flex min-w-0 flex-1 items-center gap-3">
@@ -357,12 +299,7 @@
 			class="size-8"
 			title="Up Next queue"
 			aria-label="Up Next queue"
-			onclick={() => {
-				// The queue sheet portals below the visualizer overlay — leave the
-				// visualizer first so the sheet is actually visible.
-				if (visualizer.active) visualizer.toggle();
-				showQueue = true;
-			}}
+			onclick={() => (showQueue = true)}
 		>
 			<ListMusic class="size-4" />
 		</Button>

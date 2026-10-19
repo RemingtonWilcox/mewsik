@@ -29,7 +29,8 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['trace3v', ['t3vx', 't3vy', 't3scroll', 't3vis']],
 	['band2', ['band2Level', 'band2Lo', 'band2Hi', 'band2Cycles']],
 	['band3', ['band3Level', 'band3Lo', 'band3Hi', 'band3Cycles']],
-	// Horizon surface and camera.
+	// Horizon surfaces. Rig A is the leaving bench's camera and geometry, rig B
+	// the arriving bench's; the shader blends their projections on screen.
 	['surface', ['surfaceA', 'surfaceB', 'surfaceMix', 'terrainVis']],
 	['terrain', ['tickPhase', 'headIndex', 'tickFlash', 'relief']],
 	['camera', ['camHeight', 'camPitch', 'camYaw', 'focal']],
@@ -37,6 +38,10 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['depth', ['near', 'far', 'span', 'rails']],
 	['rings', ['ringInner', 'ringOuter', 'ringZ', 'radarArm']],
 	['waterfall', ['wfX', 'wfY', 'wfDx', 'wfDy']],
+	['cameraB', ['camHeightB', 'camPitchB', 'camYawB', 'focalB']],
+	['depthB', ['nearB', 'farB', 'spanB', 'reliefB']],
+	['ringsB', ['ringInnerB', 'ringOuterB', 'ringZB', 'surfaceRipple']],
+	['waterfallB', ['wfXB', 'wfYB', 'wfDxB', 'wfDyB']],
 	// Scope faces, bezels and glass.
 	['faceA', ['faceAX', 'faceAY', 'faceAW', 'faceAH']],
 	['faceAStyle', ['faceARadius', 'faceARepeat', 'faceAGap', 'faceAVis']],

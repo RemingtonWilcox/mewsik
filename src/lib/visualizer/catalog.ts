@@ -2,10 +2,8 @@ export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal', 'loom'] as const;
 
 export type VisualizerEngine = (typeof VISUALIZER_ENGINES)[number];
 
-export const VISUALIZER_RESPONSES = ['still', 'flow', 'surge'] as const;
-
-export type VisualizerResponse = (typeof VISUALIZER_RESPONSES)[number];
-
+/** How an engine is presented to a listener. `subtitle` and `description`
+ * are listener-facing copy: evocative, never technical. */
 export type VisualizerIdentity = {
 	name: string;
 	subtitle: string;
@@ -18,83 +16,47 @@ export type VisualizerIdentity = {
 export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = {
 	mk1: {
 		name: 'Prism',
-		subtitle: 'Rhythmic geometry',
+		subtitle: 'Rose window',
 		role: 'Impact',
-		description: 'An obsidian rose window; beats travel as light through jewel glass.',
+		description: 'Beats travel as light through a turning rose window.',
 		accent: '#e9d5ff',
 		accentMuted: 'rgba(216, 180, 254, 0.46)'
 	},
 	mk2: {
 		name: 'Soma',
-		subtitle: 'Living fractal',
+		subtitle: 'Deep-sea organism',
 		role: 'Evolution',
-		description: 'A bioluminescent deep-sea organism; beats travel as light along its body and tendrils.',
+		description: 'A deep-sea creature that glows and breathes with the song.',
 		accent: '#fde68a',
 		accentMuted: 'rgba(251, 191, 36, 0.46)'
 	},
 	signal: {
 		name: 'Signal',
-		subtitle: 'Phosphor score',
+		subtitle: 'Phosphor scope',
 		role: 'Flow',
-		description: 'A night phosphor scope: an XY figure tuned to harmony, beat-swept channel traces and a spectral horizon.',
+		description: 'A phosphor scope that draws the music as living traces.',
 		accent: '#a7f3d0',
 		accentMuted: 'rgba(52, 211, 153, 0.46)'
 	},
 	loom: {
 		name: 'Loom',
-		subtitle: 'Harmonic weave',
+		subtitle: 'Woven light',
 		role: 'Harmony',
-		description: 'A lit ribbon manifold that reweaves its topology as harmony, phrases, and releases unfold.',
+		description: 'Ribbons of light that reweave themselves as the harmony shifts.',
 		accent: '#bfdbfe',
 		accentMuted: 'rgba(96, 165, 250, 0.46)'
 	}
 };
 
-export const VISUALIZER_RESPONSE_LABELS: Record<VisualizerResponse, string> = {
-	still: 'Calm',
-	flow: 'Flow',
-	surge: 'Surge'
-};
-
-// Shared response profiles keep the UI modes honest across renderers. Flow is
-// deliberately the exact authored baseline (unit multipliers, zero offsets),
-// while Still and Surge only scale intensity around that identity.
-export const VISUALIZER_RESPONSE_PROFILES = {
-	mk1: {
-		still: { motion: 0.64, impact: 0.62, bloomThresholdOffset: 0.12, feedbackFadeOffset: -0.025 },
-		flow: { motion: 1, impact: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
-		surge: { motion: 1.22, impact: 1.18, bloomThresholdOffset: -0.1, feedbackFadeOffset: 0.02 }
-	},
-	mk2: {
-		still: { motion: 0.68, impact: 0.62, fog: 0.9, shafts: 0.84 },
-		flow: { motion: 1, impact: 1, fog: 1, shafts: 1 },
-		surge: { motion: 1.15, impact: 1.18, fog: 1.08, shafts: 1.1 }
-	},
-	signal: {
-		still: { motion: 0.76, impact: 0.62, persistenceOffset: -0.018, stroke: 0.82, saturation: 0.88 },
-		flow: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
-		surge: { motion: 1.12, impact: 1.18, persistenceOffset: 0.01, stroke: 1.1, saturation: 1.06 }
-	},
-	loom: {
-		still: {
-			motion: 0.68,
-			impact: 0.62,
-			width: 0.88,
-			glow: 0.76,
-			bloomThresholdOffset: 0.12,
-			feedbackFadeOffset: -0.03
-		},
-		flow: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
-		surge: {
-			motion: 1.16,
-			impact: 1.2,
-			width: 1.08,
-			glow: 1.14,
-			bloomThresholdOffset: -0.1,
-			feedbackFadeOffset: 0.02
-		}
-	}
-} as const satisfies Record<VisualizerEngine, Record<VisualizerResponse, Record<string, number>>>;
+// Per-engine tuning constants. These used to be the "Flow" column of a
+// Calm/Flow/Surge response switch that never meaningfully changed the
+// picture; the switch is gone and every engine runs its authored baseline.
+export const VISUALIZER_TUNING = {
+	mk1: { motion: 1, impact: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
+	mk2: { motion: 1, impact: 1, fog: 1, shafts: 1 },
+	signal: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
+	loom: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 }
+} as const satisfies Record<VisualizerEngine, Record<string, number>>;
 
 export function adjacentVisualizer(
 	engine: VisualizerEngine,

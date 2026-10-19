@@ -81,12 +81,15 @@ test.describe('visual variation genome', () => {
 			];
 			const holdGenome = new VariationGenome(holdAxes as never, 'hold');
 			// The first frame is never a boundary; start counting after it.
-			holdGenome.advance({ phraseIndex: 0, sectionKey: 's0', energy: 0.5, dt: 0.1 });
+			holdGenome.advance({ phraseIndex: 0, sectionKey: 's0', energy: 0.5, dt: 1.5 });
 			let longestHold = 0;
 			let currentHold = 0;
 			let lastRare = holdGenome.choice('rare').to;
 			for (let section = 1; section < 400; section += 1) {
-				holdGenome.advance({ phraseIndex: section, sectionKey: 's' + section, energy: 0.5, dt: 0.1 });
+				// advance() clamps dt to 0.5 s: four frames let each fade finish before the next boundary.
+				for (let frame = 0; frame < 4; frame += 1) {
+					holdGenome.advance({ phraseIndex: section, sectionKey: 's' + section, energy: 0.5, dt: 0.5 });
+				}
 				const rare = holdGenome.choice('rare').to;
 				currentHold = rare === lastRare ? currentHold + 1 : 0;
 				longestHold = Math.max(longestHold, currentHold);
@@ -100,7 +103,9 @@ test.describe('visual variation genome', () => {
 			weighted.setWeights('pick', [0, 1, 8, 1]);
 			const counts = [0, 0, 0, 0];
 			for (let phrase = 0; phrase < 800; phrase += 1) {
-				weighted.advance({ phraseIndex: phrase, sectionKey: 's', energy: 0.5, dt: 0.1 });
+				for (let frame = 0; frame < 4; frame += 1) {
+					weighted.advance({ phraseIndex: phrase, sectionKey: 's', energy: 0.5, dt: 0.5 });
+				}
 				counts[weighted.choice('pick').to] += 1;
 			}
 
@@ -112,7 +117,30 @@ test.describe('visual variation genome', () => {
 			settling.settle();
 			const target = settling.targetVector();
 
+			// Retargeting mid-crossfade: the visible blend never jumps. Boundaries
+			// every 10 frames, fades 40 frames long.
+			const fast = new VariationGenome(
+				[{ kind: 'choice', name: 'x', options: 8, scale: 'phrase', chance: 1, memory: 2, tau: 40 / 60 }] as never,
+				'fast'
+			);
+			let maxBlendJump = 0;
+			let lastVisible: Record<number, number> | null = null;
+			for (let frame = 0; frame < 3000; frame += 1) {
+				fast.advance({ phraseIndex: Math.floor(frame / 10), sectionKey: 's', energy: 0.7, dt: 1 / 60 });
+				const c = fast.choice('x');
+				const visible: Record<number, number> = {};
+				visible[c.from] = (visible[c.from] ?? 0) + (1 - c.mix);
+				visible[c.to] = (visible[c.to] ?? 0) + c.mix;
+				if (lastVisible) {
+					for (const key of new Set([...Object.keys(visible), ...Object.keys(lastVisible)])) {
+						maxBlendJump = Math.max(maxBlendJump, Math.abs((visible[Number(key)] ?? 0) - (lastVisible[Number(key)] ?? 0)));
+					}
+				}
+				lastVisible = visible;
+			}
+
 			return {
+				maxBlendJump,
 				longestHold,
 				weightCounts: counts,
 				settledGap: Math.abs(settling.value('density') - target[4]),
@@ -160,5 +188,7 @@ test.describe('visual variation genome', () => {
 		expect(result.weightCounts[2]).toBeGreaterThan(result.weightCounts[3] * 1.5);
 		expect(result.settledGap).toBeLessThan(1e-9);
 		expect(result.settledMix).toBe(1);
+		// A smoothstepped 40-frame fade moves at most ~4% per frame; a retarget snap would be 50%+.
+		expect(result.maxBlendJump).toBeLessThan(0.06);
 	});
 });

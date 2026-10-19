@@ -200,14 +200,14 @@ function target(genome: VariationGenome, vector: readonly number[], name: string
 	return axis.min + vector[index!] * (axis.max - axis.min);
 }
 
-// ── Structure: what a re-leading wave carries ──────────────────────────────
+// ── Structure: what a morph carries (see continuity.ts) ────────────────────
 export type PrismStructure = {
 	grammar: number;
 	fold: number;
 	mosaic: number;
 	/** Mosaic cells per window radius (section drive x genome). */
 	cellScale: number;
-	/** Quantized so that a change is a deliberate re-lead, not a drift. */
+	/** Quantized so that a change is a deliberate morph, not a drift. */
 	tiers: number;
 	outline: number;
 };
@@ -218,7 +218,7 @@ export function prismStructureKey(s: PrismStructure): string {
 
 /**
  * The structural composition the genome is heading for. Read from targets so
- * a wave launched on a boundary carries the new window, not the old one.
+ * a morph launched on a boundary carries the new window, not the old one.
  */
 export function prismStructure(genome: VariationGenome, family: PrismFamily): PrismStructure {
 	const vector = genome.targetVector();
@@ -408,6 +408,12 @@ export const PRISM_ROSE_Y = 0.07;
 export const PRISM_ROSE_R = 0.32;
 export const PRISM_FLOOR_Y = -0.29;
 
+/** A smooth side sign: -1..1 that swings through 0 instead of flipping. */
+export function prismSoftSign(side: number, width = 0.3): number {
+	const t = Math.min(1, Math.max(-1, (Number.isFinite(side) ? side : 0) / width));
+	return t * (1.5 - 0.5 * t * t);
+}
+
 /** One regime's camera given the section's side/focus and the phrase drift. */
 export function prismCameraRegime(
 	regime: number,
@@ -416,7 +422,9 @@ export function prismCameraRegime(
 	drift: number,
 	dolly: number
 ): PrismCameraParams {
-	const sgn = side >= 0 ? 1 : -1;
+	// The side swings the camera through square-on instead of flipping it
+	// from one wall to the other the moment camSide crosses zero.
+	const sgn = prismSoftSign(side);
 	const mag = Math.abs(side);
 	switch (Math.round(regime)) {
 		case 1:

@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import {
-		VISUALIZER_RESPONSE_PROFILES,
+		VISUALIZER_TUNING,
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
@@ -48,6 +48,8 @@
 	let hudMaterial = $state('');
 	let hudEnvironment = $state('');
 	let hudBeatForm = $state('');
+	let hudTone = $state('');
+	let hudComposition = $state('');
 	let raf = 0;
 	let running = false;
 	let unsubscribe: (() => void) | null = null;
@@ -74,6 +76,15 @@
 	let driftPhase = 0;
 	let seedHi = 0;
 	let seedLo = 0;
+	/** Journey identity the strand hashes were seeded from (stable across songs). */
+	let rendererIdentity = -1;
+	/**
+	 * Whole beats between the song's phrase anchor and the rendered conveyor. A
+	 * new song (or a seek) restarts the anchor; the offset absorbs that so the
+	 * conveyor, hero hand-offs, weft drafts and phrase framing carry on instead
+	 * of snapping, while staying locked to the beat.
+	 */
+	let beatOffset = 0;
 	/** Frames left during which the feedback trail is cleared (source reset, resize). */
 	let feedbackResetFrames = 0;
 	const renderDetailBins = new Float32Array(64);
@@ -530,28 +541,46 @@
 		const shared = vis.getJourney(now);
 		const loom = shared.loom;
 		if (rendererSourceEpoch !== shared.sourceEpoch) {
+			const fresh = rendererSourceEpoch === -1;
 			rendererSourceEpoch = shared.sourceEpoch;
-			rms = clamp(feature?.rms ?? 0, 0, 1);
-			renderCentroid = shared.spectrum.centroid;
-			renderSpectralMotion = shared.spectrum.spectralMotion;
-			for (let index = 0; index < renderDetailBins.length; index += 1) {
-				renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
+			if (fresh) {
+				// First frame of this renderer: nothing is on screen yet, so start
+				// exactly on the journey's state.
+				rms = clamp(feature?.rms ?? 0, 0, 1);
+				renderCentroid = shared.spectrum.centroid;
+				renderSpectralMotion = shared.spectrum.spectralMotion;
+				for (let index = 0; index < renderDetailBins.length; index += 1) {
+					renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
+				}
+				renderBeats = beatAnchor(loom) ?? 0;
+				beatOffset = 0;
+				swayPhase = 0;
+				poseSyncRequested = true;
+				quietFor = feature ? 0 : 0.5;
+				silence = feature ? 0 : 1;
+			} else {
+				// A new song: every rail glides on from the picture on screen (the
+				// conductor carries its slow rails, the look carries on), the
+				// trail is kept, and the conveyor keeps its place.
+				const anchor = beatAnchor(loom);
+				if (anchor !== null) beatOffset = Math.round(renderBeats - anchor);
 			}
-			const seedWord = Math.floor(clamp(shared.seed, 0, 1) * 0xffffffff) >>> 0;
+		}
+		if (loom.look.identity !== rendererIdentity) {
+			// Only a new journey changes this; a new song keeps every strand hash.
+			rendererIdentity = loom.look.identity;
+			const seedWord = Math.floor(clamp(rendererIdentity, 0, 1) * 0xffffffff) >>> 0;
 			seedHi = seedWord >>> 16;
 			seedLo = seedWord & 0xffff;
-			renderBeats = beatAnchor(loom) ?? 0;
-			swayPhase = 0;
-			poseSyncRequested = true;
-			feedbackResetFrames = 2;
-			quietFor = feature ? 0 : 0.5;
-			silence = feature ? 0 : 1;
 		}
 		const rmsTarget = clamp(feature?.rms ?? 0, 0, 1);
 		rms = approach(rms, rmsTarget, rmsTarget > rms ? 17 : 6, dt);
 		if (!feature || rmsTarget < 0.009) quietFor += dt;
 		else quietFor = 0;
-		silence = approach(silence, quietFor > 0.45 ? 1 : 0, quietFor > 0.45 ? 4 : 12, dt);
+		// Silence relights the room and fans the ghost rails, so it must glide:
+		// the gap between two songs used to relight the room in under 0.1 s.
+		// Beats and bands still answer instantly; only the room and pose ease.
+		silence = approach(silence, quietFor > 0.45 ? 1 : 0, quietFor > 0.45 ? 1.1 : 1.6, dt);
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
@@ -571,15 +600,20 @@
 		const bpmTarget = clamp(clock.tempoBpm || 0, 0, 220);
 		renderBpm = approach(renderBpm, bpmTarget >= 30 ? bpmTarget : 120, 2, dt);
 		if (feature && silence < 0.5) renderBeats += (dt * renderBpm) / 60;
-		const anchor = beatAnchor(loom);
-		if (feature && anchor !== null) {
-			const diff = anchor - renderBeats;
-			if (Math.abs(diff) > BEATS_PER_PHRASE * 0.75) renderBeats = anchor;
-			else renderBeats += diff * (1 - Math.exp(-dt / 0.45));
+		const rawAnchor = beatAnchor(loom);
+		if (feature && rawAnchor !== null) {
+			let diff = rawAnchor + beatOffset - renderBeats;
+			// A seek or relabel jumps the anchor: absorb it in whole beats rather
+			// than snapping the conveyor (which would re-roll hero and drafts).
+			if (Math.abs(diff) > BEATS_PER_PHRASE * 0.75) {
+				beatOffset -= Math.round(diff);
+				diff = rawAnchor + beatOffset - renderBeats;
+			}
+			renderBeats += diff * (1 - Math.exp(-dt / 0.45));
 		}
 		const beatPhase = clamp(clock.beatPhase, 0, 1);
 		beatGlow = approach(beatGlow, feature ? Math.exp(-beatPhase * 5) : 0, 30, dt);
-		const response = VISUALIZER_RESPONSE_PROFILES.loom[vis.response];
+		const response = VISUALIZER_TUNING.loom;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
 		swayPhase +=
@@ -594,10 +628,13 @@
 		// The long-listen look (genome) supplies camera regime, grammar, palette,
 		// material and environment; the conductor's patient rails ride on top.
 		const look = loom.look;
+		const budget = look.exposure;
 		const cameraYaw = pose.cameraYaw + Math.sin(driftPhase * 0.5) * 0.045 + look.camYaw;
 
 		// Post stack: trails shorten on impact and in silence; the bloom knee
 		// drops with energy so drops glow and verses stay graphic.
+		// The light budget shortens trails when the scene is busy, so they never
+		// smear into fog; the reset only ever happens on a resize.
 		const feedbackFade =
 			feedbackResetFrames > 0
 				? 0
@@ -605,17 +642,22 @@
 						(0.86 +
 							look.trail * 0.05 +
 							look.material.trail +
-							energy * 0.05 -
+							energy * 0.04 -
 							impact * 0.16 +
+							budget.trailOffset +
 							response.feedbackFadeOffset) *
 							(1 - silence * 0.35),
 						0.4,
-						0.955
+						0.93
 					);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 		const feedbackZoom = 1 - (0.0025 + renderBands.sub * 0.004) * responseMotion;
 		const bloomThreshold =
-			0.75 - energy * 0.2 + (0.5 - look.bloom) * 0.14 + response.bloomThresholdOffset;
+			0.75 -
+			energy * 0.2 +
+			(0.5 - look.bloom) * 0.14 +
+			budget.bloomThresholdOffset +
+			response.bloomThresholdOffset;
 		const aberration = 1 + impact * 1.8;
 
 		const values: LoomUniformValues = {
@@ -694,7 +736,7 @@
 			frameScale: look.frameScale,
 			nearFade: 1,
 			widthScale: look.material.width,
-			frameSpare: 0,
+			emissionGain: budget.emissionGain,
 			focal: look.focal,
 			lensShiftX: look.lensShiftX,
 			lensShiftY: look.lensShiftY,
@@ -702,27 +744,27 @@
 			heroR: look.hero[0],
 			heroG: look.hero[1],
 			heroB: look.hero[2],
-			heroGain: 1,
+			heroGain: budget.heroGain,
 			supportR: look.support[0],
 			supportG: look.support[1],
 			supportB: look.support[2],
-			supportGain: 1,
+			supportGain: budget.supportGain,
 			weftR: look.weft[0],
 			weftG: look.weft[1],
 			weftB: look.weft[2],
-			weftGain: 1,
+			weftGain: budget.weftGain,
 			deepR: look.deep[0],
 			deepG: look.deep[1],
 			deepB: look.deep[2],
-			envGain: 1,
+			envGain: budget.envGain,
 			hazeR: look.haze[0],
 			hazeG: look.haze[1],
 			hazeB: look.haze[2],
-			hazeGain: 1,
+			hazeGain: budget.hazeGain,
 			glowR: look.glow[0],
 			glowG: look.glow[1],
 			glowB: look.glow[2],
-			glowGain: 1,
+			glowGain: budget.glowGain,
 			diffuse: look.material.diffuse,
 			gloss: look.material.gloss,
 			sharpness: look.material.sharpness,
@@ -737,7 +779,7 @@
 			hotspot: look.material.hotspot,
 			iridescence: look.material.iridescence,
 			glint: look.material.glint,
-			chorusLevel: 1,
+			chorusLevel: budget.chorusWidth,
 			pale: look.material.pale,
 			floorMirror: look.env.floorMirror,
 			ripple: look.env.ripple,
@@ -750,7 +792,7 @@
 			floorLine: look.floorLine,
 			sunX: look.env.sunX,
 			floorAmount: look.floorAmount,
-			envSpare: 0,
+			bloomWeight: budget.bloomWeight,
 			keyAzimuth: look.keyAzimuth,
 			keyElevation: look.keyElevation,
 			lightWarmth: look.lightWarmth,
@@ -761,12 +803,14 @@
 			shuttle: look.beat[3],
 			sparks: look.beat[4],
 			beatGain: responseImpact,
-			beatSpareA: 0,
-			beatSpareB: 0,
+			litGain: budget.litGain,
+			chorusGlow: budget.chorusGlow,
 			driftX: look.drift * 0.0011,
 			driftY: Math.abs(look.drift) * 0.0005 - 0.00025,
 			spin: look.drift * 0.0016,
-			trailBoost: 0
+			// Squared: the room lifts slowly out of the dark and settles slowly back
+			// into it, so a light to dark crossfade never reads as a sudden relight.
+			paper: look.tonePaper * look.tonePaper
 		};
 		packLoomUniforms(state.uniforms, values);
 
@@ -793,6 +837,8 @@
 		hudMaterial = look.names.material;
 		hudEnvironment = look.names.environment;
 		hudBeatForm = look.names.beatForm;
+		hudTone = look.names.tone;
+		hudComposition = look.names.composition;
 		const encoder = state.device.createCommandEncoder({ label: 'Loom frame' });
 		{
 			const pass = encoder.beginRenderPass({
@@ -800,7 +846,8 @@
 				colorAttachments: [
 					{
 						view: targets.sceneView,
-						clearValue: { r: 0, g: 0, b: 0, a: 1 },
+						// Alpha 0 off the threads: alpha carries coverage for the ink tone.
+						clearValue: { r: 0, g: 0, b: 0, a: 0 },
 						loadOp: 'clear',
 						storeOp: 'store'
 					}
@@ -979,6 +1026,8 @@
 			data-loom-material={hudMaterial}
 			data-loom-environment={hudEnvironment}
 			data-loom-beat-form={hudBeatForm}
+			data-loom-tone={hudTone}
+			data-loom-composition={hudComposition}
 			data-loom-render-passes="8"
 			data-loom-strands={LOOM_STRANDS}
 			data-loom-frame-stride={activeFrameStride}
