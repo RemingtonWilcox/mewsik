@@ -19,48 +19,69 @@
 	} from '$lib/visualizer/mandala/uniform-layout';
 	import {
 		MANDALA_AXES,
-		MANDALA_DIVERGENCE,
-		MANDALA_FAMILIES,
 		MANDALA_FOLDS,
 		MANDALA_PALETTES,
-		MANDALA_RAW_SECTORS,
-		MANDALA_SHAPES,
-		MANDALA_SHAPE_NAMES,
+		MANDALA_RAYMARCHED,
 		MANDALA_VARIANT_NAMES,
-		MANDALA_VARIANTS,
+		MANDALA_WORLDS,
 		MandalaFollower,
+		mandalaAnswer,
 		mandalaApplyCharacter,
 		mandalaPaletteFit,
 		mandalaPullCharacter,
+		mandalaSlot,
+		mandalaSlotParts,
+		mandalaWorldFit,
 		mixRgb,
-		phyllotaxisBasis,
 		type Rgb
 	} from '$lib/visualizer/mandala/look';
-	import { MandalaFlight, hyperbolicPeriod } from '$lib/visualizer/mandala/flight';
+	import { FoldSpring, JuliaTrack, MandalaVoyage } from '$lib/visualizer/mandala/flight';
+	import { HeardPulse } from '$lib/visualizer/mandala/pulse';
 	import { VariationGenome, type ContinuousAxis } from '$lib/visualizer/variation';
 	import type { MusicCharacter } from '$lib/visualizer/character';
 
 	const vis = useVisualizer();
 
 	const TARGET_FRAME_RATE = 60;
-	const INTERNAL_SCALE = 0.78;
-	const MAX_INTERNAL_PIXELS = 1600 * 900;
 	const RENDER_PASSES = 9;
-	const FOLD_COUNT = MANDALA_FOLDS.length;
+	const WORLD_INDEX = Object.fromEntries(MANDALA_WORLDS.map((name, index) => [name, index])) as Record<
+		(typeof MANDALA_WORLDS)[number],
+		number
+	>;
+
+	/**
+	 * Quality tiers. Desktop GPUs take the full march; phones and tablets
+	 * march fewer steps and fewer fractal iterations at a lower internal
+	 * resolution, and skip ambient occlusion. A governor scales resolution
+	 * down further if frames run long.
+	 */
+	const QUALITY_TIERS = {
+		high: { steps: 120, detail: 1, scale: 0.78, maxPixels: 1600 * 900, occlusion: 1 },
+		low: { steps: 60, detail: 0.7, scale: 0.55, maxPixels: 1024 * 576, occlusion: 0 }
+	} as const;
+	type QualityTier = keyof typeof QUALITY_TIERS;
+
+	function pickTier(): QualityTier {
+		if (typeof navigator === 'undefined') return 'high';
+		const forcedTier = forced()?.quality;
+		if (forcedTier === 0) return 'low';
+		if (forcedTier === 1) return 'high';
+		return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) ? 'low' : 'high';
+	}
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
 	let ready = $state(false);
 	let internalPixels = $state(0);
-	let hudSection = $state('intro');
-	let hudWall = $state('');
-	let hudScreen = $state('');
+	let hudWorld = $state('');
+	let hudVariant = $state('');
 	let hudFold = $state(8);
-	let hudShape = $state('round');
 	let hudPalette = $state('');
 	let hudShifts = $state(0);
-	let earContrast = 0;
-	let hudEar = $state('0');
+	let hudHits = $state(0);
+	let hudHeard = $state('');
+	let hudTier = $state<QualityTier>('high');
+	let hudScale = $state('1.00');
 	let raf = 0;
 	let running = false;
 	let unsubscribe: (() => void) | null = null;
@@ -75,34 +96,25 @@
 	let rendererSourceEpoch = -1;
 	/** Frames left during which the feedback trail and the exposure meter restart. */
 	let feedbackResetFrames = 2;
+	let tier: QualityTier = 'high';
+	/** Resolution governor: fraction of the tier's internal scale in use. */
+	let governor = 1;
+	let slowFor = 0;
+	let fastFor = 0;
+	/** Smoothed submit-to-done time of recent frames, ms. */
+	let gpuFrameMs = 0;
 
-	type Palette = {
-		stone: Rgb;
-		metal: Rgb;
-		glow: Rgb;
-		accent: Rgb;
-		rig: Rgb;
-		sconce: Rgb;
-		fog: Rgb;
-		iridescence: number;
-		stoneGloss: number;
-	};
+	type Palette = { stops: [Rgb, Rgb, Rgb, Rgb]; spark: Rgb; sheen: number };
 
 	function freshEnv() {
 		return {
 			rms: 0,
 			energy: 0,
 			bass: 0,
+			mid: 0,
 			treble: 0,
-			impact: 0,
-			kick: 0,
-			beatGlow: 0,
 			silence: 1,
 			quietFor: 0.5,
-			sub: 0,
-			kickBand: 0,
-			body: 0,
-			presence: 0,
 			// Character rails: always follow what kind of music it is, through
 			// glides of about a second that speed up after a shift.
 			tempo: 0.5,
@@ -122,20 +134,20 @@
 	/**
 	 * Everything the picture is made of beyond the genome. Lives in the
 	 * journey's persistent look next to the genome, so a new song continues
-	 * the flight and a remount resumes it exactly.
+	 * the voyage and a remount resumes it exactly.
 	 */
 	type MandalaRun = {
-		flight: MandalaFlight;
+		voyage: MandalaVoyage;
+		spring: FoldSpring;
+		pulse: HeardPulse;
+		julia: JuliaTrack[];
 		env: ReturnType<typeof freshEnv>;
-		/** Grammar x fold slots, cross-faded on the GPU. */
-		wall: MandalaFollower;
-		screen: MandalaFollower;
-		shape: MandalaFollower;
+		/** World x variant x fold, morphed on the GPU. */
+		scene: MandalaFollower;
 		palette: MandalaFollower;
 		colours: Palette;
 		lastShiftSerial: number;
-		lastBeatCount: number;
-		resyncBeat: boolean;
+		lastHits: number;
 		/** Seconds until the character weights are refreshed. */
 		weightsIn: number;
 		/**
@@ -149,10 +161,28 @@
 		/** Seconds the ear has heard a change it has not answered yet (-1: none). */
 		earPending: number;
 		earPeak: number;
-		/** The answer to a shift is re-checked once the new music has settled. */
-		settleChecked: boolean;
+		/**
+		 * Re-checks left for the answer to the latest change of music: the
+		 * character lags the music by a second or so, so the first pick is
+		 * checked again at 1.4 s and at 3 s after that.
+		 */
+		settleChecks: number;
+		/** Seconds since the shift at which the next settle check runs. */
+		nextCheck: number;
+		/** Recent peak of the character's contrast (how different the music is). */
+		contrastPeak: number;
 		/** Eased continuous look values (see glideValues). */
 		vals: Record<string, number>;
+		/** Seconds of transient surge left over from the last kick. */
+		surge: number;
+		/**
+		 * Mandala's own answers to the latest change of music (see answered()),
+		 * held until the genome's next boundary that may move that axis.
+		 */
+		answers: Record<'world' | 'palette', { option: number; boundary: number } | null>;
+		/** Seconds the running world and palette morphs take (fixed at their start). */
+		sceneTau: number;
+		paletteTau: number;
 	};
 
 	const lookState = vis.persistentLook('mandala', () => ({
@@ -180,7 +210,7 @@
 	}
 
 	// Dev-only look override for the lab and capture scripts:
-	// window.__MANDALA_FORCE__ = { wall: 26, screen: 4, fold: 5, shape: 0, palette: 1, density: 1.4 }.
+	// window.__MANDALA_FORCE__ = { world: 3, variant: 1, fold: 5, palette: 2, formA: 0.4, quality: 0 }.
 	type MandalaForce = Partial<Record<string, number>>;
 	function forced(): MandalaForce | null {
 		if (!import.meta.env.DEV) return null;
@@ -226,22 +256,47 @@
 		}
 	}
 
-	function slotId(grammarAxis: string): number {
-		return choiceTarget(grammarAxis) * FOLD_COUNT + choiceTarget('fold');
+	/**
+	 * World and palette: the genome's choice, except right after a change of
+	 * music, when Mandala's own answer (keep what fits, else the best fit)
+	 * holds until the genome next moves that axis at a boundary.
+	 */
+	function answered(name: 'world' | 'palette'): number {
+		const run = lookState.run;
+		const forcedValue = forced()?.[name];
+		if (forcedValue !== undefined || !run) return choiceTarget(name);
+		const answer = run.answers[name];
+		if (answer && boundaryCount(name) === answer.boundary) return answer.option;
+		run.answers[name] = null;
+		return genome.choice(name).to;
+	}
+
+	/** The genome boundaries that may move an axis: sections for worlds, eras for palettes. */
+	function boundaryCount(name: 'world' | 'palette'): number {
+		const boundaries = genome.boundaries;
+		return name === 'world' ? boundaries.sections : boundaries.eras;
+	}
+
+	let answerSerial = 0;
+	/** A deterministic 0..1 roll per answer (golden-ratio sequence). */
+	function answerRoll(run: MandalaRun): number {
+		answerSerial += 1;
+		return (run.voyage.phase[0] * 0.37 + answerSerial * 0.6180339887) % 1;
+	}
+
+	function sceneTarget(): number {
+		const world = clamp(Math.round(answered('world')), 0, MANDALA_WORLDS.length - 1);
+		const variant = clamp(Math.round(choiceTarget('variant')), 0, 3);
+		const fold = clamp(Math.round(choiceTarget('fold')), 0, MANDALA_FOLDS.length - 1);
+		return mandalaSlot(world, variant, fold);
 	}
 
 	function paletteFrom(index: number): Palette {
 		const p = MANDALA_PALETTES[clamp(Math.round(index), 0, MANDALA_PALETTES.length - 1)];
 		return {
-			stone: [...p.stone],
-			metal: [...p.metal],
-			glow: [...p.glow],
-			accent: [...p.accent],
-			rig: [...p.rig],
-			sconce: [...p.sconce],
-			fog: [...p.fog],
-			iridescence: p.iridescence,
-			stoneGloss: 0.25
+			stops: [[...p.stops[0]], [...p.stops[1]], [...p.stops[2]], [...p.stops[3]]],
+			spark: [...p.spark],
+			sheen: p.sheen
 		};
 	}
 
@@ -251,24 +306,31 @@
 		env.quietFor = hasAudio ? 0 : 0.5;
 		const palette = new MandalaFollower(choiceTarget('palette'));
 		return {
-			flight: new MandalaFlight(seed),
+			voyage: new MandalaVoyage(seed),
+			spring: new FoldSpring(),
+			pulse: new HeardPulse(),
+			julia: [2, 3, 4, 5].map((power) => new JuliaTrack(power)),
 			env,
-			wall: new MandalaFollower(slotId('wall')),
-			screen: new MandalaFollower(slotId('screen')),
-			shape: new MandalaFollower(choiceTarget('shape')),
+			scene: new MandalaFollower(sceneTarget()),
 			palette,
 			colours: paletteFrom(palette.to),
 			lastShiftSerial: shiftSerial,
-			lastBeatCount: -1,
-			resyncBeat: true,
+			lastHits: 0,
 			weightsIn: 0,
 			earFast: [],
 			earSlow: [],
-			sinceShift: 0,
+			// Long enough ago that the first shift (the music arriving) is answered.
+			sinceShift: 10,
 			earPending: -1,
 			earPeak: 0,
-			settleChecked: true,
-			vals: Object.fromEntries(CONTINUOUS.map(({ axis }) => [axis.name, genome.value(axis.name)]))
+			settleChecks: 0,
+			nextCheck: 0,
+			contrastPeak: 0,
+			vals: Object.fromEntries(CONTINUOUS.map(({ axis }) => [axis.name, genome.value(axis.name)])),
+			surge: 0,
+			answers: { world: null, palette: null },
+			sceneTau: 6.5,
+			paletteTau: 5
 		};
 	}
 
@@ -284,34 +346,9 @@
 		}
 		if (lookState.epoch !== sourceEpoch) {
 			genome.reseed(seed);
-			lookState.run.flight.continueSource(seed);
-			lookState.run.resyncBeat = true;
+			lookState.run.voyage.continueSource(seed);
 			lookState.epoch = sourceEpoch;
 		}
-	}
-
-	function grammarName(slot: number) {
-		const grammar = Math.floor(slot / FOLD_COUNT);
-		const family = MANDALA_FAMILIES[Math.floor(grammar / MANDALA_VARIANTS)] ?? 'truchet';
-		return `${family}:${MANDALA_VARIANT_NAMES[family][grammar % MANDALA_VARIANTS]}`;
-	}
-
-	function slotGrammar(slot: number) {
-		return Math.floor(slot / FOLD_COUNT);
-	}
-
-	function slotFold(slot: number) {
-		return MANDALA_FOLDS[slot % FOLD_COUNT];
-	}
-
-	function hyperPeriods(follower: MandalaFollower): number[] {
-		const out: number[] = [];
-		const visible = follower.mix >= 1 ? [follower.to] : [follower.from, follower.to];
-		for (const slot of visible) {
-			const grammar = slotGrammar(slot);
-			if (Math.floor(grammar / MANDALA_VARIANTS) === 6) out.push(hyperbolicPeriod(grammar % MANDALA_VARIANTS));
-		}
-		return out;
 	}
 
 	type Targets = {
@@ -357,6 +394,8 @@
 			composite: GPURenderPipeline;
 		};
 		targets: Targets | null;
+		/** Targets replaced by a resize, read once by the next frame and then destroyed. */
+		retired: Targets | null;
 		bindGroups: BindGroups | null;
 		parity: 0 | 1;
 	};
@@ -364,14 +403,17 @@
 	let gpu: MandalaGpu | null = null;
 
 	function backingSize(targetCanvas: HTMLCanvasElement) {
+		const quality = QUALITY_TIERS[tier];
 		const cssWidth = Math.max(1, targetCanvas.clientWidth);
 		const cssHeight = Math.max(1, targetCanvas.clientHeight);
 		const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
-		let width = Math.max(1, Math.floor(cssWidth * pixelRatio * INTERNAL_SCALE));
-		let height = Math.max(1, Math.floor(cssHeight * pixelRatio * INTERNAL_SCALE));
+		const scale = quality.scale * governor * (forced()?.scale ?? 1);
+		let width = Math.max(1, Math.floor(cssWidth * pixelRatio * scale));
+		let height = Math.max(1, Math.floor(cssHeight * pixelRatio * scale));
 		const pixels = width * height;
-		if (pixels > MAX_INTERNAL_PIXELS) {
-			const reduction = Math.sqrt(MAX_INTERNAL_PIXELS / pixels);
+		const maxPixels = forced()?.maxPixels ?? quality.maxPixels;
+		if (pixels > maxPixels) {
+			const reduction = Math.sqrt(maxPixels / pixels);
 			width = Math.max(1, Math.floor(width * reduction));
 			height = Math.max(1, Math.floor(height * reduction));
 		}
@@ -386,7 +428,12 @@
 
 	function ensureTargets(g: MandalaGpu, width: number, height: number) {
 		if (g.targets && g.targets.width === width && g.targets.height === height) return;
-		disposeTargets(g.targets);
+		// A resize (window, or the governor) keeps the old trail and meter
+		// alive for one frame so the new targets start from them: clearing
+		// the trail would be a cut. Only the very first targets start fresh.
+		const previous = g.targets;
+		disposeTargets(g.retired);
+		g.retired = previous;
 		const { device, pipelines } = g;
 		const hdr = (label: string, w: number, h: number) =>
 			device.createTexture({
@@ -453,13 +500,13 @@
 				bind(pipelines.composite, 'Mandala present B', [t.feedbackView[1], t.bloomView[0], t.exposureView[1]])
 			]
 		};
-		feedbackResetFrames = 2;
+		if (!previous) feedbackResetFrames = 2;
 	}
 
 	async function initGpu(targetCanvas: HTMLCanvasElement): Promise<MandalaGpu> {
 		const gpuApi = navigator.gpu;
 		if (!gpuApi) throw new Error('Mandala needs WebGPU, but this WebView does not expose it.');
-		const adapter = await gpuApi.requestAdapter();
+		const adapter = await gpuApi.requestAdapter({ powerPreference: 'high-performance' });
 		if (!adapter) throw new Error('No compatible WebGPU adapter was found.');
 		const device = (await adapter.requestDevice()) as GPUDevice;
 		let context: GPUCanvasContext | null = null;
@@ -471,7 +518,7 @@
 			const format = gpuApi.getPreferredCanvasFormat() as GPUTextureFormat;
 			context.configure({ device, format, alphaMode: 'opaque' });
 			const sources: [string, string][] = [
-				['Mandala tunnel', MANDALA_SCENE_WGSL],
+				['Mandala worlds', MANDALA_SCENE_WGSL],
 				['Mandala feedback', MANDALA_FEEDBACK_WGSL],
 				['Mandala exposure', MANDALA_EXPOSURE_WGSL],
 				['Mandala bloom prefilter', MANDALA_BLOOM_DOWN_WGSL],
@@ -502,7 +549,7 @@
 					primitive: { topology: 'triangle-list' }
 				});
 			const built = await Promise.all([
-				pipeline('Mandala tunnel pipeline', modules[0], hdr),
+				pipeline('Mandala worlds pipeline', modules[0], hdr),
 				pipeline('Mandala feedback pipeline', modules[1], hdr),
 				pipeline('Mandala exposure pipeline', modules[2], hdr),
 				pipeline('Mandala bloom prefilter pipeline', modules[3], hdr),
@@ -541,6 +588,7 @@
 					composite: built[6]
 				},
 				targets: null,
+				retired: null,
 				bindGroups: null,
 				parity: 0
 			};
@@ -567,6 +615,7 @@
 	function destroyGpuState(state: MandalaGpu | null) {
 		if (!state) return;
 		disposeTargets(state.targets);
+		disposeTargets(state.retired);
 		state.uniformBuffer.destroy();
 		state.binsBuffer.destroy();
 		try {
@@ -585,6 +634,76 @@
 	}
 
 	const values = {} as MandalaUniformValues;
+
+	/**
+	 * The Julia dives, one per spiral variant (power 2..5): multiplier angle
+	 * (turns), |lambda| range, window size. Near these angles with |lambda|
+	 * ~1.25 the set is a spiral galaxy of rosettes, dense at every phase of
+	 * the dive (the connected dives at 1/2 and 1/3 were tried: their windows
+	 * empty to near black for part of each period). A dive never glides into
+	 * another (the path between them crosses dust where the picture empties):
+	 * a new dive is a new variant, which morphs on the GPU like any slot.
+	 */
+	const JULIA_DIVES: readonly [number, number, number, number][] = [
+		[0.4, 1.22, 1.3, 0.35],
+		[0.31, 1.22, 1.3, 0.35],
+		[0.13, 1.22, 1.3, 0.35],
+		[0.6, 1.22, 1.3, 0.35]
+	];
+
+	// The 3D flights are paced to their own scale: the sponge's period is a
+	// whole x3 descent with three turns, the cavern's phase unit a quarter of
+	// its lattice, so they take several log units of travel per period.
+	const PERIOD_LOG = [1.1, 1, Math.log(1.6180339887) * 3, 4.5, 3.2, 6.5, 0.25, 0.33];
+
+	// Dev-only probe for the beat-timing evidence: one entry per rendered frame.
+	type ProbeFrame = {
+		t: number;
+		kick: number;
+		delta: number;
+		hit: number;
+		hits: number;
+		spark: number;
+		sparks: number;
+		onset: number;
+		novelty: number;
+		surge: number;
+		snap: number;
+		phase: number;
+		width: number;
+		gpu: number;
+		scene: string;
+		look: string;
+	};
+	const probe: ProbeFrame[] = [];
+
+	function slotUniforms(slot: number, run: MandalaRun, which: 'A' | 'B') {
+		const { world, variant, fold } = mandalaSlotParts(slot);
+		const voyage = run.voyage;
+		const phase = voyage.phase[world];
+		values[`world${which}` as const] = world;
+		values[`variant${which}` as const] = variant;
+		values[`fold${which}` as const] = MANDALA_FOLDS[fold];
+		values[`phase${which}` as const] = phase;
+		values[`turn${which}` as const] = voyage.turn[world];
+		values[`yaw${which}` as const] = voyage.yaw;
+		values[`pitch${which}` as const] = voyage.pitch;
+		// The integer zoom count, so colour by depth carries across a wrap.
+		values[which === 'A' ? 'levelA' : 'levelB'] = Math.floor(phase) % 8;
+		const track = run.julia[variant];
+		const f = phase - Math.floor(phase);
+		const view = track.window(f, JULIA_DIVES[variant][3]);
+		values[`jcx${which}` as const] = track.c[0];
+		values[`jcy${which}` as const] = track.c[1];
+		values[`jzx${which}` as const] = track.z[0];
+		values[`jzy${which}` as const] = track.z[1];
+		values[`jsx${which}` as const] = view.scale[0];
+		values[`jsy${which}` as const] = view.scale[1];
+		values[`jtx${which}` as const] = 0;
+		values[`jty${which}` as const] = 0;
+		values[which === 'A' ? 'jnA' : 'jnB'] = track.power;
+		values[which === 'A' ? 'jwA' : 'jwB'] = view.lead;
+	}
 
 	function renderFrame(g: MandalaGpu, now: number, dt: number) {
 		if (!canvas) return;
@@ -616,36 +735,27 @@
 		const run = lookState.run;
 		if (!run) return;
 		const env = run.env;
-		const flight = run.flight;
 
-		// ── Envelopes: beats and bands answer at once.
+		// ── Envelopes. The spectrum is held as timbre (which bands are alive),
+		// slow enough that a kick does not flash the scales it lights.
 		const incoming = feat?.bins ?? [];
-		const binMix = 1 - Math.exp(-dt / 0.07);
 		for (let i = 0; i < MANDALA_BIN_COUNT; i++) {
 			const target = clamp(finite(incoming[i] ?? 0), 0, 1);
-			bins[i] += (target - bins[i]) * (target > bins[i] ? Math.min(1, binMix * 2.5) : binMix);
+			bins[i] = approach(bins[i], target, target > bins[i] ? 1 / 0.3 : 1 / 0.7, dt);
 		}
 		const rmsTarget = clamp(finite(feat?.rms ?? 0), 0, 1);
-		env.rms = approach(env.rms, rmsTarget, rmsTarget > env.rms ? 14 : 5, dt);
+		env.rms = approach(env.rms, rmsTarget, rmsTarget > env.rms ? 6 : 3, dt);
 		if (!feat || rmsTarget < 0.009) env.quietFor += dt;
 		else env.quietFor = 0;
 		const quiet = env.quietFor > 0.45;
 		env.silence = approach(env.silence, quiet ? 1 : 0, quiet ? 1.2 : 2.4, dt);
 		const levels = spectrum.levels;
-		const bandRate = 1 / 0.06;
-		env.sub = approach(env.sub, feat ? levels.sub : 0, bandRate, dt);
-		env.kickBand = approach(env.kickBand, feat ? levels.kick : 0, bandRate, dt);
-		env.body = approach(env.body, feat ? levels.body : 0, bandRate, dt);
-		env.presence = approach(env.presence, feat ? levels.presence : 0, bandRate, dt);
-		env.bass = approach(env.bass, feat ? spectrum.bass : 0, 9, dt);
-		env.treble = approach(env.treble, feat ? spectrum.treble : 0, 12, dt);
+		env.bass = approach(env.bass, feat ? spectrum.bass : 0, 1.5, dt);
+		env.mid = approach(env.mid, feat ? spectrum.mid : 0, 1.5, dt);
+		env.treble = approach(env.treble, feat ? spectrum.treble : 0, 1.5, dt);
 		const sectionEnergy = clamp(finite(directed.context.sectionEnergy), 0, 1);
-		env.energy = approach(
-			env.energy,
-			clamp(directed.energy * 0.6 + sectionEnergy * 0.25 + env.rms * 0.15, 0, 1),
-			3,
-			dt
-		);
+		// Light follows the song's arc over seconds, never the beat.
+		env.energy = approach(env.energy, clamp(character.energy * 0.65 + sectionEnergy * 0.35, 0, 1), 0.8, dt);
 
 		// ── Character: Mandala hears tilt (bright vs dark spectrum) and hiss
 		// (bright, sub-less, fast) itself, then answers each shift exactly once.
@@ -659,10 +769,13 @@
 		}
 		const heard: MusicCharacter = { ...character, noise: env.hiss, brightness: env.tilt };
 		run.sinceShift += dt;
+		// The tracker's contrast resets when it fires, so remember its recent peak.
+		run.contrastPeak = Math.max(run.contrastPeak * Math.exp(-dt / 1.2), finite(character.contrast));
 		let shiftStrength = 0;
+		let earHeard = false;
 		if (character.shiftSerial !== run.lastShiftSerial) {
 			run.lastShiftSerial = character.shiftSerial;
-			// Every change of music deserves a new palette family (an era move),
+			// Every change of music deserves a new world and palette family,
 			// unless Mandala's own ear already answered this change.
 			shiftStrength = run.sinceShift < 3 ? 0 : Math.max(0.75, character.shiftStrength);
 		}
@@ -683,36 +796,58 @@
 				contrast += Math.abs(run.earFast[i] - run.earSlow[i]);
 			}
 			contrast /= ear.length;
-			earContrast = contrast;
 			// The shared tracker misses changes that live in tilt and hiss. The
 			// ear answers at the peak of the change (or within 0.5 s), so its
 			// picks fit the new music rather than the moment between.
-			if (run.earPending < 0 && run.sinceShift > 8 && contrast > 0.1) {
+			if (run.earPending < 0 && run.sinceShift > 8 && contrast > 0.085) {
 				run.earPending = 0;
 				run.earPeak = contrast;
 			} else if (run.earPending >= 0) {
 				run.earPending += dt;
 				const falling = contrast < run.earPeak * 0.97;
 				run.earPeak = Math.max(run.earPeak, contrast);
-				if (!shiftStrength && (falling || run.earPending > 0.5)) {
+				if (!shiftStrength && (falling || run.earPending > 0.35)) {
 					shiftStrength = clamp(0.75 + (run.earPeak - 0.1) * 3, 0, 1);
+					earHeard = true;
 				}
 			}
 		}
-		// Once the new music has settled, a palette that no longer fits it moves on.
-		if (!shiftStrength && !run.settleChecked && run.sinceShift > 2.2) {
-			run.settleChecked = true;
-			if (mandalaPaletteFit(choiceTarget('palette'), heard) < 0.3) shiftStrength = 0.8;
+		// While the new music settles (the character lags it by a second or
+		// more, longer for tempo), a world or palette that does not fit it is
+		// replaced: checked every half second for six seconds, at most twice.
+		let settling = false;
+		if (!shiftStrength && run.settleChecks > 0 && run.sinceShift > 1.2 && run.sinceShift < 6 && run.sinceShift >= run.nextCheck) {
+			run.nextCheck = run.sinceShift + 0.5;
+			for (const axis of ['world', 'palette'] as const) {
+				const current = answered(axis);
+				const fit = axis === 'world' ? mandalaWorldFit(current, heard) : mandalaPaletteFit(current, heard);
+				if (fit < 0.3) {
+					settling = true;
+					run.answers[axis] = { option: mandalaAnswer(axis, current, heard, answerRoll(run), true), boundary: boundaryCount(axis) };
+				}
+			}
+			if (settling) run.settleChecks -= 1;
 		}
+		if (settling) hudShifts += 1;
 		if (shiftStrength > 0) {
 			hudShifts += 1;
-			// A settle re-check is itself the last word on this change.
-			run.settleChecked = run.sinceShift < 3;
+			// A new change of music earns two corrections while it settles.
+			run.settleChecks = 2;
+			run.nextCheck = 1.2;
+			// Did the music really change (not just a new song of the same
+			// kind)? Then the world and palette must move, to the best fit.
+			// A shift that is not a new song's arrival (strength 1) always is.
+			const changed = earHeard || run.contrastPeak > 0.08 || character.shiftStrength < 0.99;
 			run.sinceShift = 0;
 			run.earPending = -1;
 			run.earSlow = [...run.earFast];
+			const keptWorld = answered('world');
+			const keptPalette = answered('palette');
 			mandalaApplyCharacter(genome, heard, 8);
 			genome.shift(shiftStrength, character.energy);
+			// The genome moved every axis; world and palette answer for themselves.
+			run.answers.world = { option: mandalaAnswer('world', keptWorld, heard, answerRoll(run), changed), boundary: boundaryCount('world') };
+			run.answers.palette = { option: mandalaAnswer('palette', keptPalette, heard, answerRoll(run), changed), boundary: boundaryCount('palette') };
 			mandalaPullCharacter(genome, heard, 0.75 * shiftStrength);
 			run.weightsIn = 0.5;
 		}
@@ -738,283 +873,198 @@
 		const speedUp = genome.glideSpeed;
 		// Boundary changes are patient; a shift makes them land in a second or two.
 		const leap = Math.pow(speedUp, 1.6);
-		run.wall.update(slotId('wall'), 8 / leap, dt);
-		run.screen.update(slotId('screen'), 7 / leap, dt);
-		run.shape.update(choiceTarget('shape'), 6 / leap, dt);
-		run.palette.update(choiceTarget('palette'), 5 / leap, dt);
+		// A morph's length is fixed when it starts: right after a shift it is
+		// short, and it stays short even as the speed-up eases back, so the
+		// answer lands and then holds.
+		const nextScene = sceneTarget();
+		if (nextScene !== run.scene.to || run.scene.mix >= 1) {
+			const worldMove = mandalaSlotParts(nextScene).world !== mandalaSlotParts(run.scene.to).world;
+			// Never quicker than two seconds for a new world: faster reads as a cut.
+			run.sceneTau = Math.max(worldMove ? 2.0 : 1.2, (worldMove ? 6.5 : 4.5) / leap);
+		}
+		run.scene.update(nextScene, run.sceneTau, dt);
+		const paletteTarget = answered('palette');
+		if (paletteTarget !== run.palette.to || run.palette.mix >= 1) run.paletteTau = Math.max(0.8, 5 / leap);
+		run.palette.update(paletteTarget, run.paletteTau, dt);
 
-		// Palette: the family crossfades, warmth and brightness lean it, the
-		// result glides (fast right after a shift).
+		// Palette: the family crossfades, warmth leans it, the result glides
+		// (fast right after a shift).
 		const pa = paletteFrom(run.palette.from);
 		const pb = paletteFrom(run.palette.to);
 		const pw = run.palette.weight;
 		const lean = clamp(val('warmth') * 0.5 + env.valence * 0.5, 0, 1);
-		const value = 0.8 + env.bright * 0.45;
 		const colourRate = 1.2 * leap;
-		const warmTint: Rgb = [1 + (lean - 0.5) * 0.18, 1, 1 - (lean - 0.5) * 0.22];
-		const role = (a: Rgb, b: Rgb, gain = 1): Rgb => {
-			const c = mixRgb(a, b, pw);
-			return [c[0] * warmTint[0] * gain, c[1] * warmTint[1] * gain, c[2] * warmTint[2] * gain];
-		};
+		const warmTint: Rgb = [1 + (lean - 0.5) * 0.14, 1, 1 - (lean - 0.5) * 0.18];
 		const colours = run.colours;
-		approachRgb(colours.stone, role(pa.stone, pb.stone), colourRate, dt);
-		approachRgb(colours.metal, role(pa.metal, pb.metal, value), colourRate, dt);
-		approachRgb(colours.glow, role(pa.glow, pb.glow, value), colourRate, dt);
-		approachRgb(colours.accent, role(pa.accent, pb.accent, value), colourRate, dt);
-		approachRgb(colours.rig, role(pa.rig, pb.rig), colourRate, dt);
-		approachRgb(colours.sconce, role(pa.sconce, pb.sconce), colourRate, dt);
-		approachRgb(colours.fog, role(pa.fog, pb.fog), colourRate, dt);
-		colours.iridescence = approach(
-			colours.iridescence,
-			pa.iridescence + (pb.iridescence - pa.iridescence) * pw,
-			colourRate,
-			dt
-		);
-
-		// ── Beats: a ring rises out of the depths and the camera is pushed.
-		const beatCount = Math.max(
-			0,
-			Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex))
-		);
-		if (run.resyncBeat) {
-			run.lastBeatCount = beatCount;
-			run.resyncBeat = false;
+		for (let i = 0; i < 4; i++) {
+			const c = mixRgb(pa.stops[i], pb.stops[i], pw);
+			approachRgb(colours.stops[i], [c[0] * warmTint[0], c[1] * warmTint[1], c[2] * warmTint[2]], colourRate, dt);
 		}
-		const punchiness = clamp(0.25 + env.punch * 0.55 + env.weight * 0.45, 0, 1.2);
-		if (beatCount !== run.lastBeatCount) {
-			run.lastBeatCount = beatCount;
-			if (feat && env.silence < 0.6) {
-				const downbeat = Math.floor(finite(clock.beatIndex)) === 0;
-				const strength =
-					(0.35 + directed.bassPunch * 0.8 + (downbeat ? 0.3 : 0)) * response.impact * (1 - env.silence);
-				flight.launchRing(strength);
-				env.kick = Math.max(env.kick, clamp((0.45 + directed.bassPunch * 0.55) * punchiness, 0, 1));
-			}
-		}
-		env.kick *= Math.exp(-dt / 0.2);
-		const beatPhase = clamp(finite(clock.beatPhase), 0, 1);
-		env.beatGlow = approach(env.beatGlow, feat ? Math.exp(-beatPhase * 5) * (0.4 + env.punch) : 0, 30, dt);
-		const impactTarget = feat
-			? clamp(clock.beatPulse * (0.35 + directed.bassPunch * 0.75) + spectrum.novelty * 0.3, 0, 1)
-			: 0;
-		env.impact = approach(env.impact, impactTarget * response.impact, impactTarget > env.impact ? 30 : 6, dt);
+		approachRgb(colours.spark, mixRgb(pa.spark, pb.spark, pw), colourRate, dt);
+		colours.sheen = approach(colours.sheen, pa.sheen + (pb.sheen - pa.sheen) * pw, colourRate, dt);
 
-		// ── Geometry and travel.
-		const density = clamp(val('density'), 0.5, 4);
-		const wallCells = (MANDALA_RAW_SECTORS * density) / Math.PI;
-		const screenDensity = density * clamp(val('screenDensity'), 0.3, 2);
-		const screenCells = (MANDALA_RAW_SECTORS * screenDensity) / Math.PI;
-		const wallAround = wallCells * Math.PI * 2;
-		const screenAround = screenCells * Math.PI * 2;
-		const wallRise = 1.2 / wallAround;
-		const screenRise = 1.2 / screenAround;
-		const wallBasis = phyllotaxisBasis(wallAround, MANDALA_DIVERGENCE, wallRise);
-		const screenBasis = phyllotaxisBasis(screenAround, MANDALA_DIVERGENCE, screenRise);
-		const wallHyperScale = (0.94 * Math.PI) / density;
-		const screenHyperScale = (0.94 * Math.PI) / screenDensity;
-		// Ambient drifts, club cruises, noise races; energy leans on it.
-		const speed =
-			(0.035 + Math.pow(env.tempo, 1.5) * 0.55 + env.drive * 0.1 + env.energy * 0.05) * response.motion;
-		const restless = clamp(env.tempo * 0.7 + finite(directed.motion) * 0.3 + env.harsh * 0.2, 0, 1);
-		flight.update({
+		// ── Beats, heard: the kick band's own transient, never the predicted
+		// clock. A kick surges the travel, rings the fold spring and lights a
+		// sparse scatter; it never lifts the frame.
+		const loudness = clamp(env.rms * 4, 0, 1) * (1 - env.silence);
+		run.pulse.update({
 			dt,
-			speed,
-			kick: env.kick * (0.15 + env.punch * 0.55),
-			wallCells,
-			screenCells,
-			screenRate: 1.35,
-			wallHyperScale,
-			screenHyperScale,
-			wallHyperPeriods: hyperPeriods(run.wall),
-			screenHyperPeriods: hyperPeriods(run.screen),
-			divergence: MANDALA_DIVERGENCE,
-			wallRise,
-			screenRise,
-			corkscrew: val('corkscrew') * (0.6 + env.tempo * 0.6),
-			wander: val('wander') * (0.7 + env.harsh * 0.5),
-			offset: val('offset'),
-			restless,
-			silence: env.silence,
-			sconceSpacing: 0.55,
-			sconceTurn: 2.39996
+			kickDelta: feat ? finite(spectrum.deltas.kick) : 0,
+			subDelta: feat ? finite(spectrum.deltas.sub) : 0,
+			kickLevel: feat ? finite(levels.kick) : 0,
+			subLevel: feat ? finite(levels.sub) : 0,
+			onset: !!feat?.onset,
+			novelty: feat ? finite(spectrum.novelty) : 0,
+			loudness,
+			tempo: env.tempo
+		});
+		const punchiness = clamp(0.35 + env.punch * 0.5 + env.weight * 0.35, 0, 1.2);
+		if (run.pulse.hits !== run.lastHits) {
+			run.lastHits = run.pulse.hits;
+			const strength = run.pulse.lastStrength * response.impact;
+			// The spring rings to about +-0.5 on a strong kick; each world turns
+			// that into a flex of its folds (see the shaders' motion.x).
+			if (!forced()?.nosnap) run.spring.kick(strength * punchiness);
+			if (!forced()?.nosurge) run.surge = Math.max(run.surge, strength * punchiness);
+		}
+		run.surge *= Math.exp(-dt / 0.16);
+		run.spring.update(dt, 2.6 + env.tempo * 1.6, 0.45);
+
+		// ── Travel: tempo sets the pace continuously; the clock never flashes.
+		const speed = (0.06 + Math.pow(env.tempo, 1.4) * 0.5 + env.drive * 0.12) * response.motion * (forced()?.speed ?? 1);
+		const morph = run.scene.mix < 1 ? Math.sin(Math.PI * run.scene.mix) * 0.25 : 0;
+		const sceneTo = mandalaSlotParts(run.scene.to);
+		const spiralTrack = run.julia[sceneTo.world === WORLD_INDEX.spiral ? sceneTo.variant : 0];
+		const rates = PERIOD_LOG.map((period, world) =>
+			// The spiral turns arg(lambda) per period: cap the turn rate, not just the zoom.
+			world === WORLD_INDEX.spiral ? 1 / Math.max(0.15, spiralTrack.periodLog, spiralTrack.periodTurn / 1.4) : 1 / period
+		);
+		run.voyage.update({
+			dt,
+			speed: speed + morph,
+			rates,
+			spin: val('spin') * (0.05 + env.tempo * 0.12),
+			surge: run.surge * (0.35 + env.tempo * 0.4),
+			restless: clamp(env.tempo * 0.7 + finite(directed.motion) * 0.3 + env.harsh * 0.2, 0, 1),
+			drift: clamp(val('drift'), 0, 1) * (0.5 + env.harsh * 0.3),
+			silence: env.silence
 		});
 
-		const focal = (1.05 + env.weight * 0.15) * (1 - env.kick * 0.06 * response.impact);
-		const yaw = flight.yaw;
-		const pitch = flight.pitch;
-		// Where the tunnel axis lands on screen (feedback zooms about it).
-		const axisX = (-Math.sin(yaw) / Math.max(1e-3, Math.cos(yaw) * Math.cos(pitch))) * focal;
-		const axisY = -Math.tan(pitch) * focal;
-		const aspect = size.width / Math.max(1, size.height);
-		const vanishX = clamp(axisX / aspect + 0.5, -0.5, 1.5);
-		const vanishY = clamp(0.5 - axisY, -0.5, 1.5);
+		// Julia dives are chosen by their spiral: the multiplier rests on a
+		// rational angle p/q (a q-armed rosette) with a small twist, picked by
+		// formA and moved between only when the genome moves it. Gliding
+		// continuously through the angles would cross bifurcations every
+		// second and read as flicker.
+		const juliaGrowth = clamp(val('formC') * 0.85 + env.harsh * 0.15, 0, 1);
+		const juliaTwist = (val('formB') - 0.5) * 0.03;
+		run.julia.forEach((track, variant) => {
+			const [turns, low, high] = JULIA_DIVES[variant];
+			const radius = low + (high - low) * juliaGrowth + run.spring.value * 0.003;
+			track.steer(turns * Math.PI * 2 + juliaTwist, radius, dt, 0.35 * Math.sqrt(leap));
+		});
 
-		const trail = clamp(val('trail'), 0, 1);
-		const feedbackFade =
-			feedbackResetFrames > 0
-				? 0
-				: clamp((0.6 + trail * 0.3 - env.impact * 0.1 - env.harsh * 0.08) * (1 - env.silence * 0.3), 0.35, 0.93);
-		// The trail follows the flight exactly, so it deepens the light
-		// instead of smearing the carving.
-		const feedbackZoom = Math.exp(-flight.stepLog);
-		const feedbackRoll = flight.stepRoll;
+		const forcedPhase = forced()?.phase;
+		if (forcedPhase !== undefined) run.voyage.phase[mandalaSlotParts(run.scene.to).world] = forcedPhase;
+		const sceneFrom = run.scene.from;
+		const sceneB = run.scene.to;
+		const mixing = run.scene.mix < 1;
+		slotUniforms(mixing ? sceneFrom : sceneB, run, 'A');
+		slotUniforms(sceneB, run, 'B');
+		values.mix = mixing ? run.scene.weight : 0;
+		values.revealSeed = (run.scene.to * 0.618) % 1;
 
-		const wallSlotA = run.wall.from;
-		const wallSlotB = run.wall.to;
-		const screenSlotA = run.screen.from;
-		const screenSlotB = run.screen.to;
-		const rigTurn = val('rigTurn') * Math.PI * 2 + flight.rigPhase;
-		const offX = flight.offsetX;
-		const offY = flight.offsetY;
-		const lightLevel = (0.55 + env.energy * 0.7 + env.beatGlow * 0.25) * (1 - env.silence * 0.6);
-		const fog = clamp(val('fog'), 0.02, 0.3);
-
+		const quality = QUALITY_TIERS[tier];
 		values.width = size.width;
 		values.height = size.height;
 		values.frame = frameIndex % 64;
-		values.focal = focal;
-		values.yaw = yaw;
-		values.pitch = pitch;
-		values.offsetX = offX;
-		values.offsetY = offY;
-		values.roll = flight.roll;
-		values.spin = val('spin');
-		values.kick = env.kick;
-		values.silence = env.silence;
-		values.wallRow = flight.wall.row;
-		values.wallFrac = flight.wall.frac;
-		values.wallPhylloX = flight.wall.phylloTurn;
-		values.wallPhylloY = flight.wall.phylloY;
-		values.wallHyper = flight.wall.hyper;
-		values.wallCells = wallCells;
-		values.wallHalf = density;
-		values.wallSeedRow = flight.wall.seedRow;
-		values.screenRow = flight.screen.row;
-		values.screenFrac = flight.screen.frac;
-		values.screenPhylloX = flight.screen.phylloTurn;
-		values.screenPhylloY = flight.screen.phylloY;
-		values.screenHyper = flight.screen.hyper;
-		values.screenCells = screenCells;
-		values.screenHalf = screenDensity;
-		values.screenSeedRow = flight.screen.seedRow;
-		values.wallGrammarA = slotGrammar(wallSlotA);
-		values.wallFoldA = slotFold(wallSlotA);
-		values.wallGrammarB = slotGrammar(wallSlotB);
-		values.wallFoldB = slotFold(wallSlotB);
-		values.screenGrammarA = slotGrammar(screenSlotA);
-		values.screenFoldA = slotFold(screenSlotA);
-		values.screenGrammarB = slotGrammar(screenSlotB);
-		values.screenFoldB = slotFold(screenSlotB);
-		// The A slot alone when a fade is complete: one evaluation, not two.
-		const wallMix = run.wall.mix >= 1 ? 0 : run.wall.weight;
-		if (run.wall.mix >= 1) {
-			values.wallGrammarA = values.wallGrammarB;
-			values.wallFoldA = values.wallFoldB;
-		}
-		values.wallMix = wallMix;
-		const screenMix = run.screen.mix >= 1 ? 0 : run.screen.weight;
-		if (run.screen.mix >= 1) {
-			values.screenGrammarA = values.screenGrammarB;
-			values.screenFoldA = values.screenFoldB;
-		}
-		values.screenMix = screenMix;
-		values.screenAmount = clamp((val('screenAmount') - 0.42) / 0.35, 0, 1);
-		values.screenRadius = clamp(val('screenRadius') + env.kick * 0.02, 0.4, 0.85);
-		const shapeA = MANDALA_SHAPES[run.shape.from] ?? 0;
-		const shapeB = MANDALA_SHAPES[run.shape.to] ?? 0;
-		values.shapeA = run.shape.mix >= 1 ? shapeB : shapeA;
-		values.shapeB = shapeB;
-		values.shapeMix = run.shape.mix >= 1 ? 0 : run.shape.weight;
-		values.shapeTurn = val('shapeTurn');
-		values.lineWidth = clamp(val('lineWidth') * (1.15 - env.harsh * 0.4), 0.009, 0.06);
-		values.relief = clamp(val('relief') * (0.7 + env.weight * 0.6), 0, 2);
-		values.morph = clamp(val('morph') + env.bass * 0.08, 0, 1);
-		values.fracture = Math.pow(clamp((env.harsh - 0.45) / 0.4, 0, 1), 1.3) * 1.1;
-		values.wallE1x = wallBasis.e1[0];
-		values.wallE1y = wallBasis.e1[1];
-		values.wallE2x = wallBasis.e2[0];
-		values.wallE2y = wallBasis.e2[1];
-		values.screenE1x = screenBasis.e1[0];
-		values.screenE1y = screenBasis.e1[1];
-		values.screenE2x = screenBasis.e2[0];
-		values.screenE2y = screenBasis.e2[1];
-		values.wallN1 = wallBasis.n1;
-		values.wallN2 = wallBasis.n2;
-		values.screenN1 = screenBasis.n1;
-		values.screenN2 = screenBasis.n2;
-		[values.stoneR, values.stoneG, values.stoneB] = colours.stone;
-		values.stoneGloss = colours.stoneGloss;
-		[values.metalR, values.metalG, values.metalB] = colours.metal;
-		values.metalGain = 1;
-		[values.glowR, values.glowG, values.glowB] = colours.glow;
-		// Harsh music burns its thin lines brighter.
-		values.glowGain = (0.5 + env.energy * 0.9 + env.harsh * 0.9) * (1 - env.silence * 0.5);
-		[values.accentR, values.accentG, values.accentB] = colours.accent;
-		values.accentGain = 1.3 * response.impact;
-		[values.rigR, values.rigG, values.rigB] = colours.rig;
-		values.rigGain = 0.6 * lightLevel;
-		[values.sconceR, values.sconceG, values.sconceB] = colours.sconce;
-		values.sconceGain = clamp(val('sconces'), 0, 1) * 0.9 * lightLevel;
-		[values.fogR, values.fogG, values.fogB] = colours.fog;
-		values.fogDensity = fog;
-		values.rigAx = offX + Math.cos(rigTurn) * 0.3;
-		values.rigAy = offY + Math.sin(rigTurn) * 0.3;
-		values.rigAz = 0.16;
-		values.rigSoft = 0.35;
-		values.rigBx = offX + Math.cos(rigTurn + 2.6) * 0.24;
-		values.rigBy = offY + Math.sin(rigTurn + 2.6) * 0.24;
-		values.rigBz = 0.34;
-		values.rigBalance = 0.5 + Math.sin(flight.rigPhase * 1.7) * 0.3;
-		// The spots sweep round the tunnel; slow music aims them deep and wide.
-		values.spotA = rigTurn + Math.sin(flight.rigPhase * 2.3) * 0.7;
-		values.spotB = rigTurn + 2.6 + Math.sin(flight.rigPhase * 1.9 + 1.3) * 0.7;
-		values.spotReach = 0.9 + (1 - env.tempo) * 1.1;
-		values.spotCone = 0.62 + env.punch * 0.2;
-		values.sconceSpacing = 0.55;
-		values.sconcePhase = flight.sconcePhase;
-		values.sconceTurn = 2.39996;
-		values.sconceAngle = flight.sconceAngle;
-		values.ring0z = flight.ringZ[0];
-		values.ring0s = flight.ringS[0];
-		values.ring1z = flight.ringZ[1];
-		values.ring1s = flight.ringS[1];
-		values.ring2z = flight.ringZ[2];
-		values.ring2s = flight.ringS[2];
-		values.ring3z = flight.ringZ[3];
-		values.ring3s = flight.ringS[3];
-		values.ring4z = flight.ringZ[4];
-		values.ring4s = flight.ringS[4];
-		values.ring5z = flight.ringZ[5];
-		values.ring5s = flight.ringS[5];
+		values.time = (now / 1000) % 1000;
+		values.steps = quality.steps;
+		values.detail = quality.detail * (1 + env.harsh * 0.15);
+		values.focal = 1.25;
+		values.occlusion = quality.occlusion;
+		values.formA = clamp(val('formA'), 0, 1);
+		values.formB = clamp(val('formB'), 0, 1);
+		values.formC = clamp(val('formC'), 0, 1);
+		values.formD = clamp(val('formD'), 0, 1);
 		values.energy = env.energy;
 		values.bass = env.bass;
+		values.mid = env.mid;
 		values.treble = env.treble;
-		values.beatGlow = env.beatGlow;
-		values.sub = env.sub;
-		values.kickBand = env.kickBand;
-		values.body = env.body;
-		values.presence = env.presence;
+		values.hit = forced()?.nospark ? 0 : run.pulse.hit * response.impact * (1 - env.silence);
+		values.hitSeed = run.pulse.hitSeed;
+		values.spark = run.pulse.spark * (1 - env.silence);
+		values.sparkSeed = run.pulse.sparkSeed;
+		values.snap = run.spring.value;
+		values.surge = run.surge;
+		values.silence = env.silence;
+		values.drive = env.drive;
 		values.harsh = env.harsh;
 		values.warmth = lean;
 		values.punch = env.punch;
-		values.iridescence = colours.iridescence;
-		values.feedbackFade = feedbackFade;
-		values.feedbackZoom = feedbackZoom;
-		values.bloomThreshold = 0.95 - env.energy * 0.25;
-		values.aberration = 1 + env.harsh * 1.2 + env.impact * 0.9;
-		values.vanishX = vanishX;
-		values.vanishY = vanishY;
-		values.feedbackRoll = feedbackRoll;
+		values.tempo = env.tempo;
+		values.glow = clamp(val('glow'), 0, 1);
+		values.sheen = clamp(colours.sheen * (0.5 + val('sheen') * 0.7), 0, 1);
+		values.hue = val('hue');
+		// Light follows the song's arc and the silence, never the beat.
+		values.gain = (0.75 + env.energy * 0.55) * (1 - env.silence * 0.55);
+		[values.pal0r, values.pal0g, values.pal0b] = colours.stops[0];
+		[values.pal1r, values.pal1g, values.pal1b] = colours.stops[1];
+		[values.pal2r, values.pal2g, values.pal2b] = colours.stops[2];
+		[values.pal3r, values.pal3g, values.pal3b] = colours.stops[3];
+		[values.sparkR, values.sparkG, values.sparkB] = colours.spark;
+		values.sparkGain = 1;
+		// Ambient air is clear and vast; dense music closes the distance in.
+		values.fogDensity = 0.35 + env.drive * 0.25 + env.harsh * 0.25;
+		values.saturation = 1.15 + env.punch * 0.1 - env.harsh * 0.05;
+
+		// Feedback: the trail streams outward with the zoom and turns with the roll.
+		const trail = clamp(val('trail'), 0, 1);
+		const raymarched = (slot: number) => MANDALA_RAYMARCHED.has(MANDALA_WORLDS[mandalaSlotParts(slot).world]);
+		const zoomShare = (slot: number) => {
+			const world = mandalaSlotParts(slot).world;
+			// Planes zoom; flights turn as they travel, so their trail barely zooms.
+			if (world === WORLD_INDEX.crystal || world === WORLD_INDEX.bulb) return 0.15;
+			return MANDALA_RAYMARCHED.has(MANDALA_WORLDS[world]) ? 0.3 : 1;
+		};
+		const zoomWeight = mixing
+			? zoomShare(sceneFrom) * (1 - run.scene.weight) + zoomShare(sceneB) * run.scene.weight
+			: zoomShare(sceneB);
+		const marchWeight = mixing
+			? (raymarched(sceneFrom) ? 1 - run.scene.weight : 0) + (raymarched(sceneB) ? run.scene.weight : 0)
+			: raymarched(sceneB)
+				? 1
+				: 0;
+		// The spiral turns by arg(lambda) as it dives, which the trail cannot
+		// follow exactly: it keeps a shorter one.
+		const isSpiral = (slot: number) => (mandalaSlotParts(slot).world === WORLD_INDEX.spiral ? 1 : 0);
+		const spiralWeight = mixing
+			? isSpiral(sceneFrom) * (1 - run.scene.weight) + isSpiral(sceneB) * run.scene.weight
+			: isSpiral(sceneB);
+		values.feedbackFade =
+			feedbackResetFrames > 0
+				? 0
+				: clamp(
+						(0.55 + trail * 0.33 - env.harsh * 0.12 - marchWeight * 0.3 - spiralWeight * 0.2) * (1 - env.silence * 0.3),
+						0.3,
+						0.9
+					);
+		values.feedbackZoom = Math.exp(-run.voyage.stepLog * zoomWeight);
+		values.feedbackRoll = -run.voyage.stepTurn * (1 - marchWeight);
+		values.bloomThreshold = 0.9 - env.energy * 0.2;
+		values.aberration = 0.8 + env.harsh * 1.4 + run.surge * 0.5;
+		values.vanishX = 0.5;
+		values.vanishY = 0.5;
 		values.exposure = 1;
-		values.bloomWeight = 0.55;
-		values.contrast = 1.06 + env.punch * 0.1 + env.harsh * 0.08;
+		values.bloomWeight = 0.45 + val('glow') * 0.35;
+		values.contrast = 1.04 + env.punch * 0.08;
 		values.vignette = 1;
 		values.grain = forced()?.debug ? -1 : 1.4;
-		// Ambient is soft and vast, harsh music sharp; quiet music stays dark.
-		values.softness = clamp((1 - env.punch) * (1 - env.tempo) * (1 - env.harsh) * 1.3 - 0.15, 0, 1);
-		values.depthFade = 0.6 + (1 - env.drive) * 0.8;
-		values.bounce = 0.35 + env.drive * 0.4;
-		values.exposureKey = 0.032 + env.drive * 0.03 + env.tilt * 0.012;
+		values.exposureCeil = 2.6;
+		values.meterRate = feedbackResetFrames > 0 ? 1 : 0.06;
+		values.debug = forced()?.debug ?? 0;
+		// A wall the camera passes close to fills the frame: the meter brings it
+		// down rather than letting the whole picture swell.
+		values.meanCeil = 0.22;
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 		packMandalaUniforms(g.uniforms, values);
 		frameIndex += 1;
@@ -1022,13 +1072,37 @@
 		g.device.queue.writeBuffer(g.uniformBuffer, 0, g.uniforms.buffer, g.uniforms.byteOffset, g.uniforms.byteLength);
 		g.device.queue.writeBuffer(g.binsBuffer, 0, bins.buffer, bins.byteOffset, bins.byteLength);
 
-		hudSection = directed.section;
-		hudWall = grammarName(wallSlotB);
-		hudScreen = grammarName(screenSlotB);
-		hudFold = slotFold(wallSlotB);
-		hudShape = MANDALA_SHAPE_NAMES[run.shape.to] ?? 'round';
+		const shown = mandalaSlotParts(sceneB);
+		const worldName = MANDALA_WORLDS[shown.world];
+		hudWorld = worldName;
+		hudVariant = MANDALA_VARIANT_NAMES[worldName][shown.variant] ?? '';
+		hudFold = MANDALA_FOLDS[shown.fold];
 		hudPalette = MANDALA_PALETTES[run.palette.to]?.name ?? '';
-		hudEar = earContrast.toFixed(3);
+		hudHits = run.pulse.hits;
+		if (import.meta.env.DEV) hudHeard = `t${heard.tempo.toFixed(2)} n${heard.noise.toFixed(2)} b${heard.brightness.toFixed(2)} p${heard.punch.toFixed(2)} e${heard.energy.toFixed(2)} bass${heard.bass.toFixed(2)} v${heard.valence.toFixed(2)} c${heard.contrast.toFixed(2)}`;
+
+		if (import.meta.env.DEV && forced()?.probe) {
+			probe.push({
+				t: performance.now(),
+				kick: feat ? levels.kick : 0,
+				delta: feat ? spectrum.deltas.kick : 0,
+				hit: run.pulse.hit,
+				hits: run.pulse.hits,
+				spark: run.pulse.spark,
+				sparks: run.pulse.sparks,
+				onset: feat?.onset ? 1 : 0,
+				novelty: feat ? spectrum.novelty : 0,
+				surge: run.surge,
+				snap: run.spring.value,
+				phase: run.voyage.phase[mandalaSlotParts(run.scene.to).world],
+				width: size.width,
+				gpu: gpuFrameMs,
+				scene: `${run.scene.from}>${run.scene.to}@${run.scene.mix.toFixed(2)}`,
+				look: genome.signature()
+			});
+			if (probe.length > 4000) probe.splice(0, probe.length - 4000);
+			(globalThis as { __MANDALA_PROBE__?: ProbeFrame[] }).__MANDALA_PROBE__ = probe;
+		}
 
 		// ── Render graph: scene -> feedback -> exposure -> prefilter -> 2x(H, V) blur -> present
 		const encoder = g.device.createCommandEncoder({ label: 'Mandala frame' });
@@ -1044,17 +1118,78 @@
 		};
 		const previous = g.parity;
 		const next: 0 | 1 = previous === 0 ? 1 : 0;
-		fullscreen('Mandala tunnel', t.sceneView, g.pipelines.scene, bg.scene);
-		fullscreen('Mandala feedback', t.feedbackView[next], g.pipelines.feedback, bg.feedback[previous]);
-		fullscreen('Mandala exposure', t.exposureView[next], g.pipelines.exposure, bg.exposure[next]);
+		fullscreen('Mandala worlds', t.sceneView, g.pipelines.scene, bg.scene);
+		// Right after a resize the trail and the meter are read from the
+		// retired targets (the feedback pass resamples by uv), so nothing resets.
+		const retired = g.retired;
+		let feedbackGroup = bg.feedback[previous];
+		let exposureGroup = bg.exposure[next];
+		if (retired) {
+			const carry = (pipeline: GPURenderPipeline, frame: GPUTextureView, prior: GPUTextureView) =>
+				g.device.createBindGroup({
+					label: 'Mandala resize carry',
+					layout: pipeline.getBindGroupLayout(0),
+					entries: [
+						{ binding: 0, resource: { buffer: g.uniformBuffer } },
+						{ binding: 1, resource: g.sampler },
+						{ binding: 2, resource: frame },
+						{ binding: 3, resource: prior }
+					]
+				});
+			feedbackGroup = carry(g.pipelines.feedback, t.sceneView, retired.feedbackView[previous]);
+			exposureGroup = carry(g.pipelines.exposure, t.feedbackView[next], retired.exposureView[previous]);
+		}
+		fullscreen('Mandala feedback', t.feedbackView[next], g.pipelines.feedback, feedbackGroup);
+		fullscreen('Mandala exposure', t.exposureView[next], g.pipelines.exposure, exposureGroup);
 		fullscreen('Mandala bloom prefilter', t.bloomView[0], g.pipelines.bloomDown, bg.bloomDown[next]);
 		for (let round = 0; round < 2; round++) {
 			fullscreen('Mandala bloom blur H', t.bloomView[1], g.pipelines.blurH, bg.blurH);
 			fullscreen('Mandala bloom blur V', t.bloomView[0], g.pipelines.blurV, bg.blurV);
 		}
 		fullscreen('Mandala present', g.context.getCurrentTexture().createView(), g.pipelines.composite, bg.composite[next]);
+		const submittedAt = performance.now();
 		g.device.queue.submit([encoder.finish()]);
 		g.parity = next;
+		if (retired) {
+			disposeTargets(retired);
+			g.retired = null;
+		}
+		void g.device.queue.onSubmittedWorkDone().then(() => {
+			const ms = performance.now() - submittedAt;
+			gpuFrameMs += (ms - gpuFrameMs) * 0.1;
+			if (import.meta.env.DEV && forced()?.perf) {
+				const store = globalThis as { __MANDALA_GPU_MS__?: number[] };
+				(store.__MANDALA_GPU_MS__ ??= []).push(ms);
+			}
+		});
+	}
+
+	/**
+	 * Resolution governor, driven by how long the GPU takes to finish a frame
+	 * (submit to done), not by rAF intervals, which also stretch for reasons
+	 * that have nothing to do with the GPU. Sustained overload steps the
+	 * internal resolution down; long headroom steps it back up. A step is a
+	 * resize, which carries the trail and meter over (see ensureTargets).
+	 */
+	function governFrame(dt: number) {
+		const budget = refreshIntervalMs * activeFrameStride;
+		if (gpuFrameMs > budget * 0.9) {
+			slowFor += dt;
+			fastFor = 0;
+		} else if (gpuFrameMs < budget * 0.45) {
+			fastFor += dt;
+			slowFor = Math.max(0, slowFor - dt * 0.5);
+		} else {
+			slowFor = Math.max(0, slowFor - dt * 0.5);
+		}
+		if (slowFor > 3 && governor > 0.5) {
+			governor = Math.max(0.5, governor * 0.88);
+			slowFor = 0;
+		} else if (fastFor > 20 && governor < 1) {
+			governor = Math.min(1, governor * 1.06);
+			fastFor = 0;
+		}
+		hudScale = governor.toFixed(2);
 	}
 
 	function displayFrameStride(refreshMs: number) {
@@ -1092,6 +1227,7 @@
 		framesUntilRender = activeFrameStride - 1;
 		const elapsedMs = lastRenderedAt ? now - lastRenderedAt : refreshIntervalMs * activeFrameStride;
 		lastRenderedAt = now;
+		if (frameIndex > 30 && document.visibilityState === 'visible') governFrame(elapsedMs / 1000);
 		try {
 			renderFrame(gpu, now, clamp(elapsedMs / 1000, 0.001, 0.25));
 		} catch (error) {
@@ -1115,6 +1251,8 @@
 		initializing = true;
 		errorMsg = null;
 		ready = false;
+		tier = pickTier();
+		hudTier = tier;
 		initGpu(targetCanvas)
 			.then((state) => {
 				if (version !== initVersion || canvas !== targetCanvas) {
@@ -1168,14 +1306,15 @@
 			bind:this={canvas}
 			class="h-full w-full"
 			aria-label="Mandala audio visualizer"
-			data-mandala-section={hudSection}
-			data-mandala-wall={hudWall}
-			data-mandala-screen={hudScreen}
+			data-mandala-world={hudWorld}
+			data-mandala-variant={hudVariant}
 			data-mandala-fold={hudFold}
-			data-mandala-shape={hudShape}
 			data-mandala-palette={hudPalette}
 			data-mandala-shifts={hudShifts}
-			data-mandala-ear={hudEar}
+			data-mandala-hits={hudHits}
+			data-mandala-heard={hudHeard}
+			data-mandala-quality={hudTier}
+			data-mandala-governor={hudScale}
 			data-mandala-render-passes={RENDER_PASSES}
 			data-mandala-uniform-bytes={MANDALA_UNIFORM_BYTES}
 			data-mandala-frame-stride={activeFrameStride}

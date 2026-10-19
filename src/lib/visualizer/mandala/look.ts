@@ -1,14 +1,20 @@
-// Mandala's long-listen look: which sacred-geometry grammar the tunnel walls
-// and the fretwork screen are carved with, how many mirror sectors fold them,
-// the tunnel's cross-section, the palette family, and the continuous
-// proportions (density, line weight, relief, spiral, wander). The genome walks
-// these at musical boundaries and leaps on a character shift; every discrete
-// change reaches the shader as an A -> B crossfade.
+// Mandala's long-listen look: which fractal world the picture is in, which
+// variant of it, how many mirror sectors fold it, the jewel palette, and the
+// continuous fractal parameters that drift with the music. The genome walks
+// these at musical boundaries and leaps on a character shift; a change of
+// world, variant or fold reaches the shader as an A -> B morph (both worlds
+// rendered, the new one opening out of the old), never a cut.
 //
-// Grammars are (family, variant) pairs, 9 families x 4 variants = 36 per
-// layer. With 9 fold counts, 5 cross-sections and 12 palettes the discrete
-// space alone is ~1.8 million wall/screen/fold/shape/palette combinations
-// before any continuous axis moves.
+// Worlds are genuinely different places with their own camera regime:
+//   bloom    kaleidoscopic Kaliset filigree, an endless layered zoom (plane)
+//   spiral   an n-fold Julia set dived into forever about a repelling fixed
+//            point, self-similar spiral by spiral (zoom dive)
+//   yantra   sacred-geometry line work in a Droste spiral (spiral recursion)
+//   sponge   inside the Menger sponge, x3 self-similar flight (3D zoom)
+//   cavern   pseudo-Kleinian caverns flown through on a corridor (3D flight)
+//   foam     an Apollonian sphere-inversion foam drifted through (open space)
+//   crystal  a kaleidoscopic IFS cathedral orbited up close (object orbit)
+//   bulb     the Mandelbulb's surface, power drifting (surface orbit)
 
 import type { CharacterFeature, MusicCharacter } from '../character';
 import { characterWeights } from '../character';
@@ -16,324 +22,295 @@ import type { VariationAxis, VariationGenome } from '../variation';
 
 export type Rgb = [number, number, number];
 
-export const MANDALA_FAMILIES = [
-	'truchet',
-	'flower',
+export const MANDALA_WORLDS = [
+	'bloom',
+	'spiral',
 	'yantra',
-	'girih',
-	'lace',
-	'apollonian',
-	'hyperbolic',
-	'phyllotaxis',
-	'rings'
+	'sponge',
+	'cavern',
+	'foam',
+	'crystal',
+	'bulb'
 ] as const;
-export type MandalaFamily = (typeof MANDALA_FAMILIES)[number];
+export type MandalaWorld = (typeof MANDALA_WORLDS)[number];
+/** Worlds rendered by raymarching (the rest are escape-time planes). */
+export const MANDALA_RAYMARCHED: ReadonlySet<MandalaWorld> = new Set(['sponge', 'cavern', 'foam', 'crystal', 'bulb']);
 export const MANDALA_VARIANTS = 4;
-export const MANDALA_GRAMMARS = MANDALA_FAMILIES.length * MANDALA_VARIANTS;
 
-/** Listener-neutral names per (family, variant), for QA attributes. */
-export const MANDALA_VARIANT_NAMES: Record<MandalaFamily, readonly string[]> = {
-	truchet: ['arcs', 'weave', 'diagonal', 'nested rings'],
-	flower: ['flower of life', 'tangent circles', 'vesica', 'flower lattice'],
-	yantra: ['triangle grid', 'hexagram', 'sri yantra', 'metatron'],
-	girih: ['eight star', 'six star', 'twelve rosette', 'ten star'],
-	lace: ['snowflake', 'coral', 'fern', 'crystal'],
-	apollonian: ['gasket', 'pearl', 'foam', 'lattice'],
-	hyperbolic: ['{4,5}', '{6,4}', '{8,3}', '{4,6}'],
-	phyllotaxis: ['golden seeds', 'pinecone', 'florets', 'parastichy'],
-	rings: ['fibonacci', 'primes', 'powers of two', 'triangular']
+/** Listener-neutral names per (world, variant), for QA attributes. */
+export const MANDALA_VARIANT_NAMES: Record<MandalaWorld, readonly string[]> = {
+	bloom: ['kaliset', 'twisted', 'rings', 'lattice'],
+	spiral: ['rosettes', 'rings', 'galaxy', 'mirror rosettes'],
+	yantra: ['flower of life', 'sri yantra', 'metatron', 'phyllotaxis'],
+	sponge: ['cross', 'arches', 'octahedral', 'jerusalem'],
+	cavern: ['kleinian', 'filaments', 'arcade', 'lattice'],
+	foam: ['apollonian', 'pearls', 'shells', 'coral'],
+	crystal: ['octahedral', 'icosahedral', 'cathedral', 'menger'],
+	bulb: ['bulb', 'quintic', 'tri', 'nine']
 };
 
-/** Hyperbolic {p,q} per variant (p even: the band translation is exact). */
-export const MANDALA_HYPERBOLIC: readonly [number, number][] = [
-	[4, 5],
-	[6, 4],
-	[8, 3],
-	[4, 6]
-];
-
-/** Mirror sectors the kaleidoscope folds the tunnel into. */
-export const MANDALA_FOLDS = [3, 4, 5, 6, 7, 8, 10, 12, 16] as const;
-/** Tunnel cross-sections: polygon sides, 0 = round. */
-export const MANDALA_SHAPES = [0, 3, 4, 6, 8] as const;
-export const MANDALA_SHAPE_NAMES = ['round', 'triangle', 'square', 'hexagon', 'octagon'] as const;
+/** Mirror sectors the planes are folded into (the 3D worlds read it as fold strength). */
+export const MANDALA_FOLDS = [3, 4, 5, 6, 7, 8, 9, 10, 12] as const;
 
 export type MandalaPalette = {
 	name: string;
-	/** Carved wall albedo: always near black. */
-	stone: Rgb;
-	/** Inlay metal: what the lights glint off. */
-	metal: Rgb;
-	/** Inlay emission: where the music lights the carving. */
-	glow: Rgb;
-	/** Beat rings. */
-	accent: Rgb;
-	/** Camera-carried rig lights. */
-	rig: Rgb;
-	/** Sconces along the wall. */
-	sconce: Rgb;
-	/** What the tunnel air scatters. */
-	fog: Rgb;
-	/** 0..1 view-angle colour play on the inlay (glow toward accent). */
-	iridescence: number;
-	/** 0..1 how warm the family reads; character warmth pulls toward it. */
+	/** Four emission stops, deep to hot. The background is always black. */
+	stops: [Rgb, Rgb, Rgb, Rgb];
+	/** Local beat sparks. */
+	spark: Rgb;
+	/** 0..1 how much the stops cycle with view angle and orbit (iridescence). */
+	sheen: number;
+	/** 0..1 how warm the family reads. */
 	warmth: number;
 };
 
-// Authored stops, never a cosine ramp. Every stone is near black; light only
-// comes from inlays, rigs, sconces and beat rings.
+// Authored stops, never a cosine ramp: saturated jewel colour, a deep stop
+// that is dark but never grey, and a hot stop that burns toward white.
 export const MANDALA_PALETTES: readonly MandalaPalette[] = [
 	{
-		name: 'obsidian gold',
-		stone: [0.03, 0.026, 0.024],
-		metal: [1.0, 0.74, 0.36],
-		glow: [1.0, 0.6, 0.22],
-		accent: [0.32, 0.84, 0.92],
-		rig: [1.0, 0.86, 0.66],
-		sconce: [1.0, 0.55, 0.2],
-		fog: [0.42, 0.34, 0.26],
-		iridescence: 0.1,
-		warmth: 0.8
-	},
-	{
-		name: 'lapis',
-		stone: [0.016, 0.024, 0.06],
-		metal: [0.95, 0.78, 0.42],
-		glow: [0.26, 0.46, 1.0],
-		accent: [1.0, 0.42, 0.18],
-		rig: [0.7, 0.8, 1.0],
-		sconce: [1.0, 0.72, 0.36],
-		fog: [0.2, 0.27, 0.55],
-		iridescence: 0.2,
-		warmth: 0.35
-	},
-	{
-		name: 'byzantine',
-		stone: [0.05, 0.012, 0.016],
-		metal: [1.0, 0.78, 0.38],
-		glow: [0.96, 0.2, 0.16],
-		accent: [0.26, 0.9, 0.56],
-		rig: [1.0, 0.8, 0.6],
-		sconce: [1.0, 0.46, 0.24],
-		fog: [0.5, 0.2, 0.18],
-		iridescence: 0.1,
-		warmth: 0.85
-	},
-	{
-		name: 'jade abyss',
-		stone: [0.008, 0.03, 0.026],
-		metal: [0.55, 0.95, 0.76],
-		glow: [0.18, 0.95, 0.68],
-		accent: [0.85, 0.95, 1.0],
-		rig: [0.62, 1.0, 0.86],
-		sconce: [0.3, 0.9, 0.62],
-		fog: [0.12, 0.36, 0.32],
-		iridescence: 0.3,
-		warmth: 0.3
-	},
-	{
-		name: 'ultraviolet',
-		stone: [0.018, 0.008, 0.045],
-		metal: [0.86, 0.6, 1.0],
-		glow: [0.82, 0.18, 1.0],
-		accent: [0.2, 0.95, 1.0],
-		rig: [0.7, 0.52, 1.0],
-		sconce: [1.0, 0.3, 0.7],
-		fog: [0.32, 0.16, 0.58],
-		iridescence: 0.55,
+		name: 'sapphire gold',
+		stops: [
+			[0.02, 0.05, 0.42],
+			[0.0, 0.42, 1.0],
+			[0.1, 0.88, 1.0],
+			[1.0, 0.7, 0.2]
+		],
+		spark: [1.0, 0.86, 0.5],
+		sheen: 0.35,
 		warmth: 0.4
 	},
 	{
-		name: 'ember',
-		stone: [0.036, 0.016, 0.012],
-		metal: [1.0, 0.52, 0.26],
-		glow: [1.0, 0.28, 0.06],
-		accent: [1.0, 0.86, 0.52],
-		rig: [1.0, 0.62, 0.42],
-		sconce: [1.0, 0.36, 0.1],
-		fog: [0.46, 0.18, 0.08],
-		iridescence: 0.05,
-		warmth: 1.0
+		name: 'emerald',
+		stops: [
+			[0.0, 0.14, 0.07],
+			[0.0, 0.66, 0.34],
+			[0.4, 1.0, 0.55],
+			[1.0, 0.95, 0.55]
+		],
+		spark: [1.0, 0.75, 0.25],
+		sheen: 0.3,
+		warmth: 0.45
 	},
 	{
-		name: 'moonstone',
-		stone: [0.026, 0.03, 0.04],
-		metal: [0.85, 0.9, 1.0],
-		glow: [0.58, 0.74, 1.0],
-		accent: [0.9, 0.7, 1.0],
-		rig: [0.76, 0.86, 1.0],
-		sconce: [0.62, 0.72, 1.0],
-		fog: [0.3, 0.35, 0.46],
-		iridescence: 0.4,
-		warmth: 0.15
+		name: 'ruby',
+		stops: [
+			[0.3, 0.0, 0.04],
+			[0.95, 0.03, 0.12],
+			[1.0, 0.36, 0.12],
+			[1.0, 0.86, 0.55]
+		],
+		spark: [1.0, 0.95, 0.8],
+		sheen: 0.2,
+		warmth: 0.9
 	},
 	{
-		name: 'verdigris',
-		stone: [0.012, 0.03, 0.03],
-		metal: [0.96, 0.56, 0.32],
-		glow: [0.24, 0.85, 0.74],
-		accent: [1.0, 0.6, 0.3],
-		rig: [0.92, 0.95, 0.85],
-		sconce: [0.42, 0.95, 0.8],
-		fog: [0.17, 0.34, 0.32],
-		iridescence: 0.25,
-		warmth: 0.55
+		name: 'amethyst',
+		stops: [
+			[0.14, 0.0, 0.34],
+			[0.55, 0.08, 1.0],
+			[1.0, 0.28, 0.85],
+			[1.0, 0.82, 1.0]
+		],
+		spark: [0.55, 1.0, 1.0],
+		sheen: 0.5,
+		warmth: 0.5
 	},
 	{
-		name: 'rose quartz',
-		stone: [0.04, 0.016, 0.03],
-		metal: [1.0, 0.7, 0.72],
-		glow: [1.0, 0.4, 0.58],
-		accent: [1.0, 0.86, 0.56],
-		rig: [1.0, 0.8, 0.82],
-		sconce: [1.0, 0.56, 0.6],
-		fog: [0.46, 0.26, 0.36],
-		iridescence: 0.3,
-		warmth: 0.7
-	},
-	{
-		name: 'ice',
-		stone: [0.016, 0.02, 0.026],
-		metal: [0.9, 0.95, 1.0],
-		glow: [0.74, 0.9, 1.0],
-		accent: [1.0, 1.0, 1.0],
-		rig: [0.86, 0.92, 1.0],
-		sconce: [0.6, 0.8, 1.0],
-		fog: [0.26, 0.31, 0.38],
-		iridescence: 0.15,
-		warmth: 0.0
-	},
-	{
-		name: 'saffron',
-		stone: [0.044, 0.012, 0.016],
-		metal: [1.0, 0.7, 0.22],
-		glow: [1.0, 0.54, 0.1],
-		accent: [0.36, 0.42, 1.0],
-		rig: [1.0, 0.86, 0.6],
-		sconce: [1.0, 0.6, 0.16],
-		fog: [0.46, 0.3, 0.16],
-		iridescence: 0.1,
-		warmth: 0.95
+		name: 'peacock',
+		stops: [
+			[0.0, 0.08, 0.3],
+			[0.0, 0.62, 0.62],
+			[0.35, 1.0, 0.3],
+			[1.0, 0.82, 0.15]
+		],
+		spark: [1.0, 0.3, 0.8],
+		sheen: 0.85,
+		warmth: 0.45
 	},
 	{
 		name: 'oil slick',
-		stone: [0.01, 0.01, 0.016],
-		metal: [0.7, 0.76, 0.92],
-		glow: [0.28, 0.9, 0.84],
-		accent: [1.0, 0.4, 0.8],
-		rig: [0.8, 0.86, 1.0],
-		sconce: [0.52, 0.42, 1.0],
-		fog: [0.18, 0.22, 0.32],
-		iridescence: 0.9,
+		stops: [
+			[0.1, 0.04, 0.4],
+			[0.05, 0.62, 0.7],
+			[1.0, 0.58, 0.16],
+			[0.9, 0.16, 0.72]
+		],
+		spark: [0.9, 1.0, 1.0],
+		sheen: 1.0,
+		warmth: 0.5
+	},
+	{
+		name: 'ember',
+		stops: [
+			[0.24, 0.02, 0.0],
+			[0.95, 0.2, 0.0],
+			[1.0, 0.58, 0.06],
+			[1.0, 0.92, 0.62]
+		],
+		spark: [0.4, 0.9, 1.0],
+		sheen: 0.1,
+		warmth: 1.0
+	},
+	{
+		name: 'arctic',
+		stops: [
+			[0.0, 0.05, 0.16],
+			[0.08, 0.5, 1.0],
+			[0.7, 0.95, 1.0],
+			[1.0, 1.0, 1.0]
+		],
+		spark: [1.0, 0.16, 0.24],
+		sheen: 0.25,
+		warmth: 0.0
+	},
+	{
+		name: 'acid',
+		stops: [
+			[0.02, 0.1, 0.0],
+			[0.42, 0.95, 0.0],
+			[0.92, 1.0, 0.3],
+			[1.0, 1.0, 0.9]
+		],
+		spark: [1.0, 0.1, 0.7],
+		sheen: 0.3,
 		warmth: 0.35
+	},
+	{
+		name: 'nebula',
+		stops: [
+			[0.04, 0.02, 0.24],
+			[0.26, 0.2, 0.9],
+			[0.92, 0.44, 0.78],
+			[1.0, 0.9, 0.86]
+		],
+		spark: [0.45, 0.92, 1.0],
+		sheen: 0.6,
+		warmth: 0.35
+	},
+	{
+		name: 'honey',
+		stops: [
+			[0.18, 0.06, 0.0],
+			[0.8, 0.36, 0.04],
+			[1.0, 0.72, 0.3],
+			[1.0, 0.95, 0.8]
+		],
+		spark: [0.5, 0.9, 0.55],
+		sheen: 0.15,
+		warmth: 0.95
+	},
+	{
+		name: 'blood moon',
+		stops: [
+			[0.1, 0.0, 0.03],
+			[0.62, 0.02, 0.06],
+			[1.0, 0.42, 0.1],
+			[1.0, 0.88, 0.66]
+		],
+		spark: [0.5, 0.72, 1.0],
+		sheen: 0.12,
+		warmth: 0.85
+	},
+	{
+		name: 'cobalt neon',
+		stops: [
+			[0.0, 0.0, 0.3],
+			[0.12, 0.12, 1.0],
+			[1.0, 0.1, 0.62],
+			[1.0, 0.82, 1.0]
+		],
+		spark: [0.2, 1.0, 1.0],
+		sheen: 0.55,
+		warmth: 0.3
 	}
 ];
 
 type Prototype = Partial<Record<CharacterFeature, number>>;
 
 /**
- * Which music each grammar family fits. Ambient wants vast soft florals,
- * noise wants fractured fractal lace, club wants pulsing rings and
- * hyperbolic counting, acoustic wants organic seeds and flowers.
+ * Which music each world fits, fitted to what Mandala actually hears from
+ * each genre (tempo, hiss, spectral tilt, punch, bass): ambient is vast and
+ * slow (foam), noise fractured and violent (crystal, cavern), club hypnotic
+ * and locked (spiral, sponge), acoustic warm and organic (yantra, bloom),
+ * cinematic and swing huge and slow-revealing (bulb).
  */
-const FAMILY_PROTOTYPES: Record<MandalaFamily, Prototype> = {
-	truchet: { tempo: 0.5, punch: 0.55, noise: 0.25 },
-	flower: { tempo: 0.15, noise: 0.08, energy: 0.3 },
-	yantra: { tempo: 0.12, energy: 0.45, brightness: 0.35 },
-	girih: { tempo: 0.35, valence: 0.65, noise: 0.15 },
-	lace: { tempo: 0.9, noise: 0.75, brightness: 0.75 },
-	apollonian: { tempo: 0.8, noise: 0.6, energy: 0.8 },
-	hyperbolic: { tempo: 0.58, bass: 0.75, punch: 0.65 },
-	phyllotaxis: { tempo: 0.28, noise: 0.05, valence: 0.7 },
-	rings: { tempo: 0.6, punch: 0.8, bass: 0.85 }
+const WORLD_PROTOTYPES: Record<MandalaWorld, Prototype> = {
+	bloom: { tempo: 0.3, punch: 0.65, bass: 0.45, brightness: 0.45 },
+	spiral: { tempo: 0.57, noise: 0.07, bass: 0.76, punch: 0.21 },
+	yantra: { tempo: 0.2, punch: 0.75, brightness: 0.75, bass: 0.15 },
+	sponge: { tempo: 0.5, noise: 0.04, bass: 0.6, brightness: 0.5, punch: 0.28 },
+	cavern: { tempo: 0.75, noise: 0.6, brightness: 0.8, bass: 0.25 },
+	foam: { tempo: 0.03, noise: 0, punch: 0.05, brightness: 0.71, bass: 0.33 },
+	crystal: { tempo: 0.93, noise: 0.97, brightness: 0.94, bass: 0.11 },
+	bulb: { tempo: 0.12, bass: 0.72, punch: 0.45, brightness: 0.35 }
 };
 
 const PALETTE_PROTOTYPES: readonly Prototype[] = [
-	{ valence: 0.6, brightness: 0.45, noise: 0.2 },
-	{ tempo: 0.1, energy: 0.4, valence: 0.4 },
-	{ energy: 0.65, valence: 0.55, tempo: 0.15 },
-	{ tempo: 0.6, bass: 0.75, noise: 0.2 },
-	{ tempo: 0.58, bass: 0.85, punch: 0.75 },
-	{ noise: 0.7, energy: 0.9, tempo: 0.85 },
-	{ tempo: 0.03, energy: 0.15, noise: 0.05 },
-	{ tempo: 0.3, valence: 0.6, noise: 0.08 },
-	{ valence: 0.7, tempo: 0.25, punch: 0.4 },
-	{ noise: 0.85, brightness: 0.85, tempo: 0.95 },
-	{ valence: 0.8, tempo: 0.28, noise: 0.06 },
-	{ tempo: 0.5, brightness: 0.65, bass: 0.6 }
-];
-
-const SHAPE_PROTOTYPES: readonly Prototype[] = [
-	{ noise: 0.1, tempo: 0.2 },
-	{ noise: 0.8, tempo: 0.9 },
-	{ punch: 0.75, tempo: 0.6 },
-	{ tempo: 0.35, valence: 0.6 },
-	{ tempo: 0.55, bass: 0.6 }
+	{ tempo: 0.5, brightness: 0.5, valence: 0.5 },
+	{ tempo: 0.3, valence: 0.7, noise: 0.08 },
+	{ energy: 0.75, valence: 0.45, tempo: 0.2, bass: 0.6 },
+	{ tempo: 0.55, bass: 0.7, punch: 0.65 },
+	{ tempo: 0.4, valence: 0.65, brightness: 0.55 },
+	{ tempo: 0.55, punch: 0.6, valence: 0.55 },
+	{ noise: 0.6, energy: 0.85, tempo: 0.8, valence: 0.4 },
+	{ noise: 0.95, brightness: 0.95, tempo: 0.95 },
+	{ noise: 0.85, tempo: 0.92, punch: 0.3 },
+	{ tempo: 0.03, energy: 0.18, noise: 0.03, punch: 0.05 },
+	{ tempo: 0.28, valence: 0.75, noise: 0.05, bass: 0.2 },
+	{ tempo: 0.1, energy: 0.55, bass: 0.6, valence: 0.3 },
+	{ tempo: 0.6, bass: 0.85, punch: 0.8, noise: 0.25 }
 ];
 
 const FOLD_PROTOTYPES: readonly Prototype[] = MANDALA_FOLDS.map((fold) => {
 	// Few sectors read harsh and fractured, many read hypnotic and ornate.
-	const t = (fold - 3) / 13;
-	return { noise: 0.8 - t * 0.7, tempo: 0.85 - t * 0.4, punch: 0.3 + t * 0.5 };
+	const t = (fold - 3) / 9;
+	return { noise: 0.85 - t * 0.75, tempo: 0.85 - t * 0.5, punch: 0.3 + t * 0.45 };
 });
 
+const VARIANT_PROTOTYPES: readonly Prototype[] = [
+	{ noise: 0.15, tempo: 0.3 },
+	{ tempo: 0.55, punch: 0.6 },
+	{ noise: 0.6, tempo: 0.8 },
+	{ bass: 0.7, energy: 0.6 }
+];
+
 export const MANDALA_AXES: readonly VariationAxis[] = [
-	// Discrete. Grammar slots cross-fade on the GPU (two evaluations at once),
-	// so they move at section scale and stay a while.
-	{ kind: 'choice', name: 'wall', options: MANDALA_GRAMMARS, scale: 'section', chance: 0.8, memory: 6, maxHold: 3, tau: 8 },
-	{ kind: 'choice', name: 'screen', options: MANDALA_GRAMMARS, scale: 'section', chance: 0.55, memory: 6, maxHold: 4, tau: 7 },
-	{ kind: 'choice', name: 'fold', options: MANDALA_FOLDS.length, scale: 'phrase', chance: 0.28, memory: 3, maxHold: 8, tau: 6 },
-	{ kind: 'choice', name: 'shape', options: MANDALA_SHAPES.length, scale: 'section', chance: 0.4, memory: 2, maxHold: 5, tau: 4 },
+	// Discrete: a change morphs both worlds on the GPU, so worlds move at
+	// section scale; variant and fold change inside a world more often.
+	// Memory 1: a change of music must be free to return to the world that
+	// fits it best, even one it just left.
+	{ kind: 'choice', name: 'world', options: MANDALA_WORLDS.length, scale: 'section', chance: 0.5, memory: 1, maxHold: 3, tau: 7 },
+	{ kind: 'choice', name: 'variant', options: MANDALA_VARIANTS, scale: 'phrase', chance: 0.2, memory: 2, maxHold: 8, tau: 5 },
+	{ kind: 'choice', name: 'fold', options: MANDALA_FOLDS.length, scale: 'phrase', chance: 0.2, memory: 3, maxHold: 8, tau: 5 },
 	{ kind: 'choice', name: 'palette', options: MANDALA_PALETTES.length, scale: 'era', chance: 0.9, memory: 5, maxHold: 2, tau: 6 },
-	// Continuous proportions.
-	{ kind: 'continuous', name: 'density', min: 0.7, max: 2.6, scale: 'phrase', step: 0.28, chance: 0.6, tau: 12 },
-	{ kind: 'continuous', name: 'lineWidth', min: 0.012, max: 0.05, scale: 'phrase', step: 0.35, chance: 0.6, tau: 9 },
-	{ kind: 'continuous', name: 'relief', min: 0.25, max: 1.5, scale: 'section', step: 0.4, tau: 6 },
-	{ kind: 'continuous', name: 'morph', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.7, tau: 9 },
-	{ kind: 'continuous', name: 'spin', min: -0.75, max: 0.75, scale: 'section', step: 0.4, tau: 9 },
-	{ kind: 'continuous', name: 'corkscrew', min: -0.5, max: 0.5, scale: 'section', step: 0.45, tau: 8 },
-	{ kind: 'continuous', name: 'wander', min: 0.08, max: 0.42, scale: 'section', step: 0.4, tau: 9 },
-	{ kind: 'continuous', name: 'offset', min: 0, max: 0.26, scale: 'section', step: 0.4, tau: 9 },
-	{ kind: 'continuous', name: 'screenAmount', min: 0, max: 1, scale: 'section', step: 0.5, chance: 0.7, tau: 6 },
-	{ kind: 'continuous', name: 'screenRadius', min: 0.48, max: 0.8, scale: 'phrase', step: 0.3, chance: 0.5, tau: 7 },
-	{ kind: 'continuous', name: 'screenDensity', min: 0.45, max: 1.6, scale: 'phrase', step: 0.35, chance: 0.5, tau: 7 },
-	{ kind: 'continuous', name: 'rigTurn', min: 0, max: 1, scale: 'phrase', step: 0.3, wrap: true, tau: 8 },
-	{ kind: 'continuous', name: 'sconces', min: 0, max: 1, scale: 'section', step: 0.45, tau: 6 },
-	{ kind: 'continuous', name: 'fog', min: 0.04, max: 0.2, scale: 'section', step: 0.4, tau: 7 },
+	// Continuous fractal parameters: each world reads them in its own terms
+	// (Kaliset constant, Julia angle, sponge hole shape, Kleinian box...).
+	{ kind: 'continuous', name: 'formA', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 10 },
+	{ kind: 'continuous', name: 'formB', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 12 },
+	{ kind: 'continuous', name: 'formC', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9 },
+	{ kind: 'continuous', name: 'formD', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9 },
+	{ kind: 'continuous', name: 'spin', min: -1, max: 1, scale: 'section', step: 0.45, tau: 9 },
+	{ kind: 'continuous', name: 'drift', min: 0, max: 1, scale: 'phrase', step: 0.35, tau: 8 },
 	{ kind: 'continuous', name: 'trail', min: 0, max: 1, scale: 'section', step: 0.45, tau: 6 },
-	{ kind: 'continuous', name: 'shapeTurn', min: 0, max: 1, scale: 'section', step: 0.3, wrap: true, tau: 8 },
+	{ kind: 'continuous', name: 'sheen', min: 0, max: 1, scale: 'section', step: 0.4, tau: 7 },
+	{ kind: 'continuous', name: 'glow', min: 0, max: 1, scale: 'section', step: 0.4, tau: 7 },
+	{ kind: 'continuous', name: 'hue', min: 0, max: 1, scale: 'era', step: 0.25, wrap: true, tau: 10 },
 	{ kind: 'continuous', name: 'warmth', min: 0, max: 1, scale: 'era', step: 0.35, tau: 10 }
 ];
 
 const scratch: number[] = [];
 
-/** Per-option weights for the grammar axes: family prototype, shared by variants. */
-function grammarWeights(character: MusicCharacter, sharpness: number): number[] {
-	const families = MANDALA_FAMILIES.map((family) => FAMILY_PROTOTYPES[family]);
-	const perFamily = characterWeights(families, character, sharpness, 0.03, scratch.slice());
-	const out: number[] = [];
-	for (let family = 0; family < MANDALA_FAMILIES.length; family += 1) {
-		for (let variant = 0; variant < MANDALA_VARIANTS; variant += 1) out.push(perFamily[family]);
-	}
-	return out;
-}
-
 /**
  * Bias every discrete axis toward options that fit the playing music, so a
- * shift (and every later boundary) picks a grammar, palette, fold and
- * cross-section that belong to the new genre.
+ * shift (and every later boundary) picks a world, palette, fold and variant
+ * that belong to the new genre.
  */
-export function mandalaApplyCharacter(
-	genome: VariationGenome,
-	character: MusicCharacter,
-	sharpness = 4
-): void {
-	const grammar = grammarWeights(character, sharpness);
-	genome.setWeights('wall', grammar);
-	genome.setWeights('screen', grammar);
+export function mandalaApplyCharacter(genome: VariationGenome, character: MusicCharacter, sharpness = 4): void {
+	const worlds = MANDALA_WORLDS.map((world) => WORLD_PROTOTYPES[world]);
+	genome.setWeights('world', characterWeights(worlds, character, sharpness, 0.02, scratch.slice()));
 	genome.setWeights('palette', characterWeights(PALETTE_PROTOTYPES, character, sharpness * 1.1, 0.02, []));
-	genome.setWeights('shape', characterWeights(SHAPE_PROTOTYPES, character, sharpness * 0.8, 0.1, []));
 	genome.setWeights('fold', characterWeights(FOLD_PROTOTYPES, character, sharpness * 0.8, 0.12, []));
+	genome.setWeights('variant', characterWeights(VARIANT_PROTOTYPES, character, sharpness * 0.6, 0.2, []));
 }
 
 /** How well a palette fits the music, relative to the best fitting one (0..1). */
@@ -343,23 +320,51 @@ export function mandalaPaletteFit(palette: number, character: MusicCharacter, sh
 	return best > 0 ? (weights[palette] ?? 0) / best : 1;
 }
 
+/** How well a world fits the music, relative to the best fitting one (0..1). */
+export function mandalaWorldFit(world: number, character: MusicCharacter, sharpness = 6): number {
+	const worlds = MANDALA_WORLDS.map((name) => WORLD_PROTOTYPES[name]);
+	const weights = characterWeights(worlds, character, sharpness, 0.02, []);
+	const best = Math.max(...weights);
+	return best > 0 ? (weights[world] ?? 0) / best : 1;
+}
+
 /**
- * Steer the continuous axes that the music's character should own: ambient
- * is vast (sparse cells, wide soft lines), noise is fine and fractured,
- * bass weighs the relief, valence warms the palette lean.
+ * Steer the continuous axes the music's character should own: noise
+ * fractures the form (formD is roughness everywhere), slow music trails and
+ * glows, valence warms the palette lean.
  */
-export function mandalaPullCharacter(
-	genome: VariationGenome,
-	character: MusicCharacter,
-	amount: number
-): void {
-	const fine = Math.min(1, character.tempo * 0.55 + character.noise * 0.55);
-	genome.pull('density', 0.08 + fine * 0.85, amount);
-	genome.pull('lineWidth', 0.85 - character.noise * 0.6 - character.punch * 0.25, amount);
-	genome.pull('relief', 0.25 + character.bass * 0.6, amount);
-	genome.pull('trail', 0.85 - character.tempo * 0.6 - character.noise * 0.3, amount);
-	genome.pull('fog', 0.65 - character.energy * 0.45 + (1 - character.tempo) * 0.2, amount);
+export function mandalaPullCharacter(genome: VariationGenome, character: MusicCharacter, amount: number): void {
+	genome.pull('formD', 0.1 + character.noise * 0.75 + character.tempo * 0.15, amount);
+	genome.pull('trail', 0.85 - character.tempo * 0.55 - character.noise * 0.3, amount);
+	genome.pull('glow', 0.75 - character.punch * 0.35 - character.noise * 0.25, amount);
+	genome.pull('sheen', 0.35 + (1 - character.noise) * 0.35 + character.valence * 0.2, amount);
 	genome.pull('warmth', character.valence * 0.7 + (1 - character.brightness) * 0.2, amount);
+	genome.pull('drift', 0.2 + character.motion * 0.4 + character.tempo * 0.3, amount);
+}
+
+/**
+ * The answer to a change of music for one discrete axis. `leave` (the music
+ * really changed): one of the options that fit nearly as well as the best,
+ * never the current one. Otherwise keep the current option if it still fits
+ * (at least `keep` of the best), else move to a near-best one. `pick01`
+ * chooses among the near-best. Unlike a genome shift, a new song in the same
+ * genre keeps a world that fits it.
+ */
+export function mandalaAnswer(
+	axis: 'world' | 'palette',
+	current: number,
+	character: MusicCharacter,
+	pick01: number,
+	leave = false,
+	keep = axis === 'world' ? 0.6 : 0.5
+): number {
+	const prototypes = axis === 'world' ? MANDALA_WORLDS.map((world) => WORLD_PROTOTYPES[world]) : PALETTE_PROTOTYPES;
+	const weights = characterWeights(prototypes, character, axis === 'world' ? 8 : 8.8, 0.02, []);
+	if (leave) weights[current] = 0;
+	const best = Math.max(...weights);
+	if (!leave && (weights[current] ?? 0) >= best * keep) return current;
+	const near = weights.flatMap((weight, option) => (weight >= best * 0.7 ? [option] : []));
+	return near[Math.min(near.length - 1, Math.floor(pick01 * near.length))] ?? current;
 }
 
 /** Two-slot crossfade the renderer can always show (never drops a half-shown option). */
@@ -417,32 +422,13 @@ export function mixRgb(a: Rgb, b: Rgb, t: number): Rgb {
 	return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 }
 
-/**
- * Gauss-reduced lattice basis for logarithmic phyllotaxis (cell units). The
- * lattice is generated by one seed step g1 = (cellsAround * divergence, rise)
- * and one full turn g2 = (cellsAround, 0); `n1`/`n2` give each reduced
- * vector's seed-index count, so a seed's index along the spiral is
- * u * n1 + v * n2 for lattice coordinates (u, v).
- */
-export function phyllotaxisBasis(
-	cellsAround: number,
-	divergence: number,
-	rise: number
-): { e1: [number, number]; e2: [number, number]; n1: number; n2: number } {
-	type V = { x: number; y: number; n: number };
-	let a: V = { x: cellsAround * divergence, y: rise, n: 1 };
-	let b: V = { x: cellsAround, y: 0, n: 0 };
-	const dot = (u: V, v: V) => u.x * v.x + u.y * v.y;
-	for (let guard = 0; guard < 64; guard += 1) {
-		if (dot(a, a) > dot(b, b)) [a, b] = [b, a];
-		const k = Math.round(dot(a, b) / Math.max(1e-12, dot(a, a)));
-		if (k === 0) break;
-		b = { x: b.x - k * a.x, y: b.y - k * a.y, n: b.n - k * a.n };
-	}
-	return { e1: [a.x, a.y], e2: [b.x, b.y], n1: a.n, n2: b.n };
+/** Scene slot id: world, variant and fold in one integer the follower crossfades. */
+export function mandalaSlot(world: number, variant: number, fold: number): number {
+	return (world * MANDALA_VARIANTS + variant) * MANDALA_FOLDS.length + fold;
 }
 
-/** The golden angle as a fraction of a turn: every phyllotaxis variant shares it. */
-export const MANDALA_DIVERGENCE = 0.381966011;
-/** Phyllotaxis and counting rings ignore the fold; they count round the whole circle. */
-export const MANDALA_RAW_SECTORS = 8;
+export function mandalaSlotParts(slot: number): { world: number; variant: number; fold: number } {
+	const fold = slot % MANDALA_FOLDS.length;
+	const rest = Math.floor(slot / MANDALA_FOLDS.length);
+	return { world: Math.floor(rest / MANDALA_VARIANTS), variant: rest % MANDALA_VARIANTS, fold };
+}
