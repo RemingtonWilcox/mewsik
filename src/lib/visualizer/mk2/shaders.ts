@@ -38,7 +38,7 @@ export const SOMA_UNIFORM_FIELDS = [
 	'body1', // lobeAmp, squash, fin, stalk
 	'tent0', // tentLen, tentThick, tentDir, tentRoot
 	'tent1', // tentRootY, tentCurl, tentWave, tipBulb
-	'app', // oral, cerata, eyes, mouth
+	'app', // oral, cerata, (reserved), (reserved)
 	'chain0', // chainCount, chainSpacing, chainTaper, chainCurve
 	'chain1', // chain dir xyz, size
 	'skin0', // lattice, combs, chromato, opacity
@@ -336,18 +336,6 @@ fn unit(q: vec3<f32>, seg: f32) -> Sample {
 			s.u = -sy / stalk;
 		}
 		s.d = smin(s.d, sd, 0.06);
-	}
-	if (u.app.z > 0.01) {
-		let e = vec3<f32>(q.x - rr * squash * 0.3, q.y - hh * 0.6, abs(q.z) - rr * 0.8);
-		let ed = length(e) - u.app.z * (0.05 + 0.08 * R);
-		if (ed < s.d) {
-			s.part = 3.0;
-		}
-		s.d = smin(s.d, ed, 0.02);
-	}
-	if (u.app.w > 0.01) {
-		let md = sdEllipsoid(q - vec3<f32>(-rr * squash * 0.25, hh * 0.95, 0.0), vec3<f32>(rr * squash * 0.35, hh * 0.32, rr * 0.62) * u.app.w);
-		s.d = max(s.d, -md);
 	}
 	if (u.skin0.x > 0.01) {
 		let f = 7.5;
@@ -737,6 +725,14 @@ fn waterBg(rd: vec3<f32>) -> vec3<f32> {
 	return u.water.rgb * 0.45 + scatter;
 }
 
+// The beat light as the water sees it: the body fires on the beat, the water
+// around it swells over the first part of the beat instead of stepping, so a
+// dark world never strobes as a whole on every beat.
+fn waterPulse() -> f32 {
+	let ph = u.beat.x;
+	return u.beat.z * smoothstep(0.0, 0.4, ph) * (1.0 - ph) * 1.35;
+}
+
 // The water lit by the animal itself: single scattering of a point light at
 // the animal's centre along the view ray up to depth tMax, attenuated on both
 // legs. Closed form of the inverse-square line integral (softened by the
@@ -747,7 +743,7 @@ fn livingScatter(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> vec3<f32> {
 	let h = length(ro + rd * tc - c);
 	let soft = max(h, u.orgPos.w * 0.45 + 0.2);
 	let span = atan2(tMax - tc, soft) - atan2(-tc, soft);
-	let flash = 0.7 + 0.5 * u.mood.z + (u.beat.z * (1.0 - u.beat.x) * (0.6 + 0.8 * u.mood.y) + u.beat2.x * 0.5) * (1.0 - 0.6 * u.mood.z);
+	let flash = 0.7 + 0.5 * u.mood.z + (waterPulse() * (0.6 + 0.8 * u.mood.y) + u.beat2.x * 0.5) * (1.0 - 0.6 * u.mood.z);
 	return u.glow.rgb * span / soft * absorb(tc + h) * u.flow.y * flash * 0.03 * (1.0 - u.beat2.z * 0.7);
 }
 
@@ -762,7 +758,7 @@ fn ember() -> vec3<f32> {
 }
 
 fn orgLight() -> vec3<f32> {
-	return u.glow.rgb * (0.12 + u.skin1.z * 0.15 + u.beat.z * (1.0 - u.beat.x) * 0.5 + u.audio.w * 0.15);
+	return u.glow.rgb * (0.12 + u.skin1.z * 0.15 + waterPulse() * 0.5 + u.audio.w * 0.15);
 }
 
 fn floorShade(p: vec3<f32>, rd: vec3<f32>, wVent: f32, wIce: f32, wKelp: f32) -> vec3<f32> {
@@ -1162,12 +1158,10 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	let energy = u.audio.w;
 	let hb = heartbeat() * formWeight(3.0);
 
-	// Opacity per tissue: thin tissues read denser, eyes and the lure body are opaque.
+	// Opacity per tissue: thin tissues read denser.
 	var opac = u.skin0.w;
 	if (part > 0.5 && part < 2.5) {
 		opac = mix(opac, 0.85, 0.5);
-	} else if (part > 2.5 && part < 3.5) {
-		opac = 1.0;
 	} else if (part > 3.5 && part < 4.5) {
 		opac = 0.88;
 	} else if (part > 4.5 && part < 5.5) {
@@ -1191,9 +1185,6 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 		let pigment = mix(u.accent.rgb * 0.35, u.organ.rgb * 0.4, step(0.5, vc.y));
 		let cloud = smoothstep(0.35, 0.95, sin(qi.y * 3.5 - u.orgY.w * 0.45 + qi.z * 1.2));
 		albedo = mix(albedo, pigment, spot * u.skin0.z) * (1.0 - cloud * 0.55 * u.skin0.z);
-	}
-	if (part > 2.5 && part < 3.5) {
-		albedo = vec3<f32>(0.01, 0.012, 0.015);
 	}
 
 	// Light: wrapped diffuse, soft self-shadow, occlusion, transmission, wet spec.
@@ -1223,7 +1214,7 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	// Rim glow: the membrane's edge catching its own bioluminescence.
 	let pulse = u.beat.y;
 	let rimTint = mix(u.bodyCol.rgb, u.glow.rgb, 0.6);
-	col = col + rimTint * (fres * 1.3 + pow(1.0 - ndv, 8.0) * 1.2) * u.skin1.z * (0.45 + 0.55 * energy + 0.3 * pulse) * (1.0 - 0.6 * f32(part > 2.5 && part < 3.5));
+	col = col + rimTint * (fres * 1.3 + pow(1.0 - ndv, 8.0) * 1.2) * u.skin1.z * (0.45 + 0.55 * energy + 0.3 * pulse);
 
 	// Iridescence and comb rows.
 	let phi = atan2(qi.z, qi.x);
@@ -1269,10 +1260,6 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	}
 	if (part > 7.5 && part < 8.5) {
 		photo = photo + mix(u.glow.rgb, u.accent.rgb, 0.3) * (0.9 + (note(0.15) * 1.5 * gain + u.beat2.x * 1.2 + u.beat.z * (1.0 - u.beat.x)) * (1.0 - 0.65 * u.mood.z));
-	}
-	if (part > 2.5 && part < 3.5) {
-		let iris = smoothstep(0.75, 0.5, ndv) * smoothstep(0.2, 0.45, ndv);
-		photo = photo + u.accent.rgb * iris * (0.15 + u.beat2.y * 0.6);
 	}
 	if (part > 4.5 && part < 5.5) {
 		photo = photo + u.organ.rgb * (0.3 + 0.35 * u.audio.x + hb * 0.6) * u.skin1.w;

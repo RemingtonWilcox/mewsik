@@ -151,7 +151,7 @@ test.describe('Soma look genome', () => {
 		await page.reload();
 		const result = await page.evaluate(async () => {
 			const { SomaLook } = await import('/src/lib/visualizer/mk2/look.ts');
-			const { SOMA_ANATOMY_KEYS } = await import('/src/lib/visualizer/mk2/species.ts');
+			const { SOMA_ANATOMY_KEYS, SOMA_ANATOMY_SLOTS } = await import('/src/lib/visualizer/mk2/species.ts');
 			const fake = (globalThis as any).__somaFake;
 			const look = new SomaLook(0.42);
 			const dt = 1 / 60;
@@ -217,9 +217,23 @@ test.describe('Soma look genome', () => {
 				}
 				seen.add(f.names.species);
 			}
-			return { eyeMax, keys: SOMA_ANATOMY_KEYS.length, maxAnatomyStep, maxEyeStep, maxPosStep, maxGlowStep, speciesChanges, species: seen.size };
+			return {
+				eyeMax,
+				keys: SOMA_ANATOMY_KEYS.length,
+				slotLanes: SOMA_ANATOMY_SLOTS.reduce((sum: number, [, lanes]: readonly [string, number]) => sum + lanes, 0),
+				face: SOMA_ANATOMY_KEYS.filter((key: string) => key === 'eyes' || key === 'mouth'),
+				maxAnatomyStep,
+				maxEyeStep,
+				maxPosStep,
+				maxGlowStep,
+				speciesChanges,
+				species: seen.size
+			};
 		});
-		expect(result.keys).toBe(48);
+		// Twelve vec4 slots, two lanes reserved; Soma never grows a face.
+		expect(result.keys).toBe(46);
+		expect(result.slotLanes).toBe(result.keys);
+		expect(result.face).toEqual([]);
 		expect(result.speciesChanges).toBeGreaterThanOrEqual(4);
 		expect(result.species).toBeGreaterThanOrEqual(5);
 		// At 60 fps no anatomy value moves more than 2.5% of its scale in a frame.

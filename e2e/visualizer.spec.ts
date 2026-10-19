@@ -193,12 +193,12 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByRole('radio', { name: 'Mandala' })).toHaveAttribute('aria-checked', 'true');
 		const mandalaCanvas = page.getByLabel('Mandala audio visualizer');
 		await expect(mandalaCanvas).toHaveAttribute('data-mandala-render-passes', '9');
-		await expect(mandalaCanvas).toHaveAttribute('data-mandala-uniform-bytes', '576');
+		await expect(mandalaCanvas).toHaveAttribute('data-mandala-uniform-bytes', '416');
 		if (await hasUsableWebGpu(page)) {
 			await expect(mandalaCanvas).toHaveAttribute('data-mandala-ready', 'true', { timeout: 15_000 });
 			await expect(mandalaCanvas).toHaveAttribute(
-				'data-mandala-wall',
-				/^(truchet|flower|yantra|girih|lace|apollonian|hyperbolic|phyllotaxis|rings):/
+				'data-mandala-world',
+				/^(bloom|spiral|yantra|sponge|cavern|foam|crystal|bulb)$/
 			);
 			await expect(page.getByText('Mandala unavailable', { exact: true })).toHaveCount(0);
 		}
@@ -220,7 +220,7 @@ test.describe('visualizer engine roster', () => {
 		if (await hasUsableWebGpu(page)) {
 			await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 				'data-soma-species',
-				/medusa|siphonophore|ctenophore|radiolarian|cuttlefish|nudibranch|mycelial bloom|polyp colony|anglerfish|salp chain|cell colony|pyrosome/,
+				/medusa|siphonophore|ctenophore|radiolarian|venus girdle|nudibranch|mycelial bloom|polyp colony|lantern pod|salp chain|cell colony|pyrosome/,
 				{ timeout: 15_000 }
 			);
 		}
