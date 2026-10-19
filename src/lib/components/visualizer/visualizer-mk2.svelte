@@ -1,8 +1,8 @@
 <script lang="ts">
 	// Soma: a living animal in real 3D water. One raymarched body plan whose
 	// anatomy metamorphoses between species grammars (medusa, siphonophore,
-	// comb jelly, radiolarian, cuttlefish, nudibranch, mycelial bloom, polyp
-	// colony, anglerfish, salp chain, cell colony, pyrosome), lit by its own
+	// comb jelly, radiolarian, venus girdle, nudibranch, mycelial bloom, polyp
+	// colony, lantern pod, salp chain, cell colony, pyrosome), lit by its own
 	// bioluminescence in an analytic world (abyss, vent field, kelp cathedral,
 	// bioluminescent bay, ice cave, void) and filmed by a diver-like camera.
 	// The look lives in the shared journey (persistentLook 'soma'), so a
@@ -33,6 +33,7 @@
 		type SomaUniformField
 	} from '$lib/visualizer/mk2/shaders';
 	import { createSomaLookState, somaSyncLook, type SomaFrame } from '$lib/visualizer/mk2/look';
+	import { SOMA_ANATOMY_INDEX, SOMA_ANATOMY_SLOTS } from '$lib/visualizer/mk2/species';
 
 	const vis = useVisualizer();
 
@@ -512,9 +513,13 @@
 		put3(u, 'orgX', o.axisX, m.sway);
 		put3(u, 'orgY', o.axisY, m.fin);
 		put3(u, 'orgZ', o.axisZ, m.growth);
-		put3(u, 'orgBound', o.boundCenter, a[27]);
-		const anatomyFields: SomaUniformField[] = ['body0', 'body1', 'tent0', 'tent1', 'app', 'chain0', 'chain1', 'skin0', 'skin1', 'organs', 'photo', 'posture'];
-		anatomyFields.forEach((name, index) => put(u, name, a[index * 4], a[index * 4 + 1], a[index * 4 + 2], a[index * 4 + 3]));
+		put3(u, 'orgBound', o.boundCenter, a[SOMA_ANATOMY_INDEX.size]);
+		let lane = 0;
+		for (const [name, lanes] of SOMA_ANATOMY_SLOTS) {
+			const at = (i: number) => (i < lanes ? a[lane + i] : 0);
+			put(u, name as SomaUniformField, at(0), at(1), at(2), at(3));
+			lane += lanes;
+		}
 		put(u, 'counts', f.lobes, smooth01(f.lobeFade, 0, 1), f.arms, smooth01(f.armFade, 0, 1));
 		put(u, 'modes', f.beatForm.from, f.beatForm.to, f.beatForm.mix, m.shed);
 		put(u, 'env', f.environment.from, f.environment.to, f.environment.mix, env.floorY);

@@ -343,6 +343,8 @@ export class SomaLook {
 	private lobeFade = 1;
 	private arms = 16;
 	private armFade = 1;
+	/** 0..1 glide of 'has appendages at all', so the bounds never step when the count reaches or leaves zero. */
+	private armPresence = 1;
 	private readonly lifecycle = [0, 0, 0, 0, 0, 1];
 	// Life state
 	private readonly pos: Vec3 = [0, 0, 0];
@@ -783,7 +785,8 @@ export class SomaLook {
 		t[A.bellOpen] = clamp(t[A.bellOpen] * (1 - dormancy * 0.15), 0, 1);
 	}
 
-	private resolveCounts(dt: number): void {
+	/** hurry: how much faster than a living pace the genome wants the counts to change (after a shift). */
+	private resolveCounts(dt: number, hurry: number): void {
 		const species = this.pick('species');
 		const dominant = species.mix >= 0.5 ? species.to : species.from;
 		const lobesTarget = somaSpeciesFold(dominant, this.pick('fold').to);
@@ -791,19 +794,26 @@ export class SomaLook {
 		// A count cannot glide, so the feature folds away and regrows at the new
 		// count: scallops relax smooth, tentacles retract into the body.
 		if (lobesTarget !== this.lobes) {
-			this.lobeFade = Math.max(0, this.lobeFade - dt / 0.9);
+			this.lobeFade = Math.max(0, this.lobeFade - (dt * hurry) / 0.9);
 			if (this.lobeFade <= 0 || this.lobes === 0) {
 				this.lobes = lobesTarget;
 				this.lobeFade = this.lobes === 0 ? 1 : 0;
 			}
-		} else this.lobeFade = Math.min(1, this.lobeFade + dt / 1.4);
+		} else this.lobeFade = Math.min(1, this.lobeFade + (dt * hurry) / 1.4);
+		// The appendages are most of the animal's silhouette, so they have a speed
+		// limit like the rest of the body: however much the genome hurries after
+		// a shift, the tips travel at most ~0.75 body units a second, and long
+		// tentacles take proportionally longer to draw in or grow out.
+		const reach = Math.max(0.6, this.anatomy[A.tentLen]);
+		const tipLimit = (dt * 0.75) / reach;
 		if (armsTarget !== this.arms) {
-			this.armFade = Math.max(0, this.armFade - dt / 1.1);
+			this.armFade = Math.max(0, this.armFade - Math.min((dt * hurry) / 1.1, tipLimit));
 			if (this.armFade <= 0 || this.arms === 0) {
 				this.arms = armsTarget;
 				this.armFade = 0;
 			}
-		} else this.armFade = Math.min(1, this.armFade + dt / 2.2);
+		} else this.armFade = Math.min(1, this.armFade + Math.min((dt * hurry) / 2.2, tipLimit));
+		this.armPresence = approach(this.armPresence, this.arms > 0 ? 1 : 0, 0.6, dt);
 	}
 
 	private resolvePalette(dt: number, director: VisualDirectorFrame, rate: number): void {
@@ -906,7 +916,7 @@ export class SomaLook {
 	/** The animal's extent and bounding sphere in its own body frame. */
 	private bounds(t: Float32Array = this.anatomy, armFade = this.armFade): { centerY: number; centerChain: number; radius: number; extent: number } {
 		const R = Math.max(t[A.bellR] * (1 + 0.45 * t[A.fin]), t[A.bellH]);
-		const len = t[A.tentLen] * (0.3 + 0.7 * armFade) * (this.arms > 0 ? 1 : 0);
+		const len = t[A.tentLen] * (0.3 * this.armPresence + 0.7 * armFade * (this.arms > 0 ? 1 : 0));
 		const rootR = t[A.tentRoot] * t[A.bellR];
 		const rootY = t[A.tentRootY] * t[A.bellH];
 		const dir = t[A.tentDir];
@@ -989,6 +999,7 @@ export class SomaLook {
 			this.arms = somaSpeciesArms(dominant, this.pick('arms').to);
 			this.lobeFade = 1;
 			this.armFade = 1;
+			this.armPresence = this.arms > 0 ? 1 : 0;
 			this.resolvePalette(10, director, 0.01);
 			this.resolveEnvironment(10, 0.01);
 			const env = this.frame.env;
@@ -1011,15 +1022,17 @@ export class SomaLook {
 		const quick = Math.max(1, this.genome.glideSpeed);
 		this.resolveAnatomy();
 		// Retracting and regrowing appendages keep pace with the genome after a shift.
-		this.resolveCounts(dt * (1 + (quick - 1) * 0.6));
+		this.resolveCounts(dt, 1 + (quick - 1) * 0.6);
 		const bodyTau = 0.7 / (1 + (quick - 1) * 0.5);
 		// A body changes shape at a living pace even when the genome hurries: each
-		// value moves at most ~80% of its own scale per second, and a colony buds
-		// at most about one member a second.
+		// value moves at most ~80% of its own scale per second, a colony buds at
+		// most about one member a second, and tentacle tips travel at most ~0.75
+		// body units a second (a relative limit would let long tentacles collapse
+		// in under a second, which reads as a cut).
 		for (let i = 0; i < SOMA_ANATOMY_SIZE; i += 1) {
 			const next = approach(this.anatomy[i], this.target[i], bodyTau, dt);
 			const scale = Math.max(0.5, Math.abs(this.anatomy[i]), Math.abs(this.target[i]) * 0.5);
-			const limit = dt * (i === A.chainCount ? 0.9 : 0.8 * scale);
+			const limit = dt * (i === A.chainCount ? 0.9 : i === A.tentLen ? Math.min(0.75, 0.8 * scale) : 0.8 * scale);
 			this.anatomy[i] += clamp(next - this.anatomy[i], -limit, limit);
 		}
 		this.resolvePalette(dt, director, 0.7 / quick);

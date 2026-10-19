@@ -93,6 +93,7 @@ test.describe('Soma reaction', () => {
 	test('ambient and noise make a different animal: calm drift versus frantic, bristling darting', async ({ page }) => {
 		const result = await page.evaluate(async () => {
 			const { SomaLook, somaMoodTarget } = await import('/src/lib/visualizer/mk2/look.ts');
+			const { SOMA_ANATOMY_INDEX } = await import('/src/lib/visualizer/mk2/species.ts');
 			const g = globalThis as any;
 			const run = (kind: 'ambient' | 'noise', bpm: number) => {
 				const look = new SomaLook(0.61);
@@ -119,7 +120,7 @@ test.describe('Soma reaction', () => {
 				return {
 					speed: travelled / 15,
 					distance: Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]) / Math.max(0.1, f.organism.extent),
-					spines: f.anatomy[32],
+					spines: f.anatomy[SOMA_ANATOMY_INDEX.spines],
 					mood: { ...f.mood }
 				};
 			};

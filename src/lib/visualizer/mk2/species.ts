@@ -12,7 +12,9 @@ import type { VariationAxis } from '../variation';
 export type Rgb = [number, number, number];
 
 // ── Anatomy ────────────────────────────────────────────────────────────────
-// Packed in this order into twelve uniform vec4s (see shaders.ts).
+// Packed in this order into twelve uniform vec4s (see shaders.ts and
+// SOMA_ANATOMY_SLOTS below). Soma has no eyes and no mouth on purpose: a face
+// turns the alien animal into an obvious fish.
 export const SOMA_ANATOMY_KEYS = [
 	// body0: bell/mantle radius, height, cavity opening, (reserved)
 	'bellR',
@@ -34,11 +36,9 @@ export const SOMA_ANATOMY_KEYS = [
 	'tentCurl',
 	'tentWave',
 	'tipBulb',
-	// app: frilled oral arms, dorsal cerata, eyes, mouth
+	// app: frilled oral arms, dorsal cerata (two lanes reserved)
 	'oral',
 	'cerata',
-	'eyes',
-	'mouth',
 	// chain0: colony count (fractional = budding), spacing, taper, sinuous curve
 	'chainCount',
 	'chainSpacing',
@@ -79,6 +79,22 @@ export const SOMA_ANATOMY_KEYS = [
 export type SomaAnatomyKey = (typeof SOMA_ANATOMY_KEYS)[number];
 export type SomaAnatomy = Record<SomaAnatomyKey, number>;
 export const SOMA_ANATOMY_SIZE = SOMA_ANATOMY_KEYS.length;
+export const SOMA_ANATOMY_INDEX = Object.fromEntries(SOMA_ANATOMY_KEYS.map((key, index) => [key, index])) as Record<SomaAnatomyKey, number>;
+/** Uniform vec4 slots the anatomy fills, in key order, with how many lanes each uses (the rest are zero). */
+export const SOMA_ANATOMY_SLOTS: readonly (readonly [string, number])[] = [
+	['body0', 4],
+	['body1', 4],
+	['tent0', 4],
+	['tent1', 4],
+	['app', 2],
+	['chain0', 4],
+	['chain1', 4],
+	['skin0', 4],
+	['skin1', 4],
+	['organs', 4],
+	['photo', 4],
+	['posture', 4]
+];
 
 type SpeciesSpec = {
 	name: string;
@@ -108,8 +124,6 @@ const BASE: SomaAnatomy = {
 	tipBulb: 0,
 	oral: 0,
 	cerata: 0,
-	eyes: 0,
-	mouth: 0,
 	chainCount: 1,
 	chainSpacing: 0.8,
 	chainTaper: 1,
@@ -274,34 +288,32 @@ export const SOMA_SPECIES: readonly SpeciesSpec[] = [
 		}
 	},
 	{
-		name: 'cuttlefish',
+		// A Venus girdle: a ribbon comb jelly, all membrane and no head. A thin
+		// blade lies along the swim and a wide skirt ripples down both edges in
+		// waves of pigment and comb light.
+		name: 'venus girdle',
 		folds: [0],
-		arms: [8, 10, 8],
+		arms: [0],
 		anatomy: {
-			bellR: 0.55,
-			bellH: 1.3,
-			squash: 0.62,
-			fin: 1,
-			tentLen: 0.95,
-			tentThick: 0.065,
-			tentDir: 0.14,
-			tentRoot: 0.24,
-			tentRootY: 1.12,
-			tentCurl: -0.25,
-			tentWave: 0.3,
-			eyes: 1,
-			chromato: 1,
-			opacity: 0.86,
-			iridescence: 0.45,
-			rimGlow: 0.25,
-			organGlow: 0.15,
-			photoDensity: 0.25,
+			bellR: 0.42,
+			bellH: 1.6,
+			squash: 0.2,
+			fin: 1.8,
+			combs: 1,
+			chromato: 0.55,
+			opacity: 0.16,
+			iridescence: 0.9,
+			rimGlow: 0.9,
+			organGlow: 0.45,
+			canal: 0.8,
+			vacuole: 0.2,
+			photoDensity: 0.3,
 			photoRim: 0,
-			photoTentacle: 0.2,
+			photoTentacle: 0.6,
 			pitch: PI / 2,
-			jet: 0.2,
+			jet: 0.1,
 			undulate: 1,
-			size: 1.1
+			size: 1.05
 		}
 	},
 	{
@@ -407,34 +419,34 @@ export const SOMA_SPECIES: readonly SpeciesSpec[] = [
 		}
 	},
 	{
-		name: 'anglerfish',
-		folds: [0],
-		arms: [1],
+		// A lantern pod: a dark ribbed seed adrift in black water, lit only by
+		// the ring of filaments that fountain up and droop over it, each holding
+		// a lure of living light. Cinematic, slow, more flower than animal.
+		name: 'lantern pod',
+		folds: [6, 5, 7],
+		arms: [8, 9, 7],
 		anatomy: {
-			bellR: 0.72,
-			bellH: 1,
-			squash: 0.82,
-			fin: 0.3,
-			mouth: 1,
-			eyes: 0.55,
-			tentLen: 1.35,
-			tentThick: 0.022,
-			tentDir: 0.62,
-			tentRoot: 0.55,
-			tentRootY: 0.62,
-			tentCurl: -0.55,
-			tentWave: 0.25,
-			tipBulb: 1.6,
+			bellR: 0.5,
+			bellH: 0.6,
+			lobeAmp: 0.14,
+			tentLen: 1.3,
+			tentThick: 0.012,
+			tentDir: 0.7,
+			tentRoot: 0.45,
+			tentRootY: 0.75,
+			tentCurl: 0.75,
+			tentWave: 0.35,
+			tipBulb: 1.2,
 			chromato: 0.25,
-			opacity: 0.95,
+			opacity: 0.92,
 			iridescence: 0.2,
-			rimGlow: 0.14,
+			rimGlow: 0.16,
 			organGlow: 0,
 			photoDensity: 0.35,
 			photoRim: 0,
-			photoTentacle: 0.2,
-			pitch: PI / 2,
-			undulate: 0.75,
+			photoTentacle: 0.25,
+			pitch: 0.15,
+			undulate: 0.2,
 			size: 1.05
 		}
 	},
@@ -848,11 +860,11 @@ export const SOMA_SPECIES_MOODS: readonly SomaMoodPrototype[] = [
 	{ calm: 0.6, tempo: 0.3, agitation: 0.1 }, // siphonophore
 	{ warmth: 0.5, tempo: 0.45, calm: 0.4 }, // ctenophore
 	{ agitation: 0.9, tempo: 0.9 }, // radiolarian: bristling
-	{ tempo: 0.5, pulse: 0.4, warmth: 0.5 }, // cuttlefish
+	{ tempo: 0.5, pulse: 0.4, warmth: 0.5 }, // venus girdle
 	{ warmth: 0.8, calm: 0.35, punch: 0.8 }, // nudibranch
 	{ calm: 0.9, mass: 0.5, tempo: 0.05 }, // mycelial bloom
 	{ warmth: 0.7, punch: 0.7, tempo: 0.3 }, // polyp colony
-	{ mass: 0.5, calm: 0.6, warmth: 0.5, tempo: 0.1 }, // anglerfish: cinematic dark
+	{ mass: 0.5, calm: 0.6, warmth: 0.5, tempo: 0.1 }, // lantern pod: cinematic dark
 	{ calm: 1, tempo: 0, mass: 0.5 }, // salp chain: ambient drift
 	{ agitation: 0.7, tempo: 0.75 }, // cell colony
 	{ pulse: 0.9, mass: 0.8, tempo: 0.55 } // pyrosome

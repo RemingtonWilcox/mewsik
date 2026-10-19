@@ -220,7 +220,7 @@ test.describe('visualizer engine roster', () => {
 		if (await hasUsableWebGpu(page)) {
 			await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 				'data-soma-species',
-				/medusa|siphonophore|ctenophore|radiolarian|cuttlefish|nudibranch|mycelial bloom|polyp colony|anglerfish|salp chain|cell colony|pyrosome/,
+				/medusa|siphonophore|ctenophore|radiolarian|venus girdle|nudibranch|mycelial bloom|polyp colony|lantern pod|salp chain|cell colony|pyrosome/,
 				{ timeout: 15_000 }
 			);
 		}
