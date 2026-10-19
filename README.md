@@ -5,24 +5,41 @@
 <h1 align="center">mewsik</h1>
 
 <p align="center">
-  An open-source desktop music player and visualizer prototype built with Tauri, Svelte, and Rust.
+  An open-source music player, radio, and real-time visualizer for desktop and iPhone, built with Rust, Tauri, Svelte, and WebGPU.
 </p>
 
 <p align="center">
-  <a href="https://github.com/RemingtonWilcox/mewsik/releases">Release history and signing status</a>
+  <img src="docs/visualizers.jpg" alt="mewsik visualizer engines: Prism, Mandala, Soma, Signal and Loom" width="900">
 </p>
 
 ---
 
-## Prototype features
+## What it does
 
+- **Live radio** - 50,000+ internet radio stations from the open [radio-browser](https://www.radio-browser.info/) directory, with genre discovery, health checks, and broken streams pruned automatically
+- **Your music library** - Scan and play your own files, with playlists, favorites, and listening history
+- **Discover** - Listening stats, recently played, and recommendations
+- **Real-time visualizer** - Five procedural engines that react to whatever is playing, radio included
+- **Keyboard first** - `Cmd+K` / `Ctrl+K` quick search, `Space` play/pause, `H` hides the visualizer chrome
 - **Experimental provider search** - Local development builds aggregate YouTube, SoundCloud, and Bandcamp, but those unofficial integrations are not approved for distribution and are blocked by the release gate
-- **Local music library** - Scan and play user-owned files with playlists and listening history
-- **Radio stations** - Browse 30,000+ internet radio stations by genre
-- **Discover** - Listening stats, recently played, and personalized recommendations
-- **Playlists** - Create and manage playlists from any source
-- **Audio-reactive visuals** - Prism, Soma, and Signal engines with shared musical analysis
-- **Keyboard shortcuts** - `Cmd+K` for quick search, `Space` for play/pause
+
+## The visualizer
+
+Every frame is generated on the GPU from the audio. Nothing is prerendered, sampled, or AI-generated.
+
+- **Live audio analysis in Rust** - spectrum, onsets, tempo, beat phase, and key, streamed to the renderer
+- **A musical director** - turns raw features into beats, bars, phrases, sections, builds, and drops, plus a music-character tracker that notices a genre or tempo change and moves the picture within about two seconds
+- **WGSL shaders on WebGPU** - raymarched signed distance fields and 3D fractals (Mandelbulb, Menger sponge, Kleinian and Apollonian sets, kaleidoscopic IFS), ray-marched volumetric light, a compute pass that turns ribbons into light sources
+- **HDR post stack** - temporal feedback, bloom, chromatic aberration, and dither
+- **A seeded variation genome** - palettes, cameras, topologies, and lighting mutate on musical boundaries and glide or crossfade between states, so the look keeps evolving and never jump-cuts
+
+| Engine | What it is |
+|--------|-----------|
+| **Prism** | A stained-glass rose window in a dark nave, light shafts projected through the glass |
+| **Mandala** | A voyage through fractal worlds: Kaliset filigree, Julia spiral dives, sacred geometry, Menger and Kleinian caverns, the Mandelbulb |
+| **Soma** | A bioluminescent deep-sea organism in 3D water |
+| **Signal** | A phosphor oscilloscope that draws the music as living traces |
+| **Loom** | Woven ribbons of light that are the only light in the room |
 
 ## Screenshot
 
@@ -98,6 +115,7 @@ Installing a newer build does not intentionally remove the SQLite library, setti
 | **Backend** | Rust (Tauri commands) |
 | **Audio engine** | [rodio](https://github.com/RustAudio/rodio) + [Symphonia](https://github.com/pdeljanov/Symphonia) |
 | **Database** | SQLite via [rusqlite](https://github.com/rusqlite/rusqlite) |
+| **Visualizer** | WebGPU + WGSL shaders, live Rust audio analysis |
 | **External sources** | Node.js sidecar with [youtubei.js](https://github.com/LuanRT/YouTube.js), [soundcloud-fetch](https://github.com/patrickkfkan/soundcloud-fetch), [bandcamp-fetch](https://github.com/patrickkfkan/bandcamp-fetch) |
 
 ## Project Structure
