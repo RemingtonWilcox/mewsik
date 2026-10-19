@@ -1,5 +1,12 @@
 import type { VisualDirectorFrame, VisualizerSection } from '$lib/visualizer/director/types';
 import type { SignalSpectrumProfile } from './spectrum';
+import type { MusicCharacter } from '$lib/visualizer/character';
+import {
+	createSignalVoiceFrame,
+	signalCharacterView,
+	signalVoiceTarget,
+	type SignalCharacterView
+} from './voice';
 
 export type SignalSeed = number | string;
 
@@ -367,6 +374,8 @@ export class SignalConductor {
 	private complexity = SECTION_PROFILES.intro.complexity;
 	private sweepBeats = SECTION_PROFILES.intro.sweepBeats;
 	private tickRate = SECTION_PROFILES.intro.ticks;
+	private readonly characterView: SignalCharacterView = signalCharacterView(null);
+	private readonly voice = createSignalVoiceFrame();
 
 	private readonly output: SignalConductorFrame = {
 		section: 'intro',
@@ -449,9 +458,17 @@ export class SignalConductor {
 	update(
 		frame: VisualDirectorFrame,
 		spectrum: SignalSpectrumProfile,
-		dtSeconds: number
+		dtSeconds: number,
+		// What kind of music is playing; a new shiftSerial means it just changed.
+		character?: Readonly<MusicCharacter> | null
 	): Readonly<SignalConductorFrame> {
 		const dt = safeDt(dtSeconds);
+		// The kind of music leans the composition: rough music lights more
+		// channels with denser figures, ambient pares the bench to one breathing
+		// trace, club locks into rosettes. Without a character nothing leans.
+		const voice = character
+			? signalVoiceTarget(signalCharacterView(character, this.characterView), this.voice)
+			: null;
 		const section = getSignalSectionProfile(frame.section);
 		const previousSection = this.lastSection;
 		const contextSource = frame.context.source;
@@ -649,6 +666,12 @@ export class SignalConductor {
 				sectionArc * tensionTarget * 0.035 +
 				spectrum.levels.presence * 0.035 +
 				spectrum.levels.air * 0.025;
+		if (voice) {
+			this.targetShapes[0] += voice.breathe * 0.22;
+			this.targetShapes[1] += voice.breathe * 0.12 + voice.organic * 0.08;
+			this.targetShapes[2] += voice.jitter * 0.12;
+			this.targetShapes[3] += voice.lock * 0.2 + voice.jitter * 0.06;
+		}
 		normalizeSignalShapeWeightArray(this.targetShapes);
 
 		// Macro topology takes roughly one to two bars to settle. Landings are
@@ -671,7 +694,8 @@ export class SignalConductor {
 			section.channels +
 				(frame.energy - 0.45) * 0.9 +
 				frame.drop.anticipation * 0.5 +
-				spectrum.levels.presence * 0.25 -
+				spectrum.levels.presence * 0.25 +
+				(voice?.channels ?? 0) -
 				(frame.silence ? 1 : 0),
 			0,
 			4
@@ -681,7 +705,8 @@ export class SignalConductor {
 				this.phraseBias[1] * 1.6 +
 				this.tension * 0.12 +
 				Math.abs(frame.tonnetz[2]) * 0.06 +
-				spectrum.flatness * 0.08
+				spectrum.flatness * 0.08 +
+				(voice?.complexity ?? 0) * 0.35
 		);
 		// Builds tighten the sweep toward half a beat as the riser approaches.
 		const sweepTarget = clamp(

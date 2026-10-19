@@ -5,7 +5,7 @@
 		type VisualizerEngine
 	} from '$lib/state/visualizer.svelte';
 
-	// The four engines by name, in arrow-key order. A radio group with a roving
+	// The engines by name, in arrow-key order. A radio group with a roving
 	// tab stop: Tab lands on the current engine, ←/→ (handled by the host for
 	// the whole overlay) move the selection, and focus follows it.
 	let {

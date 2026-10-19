@@ -7,7 +7,8 @@ import type {
 	SignalBandVector,
 	SignalSpectrumProfile
 } from '$lib/visualizer/signal/spectrum';
-import { LoomLook, type LoomLookFrame } from '$lib/visualizer/loom/look';
+import { LoomLook, type LoomListenCues, type LoomLookFrame } from '$lib/visualizer/loom/look';
+import type { MusicCharacter } from '$lib/visualizer/character';
 
 export type LoomSeed = SignalSeed;
 
@@ -550,6 +551,8 @@ export class LoomConductor {
 	private cameraDistance = SECTION_PROFILES.intro.cameraDistance;
 	private cameraRoll = 0;
 	private look = new LoomLook(0);
+	/** Spectrum cues the look calibrates its hearing from; one reused object. */
+	private readonly listen: LoomListenCues = { centroid: 0.1, motion: 0.2, air: 0.6 };
 	/** True when the journey owns the look; reset() then leaves it alone. */
 	private sharedLook = false;
 
@@ -600,6 +603,7 @@ export class LoomConductor {
 			this.look = look;
 			this.sharedLook = true;
 			this.output.look = look.frame;
+			look.beginSource();
 		}
 		this.reset(seed);
 	}
@@ -729,10 +733,16 @@ export class LoomConductor {
 	update(
 		frame: VisualDirectorFrame,
 		spectrum: SignalSpectrumProfile,
-		dtSeconds: number
+		dtSeconds: number,
+		// What kind of music is playing; a new shiftSerial means it just changed.
+		// The look answers it (shift, fit weights, weave parameters).
+		character?: Readonly<MusicCharacter> | null
 	): Readonly<LoomConductorFrame> {
 		const dt = safeDt(dtSeconds);
 		const profile = SECTION_PROFILES[frame.section] ?? SECTION_PROFILES.intro;
+		this.listen.centroid = finite(spectrum.centroid, 0.1);
+		this.listen.motion = finite(spectrum.spectralMotion, 0.2);
+		this.listen.air = finite(spectrum.levels?.air, 0.6);
 		const contextSource = frame.context.source;
 		const contextSourceChanged =
 			this.lastContextSource !== null && this.lastContextSource !== contextSource;
@@ -1059,7 +1069,9 @@ export class LoomConductor {
 			energy: this.macroEnergy,
 			mode: this.mode,
 			key: this.key,
-			dt
+			dt,
+			character: character ?? null,
+			listen: this.listen
 		});
 		this.storeCarry();
 

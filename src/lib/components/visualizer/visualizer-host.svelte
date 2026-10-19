@@ -2,6 +2,7 @@
 	import { onDestroy, onMount, tick } from 'svelte';
 	import { EyeOff, X } from '@lucide/svelte';
 	import VisualizerMk1 from './visualizer.svelte';
+	import VisualizerMandala from './visualizer-mandala.svelte';
 	import VisualizerMk2 from './visualizer-mk2.svelte';
 	import VisualizerSignal from './visualizer-signal.svelte';
 	import VisualizerLoom from './visualizer-loom.svelte';
@@ -285,6 +286,8 @@
 	>
 		{#if vis.engine === 'mk1'}
 			<VisualizerMk1 />
+		{:else if vis.engine === 'mandala'}
+			<VisualizerMandala />
 		{:else if vis.engine === 'mk2'}
 			<VisualizerMk2 />
 		{:else if vis.engine === 'signal'}

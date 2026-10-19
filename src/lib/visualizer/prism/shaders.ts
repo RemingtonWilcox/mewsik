@@ -19,8 +19,8 @@
 
 export const PRISM_BIN_COUNT = 64;
 
-/** Uniform floats: 24 legacy scalars + 28 vec4 groups. */
-export const PRISM_UNIFORM_FLOATS = 136;
+/** Uniform floats: 24 legacy scalars + 39 vec4 groups. */
+export const PRISM_UNIFORM_FLOATS = 180;
 export const PRISM_UNIFORM_BYTES = PRISM_UNIFORM_FLOATS * 4;
 
 /** Float offsets of each vec4 group, mirrored by the WGSL Uniforms struct. */
@@ -52,8 +52,23 @@ export const PRISM_UNIFORM_OFFSETS = {
 	sky: 120,
 	atmos: 124,
 	shaft: 128,
-	morph: 132
+	morph: 132,
+	prevPos: 136,
+	prevRight: 140,
+	prevUp: 144,
+	prevFwd: 148,
+	sunDir: 152,
+	vol: 156,
+	lightBox: 160,
+	arcade: 164,
+	side: 168,
+	feel: 172,
+	rig: 176
 } as const;
+
+/** The window's light map: transmitted light in wall coordinates. */
+export const PRISM_LIGHTMAP_WIDTH = 1024;
+export const PRISM_LIGHTMAP_HEIGHT = 192;
 
 const COMMON_WGSL = /* wgsl */ `
 struct Uniforms {
@@ -71,7 +86,9 @@ struct Uniforms {
 	feedbackRotation: f32,
 	feedbackZoom: f32,
 	blurDirX: f32,
-	blurDirY: f32,
+	// 0..1 fade from black when the renderer (re)starts, so opening the
+	// visualizer never pops
+	fadeIn: f32,
 	beatPhase: f32,
 	chromaKey: f32,
 	chromaStrength: f32,
@@ -133,6 +150,28 @@ struct Uniforms {
 	shaft: vec4<f32>,
 	// composition A salt, composition B salt, global finishing fade, unused
 	morph: vec4<f32>,
+	// previous frame's camera position xyz, history valid (0 or 1)
+	prevPos: vec4<f32>,
+	// previous frame's camera right xyz, unused
+	prevRight: vec4<f32>,
+	// previous frame's camera up xyz, unused
+	prevUp: vec4<f32>,
+	// previous frame's camera forward xyz, unused
+	prevFwd: vec4<f32>,
+	// unit direction toward the light behind the glass xyz, shaft intensity
+	sunDir: vec4<f32>,
+	// haze density, forward scattering, dust, light the windows throw into the nave
+	vol: vec4<f32>,
+	// light map region on the wall: left x, bottom y, width, height
+	lightBox: vec4<f32>,
+	// arcade presence, plane z, column radius, arch spring height
+	arcade: vec4<f32>,
+	// unit direction toward the clerestory xyz, clerestory light strength
+	side: vec4<f32>,
+	// lead edge contrast, ruin brokenness, volume history weight, jitter frame
+	feel: vec4<f32>,
+	// camera anchor x, frame seconds, beat push, unused
+	rig: vec4<f32>,
 };
 
 const TAU: f32 = 6.28318530718;
@@ -247,23 +286,216 @@ fn envWeight(e: f32) -> f32 {
 	return select(0.0, 1.0 - u.world.z, abs(u.world.x - e) < 0.5)
 		+ select(0.0, u.world.z, abs(u.world.y - e) < 0.5);
 }
+
+// Value noise in 3D for the nave's haze (integer hashed, no sine).
+fn hash3(c: vec3<f32>) -> f32 {
+	let ic = bitcast<vec3<u32>>(vec3<i32>(c));
+	return f32(pmix((ic.x * 0x9e3779b1u) ^ pmix((ic.y * 0x85ebca6bu) ^ pmix(ic.z ^ 0x27d4eb2fu))) >> 8u) / 16777216.0;
+}
+
+fn vnoise3(p: vec3<f32>) -> f32 {
+	let i = floor(p);
+	let f = fract(p);
+	let w = f * f * (3.0 - 2.0 * f);
+	let a = mix(hash3(i), hash3(i + vec3<f32>(1.0, 0.0, 0.0)), w.x);
+	let b = mix(hash3(i + vec3<f32>(0.0, 1.0, 0.0)), hash3(i + vec3<f32>(1.0, 1.0, 0.0)), w.x);
+	let c = mix(hash3(i + vec3<f32>(0.0, 0.0, 1.0)), hash3(i + vec3<f32>(1.0, 0.0, 1.0)), w.x);
+	let d = mix(hash3(i + vec3<f32>(0.0, 1.0, 1.0)), hash3(i + vec3<f32>(1.0, 1.0, 1.0)), w.x);
+	return mix(mix(a, b, w.y), mix(c, d, w.y), w.z);
+}
+
+// Henyey-Greenstein phase, scaled so isotropic scattering is 1.
+fn phaseHG(c: f32, g: f32) -> f32 {
+	let g2 = g * g;
+	return (1.0 - g2) / pow(max(1.0 + g2 - 2.0 * g * c, 1e-4), 1.5);
+}
+
+// Light from behind the glass, and from the clerestory behind the camera.
+fn sunL() -> vec3<f32> {
+	return u.sunDir.xyz;
+}
+
+fn sideL() -> vec3<f32> {
+	return u.side.xyz;
+}
+
+// Project with the previous frame's camera (feedback and volume history).
+fn projectPrev(w: vec3<f32>) -> vec2<f32> {
+	let d = w - u.prevPos.xyz;
+	let z = max(dot(d, u.prevFwd.xyz), 1e-3);
+	return vec2<f32>(dot(d, u.prevRight.xyz), dot(d, u.prevUp.xyz)) * (u.camPos.w / z);
+}
+
+// The arcade: a screen of masonry standing in front of the window wall, with
+// round columns on the bay boundaries, a pointed arch over every bay and a
+// spandrel wall above. Signed distance in its plane: negative in the opening.
+fn arcadeTop() -> f32 {
+	return u.arcade.w + 0.95;
+}
+
+fn arcadeSd(P: vec2<f32>) -> f32 {
+	let spacing = u.camRight.w;
+	let lx = P.x - floor(P.x / spacing + 0.5) * spacing;
+	let r = u.arcade.z;
+	let hw = spacing * 0.5 - r;
+	let spring = u.arcade.w;
+	let R = hw * 1.55;
+	var d = abs(lx) - hw;
+	if (P.y > spring) {
+		d = length(vec2<f32>(abs(lx) + (R - hw), P.y - spring)) - R;
+	}
+	// A ruin has lost its upper courses along a broken line.
+	let broken = u.feel.y;
+	let top = mix(arcadeTop(), spring + 0.04 + 0.42 * vnoise(vec2<f32>(P.x * 2.3, 5.0)) + 0.1 * vnoise(vec2<f32>(P.x * 9.0, 2.0)), broken);
+	return min(d, top - P.y);
+}
+
+// The camera never lets masonry fill the lens: arcade surfaces fade out as
+// they come within arm's length, the way a dolly grip would steer past them.
+fn arcadeNear(t: f32) -> f32 {
+	return smoothstep(0.28, 0.6, t);
+}
+
+// How much of the light crossing the arcade plane at P is blocked.
+fn arcadeBlock(P: vec2<f32>) -> f32 {
+	if (u.arcade.x < 0.01 || P.y < FLOOR_Y) { return 0.0; }
+	return smoothstep(-0.008, 0.008, arcadeSd(P)) * u.arcade.x;
+}
+
+// Nearest arcade surface along a ray: (t, normal). t = 1e9 when missed.
+fn arcadeHit(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+	var best = vec4<f32>(1e9, 0.0, 0.0, -1.0);
+	if (u.arcade.x < 0.01 || abs(rd.z) < 1e-4) { return best; }
+	let zA = u.arcade.y;
+	let spacing = u.camRight.w;
+	let r = u.arcade.z;
+	let spring = u.arcade.w;
+	let tP = (zA - ro.z) / rd.z;
+	if (tP > 0.0) {
+		let P = ro + rd * tP;
+		// Spandrel and arch: the planar part above the capitals.
+		if (P.y > spring - 0.02 && P.y > FLOOR_Y && arcadeSd(P.xy) > 0.0) {
+			best = vec4<f32>(tP, 0.0, 0.0, -sign(rd.z));
+		}
+	}
+	// Columns: vertical cylinders, tested around where the ray crosses the plane.
+	let cross = ro.x + rd.x * max(tP, 0.0);
+	let k0 = floor(cross / spacing);
+	let a = dot(rd.xz, rd.xz);
+	for (var j = -1; j <= 2; j = j + 1) {
+		let cx = (k0 + f32(j) - 0.5) * spacing;
+		let oc = ro.xz - vec2<f32>(cx, zA);
+		let b = dot(oc, rd.xz);
+		let cc = dot(oc, oc) - r * r;
+		let disc = b * b - a * cc;
+		if (disc <= 0.0) { continue; }
+		let t = (-b - sqrt(disc)) / a;
+		if (t <= 0.02 || t >= best.x) { continue; }
+		let y = ro.y + rd.y * t;
+		if (y < FLOOR_Y || y > spring) { continue; }
+		let h = ro + rd * t;
+		let n = normalize(vec3<f32>(h.x - cx, 0.0, h.z - zA));
+		best = vec4<f32>(t, n);
+	}
+	return best;
+}
+`;
+
+// Physical light in the nave, for passes that bind the window's light map as
+// lightTex with a sampler samp. The light map holds what the glass transmits,
+// in wall coordinates, so a point anywhere in the nave finds the light that
+// reaches it by following the sun's direction back to the wall.
+const LIGHT_WGSL = /* wgsl */ `
+fn lightAt(W: vec2<f32>) -> vec3<f32> {
+	let uv = vec2<f32>((W.x - u.lightBox.x) / u.lightBox.z, 1.0 - (W.y - u.lightBox.y) / u.lightBox.w);
+	if (uv.x <= 0.0 || uv.x >= 1.0 || uv.y <= 0.0 || uv.y >= 1.0) { return vec3<f32>(0.0); }
+	let fade = smoothstep(0.0, 0.06, min(uv.x, 1.0 - uv.x));
+	return textureSampleLevel(lightTex, samp, uv, 0.0).rgb * fade;
+}
+
+// Sunlight through the glass at X: traced back along the sun to the wall,
+// shadowed by the arcade it crosses on the way.
+fn shaftLight(X: vec3<f32>) -> vec3<f32> {
+	if (X.z > -0.002) { return vec3<f32>(0.0); }
+	let L = sunL();
+	let W = X.xy + L.xy * (-X.z / L.z);
+	var lit = lightAt(W);
+	let zA = u.arcade.y;
+	if (X.z < zA) {
+		let P = X.xy + L.xy * ((zA - X.z) / L.z);
+		lit = lit * (1.0 - arcadeBlock(P));
+	}
+	return lit;
+}
+
+// The clerestory: tall lancet pairs high in the opposite wall behind the
+// camera, their glass in the support and accent colours, mullions and transoms
+// casting real structure into the beams.
+fn clerestoryAt(Q: vec2<f32>) -> vec3<f32> {
+	let spacing = u.camRight.w * 0.5;
+	let cell = floor(Q.x / spacing + 0.5);
+	let lx = Q.x - cell * spacing;
+	let x = abs(lx) - 0.1;
+	let hw = 0.042;
+	let bottom = 0.62;
+	let spring = 1.18;
+	var d = max(abs(x) - hw, bottom - Q.y);
+	if (Q.y > spring) {
+		d = length(vec2<f32>(abs(x) + hw, Q.y - spring)) - 2.0 * hw;
+	}
+	let open = smoothstep(0.006, -0.006, d);
+	let transom = smoothstep(0.004, 0.009, abs(fract((Q.y - bottom) / 0.15) - 0.5) * 0.15);
+	let leftSide = lx < 0.0;
+	let pane = floor((Q.y - bottom) / 0.15);
+	let alt = fract(pane * 0.5 + select(0.0, 0.5, leftSide) + hnum(cell, 0x3a1u) * 0.5) > 0.25;
+	let glass = select(u.accentCol.rgb, mix(u.supportCol.rgb, u.heroCol.rgb, 0.35), alt) * u.sky.rgb;
+	return glass * open * transom * 2.2;
+}
+
+fn sideLight(X: vec3<f32>) -> vec3<f32> {
+	if (u.side.w < 0.01 || X.z > -0.002) { return vec3<f32>(0.0); }
+	let L2 = sideL();
+	let zC = -2.9;
+	if (X.z < zC + 0.05) { return vec3<f32>(0.0); }
+	let Q = X + L2 * ((zC - X.z) / L2.z);
+	var lit = clerestoryAt(Q.xy);
+	let zA = u.arcade.y;
+	if (X.z > zA) {
+		let P = X.xy + L2.xy * ((zA - X.z) / L2.z);
+		lit = lit * (1.0 - arcadeBlock(P));
+	}
+	return lit * u.side.w;
+}
+
+// The lit windows are area lights too: a soft glow they throw into the nave,
+// falling off with distance from the nearest bay.
+fn windowGlow(X: vec3<f32>) -> vec3<f32> {
+	if (X.z > -0.002) { return vec3<f32>(0.0); }
+	let spacing = u.camRight.w;
+	let bay = floor(X.x / spacing + 0.5);
+	let anchorBay = u.rig.x / spacing;
+	let lit = mix(0.06, 1.0, clamp(u.detail.w - abs(bay - anchorBay) + 1.0, 0.0, 1.0));
+	let C = vec3<f32>(bay * spacing, ROSE_Y, 0.0);
+	let d = X - C;
+	let falloff = (ROSE_R * ROSE_R) / (dot(d, d) * 2.5 + ROSE_R * ROSE_R);
+	let facing = clamp(-d.z / max(length(d), 1e-3) * 1.2, 0.0, 1.0);
+	return mix(u.heroCol.rgb, u.accentCol.rgb, 0.4) * u.sky.rgb * u.light.x * lit * falloff * (0.3 + 0.7 * facing) * u.vol.w;
+}
 `;
 
 // ---------------------------------------------------------------------------
 // Production scene: the window, its building and the camera.
 // ---------------------------------------------------------------------------
-export const PRISM_ROSE_WGSL = /* wgsl */ `
-${COMMON_WGSL}
-
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var<storage, read> bins: array<f32, ${PRISM_BIN_COUNT}>;
-
-${ROSE_HELPERS_WGSL}
-
-@vertex
-fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
-	return fullscreenVS(idx);
-}
+// The window itself, shared by the camera view and the light map: grammars,
+// tracery, mosaic, beat light, the building around it, and the morph between
+// two compositions. Needs u and bins.
+const ROSE_BODY_WGSL = /* wgsl */ `
+// Glass coverage of the last windowPane call: 1 where light passes through.
+var<private> gOpen: f32;
+// Set by the light map pass: beat packets throw only part of their flash into
+// the shafts and onto the floor, so a beat glows in the glass without
+// strobing the whole nave.
+var<private> gLightPass: f32;
 
 struct Sym {
 	q: vec2<f32>,
@@ -801,8 +1033,14 @@ fn wrapAngle(a: f32) -> f32 {
 
 // Light that the window lets through: one to three suns drifting behind the
 // glass and clouds passing across it, so a symmetric window is never lit
-// symmetrically.
-fn backlight(rel: vec2<f32>) -> f32 {
+// symmetrically. Stained glass diffuses, but it still glows hotter where the
+// view looks toward the sun through it, so the light shifts as the camera moves.
+fn backlight(rel: vec2<f32>, rd: vec3<f32>) -> f32 {
+	let lobe = pow(max(dot(rd, sunL()), 0.0), 8.0);
+	return backlightFlat(rel) * (0.8 + 0.45 * lobe);
+}
+
+fn backlightFlat(rel: vec2<f32>) -> f32 {
 	let d = rel - u.sun.xy;
 	var hot = exp(-dot(d, d) * 9.0);
 	let count = u.atmos.w;
@@ -941,13 +1179,15 @@ fn wallNave(w: WallIn) -> vec3<f32> {
 		+ exp(-pow((w.od - 0.055) * 140.0, 2.0)) * 0.6
 		+ exp(-pow((w.od - 0.41) * 160.0, 2.0)) * 0.35;
 	let ao = archOrders(w.wl);
-	let roomLight = w.back * exp(-length(w.wl) * 1.7) * (0.6 + 0.4 * u.sun.w);
-	let warmStone = mix(stoneTint(), accent, 0.25);
-	var col = warmStone * (0.045 + roomLight * 1.25 * (0.55 + ao.y * 0.6)) * masonry(w.P)
+	// The wall is lit from below: the window's light pools on the floor in
+	// front of it and bounces back up the stone, in the colours of the glass.
+	let roomLight = w.back * exp(-(w.P.y - FLOOR_Y) * 3.2) * (0.45 + 0.55 * exp(-w.lx * w.lx * 2.5)) * (0.6 + 0.4 * u.sun.w);
+	let warmStone = mix(stoneTint(), mix(hero, accent, 0.5), 0.3);
+	var col = warmStone * (0.012 + roomLight * 0.75 * (0.55 + ao.y * 0.6)) * masonry(w.P)
 		+ mix(hero, accent, 0.5) * moulding * spillW * 0.22
 		+ warmStone * ringBand * spillW * (0.07 - jointLine * 0.06)
-		+ mix(accent, support, 0.4) * ao.x * (0.035 + roomLight * 0.5)
-		+ mix(accent, support, 0.5) * piers(w.lx, w.spacing) * (0.012 + roomLight * 0.25);
+		+ mix(accent, support, 0.4) * ao.x * (0.015 + roomLight * 0.5)
+		+ mix(accent, support, 0.5) * piers(w.lx, w.spacing) * (0.006 + roomLight * 0.25);
 	col = max(col, vec3<f32>(0.0));
 	return col + accent * w.seam * (moulding + ao.x * 0.5 + ringBand * 0.3) * (0.05 + spillW * 0.25);
 }
@@ -988,19 +1228,22 @@ fn wallCrypt(w: WallIn) -> vec3<f32> {
 		+ accent * w.seam * ring * 0.2;
 }
 
-// Night sky through a broken wall: stars, moonlit cloud, a cold gradient.
+// Night sky through a broken wall: a moonlit cloud deck. The moon sits in a
+// fixed world direction, so the sky stays at infinity as the camera travels;
+// the clouds are lit on the side facing it, and only its own glow brightens
+// the sky around it.
 fn nightSky(rd: vec3<f32>) -> vec3<f32> {
 	let sp = rd.xy / max(rd.z, 0.05);
 	let moonCol = mix(vec3<f32>(0.5, 0.6, 0.9), u.sky.rgb, 0.4);
-	let grad = mix(u.fieldCol.rgb * 0.08, moonCol * 0.035, smoothstep(0.0, 0.8, sp.y));
-	let sc = floor(sp * 110.0);
-	let sh = hcell(sc, 0x51a7u);
-	let tw = 0.6 + 0.4 * sin(u.time * (1.0 + sh.y * 3.0) + sh.x * 30.0);
-	let star = step(0.988, sh.x) * smoothstep(0.35, 0.0, length(fract(sp * 110.0) - 0.5)) * tw;
-	let cloud = smoothstep(0.45, 0.85, vnoise(sp * 2.2 + vec2<f32>(u.time * 0.012, 0.0)) * 0.7 + vnoise(sp * 5.0) * 0.3);
 	let md = sp - vec2<f32>(0.75, 0.55);
-	let moon = exp(-dot(md, md) * 30.0) * 0.08 + smoothstep(0.06, 0.05, length(md)) * 0.5;
-	return grad * (1.0 - cloud * 0.6) + moonCol * (star * 0.5 + moon) + moonCol * cloud * 0.02;
+	let moonGlow = exp(-dot(md, md) * 6.0);
+	let flow = vec2<f32>(u.time * 0.012, 0.0);
+	let c0 = vnoise(sp * 2.2 + flow) * 0.62 + vnoise(sp * 5.3 + flow * 1.6) * 0.28 + vnoise(sp * 11.0 + flow * 2.3) * 0.1;
+	let c1 = vnoise((sp - normalize(md + vec2<f32>(1e-4)) * 0.05) * 2.2 + flow) * 0.62 + vnoise((sp - normalize(md + vec2<f32>(1e-4)) * 0.05) * 5.3 + flow * 1.6) * 0.28;
+	let cover = smoothstep(0.42, 0.7, c0);
+	let rimLit = clamp((c0 - c1) * 8.0, 0.0, 1.0) * cover;
+	let moon = smoothstep(0.06, 0.05, length(md)) * 0.5 * (1.0 - cover * 0.85);
+	return moonCol * (moonGlow * 0.025 * (1.0 - cover * 0.7) + moon + rimLit * moonGlow * 0.12 + cover * moonGlow * 0.01);
 }
 
 // Ruined chapel: the nave wall broken off above the window, open to the sky.
@@ -1010,7 +1253,7 @@ fn wallRuin(w: WallIn) -> vec3<f32> {
 		return nightSky(w.rd);
 	}
 	let moonCol = mix(vec3<f32>(0.5, 0.6, 0.9), u.sky.rgb, 0.4);
-	let edge = exp(-pow((w.P.y - breakY) * 70.0, 2.0)) * 0.05;
+	let edge = exp(-pow((w.P.y - breakY) * 90.0, 2.0)) * 0.018;
 	return wallNave(w) * 0.85 + moonCol * edge * masonry(w.P);
 }
 
@@ -1045,8 +1288,11 @@ fn wallApse(w: WallIn) -> vec3<f32> {
 		+ accent * w.seam * ring * 0.15;
 }
 
-// Void: no building at all, the window floats in darkness among drifting
-// shards of glass on two depth planes behind it.
+// Void: no building at all, the window floats in darkness among slowly
+// tumbling shards of glass on two depth planes behind it. The shards are lit
+// the way glass is: by the sun behind them, glowing where the view looks
+// through them toward it and dark against it elsewhere, with a thin edge
+// where the light grazes their cut sides.
 fn shardLayer(ro: vec3<f32>, rd: vec3<f32>, z: f32, scale: f32, salt: u32) -> vec3<f32> {
 	let t = (z - ro.z) / max(rd.z, 1e-3);
 	let P = (ro + rd * t).xy;
@@ -1055,20 +1301,20 @@ fn shardLayer(ro: vec3<f32>, rd: vec3<f32>, z: f32, scale: f32, salt: u32) -> ve
 	let h = hcell(cid, salt);
 	let local = rot2(u.time * (h.y - 0.5) * 0.4 + h.x * 6.0) * (fract(g) - 0.5 - (h - 0.5) * 0.35);
 	let sd = sdBox(local, vec2<f32>(0.07 + 0.08 * h.y, 0.025 + 0.05 * h.x));
-	let present = step(0.7, h.x);
-	let col = select(select(u.accentCol.rgb, u.supportCol.rgb, h.y > 0.4), u.heroCol.rgb, h.y > 0.72);
-	let glow = smoothstep(0.012, -0.012, sd) * (0.6 + 0.4 * sin(u.time * 0.7 + h.x * 20.0));
-	let rimL = exp(-pow(sd * 160.0, 2.0)) * 0.6;
-	return col * (glow + rimL) * present;
+	let present = step(0.82, h.x);
+	let col = select(select(u.accentCol.rgb, u.supportCol.rgb, h.y > 0.4), u.heroCol.rgb, h.y > 0.72) * u.sky.rgb;
+	let lobe = pow(max(dot(rd, sunL()), 0.0), 6.0);
+	let through = smoothstep(0.012, -0.012, sd) * (0.18 + 0.82 * lobe);
+	let rimL = exp(-pow(sd * 160.0, 2.0)) * 0.35 * (0.3 + lobe);
+	return col * (through * 0.6 + rimL) * present * backlightFlat(P * 0.4);
 }
 
 fn wallVoid(w: WallIn) -> vec3<f32> {
 	let ro = u.camPos.xyz;
-	let pulse = 0.12 + u.light.x * 0.5 + u.light.y * 0.25 * pow(1.0 - clamp(u.light.z, 0.0, 1.0), 2.0);
 	let near = shardLayer(ro, w.rd, 0.35, 5.0, 0x77u);
 	let far = shardLayer(ro, w.rd, 1.1, 3.0, 0x99u) * 0.45;
 	let halo = mix(u.heroCol.rgb, u.accentCol.rgb, 0.4) * w.back * exp(-max(w.od, 0.0) * 4.0) * 0.06;
-	return (near + far) * pulse * 0.5 + halo + u.fieldCol.rgb * 0.01;
+	return (near + far) * 0.9 + halo;
 }
 
 fn wallFor(e: f32, w: WallIn) -> vec3<f32> {
@@ -1121,6 +1367,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 	let od = outlineSd(stoneP, grammar, gram.w);
 	// Stone and wall dissolve in soft blotches; glass pieces override below.
 	var key = vnoise(pi.wallRel / ROSE_R * 5.0 + vec2<f32>(f32(baseSalt & 255u) * 0.37, 0.0));
+	gOpen = 0.0;
 
 	var col = vec3<f32>(0.0);
 
@@ -1133,7 +1380,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 		let bevel = exp(-pow((ts.sd - 0.016) * 150.0, 2.0));
 		let ridge = exp(-pow(ts.sd * 260.0, 2.0));
 		let frame = exp(-pow((od + 0.02) * 120.0, 2.0));
-		col = stoneTint() * (0.05 + back * 0.12)
+		col = stoneTint() * (0.02 + back * 0.1)
 			+ mix(hero, accent, 0.35) * spill * 0.12
 			+ accent * (bevel * 0.14 + frame * 0.08) * back
 			+ support * ridge * back * 0.05;
@@ -1207,7 +1454,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 				pkv = mix(packetForm(u.modes.x, cellRn, cellAngle, nForm, cell.id.x, pixRn, pixAngle), pkv, u.modes.z);
 			}
 			let tail = pow(1.0 - clamp(u.light.z, 0.0, 1.0), 1.3) * u.light.y * lit;
-			let pk = pkv.x * tail * (0.35 + 0.65 * tierLit);
+			let pk = pkv.x * tail * (0.35 + 0.65 * tierLit) * (1.0 - gLightPass * 0.7);
 			var g = glass * (transmitted + pk * 2.4) * 3.0
 				+ mix(glass, accent, 0.5) * cell.birth * (0.5 + back * 1.4);
 
@@ -1224,9 +1471,11 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 			let cellsPerPixel = footprint * cellScale;
 			let detail = 1.0 - smoothstep(0.18, 0.5, cellsPerPixel);
 			let aa = cellsPerPixel * 0.6;
-			let came = (1.0 - smoothstep(0.075 - aa, 0.15 + aa, cell.edge)) * mix(0.35, 1.0, detail);
+			// Punchy music cuts the lead finer and sharper.
+			let cameW = mix(0.17, 0.115, u.feel.x);
+			let came = (1.0 - smoothstep(cameW * 0.45 - aa, cameW + aa, cell.edge)) * mix(0.35, 1.0, detail);
 			let leadGlint = accent * back * 0.03 * exp(-pow((cell.edge - 0.02) * 60.0, 2.0));
-			let bolt = mix(accent, vec3<f32>(1.0), 0.35) * pkv.y * tail * 2.2;
+			let bolt = mix(accent, vec3<f32>(1.0), 0.25) * pkv.y * tail * 1.5;
 			g = mix(g, lead + leadGlint + bolt, came);
 			let rimLead = smoothstep(-0.026, -0.01, ts.sd);
 			g = mix(g, lead + bolt * 0.5, rimLead);
@@ -1239,6 +1488,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 			}
 			let opening = smoothstep(0.006, -0.002, ts.sd) * smoothstep(-0.012, -0.024, od);
 			col = mix(col, g, opening);
+			gOpen = opening;
 			// Each glass piece is re-set as one: its key is the piece's own
 			// (decorrelated from the hash that picks its colour).
 			key = mix(key, fract(cell.id.x * 7.31 + cell.id.y * 3.17), opening);
@@ -1270,29 +1520,11 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 const MORPH_BAND: f32 = 0.5;
 const MORPH_SPREAD: f32 = 1.2;
 
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let p = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / res.y;
-	let ro = u.camPos.xyz;
-	let rd = camRay(p);
-	// The floor and everything below it belong to the presentation pass.
-	if (rd.z <= 1e-3) {
-		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-	}
-	let tWall = -ro.z / rd.z;
-	let wall = ro + rd * tWall;
-	// Pixel footprint on the wall in window radii: distant and grazing windows
-	// fold their mosaic detail away instead of shimmering.
-	let footprint = tWall / (u.camPos.w * res.y * max(rd.z, 0.2) * ROSE_R);
-	if (wall.y < FLOOR_Y) {
-		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-	}
-
-	// Three planes: glass recessed deepest, carved tracery in front of it, the
-	// wall surface in front of both, so the camera reveals the window's depth.
-	let stoneW = (ro + rd * ((STONE_Z - ro.z) / rd.z)).xy;
-	let glassW = (ro + rd * ((GLASS_Z - ro.z) / rd.z)).xy;
+// Where a wall point sits among the bays, how brightly its bay is lit, and
+// where the ray meets the carved stone and the recessed glass of that bay.
+// Neighbouring bays light up around the bay the camera is working on; unlit
+// ones hang as dark tracery silhouettes.
+fn makePane(rd: vec3<f32>, wall: vec3<f32>, stoneW: vec2<f32>, glassW: vec2<f32>, footprint: f32) -> PaneIn {
 	let spacing = u.camRight.w;
 	let bay = floor(wall.x / spacing + 0.5);
 	let center = vec2<f32>(bay * spacing, ROSE_Y);
@@ -1306,40 +1538,170 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 	pi.bay = bay;
 	pi.spacing = spacing;
 	pi.footprint = footprint;
-	// Neighbouring bays light up as the camera reveals them; unlit ones hang
-	// as dark tracery silhouettes.
-	let bayLit = clamp(u.detail.w - abs(bay) + 1.0, 0.0, 1.0);
+	let anchorBay = u.rig.x / spacing;
+	let bayLit = clamp(u.detail.w - abs(bay - anchorBay) + 1.0, 0.0, 1.0);
 	pi.lit = mix(0.06, 1.0, bayLit);
-	pi.back = backlight(pi.glassRel) * pi.lit;
-	let rnW = length(pi.wallRel) / ROSE_R;
+	pi.back = backlight(pi.glassRel, rd) * pi.lit;
+	return pi;
+}
 
-	// Structure morph: composition B re-sets the window piece by piece as a
-	// front washes outward (each piece on its own staggered threshold, lit as
-	// it is set), then a global fade finishes whatever lies beyond the front.
-	// Outside a morph both compositions are the same and only B is drawn.
+// The window at this point through the structure morph: composition B
+// re-sets the window piece by piece as a front washes outward (each piece on
+// its own staggered threshold, lit as it is set), then a global fade finishes
+// whatever lies beyond the front. Outside a morph only B is drawn. Leaves the
+// glass coverage of the blend in gOpen.
+fn composeWindow(pi: PaneIn) -> vec3<f32> {
+	let rnW = length(pi.wallRel) / ROSE_R;
 	let front = u.comp.z;
 	let finish = clamp(u.morph.z, 0.0, 1.0);
 	let reach = (front - rnW) / MORPH_BAND - MORPH_SPREAD * 0.5;
-	var col: vec3<f32>;
-	if (finish >= 0.999 || reach - MORPH_SPREAD * 0.5 >= 1.0) {
-		col = windowPane(pi, u.comp.y, u.shapeB, u.gramB, u32(max(u.morph.y, 0.0))).rgb;
-	} else if (reach + MORPH_SPREAD * 0.5 <= 0.0 && finish <= 0.001) {
-		col = windowPane(pi, u.comp.x, u.shapeA, u.gramA, u32(max(u.morph.x, 0.0))).rgb;
-	} else {
-		let paneB = windowPane(pi, u.comp.y, u.shapeB, u.gramB, u32(max(u.morph.y, 0.0)));
-		let spatial = smoothstep(0.0, 1.0, reach + (paneB.w - 0.5) * MORPH_SPREAD);
-		let wB = max(spatial, finish);
-		var mixed = paneB.rgb;
-		if (wB < 0.999) {
-			let paneA = windowPane(pi, u.comp.x, u.shapeA, u.gramA, u32(max(u.morph.x, 0.0)));
-			mixed = mix(paneA.rgb, paneB.rgb, wB);
+	let onlyB = finish >= 0.999 || reach - MORPH_SPREAD * 0.5 >= 1.0;
+	let onlyA = !onlyB && reach + MORPH_SPREAD * 0.5 <= 0.0 && finish <= 0.001;
+	// One call site for the whole window, in a loop whose length depends on
+	// the uniforms: the shader compiler inlines it once instead of per branch.
+	var count = 2;
+	if (onlyA || onlyB) { count = 1; }
+	var colA = vec3<f32>(0.0);
+	var colB = vec3<f32>(0.0);
+	var keyB = 0.5;
+	var openA = 0.0;
+	var openB = 0.0;
+	for (var k = 0; k < count; k = k + 1) {
+		let useA = onlyA || k == 1;
+		let pane = windowPane(
+			pi,
+			select(u.comp.y, u.comp.x, useA),
+			select(u.shapeB, u.shapeA, useA),
+			select(u.gramB, u.gramA, useA),
+			u32(max(select(u.morph.y, u.morph.x, useA), 0.0))
+		);
+		if (useA) {
+			colA = pane.rgb;
+			openA = gOpen;
+		} else {
+			colB = pane.rgb;
+			keyB = pane.w;
+			openB = gOpen;
 		}
-		// Light leads the reveal: a piece glows while it is being set.
-		let seam = u.comp.w * 4.0 * spatial * (1.0 - spatial);
-		col = mixed + paneB.rgb * seam * 1.1;
 	}
+	if (onlyA) {
+		gOpen = openA;
+		return colA;
+	}
+	if (onlyB) {
+		gOpen = openB;
+		return colB;
+	}
+	let spatial = smoothstep(0.0, 1.0, reach + (keyB - 0.5) * MORPH_SPREAD);
+	let wB = max(spatial, finish);
+	gOpen = mix(openA, openB, wB);
+	// Light leads the reveal: a glass piece glows while it is being set.
+	let seam = u.comp.w * 4.0 * spatial * (1.0 - spatial) * openB;
+	return mix(colA, colB, wB) + colB * seam * 1.1;
+}
+`;
 
+// ---------------------------------------------------------------------------
+// Production scene: the window wall, the arcade in front of it, the camera.
+// ---------------------------------------------------------------------------
+export const PRISM_ROSE_WGSL = /* wgsl */ `
+${COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> bins: array<f32, ${PRISM_BIN_COUNT}>;
+@group(0) @binding(2) var lightTex: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+
+${ROSE_HELPERS_WGSL}
+${LIGHT_WGSL}
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	return fullscreenVS(idx);
+}
+
+${ROSE_BODY_WGSL}
+
+// The arcade's masonry is dark stone that only shows where light reaches it:
+// sunlight through the glass on the faces turned to the wall (a rim on the
+// columns as seen from the nave), the clerestory beams on the faces turned to
+// the camera, and the soft glow the windows throw into the nave.
+fn shadeArcade(h: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+	let L = sunL();
+	let sun = lightAt(h.xy + L.xy * (-h.z / L.z)) * max(dot(n, L), 0.0);
+	let side = sideLight(h) * max(dot(n, sideL()), 0.0);
+	let glow = windowGlow(h);
+	let column = abs(n.x) > 0.01 || abs(n.z) < 0.99;
+	let drums = 1.0 - 0.35 * exp(-pow((0.5 - abs(fract((h.y - FLOOR_Y) / 0.092) - 0.5)) * 90.0, 2.0));
+	let courses = select(masonry(h.xy + vec2<f32>(0.37, 0.0)), drums, column);
+	let capital = exp(-pow((h.y - u.arcade.w) * 60.0, 2.0)) * 0.6;
+	let stone = stoneTint() * 1.2 * courses * (1.0 + capital);
+	return stone * (sun * 1.6 + side * 0.6 + glow * (0.25 + 0.75 * max(n.z, 0.0)) + vec3<f32>(0.002));
+}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let res = vec2<f32>(u.resolutionX, u.resolutionY);
+	let p = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / res.y;
+	let ro = u.camPos.xyz;
+	let rd = camRay(p);
+	let tW = select(1e9, -ro.z / rd.z, rd.z > 1e-3);
+	let tF = select(1e9, (FLOOR_Y - ro.y) / rd.y, rd.y < -1e-4);
+	var col = vec3<f32>(0.0);
+	// The floor and everything below it belong to the presentation pass.
+	if (rd.z > 1e-3) {
+		let wall = ro + rd * tW;
+		if (wall.y >= FLOOR_Y) {
+			// Pixel footprint on the wall in window radii: distant and grazing
+			// windows fold their mosaic detail away instead of shimmering.
+			let footprint = tW / (u.camPos.w * res.y * max(rd.z, 0.2) * ROSE_R);
+			// Three planes: glass recessed deepest, carved tracery in front of
+			// it, the wall surface in front of both.
+			let stoneW = (ro + rd * ((STONE_Z - ro.z) / rd.z)).xy;
+			let glassW = (ro + rd * ((GLASS_Z - ro.z) / rd.z)).xy;
+			col = composeWindow(makePane(rd, wall, stoneW, glassW, footprint));
+			// The clerestory's beams land on the stone of the wall too.
+			col = col + stoneTint() * 1.4 * sideLight(wall - vec3<f32>(0.0, 0.0, 0.004)) * (1.0 - gOpen);
+		}
+	}
+	let arc = arcadeHit(ro, rd);
+	if (arc.x < min(tW, tF)) {
+		col = mix(col, shadeArcade(ro + rd * arc.x, arc.yzw), u.arcade.x * arcadeNear(arc.x));
+	}
 	return vec4<f32>(col * u.sceneWeight, 1.0);
+}
+`;
+
+// The window's light map: the same window seen straight through along the
+// sun, keeping only what the glass transmits. Every shaft, every coloured
+// patch on the floor and every lit mote in the air reads it.
+export const PRISM_LIGHTMAP_WGSL = /* wgsl */ `
+${COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var<storage, read> bins: array<f32, ${PRISM_BIN_COUNT}>;
+
+${ROSE_HELPERS_WGSL}
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> @builtin(position) vec4<f32> {
+	return fullscreenVS(idx);
+}
+
+${ROSE_BODY_WGSL}
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let size = vec2<f32>(${PRISM_LIGHTMAP_WIDTH}.0, ${PRISM_LIGHTMAP_HEIGHT}.0);
+	let uv = frag.xy / size;
+	let W = vec2<f32>(u.lightBox.x + uv.x * u.lightBox.z, u.lightBox.y + (1.0 - uv.y) * u.lightBox.w);
+	if (W.y < FLOOR_Y) {
+		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+	}
+	let footprint = (u.lightBox.z / size.x) / ROSE_R;
+	gLightPass = 1.0;
+	let col = composeWindow(makePane(sunL(), vec3<f32>(W, 0.0), W, W, footprint));
+	return vec4<f32>(col * gOpen, 1.0);
 }
 `;
 
@@ -1617,8 +1979,10 @@ ${COMMON_WGSL}
 ${FULLSCREEN_UV_WGSL}
 `;
 
-// Temporal feedback around the hero window: the previous frame follows the
-// rose's own rotation, drifts a hair outward, decays, and is max-blended with
+// Temporal feedback, reprojected through the camera: each pixel finds where
+// its point on the wall was in the previous frame, so the afterglow stays on
+// the glass while the camera travels. The trail follows the rose's own turn
+// about its centre, drifts a hair outward, decays, and is max-blended with
 // the new scene so light leaves silk afterglow without accumulating to white.
 export const PRISM_FEEDBACK_WGSL = /* wgsl */ `
 ${POST_COMMON_WGSL}
@@ -1628,25 +1992,102 @@ ${POST_COMMON_WGSL}
 @group(0) @binding(2) var sceneTex: texture_2d<f32>;
 @group(0) @binding(3) var feedbackPrev: texture_2d<f32>;
 
+${ROSE_HELPERS_WGSL}
+
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let aspect = u.resolutionX / max(u.resolutionY, 1.0);
-	let rs = clamp(u.roseScreen.xy, vec2<f32>(-aspect * 0.5, -0.5), vec2<f32>(aspect * 0.5, 0.5));
-	let center = vec2<f32>(0.5 + rs.x / aspect, 0.5 - rs.y);
-	var d = in.uv - center;
-	d.x = d.x * aspect;
-	let th = u.motion.x;
-	let c = cos(th);
-	let s = sin(th);
-	// Screen y grows downward, so the rotation sign flips relative to the scene.
-	d = vec2<f32>(c * d.x + s * d.y, -s * d.x + c * d.y) * u.post.y;
-	d.x = d.x / aspect;
-	let prevUv = center + d;
+	let p = vec2<f32>((in.uv.x - 0.5) * aspect, 0.5 - in.uv.y);
+	let ro = u.camPos.xyz;
+	let rd = camRay(p);
+	let t = select(6.0, min(-ro.z / rd.z, 6.0), rd.z > 1e-3);
+	let hit = ro + rd * t;
+	let spacing = u.camRight.w;
+	let c = vec2<f32>(floor(u.rig.x / spacing + 0.5) * spacing, ROSE_Y);
+	let turned = c + rot2(-u.motion.x) * (hit.xy - c) * u.post.y;
+	let prevUv = toUv(projectPrev(vec3<f32>(turned, hit.z)), aspect);
 	let edge = min(min(prevUv.x, prevUv.y), min(1.0 - prevUv.x, 1.0 - prevUv.y));
-	let border = smoothstep(0.0, 0.03, edge);
-	let prev = textureSampleLevel(feedbackPrev, samp, prevUv, 0.0).rgb;
+	let border = smoothstep(0.0, 0.03, edge) * u.prevPos.w;
+	let prev = textureSampleLevel(feedbackPrev, samp, clamp(prevUv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
 	let scene = textureSampleLevel(sceneTex, samp, in.uv, 0.0).rgb;
 	return vec4<f32>(max(prev * u.post.x * border, scene), 1.0);
+}
+`;
+
+// The air of the nave, at half resolution: a ray march from the camera to
+// the first surface through haze that pools near the floor and drifts. Each
+// step finds the sunlight that reaches it through the glass (coloured and
+// patterned by the window, shadowed by the arcade), the clerestory beams from
+// behind the camera, and the windows' own glow, and scatters it toward the
+// camera. Jittered steps settle in a reprojected history. Output: in-scattered
+// light (rgb) and the transmittance to the surface (a), so depth fog separates
+// the arcade, the wall and the far bays.
+export const PRISM_VOLUME_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var lightTex: texture_2d<f32>;
+@group(0) @binding(3) var volumePrev: texture_2d<f32>;
+
+${ROSE_HELPERS_WGSL}
+${LIGHT_WGSL}
+
+fn ign(pixel: vec2<f32>, frame: f32) -> f32 {
+	return fract(52.9829189 * fract(dot(pixel + vec2<f32>(frame * 5.588238, frame * 3.11), vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn hazeDensity(X: vec3<f32>) -> f32 {
+	let h = max(X.y - FLOOR_Y, 0.0);
+	let pool = 0.45 + 0.55 * exp(-h * 1.8);
+	let flow = vec3<f32>(u.time * 0.035, u.time * 0.011, -u.time * 0.02);
+	let q = X * 2.6 + flow;
+	let n = vnoise3(q) * 0.65 + vnoise3(q * 2.4 + vec3<f32>(5.3, 1.7, 3.1)) * 0.35;
+	return u.vol.x * pool * (0.25 + 1.5 * n * n);
+}
+
+const STEPS: i32 = 26;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let aspect = u.resolutionX / max(u.resolutionY, 1.0);
+	let p = vec2<f32>((in.uv.x - 0.5) * aspect, 0.5 - in.uv.y);
+	let ro = u.camPos.xyz;
+	let rd = camRay(p);
+	let tW = select(1e9, -ro.z / rd.z, rd.z > 1e-3);
+	let tF = select(1e9, (FLOOR_Y - ro.y) / rd.y, rd.y < -1e-4);
+	let arc = arcadeHit(ro, rd);
+	let tArc = select(1e9, arc.x, arcadeNear(arc.x) > 0.5);
+	let tEnd = min(min(tW, tF), min(tArc, 6.0));
+	let L = sunL();
+	let L2 = sideL();
+	let cs = dot(rd, L);
+	let ph = mix(phaseHG(cs, u.vol.y), phaseHG(cs, -0.25), 0.2) * u.sunDir.w;
+	let cs2 = dot(rd, L2);
+	let ph2 = mix(phaseHG(cs2, u.vol.y), phaseHG(cs2, -0.25), 0.35);
+	let jitter = ign(in.position.xy, u.feel.w);
+	let dt = tEnd / f32(STEPS);
+	var T = 1.0;
+	var acc = vec3<f32>(0.0);
+	for (var i = 0; i < STEPS; i = i + 1) {
+		let t = (f32(i) + jitter) * dt;
+		let X = ro + rd * t;
+		if (X.z > -0.002) { break; }
+		// The air right at the lens stays clear, so a beam passing the camera
+		// never fills the frame with a flat slab of light.
+		let dens = hazeDensity(X) * smoothstep(0.12, 0.75, t);
+		let light = shaftLight(X) * ph + sideLight(X) * ph2 + windowGlow(X);
+		acc = acc + T * light * dens * dt * 1.8;
+		// Thin air: it lights up far more than it hides, so the glass stays
+		// vivid while the far bays still sink into it.
+		T = T * exp(-dens * 0.2 * dt);
+	}
+	let H = ro + rd * tEnd;
+	let prevUv = toUv(projectPrev(H), aspect);
+	let inside = prevUv.x > 0.0 && prevUv.x < 1.0 && prevUv.y > 0.0 && prevUv.y < 1.0;
+	let hist = textureSampleLevel(volumePrev, samp, clamp(prevUv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+	let w = select(1.0, u.feel.z, u.prevPos.w > 0.5 && inside);
+	return mix(hist, vec4<f32>(acc, T), w);
 }
 `;
 
@@ -1696,10 +2137,50 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 export const PRISM_BLUR_H_WGSL = blurShader(1, 0);
 export const PRISM_BLUR_V_WGSL = blurShader(0, 1);
 
-// Presentation: lens, the air of the building (haze, light shafts falling
-// from the window, shafts from off-screen windows, dust, rain), the floor
-// (its mirror of the window, the coloured light the window throws onto it,
-// caustics and rain rings), then ACES, a contrast lift and IGN dither.
+// Exposure: a 1x1 meter of the lit part of the frame. It averages the
+// luminance of what is actually lit (black stays out of the average, so the
+// dark nave is never lifted), and adapts slowly and only part of the way, so
+// a far view of a small window reads as well as a close pass while quiet
+// passages still stay dimmer than drops.
+export const PRISM_EXPOSURE_WGSL = /* wgsl */ `
+${POST_COMMON_WGSL}
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var sceneTex: texture_2d<f32>;
+@group(0) @binding(3) var exposurePrev: texture_2d<f32>;
+
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	var lit = 0.0;
+	var weight = 0.0;
+	for (var j = 0; j < 10; j = j + 1) {
+		for (var i = 0; i < 16; i = i + 1) {
+			let uv = vec2<f32>((f32(i) + 0.5) / 16.0, (f32(j) + 0.5) / 10.0);
+			let c = textureSampleLevel(sceneTex, samp, uv, 0.0).rgb;
+			let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+			let w = smoothstep(0.004, 0.03, l);
+			lit = lit + log(max(l, 1e-4)) * w;
+			weight = weight + w;
+		}
+	}
+	let coverage = weight / 160.0;
+	let litMean = select(0.08, exp(lit / max(weight, 1e-3)), weight > 0.5);
+	// Half-way compensation toward a key, gentler still when little is lit.
+	let key = 0.2;
+	let aim = clamp(pow(key / max(litMean, 1e-3), 0.65) * mix(1.2, 1.0, smoothstep(0.02, 0.2, coverage)), 0.7, 2.6);
+	let prev = textureSampleLevel(exposurePrev, samp, vec2<f32>(0.5), 0.0).r;
+	let k = 1.0 - exp(-max(u.rig.y, 0.0) * 0.9);
+	let e = select(aim, mix(prev, aim, k), u.prevPos.w > 0.5 && prev > 0.1);
+	return vec4<f32>(e, litMean, coverage, 1.0);
+}
+`;
+
+// Presentation: lens, the floor (its mirror of the window, the window's
+// light thrown onto it through the glass, the clerestory beams, caustics and
+// rain rings), the air of the nave from the volume pass (depth fog and lit
+// haze), dust motes that only show where a beam crosses them, then ACES, a
+// contrast lift and IGN dither.
 export const PRISM_COMPOSITE_WGSL = /* wgsl */ `
 ${POST_COMMON_WGSL}
 
@@ -1707,8 +2188,12 @@ ${POST_COMMON_WGSL}
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var feedbackTex: texture_2d<f32>;
 @group(0) @binding(3) var bloomTex: texture_2d<f32>;
+@group(0) @binding(4) var volumeTex: texture_2d<f32>;
+@group(0) @binding(5) var lightTex: texture_2d<f32>;
+@group(0) @binding(6) var exposureTex: texture_2d<f32>;
 
 ${ROSE_HELPERS_WGSL}
+${LIGHT_WGSL}
 
 fn aces(color: vec3<f32>) -> vec3<f32> {
 	return clamp((color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14), vec3<f32>(0.0), vec3<f32>(1.0));
@@ -1722,6 +2207,37 @@ fn inBounds(uv: vec2<f32>) -> f32 {
 	return smoothstep(0.0, 0.03, min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y)));
 }
 
+// Dust: motes on six world-space slices through the nave, drifting slowly.
+// A mote is only visible where a beam crosses it, scattering that beam's
+// light; sub-pixel motes dim instead of growing.
+fn dustMotes(ro: vec3<f32>, rd: vec3<f32>, tEnd: f32, pix: f32) -> vec3<f32> {
+	var acc = vec3<f32>(0.0);
+	if (u.vol.z < 0.01 || rd.z <= 1e-4) { return acc; }
+	let ph = phaseHG(dot(rd, sunL()), 0.6) * u.sunDir.w;
+	let ph2 = phaseHG(dot(rd, sideL()), 0.35);
+	for (var k = 0; k < 6; k = k + 1) {
+		let fk = f32(k);
+		let z = -0.1 - fk * 0.26;
+		if (ro.z >= z - 0.05) { continue; }
+		let t = (z - ro.z) / rd.z;
+		if (t > tEnd) { continue; }
+		let P = ro + rd * t;
+		let cell = 0.055;
+		let sway = vec2<f32>(sin(u.time * 0.07 + fk * 1.7) * 0.03, u.time * (0.004 + fk * 0.0012));
+		let g = (P.xy + sway) / cell;
+		let c = floor(g);
+		let h = hcell(c + vec2<f32>(fk * 131.0, 0.0), 0x6d2bu);
+		if (h.x > u.vol.z * 0.5) { continue; }
+		let size = 0.0009 + h.y * 0.0012;
+		let r = max(size, t * pix * 1.1);
+		let off = (fract(g) - 0.5 - (h - vec2<f32>(0.5)) * 0.6) * cell;
+		let m = smoothstep(r, r * 0.2, length(off)) * min(1.0, (size * size) / (r * r) * 1.6);
+		if (m <= 0.001) { continue; }
+		acc = acc + (shaftLight(P) * ph + sideLight(P) * ph2) * m * (0.6 + h.y);
+	}
+	return acc;
+}
+
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let res = vec2<f32>(u.resolutionX, u.resolutionY);
@@ -1731,109 +2247,33 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 
 	// Lens: slight barrel, chromatic aberration growing with r squared and impact.
 	let warped = 0.5 + centered * (1.0 + r2 * 0.05);
-	let caAmount = (0.0009 + r2 * 0.007) * u.post.w;
+	let caAmount = (0.0007 + r2 * 0.005) * u.post.w;
 	let dir = normalize(centered + vec2<f32>(1e-4, 1e-4));
-	var scene = vec3<f32>(
+	let scene = vec3<f32>(
 		textureSampleLevel(feedbackTex, samp, warped + dir * caAmount, 0.0).r,
 		textureSampleLevel(feedbackTex, samp, warped, 0.0).g,
 		textureSampleLevel(feedbackTex, samp, warped - dir * caAmount, 0.0).b
 	);
 	let bloom = textureSampleLevel(bloomTex, samp, warped, 0.0).rgb;
+	let air = textureSampleLevel(volumeTex, samp, warped, 0.0);
 
 	let p = vec2<f32>((warped.x - 0.5) * aspect, 0.5 - warped.y);
-	let rs = u.roseScreen.xy;
-	let rr = max(u.roseScreen.z, 0.02);
-	let rel = p - rs;
-	let dist = length(rel);
 	let silence = u.env.z;
 	let back = u.light.x;
 	let hero = u.heroCol.rgb;
-	let support = u.supportCol.rgb;
 	let accent = u.accentCol.rgb;
-	let field = u.fieldCol.rgb;
 	let lightCol = u.sky.rgb;
-	let fog = u.atmos.x;
-	let dust = u.atmos.y;
 	let rain = u.world.w;
 
-	// Where this pixel's ray lands: the wall, or the floor in front of it.
+	// Where this pixel's ray lands: the wall, the arcade, or the floor.
 	let ro = u.camPos.xyz;
 	let rd = camRay(p);
 	let tw = select(1e6, -ro.z / rd.z, rd.z > 1e-4);
 	let tf = select(1e6, (FLOOR_Y - ro.y) / rd.y, rd.y < -1e-4);
+	let arc = arcadeHit(ro, rd);
 	let wallY = select(select(1e3, -1e3, rd.y < 0.0), ro.y + rd.y * tw, rd.z > 1e-4);
-	let floorMask = select(smoothstep(FLOOR_Y + 0.002, FLOOR_Y - 0.006, wallY), select(0.0, 1.0, tf < 1e5), rd.z <= 1e-4);
-
-	// Air: deep field-coloured haze that thickens near the window and moves
-	// slowly, so the darkness has volume instead of being flat black.
-	let air = vnoise(p * 2.4 + vec2<f32>(u.time * 0.02, u.time * 0.008))
-		* 0.6 + vnoise(p * 5.1 - vec2<f32>(u.time * 0.013, 0.0)) * 0.4;
-	let veil = mix(1.0, 0.35, smoothstep(rr * 1.05, rr * 0.8, dist));
-	let near = exp(-dist / rr * 0.7);
-	let hazeTint = mix(field, mix(hero, accent, 0.4) * lightCol, near * 0.35);
-	let haze = hazeTint * (0.06 + fog * 0.08 + near * 0.32 * (0.35 + back)) * (0.7 + air * 0.6) * u.sun.w * veil * (0.6 + fog * 0.9);
-
-	// Light shafts: march the bloom toward the window centre. They lean
-	// downward, the way sun through a high window falls into the building.
-	let lightUv = toUv(rs, aspect);
-	let toLight = lightUv - warped;
-	var shafts = vec3<f32>(0.0);
-	var weight = 1.0;
-	for (var i = 1; i <= 12; i = i + 1) {
-		let s = textureSampleLevel(bloomTex, samp, warped + toLight * (f32(i) / 12.0) * 0.82, 0.0).rgb;
-		shafts = shafts + s * weight;
-		weight = weight * 0.86;
-	}
-	let downward = 0.12 + 0.88 * smoothstep(-0.1, 0.95, -rel.y / max(dist, 1e-3));
-	let outside = smoothstep(rr * 0.92, rr * 1.35, dist);
-	let streaks = 0.75 + 0.5 * vnoise(vec2<f32>(atan2(rel.y, rel.x) * 9.0, u.time * 0.05));
-	shafts = shafts * outside * downward * streaks * (0.14 + air * 0.1) * u.sun.w * (0.7 + fog * 0.7);
-
-	// A shaft from a window out of frame: a coloured beam slanting down across
-	// the air, split into the glass colours across its width.
-	let sideStrength = u.shaft.x;
-	var beam = vec3<f32>(0.0);
-	var beamLum = 0.0;
-	if (sideStrength > 0.02) {
-		let ang = -0.55 + u.shaft.y * 0.35;
-		let bdir = normalize(vec2<f32>(sin(ang), -cos(ang)));
-		let origin = vec2<f32>(u.shaft.z * aspect * 0.5, 0.62);
-		let rp = p - origin;
-		let along = dot(rp, bdir);
-		let across = rp.x * bdir.y - rp.y * bdir.x;
-		let width = 0.07 + max(along, 0.0) * 0.16;
-		let core = exp(-pow(across / width, 2.0)) * smoothstep(0.0, 0.25, along) * exp(-max(along, 0.0) * 0.9);
-		let split = clamp(across / width * 0.5 + 0.5, 0.0, 1.0);
-		let tint = mix(mix(hero, accent, smoothstep(0.0, 0.5, split)), support, smoothstep(0.5, 1.0, split));
-		let flutter = 0.75 + 0.25 * vnoise(vec2<f32>(along * 6.0 - u.time * 0.2, across * 30.0));
-		beamLum = core * sideStrength * (0.25 + back * 0.6) * (0.6 + air * 0.6);
-		beam = tint * lightCol * beamLum * flutter * 0.2;
-	}
-
-	// Dust drifting through the light: two parallax layers of motes that only
-	// show where a shaft passes, so the air between window and floor has depth.
-	var motes = 0.0;
-	for (var layer = 0; layer < 2; layer = layer + 1) {
-		let scale = select(52.0, 30.0, layer == 1);
-		let flow = vec2<f32>(u.time * 0.11, u.time * -0.045) * select(1.0, 1.7, layer == 1);
-		let grid = p * scale + flow;
-		let mc = floor(grid);
-		let mh = hcell(mc, 91u + u32(layer));
-		let md = length(grid - (mc + 0.2 + mh * 0.6));
-		let present = step(0.88 - dust * 0.16, hcell(mc, 37u + u32(layer)).x);
-		motes = motes + smoothstep(0.11, 0.0, md) * present * select(0.6, 1.0, layer == 1);
-	}
-	let shaftLum = dot(shafts, vec3<f32>(0.3333)) + beamLum * 0.3;
-
-	// Rain falling through the light.
-	var rainLines = 0.0;
-	if (rain > 0.02) {
-		let rx = p.x * 150.0 + p.y * 14.0;
-		let col = floor(rx);
-		let rh = hcell(vec2<f32>(col, 7.0), 0x2a1u);
-		let fall = fract(p.y * (1.6 + rh.y) + u.time * (2.2 + rh.x * 1.4) + rh.x * 9.0);
-		rainLines = smoothstep(0.5, 0.0, abs(fract(rx) - 0.5) * 2.0 - 0.3) * smoothstep(0.86, 1.0, fall) * step(0.75, rh.y) * rain;
-	}
+	var floorMask = select(smoothstep(FLOOR_Y + 0.002, FLOOR_Y - 0.006, wallY), select(0.0, 1.0, tf < 1e5), rd.z <= 1e-4);
+	floorMask = floorMask * (1.0 - u.arcade.x * arcadeNear(arc.x) * select(0.0, 1.0, arc.x < tf));
 
 	// Floor: where the ray meets the floor plane in front of the wall.
 	var floorCol = vec3<f32>(0.0);
@@ -1865,34 +2305,43 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		let soft = textureSampleLevel(bloomTex, samp, mUv, 0.0).rgb;
 		let reflection = mix(soft * 1.2, mix(sharp, soft, 0.35), 0.25 + wet * 0.75)
 			* (0.28 + wet * 0.42) * exp(-depthZ * (1.2 - wet * 0.8)) * inBounds(mUv);
-		// The window's colours thrown onto the floor by the sun behind it,
-		// traced back to the glass they passed through, with caustic veins.
-		let L = vec3<f32>(u.sun.x * 1.4, 0.75 + u.sun.y * 1.2, 1.0);
-		let G = F + L * depthZ;
-		let gUv = toUv(projectScreen(G), aspect);
+		// The window's light on the floor: sunlight through the glass, traced
+		// back along the sun to the piece it passed through and shadowed by the
+		// arcade, rippled into caustic veins; the clerestory beams; the
+		// windows' own glow.
+		let L = sunL();
 		let caustic = 1.0 + u.atmos.z * (pow(1.0 - abs(vnoise(F.xz * 8.0 + vec2<f32>(u.time * 0.15, 0.0)) * 2.0 - 1.0), 6.0) * 2.4 - 0.45);
-		let carpetWin = smoothstep(0.0, 0.08, depthZ) * exp(-depthZ * 0.7);
-		let carpet = (textureSampleLevel(bloomTex, samp, gUv, 0.0).rgb * 0.5
-			+ textureSampleLevel(feedbackTex, samp, gUv, 0.0).rgb * 0.14) * carpetWin * caustic * inBounds(gUv);
+		let Fl = F + vec3<f32>(0.0, 0.001, 0.0);
+		let irradiance = shaftLight(Fl) * L.y * 7.0 * caustic
+			+ sideLight(Fl) * max(sideL().y, 0.0) * 1.8
+			+ windowGlow(Fl) * 0.7;
 		// Dry floors show stone flags.
 		let fg = abs(fract(F.xz * vec2<f32>(4.0, 3.0)) - 0.5);
 		let flags = 1.0 - (1.0 - wet) * 0.5 * (exp(-pow((0.5 - fg.x) * 40.0, 2.0)) + exp(-pow((0.5 - fg.y) * 40.0, 2.0)));
+		let albedo = mix(vec3<f32>(0.13, 0.12, 0.12), vec3<f32>(0.05, 0.05, 0.055), wet);
 		let horizon = exp(-pow((wallY - FLOOR_Y) * 140.0, 2.0)) * (0.02 + back * 0.03);
-		floorCol = (vec3<f32>(0.0015, 0.0016, 0.0022) + carpet * (1.0 - wet * 0.35)) * flags + reflection
+		floorCol = (vec3<f32>(0.0015, 0.0016, 0.0022) + albedo * irradiance) * flags + reflection
 			+ mix(accent, hero, 0.4) * horizon
 			+ mix(accent, lightCol, 0.5) * ringLit * (0.02 + back * 0.05);
-		floorCol = floorCol * exp(-tf * 0.06 * (0.5 + fog));
 	}
 
-	scene = scene * (1.0 - floorMask);
-	var color = scene + haze + shafts + beam
-		+ mix(accent, vec3<f32>(1.0), 0.35) * motes * shaftLum * 5.0 * (1.0 - floorMask)
-		+ mix(lightCol, accent, 0.3) * rainLines * (0.008 + shaftLum * 1.0)
-		+ bloom * (0.9 + u.motion.z * 0.3) + floorCol * floorMask;
+	// DEBUG-VIEW (lab only): 1 light map, 2 air, 3 transmittance.
+	if (u.palJump > 0.5) {
+		var dbg = textureSampleLevel(lightTex, samp, in.uv, 0.0).rgb;
+		if (u.palJump > 1.5) { dbg = air.rgb * 4.0; }
+		if (u.palJump > 2.5) { dbg = vec3<f32>(air.a); }
+		if (u.palJump > 3.5) { dbg = aces(scene * 1.05 * max(1.0, u.motion.w)); }
+		return vec4<f32>(dbg, 1.0);
+	}
+	let surface = scene * (1.0 - floorMask) + floorCol * floorMask;
+	let tEnd = min(min(tw, tf), min(select(1e9, arc.x, arcadeNear(arc.x) > 0.5), 6.0));
+	let motes = dustMotes(ro, rd, tEnd, 1.0 / (u.camPos.w * res.y));
+	var color = surface * air.a + air.rgb + motes * 3.0 + bloom * (0.9 + u.motion.z * 0.3);
 
 	let vignette = 1.0 - smoothstep(0.5, 1.15, length(centered * vec2<f32>(aspect * 0.8, 1.0)) * 1.25);
-	color = color * (0.62 + vignette * 0.38) * (1.0 - silence * 0.25);
-	color = aces(color * 1.05 * max(1.0, u.motion.w));
+	color = color * (0.7 + vignette * 0.3) * (1.0 - silence * 0.25) * u.fadeIn;
+	let metered = textureSampleLevel(exposureTex, samp, vec2<f32>(0.5), 0.0).r;
+	color = aces(color * 1.05 * max(1.0, u.motion.w) * clamp(metered, 0.6, 2.6));
 	color = max((color - 0.5) * 1.12 + 0.5, vec3<f32>(0.0));
 	color = color + (ign(in.uv * res, u.motion.y) - 0.5) * (1.4 / 255.0);
 	return vec4<f32>(color, 1.0);

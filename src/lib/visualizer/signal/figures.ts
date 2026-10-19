@@ -73,6 +73,12 @@ export type SignalFigureInput = {
 	dt: number;
 	/** Integration speed for the attractor (beats per second-ish). */
 	pace: number;
+	/** 0..1 jagged beam noise (rough music); 0 when absent. */
+	jitter?: number;
+	/** 0..1 slow hand-drawn wander (acoustic touch); 0 when absent. */
+	wander?: number;
+	/** Seconds-like clock the jitter and wander move on. */
+	grainTime?: number;
 };
 
 type Vec3 = [number, number, number];
@@ -100,6 +106,26 @@ const SPIRO: readonly (readonly [number, number])[] = [
 const KNOTS: readonly (readonly [number, number])[] = [
 	[2, 3], [3, 2], [2, 5], [3, 4], [3, 5], [2, 7], [4, 5], [5, 3]
 ];
+
+/** Integer hash to 0..1. */
+function hash01(n: number) {
+	let x = Math.imul(n | 0, 0x27d4eb2d) ^ 0x165667b1;
+	x ^= x >>> 15;
+	x = Math.imul(x, 0x85ebca6b);
+	x ^= x >>> 13;
+	return (x >>> 0) / 0x1_0000_0000;
+}
+
+/** Smooth 1D value noise, -1..1, repeating every `period` units. */
+function valueNoise(t: number, salt: number, period: number) {
+	const i = Math.floor(t);
+	const f = t - i;
+	const i0 = ((i % period) + period) % period;
+	const i1 = (i0 + 1) % period;
+	const a = hash01(i0 * 2 + salt * 7919);
+	const b = hash01(i1 * 2 + salt * 7919);
+	return (a + (b - a) * smooth(f)) * 2 - 1;
+}
 
 function smoothDetail(detail: Float32Array, position: number) {
 	const scaled = clamp(position, 0, 0.999) * 63;
@@ -424,6 +450,12 @@ export class SignalFigureEngine {
 		const sy = (0.76 + input.mids * 0.16 + input.presence * 0.12) * (1 - input.tension * 0.12);
 		const ripplePhase = input.phase * 0.021;
 		const rippleGain = 0.03 + input.spectralMotion * 0.05;
+		// Rough music shakes the beam: a fine jag that crawls along the curve,
+		// strongest where the high bands are; acoustic touch wanders slowly.
+		const jitter = clamp(input.jitter ?? 0, 0, 1) * (0.04 + input.presence * 0.03 + input.air * 0.03 + input.energy * 0.02);
+		const wander = clamp(input.wander ?? 0, 0, 1) * 0.035;
+		const grainTime = input.grainTime ?? 0;
+		const jagTime = Math.floor(grainTime * 24);
 		const pitch = input.tilt * tiltFactor;
 		const cp = Math.cos(pitch);
 		const sp = Math.sin(pitch);
@@ -444,6 +476,17 @@ export class SignalFigureEngine {
 			const ripple = (detail * rippleGain + Math.sin(u * TAU * 41 + input.phase * 3) * input.air * 0.006) * centreFade;
 			x += (x / length) * ripple;
 			y += (y / length) * ripple;
+			if (jitter > 1e-5) {
+				const along = u * 140 + grainTime * 9;
+				// Both noises repeat once per curve, so closed figures stay closed.
+				const point = Math.round(u * 480) % 480;
+				x += jitter * (valueNoise(along, 1, 140) * 0.75 + (hash01(point + jagTime * 977) - 0.5) * 0.5);
+				y += jitter * (valueNoise(along, 2, 140) * 0.75 + (hash01(point * 3 + jagTime * 613) - 0.5) * 0.5);
+			}
+			if (wander > 1e-5) {
+				x += wander * (Math.sin(TAU * u * 2 + grainTime * 0.4 + 1) * 0.6 + Math.sin(TAU * u * 3 - grainTime * 0.27) * 0.4);
+				y += wander * (Math.sin(TAU * u * 2 - grainTime * 0.33 + 2) * 0.6 + Math.sin(TAU * u * 5 + grainTime * 0.21) * 0.4);
+			}
 			const cy = Math.cos(yawAngle * tiltFactor);
 			const sy2 = Math.sin(yawAngle * tiltFactor);
 			const rx = x * cy + z * sy2;

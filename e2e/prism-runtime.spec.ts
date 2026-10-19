@@ -220,35 +220,45 @@ test.describe('Prism render foundations', () => {
 	test('cameras frame the wall and never sink through the floor', async ({ page }) => {
 		await page.goto('/');
 		const result = await page.evaluate(async () => {
-			const modulePath = '/src/lib/visualizer/prism/composition.ts';
-			const prism = await import(modulePath);
-			const straight = prism.prismCameraBasis(prism.prismCameraRegime(0, 0, 0, 0, 0));
+			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const rig = await import('/src/lib/visualizer/prism/camera.ts');
+			const path = (regime: number, travel: number, side = 0, focus = 0) =>
+				rig.prismCameraPath(regime, { travel, side, focus, drift: 0, anchor: 0 });
+			const straight = prism.prismCameraBasis(path(0, 0));
 			const centre = prism.prismProject(straight, [0, prism.PRISM_ROSE_Y, 0]);
 			const edge = prism.prismProject(straight, [prism.PRISM_ROSE_R, prism.PRISM_ROSE_Y, 0]);
 			const lows: number[] = [];
+			let worstAim = 0;
 			for (let from = 0; from < prism.PRISM_CAMERAS.length; from += 1) {
 				for (let to = 0; to < prism.PRISM_CAMERAS.length; to += 1) {
 					for (const mix of [0, 0.25, 0.5, 0.75, 1]) {
 						for (const side of [-1, 0.3, 1]) {
-							const basis = prism.prismCameraBasis(prism.prismCamera({ from, to, mix }, side, 0.4, 0.5, 0.8));
-							lows.push(basis.pos[1]);
+							for (let travel = 0; travel < 60; travel += 1.7) {
+								const a = path(from, travel, side, 0.4);
+								const b = path(to, travel, side, 0.4);
+								const cam = rig.prismBlendCameras(a, b, mix);
+								lows.push(prism.prismCameraBasis(cam).pos[1]);
+								// Every path looks at a point on the working window.
+								worstAim = Math.max(worstAim, Math.hypot(cam.tx, cam.ty - prism.PRISM_ROSE_Y) / prism.PRISM_ROSE_R);
+							}
 						}
 					}
 				}
 			}
-			const regimes = prism.PRISM_CAMERAS.map((_: string, regime: number) => prism.prismCameraRegime(regime, 0.7, 0.2, 0, 0));
-			return { centre, edge, lowest: Math.min(...lows), floor: prism.PRISM_FLOOR_Y, regimes };
+			const regimes = prism.PRISM_CAMERAS.map((_: string, regime: number) => path(regime, 3.1, 0.7, 0.2));
+			return { centre, edge, lowest: Math.min(...lows), floor: prism.PRISM_FLOOR_Y, regimes, worstAim };
 		});
 
-		// Square-on is the original framing: the rose at (0, 0.07), radius 0.32.
+		// The orbit starts square-on: the original framing, the rose at (0, 0.07), radius 0.32.
 		expect(result.centre[0]).toBeCloseTo(0, 5);
 		expect(result.centre[1]).toBeCloseTo(0.07, 5);
 		expect(result.edge[0]).toBeCloseTo(0.32, 5);
 		expect(result.lowest).toBeGreaterThan(result.floor);
+		expect(result.worstAim).toBeLessThan(1.25);
 		// Regimes are genuinely different framings, not one camera jittered.
 		const signatures = new Set(
-			result.regimes.map((c: { yaw: number; pitch: number; dist: number }) =>
-				[c.yaw.toFixed(1), c.pitch.toFixed(1), c.dist.toFixed(1)].join()
+			result.regimes.map((c: { yaw: number; pitch: number; roll: number; dist: number }) =>
+				[c.yaw.toFixed(1), c.pitch.toFixed(1), c.roll.toFixed(1), c.dist.toFixed(1)].join()
 			)
 		);
 		expect(signatures.size).toBe(result.regimes.length);
@@ -472,7 +482,7 @@ test.describe('Prism continuity', () => {
 	test('the rose turn, clock and camera side carry through a source reset', async ({ page }) => {
 		await page.goto('/');
 		const result = await page.evaluate(async () => {
-			const prism = await import('/src/lib/visualizer/prism/composition.ts');
+			const rig = await import('/src/lib/visualizer/prism/camera.ts');
 			const { PrismMotion } = await import('/src/lib/visualizer/prism/continuity.ts');
 			const motion = new PrismMotion(0.8);
 			const dt = 1 / 60;
@@ -495,7 +505,9 @@ test.describe('Prism continuity', () => {
 				clock = motion.clock;
 			}
 			const sides = Array.from({ length: 201 }, (_, i) => -1 + i / 100);
-			const yaws = sides.map((side) => prism.prismCameraRegime(1, side, 0.3, 0, 0).yaw);
+			const yaws = sides.map(
+				(side) => rig.prismCameraPath(1, { travel: 0, side, focus: 0.3, drift: 0, anchor: 0 }).yaw
+			);
 			const yawStep = Math.max(...yaws.slice(1).map((yaw: number, i: number) => Math.abs(yaw - yaws[i])));
 			return { maxTurn, maxClockStep, clock: motion.clock, turn: motion.turn, yawStep };
 		});

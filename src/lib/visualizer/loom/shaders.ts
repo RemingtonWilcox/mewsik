@@ -19,6 +19,20 @@ export const LOOM_FIRST_CHORUS = LOOM_INSTANCES;
 export const LOOM_TUBE_SIDES = 10;
 export const LOOM_VERTEX_COUNT = LOOM_SEGMENTS * LOOM_TUBE_SIDES * 6;
 export const LOOM_CHORUS_VERTEX_COUNT = LOOM_CHORUS_SEGMENTS * LOOM_CHORUS_SIDES * 6;
+/** The primary rails are the scene's light sources, sampled at this many points each. */
+export const LOOM_LIGHT_RAILS = LOOM_PRIMARY_RAILS;
+export const LOOM_LIGHT_POINTS = 13;
+/** Two vec4 per light point, then one for the stage's adapted exposure. */
+export const LOOM_LIGHT_VEC4S = LOOM_LIGHT_RAILS * LOOM_LIGHT_POINTS * 2 + 1;
+export const LOOM_LIGHT_BYTES = LOOM_LIGHT_VEC4S * 16;
+/** Far threads round the stage, and the strip segments each is drawn with. */
+export const LOOM_THREADS = 360;
+export const LOOM_THREAD_SEGMENTS = 28;
+export const LOOM_THREAD_VERTEX_COUNT = LOOM_THREAD_SEGMENTS * 6;
+/** Dust and loose fibres in the air round the figure. */
+export const LOOM_DUST = 1400;
+/** The participating medium is marched at this fraction of the scene size. */
+export const LOOM_VOLUME_SCALE = 1 / 3;
 
 // Field comments double as the machine-checkable packing contract; they must
 // match LOOM_UNIFORM_GROUPS in uniform-layout.ts (see e2e loom-uniform-contract).
@@ -82,11 +96,11 @@ struct Params {
 	materialC: vec4<f32>,
 	// iridescence, glint, chorusLevel, pale
 	materialD: vec4<f32>,
-	// floorMirror, ripple, fog, stars
+	// reflect, roughness, ripple, floorAlbedo
 	envA: vec4<f32>,
-	// sky, walls, pool, horizon
+	// mist, mistHeight, mistNoise, fogExtinction
 	envB: vec4<f32>,
-	// floorLine, sunX, floorAmount, bloomWeight
+	// floorY, floorAmount, envLight, bloomWeight
 	envC: vec4<f32>,
 	// keyAzimuth, keyElevation, lightWarmth, fillLevel
 	light: vec4<f32>,
@@ -94,8 +108,12 @@ struct Params {
 	beat: vec4<f32>,
 	// sparks, beatGain, litGain, chorusGlow
 	beatB: vec4<f32>,
-	// driftX, driftY, spin, paper
+	// driftX, driftY, spin, flowPhase
 	postB: vec4<f32>,
+	// threads, warpRows, threadReach, dust
+	envD: vec4<f32>,
+	// fray, grain, turbulence, edge
+	weave: vec4<f32>,
 };
 `;
 
@@ -146,6 +164,128 @@ fn hashUnit(a: u32, b: u32, c: u32) -> f32 {
 	let h = loomMix(seedWord() ^ (a * 0x9e3779b1u) ^ (b * 0x85ebca6bu) ^ (c * 0x27d4eb2fu));
 	return f32(h & 0x00ffffffu) / 16777216.0;
 }
+
+// Camera and stage. Strand space (the grammar surfaces) is scaled into stage
+// space, where the floor, the far threads and the dust live; the stage is then
+// turned to the camera (view space: camera on +z looking down -z).
+const LOOM_NEAR: f32 = 0.1;
+const LOOM_FAR: f32 = 32.0;
+const STAGE_OFFSET: vec3<f32> = vec3<f32>(0.04, -0.08, -0.18);
+
+// Phrase-scale evolution shared by the hero and the camera: x = phrase index,
+// y = blend toward the next phrase over its final eighth, so changes ease in.
+fn phraseClock() -> vec2<f32> {
+	let beats = params.cloth.x / 32.0;
+	return vec2<f32>(floor(beats), smoothstep(0.875, 1.0, fract(beats)));
+}
+
+// A small per-phrase change of viewing angle, so long passages do not hold one
+// framing; it eases across the phrase boundary instead of cutting.
+fn phraseYaw() -> f32 {
+	let clock = phraseClock();
+	let now = hashUnit(u32(max(clock.x, 0.0)) + 5u, 53u, 3u) - 0.5;
+	let next = hashUnit(u32(max(clock.x + 1.0, 0.0)) + 5u, 53u, 3u) - 0.5;
+	return mix(now, next, clock.y) * 0.42 * params.view.w;
+}
+
+fn stageYaw() -> f32 {
+	return params.camera.x + 0.62 + phraseYaw() + params.lens.w;
+}
+
+fn stagePitch() -> f32 {
+	return params.camera.y - 0.18;
+}
+
+fn stagePoint(p0: vec3<f32>) -> vec3<f32> {
+	var p = p0 * params.frame.x;
+	p.x = p.x * 1.32;
+	p.y = p.y * 1.12;
+	p.z = p.z * 1.16;
+	return p;
+}
+
+fn stageRotate(v: vec3<f32>) -> vec3<f32> {
+	return rotateZ(rotateX(rotateY(v, stageYaw()), stagePitch()), params.camera.w);
+}
+
+fn stageToView(q: vec3<f32>) -> vec3<f32> {
+	return stageRotate(q) + STAGE_OFFSET;
+}
+
+fn viewToStage(v: vec3<f32>) -> vec3<f32> {
+	return rotateY(rotateX(rotateZ(v - STAGE_OFFSET, -params.camera.w), -stagePitch()), -stageYaw());
+}
+
+fn viewPoint(p0: vec3<f32>) -> vec3<f32> {
+	return stageToView(stagePoint(p0));
+}
+
+fn floorStageY() -> f32 {
+	return params.envC.x * params.frame.x * 1.12;
+}
+
+// The floor fades out as the camera nears it or looks up from below it.
+fn floorVisibility() -> f32 {
+	let eye = viewToStage(vec3<f32>(0.0, 0.0, params.camera.z));
+	return clamp(params.envC.y, 0.0, 1.0) * smoothstep(0.1, 0.45, eye.y - floorStageY());
+}
+
+// Perspective with lens shift; w is the depth in front of the camera.
+fn projectView(position: vec3<f32>) -> vec4<f32> {
+	let depth = params.camera.z - position.z;
+	let aspect = params.view.x / max(params.view.y, 1.0);
+	let focal = params.lens.x;
+	let clipZ = clamp((depth - LOOM_NEAR) / (LOOM_FAR - LOOM_NEAR), -1.0, 2.0) * depth;
+	return vec4<f32>(
+		position.x * focal / aspect + params.lens.y * depth,
+		position.y * focal + params.lens.z * depth,
+		clipZ,
+		depth
+	);
+}
+
+// View-space ray through a screen uv (y down), scaled so that its z is -1:
+// camera + ray * d is the point at depth d.
+fn viewRay(uv: vec2<f32>) -> vec3<f32> {
+	let aspect = params.view.x / max(params.view.y, 1.0);
+	let focal = params.lens.x;
+	let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+	return vec3<f32>((ndc.x - params.lens.y) * aspect / focal, (ndc.y - params.lens.z) / focal, -1.0);
+}
+
+// Depth along a viewRay at which it meets the floor plane (negative: never).
+fn floorDepth(ray: vec3<f32>) -> f32 {
+	let n = stageRotate(vec3<f32>(0.0, 1.0, 0.0));
+	let q = stageToView(vec3<f32>(0.0, floorStageY(), 0.0));
+	let denom = dot(ray, n);
+	if (denom > -1e-4) { return -1.0; }
+	return dot(q - vec3<f32>(0.0, 0.0, params.camera.z), n) / denom;
+}
+
+fn hash3(c: vec3<i32>) -> f32 {
+	let h = loomMix((bitcast<u32>(c.x) * 0x8da6b343u) ^ (bitcast<u32>(c.y) * 0xd8163841u) ^ (bitcast<u32>(c.z) * 0xcb1ab31fu));
+	return f32(h & 0x00ffffffu) / 16777216.0;
+}
+
+// Smooth value noise, 0..1.
+fn noise3(p: vec3<f32>) -> f32 {
+	let i = vec3<i32>(floor(p));
+	let f = fract(p);
+	let u = f * f * (3.0 - 2.0 * f);
+	let n000 = hash3(i);
+	let n100 = hash3(i + vec3<i32>(1, 0, 0));
+	let n010 = hash3(i + vec3<i32>(0, 1, 0));
+	let n110 = hash3(i + vec3<i32>(1, 1, 0));
+	let n001 = hash3(i + vec3<i32>(0, 0, 1));
+	let n101 = hash3(i + vec3<i32>(1, 0, 1));
+	let n011 = hash3(i + vec3<i32>(0, 1, 1));
+	let n111 = hash3(i + vec3<i32>(1, 1, 1));
+	return mix(
+		mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
+		mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y),
+		u.z
+	);
+}
 `;
 
 export const LOOM_SCENE_WGSL = /* wgsl */ `
@@ -160,6 +300,8 @@ const CHORUS_SEGMENTS: u32 = ${LOOM_CHORUS_SEGMENTS}u;
 const CHORUS_SIDES: u32 = ${LOOM_CHORUS_SIDES}u;
 const PRIMARY: u32 = ${LOOM_PRIMARY_RAILS}u;
 const FIRST_CHORUS: u32 = ${LOOM_FIRST_CHORUS}u;
+const LIGHT_RAILS: u32 = ${LOOM_LIGHT_RAILS}u;
+const LIGHT_POINTS: u32 = ${LOOM_LIGHT_POINTS}u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> detailBins: array<f32, 64>;
@@ -176,6 +318,8 @@ struct LoomOut {
 	@location(5) tangent: vec3<f32>,
 	// x: lane, y: strand hash, z: spark, w: hotspot phase
 	@location(6) dataC: vec4<f32>,
+	// x: height above the floor, y: mirrored, z: reflection dim, w: unused
+	@location(7) envData: vec4<f32>,
 };
 
 // A point on a grammar surface: position, two directions perpendicular to the
@@ -572,13 +716,6 @@ fn surfacePoint(s: f32, strand: Strand, lane: f32) -> GPoint {
 	);
 }
 
-// Phrase-scale evolution shared by the hero and the camera: x = phrase index,
-// y = blend toward the next phrase over its final eighth, so changes ease in.
-fn phraseClock() -> vec2<f32> {
-	let beats = params.cloth.x / 32.0;
-	return vec2<f32>(floor(beats), smoothstep(0.875, 1.0, fract(beats)));
-}
-
 // Which primary rail leads this phrase. The centre rail leads most phrases;
 // roughly one in three hands the lead to an outer rail.
 fn heroRail(phrase: f32) -> u32 {
@@ -592,15 +729,6 @@ fn heroWeight(instanceIndex: u32) -> f32 {
 	let now = select(0.0, 1.0, heroRail(clock.x) == instanceIndex);
 	let next = select(0.0, 1.0, heroRail(clock.x + 1.0) == instanceIndex);
 	return mix(now, next, clock.y);
-}
-
-// A small per-phrase change of viewing angle, so long passages do not hold one
-// framing; it eases across the phrase boundary instead of cutting.
-fn phraseYaw() -> f32 {
-	let clock = phraseClock();
-	let now = hashUnit(u32(max(clock.x, 0.0)) + 5u, 53u, 3u) - 0.5;
-	let next = hashUnit(u32(max(clock.x + 1.0, 0.0)) + 5u, 53u, 3u) - 0.5;
-	return mix(now, next, clock.y) * 0.42 * params.view.w;
 }
 
 // One weft draft: how many times a filament crosses between its two rails in
@@ -710,6 +838,24 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 		p = p + r * g.react;
 	}
 
+	// Turbulence (noisy, restless music): the threads churn in an eddying
+	// current; fraying shivers loose fibres off the weft and chorus.
+	let turbulence = params.weave.z;
+	if (turbulence > 0.001) {
+		let tt = params.postB.w * 1.7;
+		let eddy = vec3<f32>(
+			sin(sw * 11.0 + tt * 2.3 + st.sid * 7.0) + 0.5 * sin(sw * 27.0 - tt * 3.9 + st.sid * 2.0),
+			sin(sw * 13.0 - tt * 1.9 + st.sid * 3.0) + 0.5 * sin(sw * 23.0 + tt * 4.3 + st.sid * 5.0),
+			sin(sw * 9.0 + tt * 2.7 + st.sid * 5.0) + 0.5 * sin(sw * 31.0 - tt * 3.1 + st.sid * 9.0)
+		);
+		p = p + eddy * turbulence * 0.032 * env;
+	}
+	let frayAmount = params.weave.x * select(0.004, 0.011, st.kind > 0.5);
+	if (frayAmount > 0.0001) {
+		p = p + vec3<f32>(sin(sw * 97.0 + st.sid * 13.0), sin(sw * 83.0 + st.sid * 29.0), sin(sw * 71.0 + st.sid * 7.0))
+			* frayAmount * env;
+	}
+
 	// Beat forms. Plucked strings ring a standing wave on each kick; the
 	// shuttle bump rides the threads one step per beat.
 	let modeCount = 2.0 + f32(st.family % 3u);
@@ -720,29 +866,37 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 	return vec4<f32>(p, g.closed);
 }
 
-fn viewPoint(p0: vec3<f32>) -> vec3<f32> {
-	var p = p0 * params.frame.x;
-	p.x = p.x * 1.32;
-	p.y = p.y * 1.12;
-	p.z = p.z * 1.16;
-	p = rotateY(p, params.camera.x + 0.62 + phraseYaw() + params.lens.w);
-	p = rotateX(p, params.camera.y - 0.18);
-	p = rotateZ(p, params.camera.w);
-	p.x = p.x + 0.04;
-	p.y = p.y - 0.08;
-	p.z = p.z - 0.18;
-	return p;
-}
-
 fn colorPeak(c: vec3<f32>) -> vec3<f32> {
 	return c / max(max(c.r, max(c.g, c.b)), 1e-3);
 }
 
-@vertex
-fn vs_main(
-	@builtin(vertex_index) vertexIndex: u32,
-	@builtin(instance_index) instanceIndex: u32
-) -> LoomOut {
+// The floor's reflection of a strand point: mirrored through the floor plane
+// in stage space and, on water, rippled (kicks and sub send swells, and the
+// deeper the image the more the surface bends it). w: height of the original
+// above the floor (negative = the strand dips under the surface).
+fn mirrorStage(q: vec3<f32>) -> vec4<f32> {
+	let floorY = floorStageY();
+	let height = q.y - floorY;
+	let t = params.view.z;
+	let swell = params.envA.z * (0.45 + params.audioA.y * 0.8 + params.audioA.z * 0.9) * (0.2 + max(height, 0.0));
+	let wobble = vec2<f32>(
+		sin(q.z * 6.3 + t * 1.3 + sin(q.x * 3.1 - t * 0.7)) + 0.5 * sin(q.x * 13.0 - t * 2.1),
+		sin(q.x * 5.7 - t * 1.1) + 0.5 * sin(q.z * 11.0 + t * 1.7)
+	) * 0.016 * swell;
+	return vec4<f32>(q.x + wobble.x, 2.0 * floorY - q.y, q.z + wobble.y, height);
+}
+
+// Strand point in view space; w is its height above the floor.
+fn strandView(world: vec3<f32>, mirrored: bool) -> vec4<f32> {
+	let q = stagePoint(world);
+	if (mirrored) {
+		let m = mirrorStage(q);
+		return vec4<f32>(stageToView(m.xyz), m.w);
+	}
+	return vec4<f32>(stageToView(q), q.y - floorStageY());
+}
+
+fn strandVertex(vertexIndex: u32, instanceIndex: u32, mirrored: bool) -> LoomOut {
 	let isChorus = instanceIndex >= FIRST_CHORUS;
 	let segments = select(SEGMENTS, CHORUS_SEGMENTS, isChorus);
 	let sides = select(TUBE_SIDES, CHORUS_SIDES, isChorus);
@@ -762,9 +916,11 @@ fn vs_main(
 	let previousWorld = loomPoint(s - epsilon, st);
 	let followingWorld = loomPoint(s + epsilon, st);
 	let closed = clamp(centerWorld.w, 0.0, 1.0);
-	let center = viewPoint(centerWorld.xyz);
-	let previous = viewPoint(previousWorld.xyz);
-	let following = viewPoint(followingWorld.xyz);
+	let centerView = strandView(centerWorld.xyz, mirrored);
+	let center = centerView.xyz;
+	let height = centerView.w;
+	let previous = strandView(previousWorld.xyz, mirrored).xyz;
+	let following = strandView(followingWorld.xyz, mirrored).xyz;
 	let tangent = normalize(following - previous + vec3<f32>(0.0001, 0.0002, 0.0003));
 	let reference = select(
 		vec3<f32>(0.0, 1.0, 0.0),
@@ -789,7 +945,10 @@ fn vs_main(
 	let taper = mix(1.0, 0.45 + 0.55 * pow(max(0.0, 1.0 - q * q), 0.5), params.formB.y * (1.0 - closed));
 	let bead = 1.0 + params.formB.z * 0.95 * pow(0.5 + 0.5 * sin(s * TAU * 9.0 - params.cloth.x * 0.25 + st.sid * 4.0), 6.0);
 	let swell = 1.0 + params.formB.w * 0.75 * (0.5 + 0.5 * sin(s * TAU * 1.5 + params.cloth.w * 0.4 + st.sid * 3.0));
-	let profile = capEnds * taper * bead * swell * params.frame.z;
+	// Fraying (noisy music): the tube surface goes ragged, fibre by fibre.
+	let frayNoise = hashUnit(sample + instanceIndex * 409u, radialIndex % sides, 29u);
+	let fray = 1.0 + params.weave.x * (frayNoise - 0.4) * 0.9;
+	let profile = capEnds * taper * bead * swell * fray * params.frame.z;
 
 	var hero = 0.0;
 	var radius = params.style.x;
@@ -808,24 +967,21 @@ fn vs_main(
 	}
 	radius = radius * profile;
 
+	// A reflection deep below a rough floor spreads and dims (energy kept).
+	var mirrorDim = 1.0;
+	if (mirrored) {
+		let spread = 1.0 + params.envA.y * max(height, 0.0) * 3.0;
+		radius = radius * spread;
+		mirrorDim = floorVisibility() / spread;
+	}
+
 	// Proper perspective with near clipping, so camera regimes can fly inside
 	// the weave; threads close to the lens thin out instead of filling it.
 	let depth0 = params.camera.z - center.z;
 	radius = radius * mix(1.0, smoothstep(0.12, 0.95, depth0), params.frame.y);
 	let position = center + radial * radius;
 	let depth = params.camera.z - position.z;
-	let focal = params.lens.x;
-	let resolution = params.view.xy;
-	let aspect = resolution.x / max(resolution.y, 1.0);
-	let near = 0.1;
-	let far = 14.0;
-	let clipZ = clamp((depth - near) / (far - near), -1.0, 2.0) * depth;
-	let clip = vec4<f32>(
-		position.x * focal / aspect + params.lens.y * depth,
-		position.y * focal + params.lens.z * depth,
-		clipZ,
-		depth
-	);
+	let clip = projectView(position);
 
 	let detail = bandDetail(family, fract(s));
 	let intersection = exp(-pow(abs(fract(s) - fract(params.cloth.x * 0.03125 + familyUnit * 0.23)), 2.0) * 70.0);
@@ -847,10 +1003,10 @@ fn vs_main(
 	// Shuttle: a bright band crossing every thread, one throw per beat.
 	let shuttleBand = exp(-pow((fract(s) - shuttleS()) * 16.0, 2.0));
 	emission = emission + params.beat.w * shuttleBand * (0.9 + params.pulse.x * 3.0);
-	// Sparks: fine glints shed along the threads, fed by air and impacts.
+	// Sparks: fine glints shed along the threads, fed by air, impacts and fraying.
 	let sparkSeed = hashUnit(u32(fract(s) * 61.0) + 1u, instanceIndex + 3u, u32(params.cloth.x * 2.0));
-	let spark = select(0.0, 1.0, sparkSeed > 0.95) * pow(max(0.0, sin(s * 157.0 + st.sid * 13.7 - params.view.z * 11.0)), 40.0)
-		* (params.beatB.x * (0.3 + params.audioB.z * 1.2 + params.pulse.x * 1.6) + params.materialD.y * params.audioB.z * 0.25)
+	let spark = select(0.0, 1.0, sparkSeed > 0.95 - params.weave.x * 0.04) * pow(max(0.0, sin(s * 157.0 + st.sid * 13.7 - params.view.z * 11.0)), 40.0)
+		* (params.beatB.x * (0.3 + params.audioB.z * 1.2 + params.pulse.x * 1.6) + params.materialD.y * params.audioB.z * 0.25 + params.weave.x * 0.35)
 		* select(1.0, 0.5, kind == 2.0);
 	emission = emission * params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
 	// Beats read as a colour event, not only a brightness event: the packet
@@ -885,22 +1041,41 @@ fn vs_main(
 	out.dataB = vec4<f32>(detail, emission, intersection, depth);
 	out.tangent = tangent;
 	out.dataC = vec4<f32>(st.lane, st.sid, spark * params.style.z * (1.0 - params.style.w), visible);
+	out.envData = vec4<f32>(height, select(0.0, 1.0, mirrored), mirrorDim, 0.0);
 	return out;
 }
 
+@vertex
+fn vs_main(
+	@builtin(vertex_index) vertexIndex: u32,
+	@builtin(instance_index) instanceIndex: u32
+) -> LoomOut {
+	return strandVertex(vertexIndex, instanceIndex, false);
+}
+
+// The same strands drawn mirrored through the floor plane, before the floor
+// itself, which then lays its Fresnel-weighted surface over them.
+@vertex
+fn vs_mirror(
+	@builtin(vertex_index) vertexIndex: u32,
+	@builtin(instance_index) instanceIndex: u32
+) -> LoomOut {
+	return strandVertex(vertexIndex, instanceIndex, true);
+}
+
+// What a chrome or pearl fibre sees: the dark stage, the key light's glint,
+// and the floor's pool of ribbon light below.
 fn envReflection(r: vec3<f32>, keyLight: vec3<f32>, keyColor: vec3<f32>) -> vec3<f32> {
-	let deep = params.deepTint.rgb;
-	let haze = params.hazeTint.rgb;
 	let glow = params.glowTint.rgb;
+	let haze = params.hazeTint.rgb;
 	let up = clamp(r.y * 0.5 + 0.5, 0.0, 1.0);
-	var c = mix(glow * 0.35 + haze * 0.5, haze * 1.4 + deep, smoothstep(0.42, 0.95, up));
-	c = c + glow * exp(-pow((r.y - 0.02) * 7.0, 2.0)) * 1.1;
+	var c = haze * 0.12 * up;
+	c = c + glow * 0.32 * exp(-pow((r.y + 0.45) * 3.0, 2.0)) * params.envC.y;
 	c = c + keyColor * pow(max(dot(r, keyLight), 0.0), 24.0) * 1.6;
 	return c;
 }
 
-@fragment
-fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
+fn shadeStrand(in: LoomOut) -> vec3<f32> {
 	let normal = normalize(in.worldNormal);
 	let view = normalize(in.viewDirection);
 	let az = params.light.x * TAU;
@@ -913,12 +1088,14 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let matB = params.materialB;
 	let matC = params.materialC;
 	let matD = params.materialD;
+	// Punchy music cuts hard, hot-cored edges; soft music glows softly.
+	let edge = params.weave.w;
 
 	let ndv = dot(normal, view);
 	let diffuseKey = max(dot(normal, keyLight), 0.0);
 	let diffuseFill = max(dot(normal, rimLight), 0.0);
-	let rim = pow(1.0 - abs(ndv), 2.0);
-	let specPower = mix(12.0, 110.0, matA.z);
+	let rim = pow(1.0 - abs(ndv), mix(2.6, 1.6, edge));
+	let specPower = mix(12.0, 110.0, matA.z) * mix(0.6, 1.7, edge);
 	let specular = pow(max(dot(reflect(-keyLight, normal), view), 0.0), specPower);
 	let hero = select(0.0, in.dataA.w, kind == 0.0);
 	// Striations crawl along the rail a quarter period per beat, so tempo is
@@ -928,6 +1105,9 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let stripePhase = in.dataA.x * select(190.0, 330.0, isSecondary) - params.cloth.x * 1.5707963;
 	let stripeAmount = clamp((0.015 + hero * 0.075) * matC.y + max(0.0, matC.y - 2.0) * 0.09, 0.0, 0.62);
 	let striation = (1.0 - stripeAmount) + stripeAmount * cos(stripePhase);
+	// Fibre grain (noisy, dark timbres): a fixed, coarse grain on the surface.
+	let grainNoise = hashUnit(u32(in.dataA.x * 420.0), u32(in.dataC.y * 977.0) + u32(kind), 17u);
+	let grain = 1.0 - params.weave.y * 0.5 * grainNoise;
 
 	let warm = params.light.z;
 	let warmTint = mix(vec3<f32>(0.96, 0.98, 1.04), vec3<f32>(1.06, 0.94, 0.8), warm);
@@ -951,7 +1131,8 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 	let sinT = sqrt(max(1.0 - tangentDot * tangentDot, 0.0));
 	let aniso = pow(sinT, select(48.0, 90.0, isSecondary));
 	let sheen = pow(sinT, 6.0);
-	let core = pow(max(ndv, 0.0), 2.2);
+	let coreExponent = mix(1.5, 4.2, edge);
+	let core = pow(max(ndv, 0.0), coreExponent) * mix(0.85, 1.35, edge);
 	// Molten glass: long, slowly flowing heat bands along the thread.
 	let hot = 1.0 + matC.w * 0.9 * pow(0.5 + 0.5 * sin(in.dataA.x * TAU * 1.5 + in.dataC.y * 6.0 - params.cloth.x * 0.125), 2.5);
 	let emissive = body * in.dataB.y * (0.4 + core * 1.3) * (1.0 + in.dataB.x * 0.6 * hero) * matB.y * hot;
@@ -971,15 +1152,75 @@ fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
 		+ body * sheen * 0.32 * matC.x
 		+ emissive + whiteCore + crossingGlow + mirror + backLight + sparkle;
 	lit = mix(lit, lit * 0.7, select(0.0, 0.3, isSecondary));
-	lit = lit * select(1.0, 0.92, isChorus) * params.beatB.z;
-	// Ink on paper: the fibre becomes a deep coloured line, shaded by the key
-	// light, with a thin cool sheen; the paper room is composited around it.
-	let paper = params.postB.w;
-	let ink = in.color * (0.1 + diffuseKey * 0.3 + diffuseFill * 0.08) * striation * mix(1.0, 0.6, hero)
-		+ keyColor * (specular * 0.05 + aniso * 0.03) + rimColor * rim * 0.025;
-	lit = mix(lit, ink, paper);
-	// Alpha is coverage: the composite inks the paper room with it.
-	return vec4<f32>(lit, 1.0);
+	return lit * select(1.0, 0.92, isChorus) * params.beatB.z * grain;
+}
+
+@fragment
+fn fs_main(in: LoomOut) -> @location(0) vec4<f32> {
+	return vec4<f32>(shadeStrand(in), 1.0);
+}
+
+@fragment
+fn fs_mirror(in: LoomOut) -> @location(0) vec4<f32> {
+	// A strand that dips under the surface has no reflection above it.
+	if (in.envData.x < 0.0) { discard; }
+	return vec4<f32>(shadeStrand(in) * in.envData.z, 1.0);
+}
+
+// The ribbons as light sources. Each primary rail is sampled at a few points
+// (view space) with the light it gives off, so the floor, the medium, the far
+// threads and the dust can be lit by it. Packets and the shuttle travel along
+// it, so beats light the room where they run.
+fn railLight(s: f32, rail: u32, st: Strand) -> vec3<f32> {
+	let hero = heroWeight(rail);
+	let band = strandBand(st);
+	let familyUnit = f32(st.family % 6u) / 5.0;
+	let packetsW = 0.45 + params.beat.x * 0.55;
+	// Wider than the visible packet: the light is sampled at only a few points.
+	let packet = exp(-pow(s - fract(params.cloth.x * 0.1618 + familyUnit * 0.37), 2.0) * 26.0);
+	let shuttle = params.beat.w * exp(-pow((s - shuttleS()) * 7.0, 2.0)) * (0.5 + params.pulse.x * 1.5);
+	var emission = (0.42 + hero * 0.62) + band * (0.62 + hero * 0.6) + packet * params.pulse.x * 2.4 * packetsW
+		+ params.pulse.w * 0.3 + shuttle;
+	emission = emission * params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
+	let base = mix(params.supportTint.rgb * params.supportTint.w, params.heroTint.rgb * params.heroTint.w, hero);
+	let value = 0.36 + hero * 0.2 + band * 0.3 + params.macroRails.x * 0.1;
+	let glowing = clamp(params.materialB.y, 0.2, 2.2);
+	let width = (1.22 + hero * 1.2 + band * 0.6) * params.style.x * 60.0;
+	return base * value * (0.3 + emission * glowing) * width * params.envC.z;
+}
+
+@group(0) @binding(2) var<storage, read_write> lightsOut: array<vec4<f32>, ${LOOM_LIGHT_VEC4S}>;
+
+var<workgroup> lightLevels: array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn cs_lights(@builtin(local_invocation_index) index: u32) {
+	let count = LIGHT_RAILS * LIGHT_POINTS;
+	var level = 0.0;
+	if (index < count) {
+		let rail = index / LIGHT_POINTS;
+		let k = index % LIGHT_POINTS;
+		let s = 0.04 + 0.92 * f32(k) / f32(LIGHT_POINTS - 1u);
+		let st = strandInfo(rail);
+		let world = loomPoint(s, st);
+		let light = railLight(s, rail, st);
+		lightsOut[index * 2u] = vec4<f32>(viewPoint(world.xyz), 0.0);
+		lightsOut[index * 2u + 1u] = vec4<f32>(light, 0.0);
+		level = dot(light, vec3<f32>(0.2126, 0.7152, 0.0722));
+	}
+	lightLevels[index] = level;
+	workgroupBarrier();
+	if (index == 0u) {
+		// The stage's eye adapts (about a second) to how much light the ribbons
+		// give, so a quiet, dim weave still shows the space it lives in, while
+		// beats, which are faster than the adaptation, still light it up.
+		var total = 0.0;
+		for (var i = 0u; i < count; i = i + 1u) { total = total + lightLevels[i]; }
+		let goal = clamp(pow(9.0 / max(total, 0.05), 0.8), 0.4, 8.0);
+		let previous = lightsOut[count * 2u].x;
+		let adapted = select(mix(previous, goal, 0.025), goal, previous <= 0.0);
+		lightsOut[count * 2u] = vec4<f32>(adapted, total, 0.0, 0.0);
+	}
 }
 `;
 
@@ -1036,14 +1277,13 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let previous = textureSampleLevel(previousTexture, sceneSampler, previousUv, 0.0);
 	let scene = textureSampleLevel(sceneTexture, sceneSampler, in.uv, 0.0);
 	let trail = previous * params.post.x * border;
-	// rgb: light trail; a: coverage trail (ink for the paper tone), kept
-	// shorter than the light so ink never bleeds into a halo.
+	// rgb: light trail; a: coverage trail, kept shorter than the light.
 	return max(vec4<f32>(trail.rgb, trail.a * 0.8), scene);
 }
 `;
 
 // Bloom prefilter: half-resolution 4-tap downsample with a soft HDR knee so
-// only the phosphor cores and light packets bloom, never the chamber.
+// only the phosphor cores and light packets bloom, never the stage.
 export const LOOM_BLOOM_DOWN_WGSL = /* wgsl */ `
 ${POST_COMMON_WGSL}
 
@@ -1095,6 +1335,394 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 export const LOOM_BLOOM_BLUR_H_WGSL = loomBlurShader(1, 0);
 export const LOOM_BLOOM_BLUR_V_WGSL = loomBlurShader(0, 1);
 
+// The place the weave lives in. Nothing here paints a backdrop: the primary
+// rails are the only light sources (cs_lights writes them as short emitting
+// segments), and every surface and medium below is lit by them with real
+// falloff, so the room is dark wherever the ribbons are not.
+//   floor    a plane under the figure: pools the ribbons' light, and lays a
+//            Fresnel-weighted surface over their mirrored image (vs_mirror),
+//            rippled when it is water
+//   threads  a hall of hanging threads or the rings of a warp, far round the
+//            stage, catching ribbon light and receding into fog (parallax)
+//   dust     motes and loose fibres that glint only near a strand
+//   volume   a participating medium (ground mist, haze), ray-marched at low
+//            resolution, scattering the ribbon light toward the camera
+const ENV_COMMON_WGSL = /* wgsl */ `
+${PARAMS_WGSL}
+${SHARED_WGSL}
+
+const PI: f32 = 3.14159265359;
+const TAU: f32 = 6.28318530718;
+const LIGHT_RAILS: u32 = ${LOOM_LIGHT_RAILS}u;
+const LIGHT_POINTS: u32 = ${LOOM_LIGHT_POINTS}u;
+const THREADS: u32 = ${LOOM_THREADS}u;
+const THREAD_SEGMENTS: u32 = ${LOOM_THREAD_SEGMENTS}u;
+
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> lights: array<vec4<f32>, ${LOOM_LIGHT_VEC4S}>;
+
+// Light arriving at p from the ribbons. Each segment between two light samples
+// is a uniformly emitting line; its contribution is the closed-form integral
+// of 1/d^2 along it (a small core keeps it finite on the strand). normalWeight
+// blends in a Lambert term toward the closest point (surfaces), fibreWeight a
+// Kajiya-Kay term for thin fibres with tangent t (threads); extinction is how
+// fast the light dies out with distance through the medium.
+fn ribbonLight(p: vec3<f32>, n: vec3<f32>, normalWeight: f32, t: vec3<f32>, fibreWeight: f32, core: f32, extinction: f32) -> vec3<f32> {
+	var sum = vec3<f32>(0.0);
+	for (var rail = 0u; rail < LIGHT_RAILS; rail = rail + 1u) {
+		let first = rail * LIGHT_POINTS;
+		var a = lights[first * 2u].xyz;
+		var ca = lights[first * 2u + 1u].rgb;
+		for (var k = 1u; k < LIGHT_POINTS; k = k + 1u) {
+			let b = lights[(first + k) * 2u].xyz;
+			let cb = lights[(first + k) * 2u + 1u].rgb;
+			let d = b - a;
+			let len = max(length(d), 1e-4);
+			let dir = d / len;
+			let ap = p - a;
+			let t0 = dot(ap, dir);
+			let h2 = max(dot(ap, ap) - t0 * t0, 0.0) + core;
+			let h = sqrt(h2);
+			// Light also thins as it travels through the medium (extinction).
+			let w = (atan((len - t0) / h) + atan(t0 / h)) / h * exp(-h * extinction);
+			let toLight = normalize(a + dir * clamp(t0, 0.0, len) - p + vec3<f32>(1e-5, 2e-5, 1e-5));
+			let lambert = mix(1.0, max(dot(n, toLight), 0.0), normalWeight);
+			let td = dot(t, toLight);
+			let fibre = mix(1.0, sqrt(max(1.0 - td * td, 0.0)), fibreWeight);
+			sum = sum + (ca + cb) * (0.5 * w * lambert * fibre);
+			a = b;
+			ca = cb;
+		}
+	}
+	return sum * 0.0796 * lights[LIGHT_RAILS * LIGHT_POINTS * 2u].x;
+}
+
+fn ign(pixel: vec2<f32>) -> f32 {
+	return fract(52.9829189 * fract(dot(pixel, vec2<f32>(0.06711056, 0.00583715))));
+}
+
+fn colorPeakEnv(c: vec3<f32>) -> vec3<f32> {
+	return c / max(max(c.r, max(c.g, c.b)), 1e-3);
+}
+
+// Fog between the camera and a point at this depth.
+fn fogTransmittance(depth: f32) -> f32 {
+	return exp(-max(depth, 0.0) * params.envB.w);
+}
+`;
+
+export const LOOM_ENV_WGSL = /* wgsl */ `
+${ENV_COMMON_WGSL}
+
+struct FloorOut {
+	@builtin(position) position: vec4<f32>,
+	@location(0) uv: vec2<f32>,
+};
+
+struct FloorFragment {
+	@location(0) color: vec4<f32>,
+	@builtin(frag_depth) depth: f32,
+};
+
+@vertex
+fn vs_floor(@builtin(vertex_index) index: u32) -> FloorOut {
+	var positions = array<vec2<f32>, 3>(
+		vec2<f32>(-1.0, -1.0),
+		vec2<f32>( 3.0, -1.0),
+		vec2<f32>(-1.0,  3.0)
+	);
+	let point = positions[index];
+	var out: FloorOut;
+	out.position = vec4<f32>(point, 0.0, 1.0);
+	out.uv = vec2<f32>(point.x * 0.5 + 0.5, 1.0 - (point.y * 0.5 + 0.5));
+	return out;
+}
+
+// Height of the floor surface (stage xz). Water carries a few wave trains and
+// rings that kicks and sub send out from under the weave; stone is flat.
+fn floorHeight(xz: vec2<f32>) -> f32 {
+	let t = params.postB.w;
+	var h = sin(dot(xz, vec2<f32>(1.7, 0.6)) * 3.1 - t * 1.4) * 0.5;
+	h = h + sin(dot(xz, vec2<f32>(-0.8, 1.3)) * 4.3 - t * 1.9) * 0.35;
+	h = h + sin(dot(xz, vec2<f32>(0.3, -1.9)) * 6.7 - t * 2.6) * 0.2;
+	let r = length(xz);
+	h = h + sin(r * 9.0 - params.view.z * 5.0) * exp(-r * 0.7) * (0.25 + params.audioA.z * 1.4 + params.audioA.y * 0.6);
+	return h * params.envA.z * 0.012;
+}
+
+@fragment
+fn fs_floor(in: FloorOut) -> FloorFragment {
+	let visibility = floorVisibility();
+	if (visibility < 0.002) { discard; }
+	let ray = viewRay(in.uv);
+	let depth = floorDepth(ray);
+	if (depth < LOOM_NEAR || depth > LOOM_FAR * 0.98) { discard; }
+	let hit = vec3<f32>(0.0, 0.0, params.camera.z) + ray * depth;
+	let stage = viewToStage(hit);
+
+	// Surface normal: water ripples, plus a fine stone grain on rough floors.
+	let e = 0.02;
+	let h0 = floorHeight(stage.xz);
+	let hx = floorHeight(stage.xz + vec2<f32>(e, 0.0));
+	let hz = floorHeight(stage.xz + vec2<f32>(0.0, e));
+	let gx = noise3(vec3<f32>(stage.xz * 23.0, 0.5)) - noise3(vec3<f32>(stage.xz * 23.0 + vec2<f32>(0.37, 0.0), 0.5));
+	let gz = noise3(vec3<f32>(stage.xz * 23.0, 1.5)) - noise3(vec3<f32>(stage.xz * 23.0 + vec2<f32>(0.0, 0.37), 1.5));
+	let grain = vec2<f32>(gx, gz) * params.envA.y * 0.5;
+	let stageNormal = normalize(vec3<f32>(-(hx - h0) / e - grain.x, 1.0, -(hz - h0) / e - grain.y));
+	let normal = stageRotate(stageNormal);
+
+	let toEye = normalize(-ray);
+	let cosView = clamp(dot(toEye, normal), 0.0, 1.0);
+	let fresnel = 0.02 + 0.98 * pow(1.0 - cosView, 5.0);
+	let fog = fogTransmittance(depth);
+
+	// Worn stone: albedo varies slab to slab and grain to grain, and on dry
+	// floors only the wet patches hold a mirror; standing water is wet all over.
+	let slab = noise3(vec3<f32>(stage.xz * 1.7, 3.5));
+	let speck = noise3(vec3<f32>(stage.xz * 9.0, 7.5));
+	let albedoVariation = 0.45 + slab * 0.8 + (speck - 0.5) * 0.35;
+	let puddles = smoothstep(0.42, 0.62, noise3(vec3<f32>(stage.xz * 0.75, 11.5)) + slab * 0.15);
+	let wet = mix(mix(0.25, 1.0, puddles), 1.0, clamp(params.envA.z * 2.0 + (1.0 - params.envA.y) * 0.5, 0.0, 1.0));
+
+	// The ribbons' light pooling on the floor, tinted a touch by the family.
+	let tint = mix(vec3<f32>(1.0), colorPeakEnv(params.deepTint.rgb), 0.3);
+	let pooled = ribbonLight(hit, normal, 1.0, vec3<f32>(0.0), 0.0, 0.004, 0.3) * params.envA.w * 6.5 * tint
+		* albedoVariation * (1.0 - fresnel * 0.5) * (1.0 - wet * params.envA.x * 0.4);
+	// Mirror strength over the reflected strands drawn beneath this surface.
+	let reflectance = clamp(params.envA.x * wet * (0.24 + 0.76 * fresnel) * (1.0 - params.envA.y * 0.35), 0.0, 1.0) * fog;
+
+	// Pooled light rolls off well below the ribbons: a floor right under a hot
+	// rail glows, it never floods the frame.
+	let pooledLevel = dot(pooled, vec3<f32>(0.2126, 0.7152, 0.0722));
+	// The floor right under the lens stays dark, so a low camera never looks
+	// through a glowing foreground.
+	let pooledSoft = pooled / (1.0 + pooledLevel * 5.0) * smoothstep(0.6, 2.2, depth);
+	var out: FloorFragment;
+	out.color = vec4<f32>(pooledSoft * fog * visibility, mix(1.0, reflectance, visibility));
+	out.depth = clamp((depth - LOOM_NEAR) / (LOOM_FAR - LOOM_NEAR), 0.0, 1.0);
+	return out;
+}
+
+struct ThreadOut {
+	@builtin(position) position: vec4<f32>,
+	@location(0) color: vec3<f32>,
+	@location(1) across: f32,
+};
+
+// Where a thread hangs (stage xz). The first half of the threads is a hall,
+// scattered; the second half stands on the concentric rings of a warp. A
+// change of arrangement crossfades the two sets (threadWeight); no thread
+// ever travels, which would sweep lines across the frame.
+fn threadAnchor(i: u32) -> vec2<f32> {
+	let half = THREADS / 2u;
+	if (i < half) {
+		let h1 = hashUnit(i, 101u, 1u);
+		let h2 = hashUnit(i, 103u, 2u);
+		let radius = sqrt(mix(3.0 * 3.0, 12.0 * 12.0, h1));
+		return vec2<f32>(cos(h2 * TAU), sin(h2 * TAU)) * radius;
+	}
+	let k = i - half;
+	let rings = 6u;
+	let ring = k % rings;
+	let slot = k / rings;
+	let perRing = half / rings;
+	let ringRadius = 3.2 * pow(1.3, f32(ring));
+	let ringAngle = (f32(slot) + 0.5 + f32(ring) * 0.37) / f32(perRing) * TAU;
+	return vec2<f32>(cos(ringAngle), sin(ringAngle)) * ringRadius;
+}
+
+fn threadWeight(i: u32) -> f32 {
+	let warp = clamp(params.envD.y, 0.0, 1.0);
+	// Each set at full strength stands for the whole thread count.
+	return 2.0 * select(warp, 1.0 - warp, i < THREADS / 2u);
+}
+
+fn threadPoint(i: u32, u: f32) -> vec3<f32> {
+	let anchor = threadAnchor(i);
+	let floorY = floorStageY();
+	let top = 5.2;
+	let hang = 1.6 + hashUnit(i, 107u, 3u) * 3.6;
+	let reach = params.envD.z;
+	let bottom = max(floorY, mix(top - hang, floorY, reach));
+	let y = mix(top, bottom, u);
+	// Free ends sway; taut warp only bows between its ends. Kicks pluck them.
+	let freeness = mix(u, sin(PI * u), reach);
+	let phase = hashUnit(i, 109u, 4u) * TAU;
+	let t = params.postB.w;
+	let sway = vec2<f32>(sin(y * 0.9 + t * 0.6 + phase), cos(y * 0.7 + t * 0.5 + phase * 1.3))
+		* (0.04 + params.weave.z * 0.12) * freeness;
+	let mode = f32(1u + i % 3u);
+	let pluck = params.pulse.x * 0.012 * sin(PI * u * mode) * sin(params.view.z * 21.0 + phase * 3.0);
+	return vec3<f32>(anchor.x + sway.x + pluck, y, anchor.y + sway.y);
+}
+
+@vertex
+fn vs_threads(
+	@builtin(vertex_index) vertexIndex: u32,
+	@builtin(instance_index) instanceIndex: u32
+) -> ThreadOut {
+	let segment = vertexIndex / 6u;
+	let corner = vertexIndex % 6u;
+	let endpoint = select(0u, 1u, corner == 1u || corner == 4u || corner == 5u);
+	let side = select(-1.0, 1.0, corner == 2u || corner == 3u || corner == 5u);
+	let u = f32(segment + endpoint) / f32(THREAD_SEGMENTS);
+	let du = 1.0 / f32(THREAD_SEGMENTS);
+	let here = stageToView(threadPoint(instanceIndex, u));
+	let along = stageToView(threadPoint(instanceIndex, clamp(u + select(du, -du, endpoint == 1u), 0.0, 1.0)));
+	let tangent = normalize(along - here + vec3<f32>(1e-5, 2e-5, 1e-5));
+	var clip = projectView(here);
+	let clipAlong = projectView(along);
+	let aspect = params.view.x / max(params.view.y, 1.0);
+	let height = max(params.view.y, 1.0);
+	let screen = (clipAlong.xy / max(clipAlong.w, 1e-3) - clip.xy / max(clip.w, 1e-3)) * vec2<f32>(aspect, 1.0);
+	let screenDir = normalize(screen + vec2<f32>(1e-6, 0.0));
+	let perpendicular = vec2<f32>(-screenDir.y, screenDir.x);
+	// Physically thin; drawn at least about a pixel wide with matching coverage.
+	let depth = max(clip.w, 1e-3);
+	let physicalPx = 0.0028 * 2.0 * params.lens.x / depth * height * 0.5;
+	let drawnPx = clamp(physicalPx, 1.8, 3.0);
+	clip = vec4<f32>(clip.xy + vec2<f32>(perpendicular.x / aspect, perpendicular.y) * side * drawnPx / height * clip.w, clip.zw);
+
+	let light = ribbonLight(here, vec3<f32>(0.0), 0.0, tangent, 1.0, 0.01, 0.05);
+	// Threads between the camera and the figure step aside (fade) so they
+	// never veil it; distance hides the rest in fog.
+	let front = 1.0 - smoothstep(0.2, 1.4, here.z);
+	// Threads right by the lens would sweep past as bars: they fade out first.
+	let near = smoothstep(1.4, 3.2, depth);
+	let tint = mix(vec3<f32>(1.0), colorPeakEnv(params.hazeTint.rgb), 0.25);
+	var out: ThreadOut;
+	out.position = clip;
+	out.color = light * tint * 6.0 * (physicalPx / drawnPx) * front * near * fogTransmittance(depth) * params.envD.x
+		* threadWeight(instanceIndex);
+	out.across = side;
+	return out;
+}
+
+@fragment
+fn fs_threads(in: ThreadOut) -> @location(0) vec4<f32> {
+	let soft = 1.0 - in.across * in.across;
+	return vec4<f32>(in.color * soft, 0.0);
+}
+
+struct DustOut {
+	@builtin(position) position: vec4<f32>,
+	@location(0) color: vec3<f32>,
+	@location(1) corner: vec2<f32>,
+};
+
+@vertex
+fn vs_dust(
+	@builtin(vertex_index) vertexIndex: u32,
+	@builtin(instance_index) instanceIndex: u32
+) -> DustOut {
+	var corners = array<vec2<f32>, 6>(
+		vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
+		vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0)
+	);
+	let corner = corners[vertexIndex % 6u];
+	let h = vec3<f32>(
+		hashUnit(instanceIndex, 201u, 1u),
+		hashUnit(instanceIndex, 203u, 2u),
+		hashUnit(instanceIndex, 207u, 3u)
+	);
+	// Motes drift on a slow current (faster with tempo) and churn with
+	// turbulence; they wrap through a box round the stage, faded at its edges.
+	let box = vec3<f32>(5.4, 3.4, 5.4);
+	let flow = params.postB.w;
+	let drift = vec3<f32>(0.06, 0.02 + params.weave.z * 0.04, -0.035) * flow;
+	let cell = fract(h + drift / box);
+	var p = (cell - vec3<f32>(0.5, 0.0, 0.5)) * box + vec3<f32>(0.0, floorStageY(), 0.0);
+	let tt = flow * 0.6;
+	p = p + vec3<f32>(
+		sin(p.y * 2.1 + tt + h.x * 6.0),
+		sin(p.z * 1.7 - tt * 0.8 + h.y * 6.0),
+		sin(p.x * 1.9 + tt * 0.9 + h.z * 6.0)
+	) * (0.05 + params.weave.z * 0.22);
+	let edgeFade = pow(max(sin(PI * cell.x) * sin(PI * cell.y) * sin(PI * cell.z), 0.0), 0.35);
+	let view = stageToView(p);
+	var clip = projectView(view);
+	let depth = max(clip.w, 1e-3);
+	let size = vec2<f32>(max(params.view.x, 1.0), max(params.view.y, 1.0));
+	let physicalPx = (0.004 + h.y * 0.006) * params.lens.x / depth * size.y;
+	let drawnPx = clamp(physicalPx, 1.4, 3.2);
+	clip = vec4<f32>(clip.xy + corner * drawnPx / size * clip.w, clip.zw);
+	let coverage = min(1.0, (physicalPx * physicalPx) / (drawnPx * drawnPx) * 4.0);
+	// Steep falloff: a mote glints only within reach of a strand, so dust never
+	// spreads over the frame like a field of stars.
+	let light = ribbonLight(view, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.004, 1.6);
+	// Motes right at the lens would streak past like stars: they fade first.
+	let near = smoothstep(1.0, 2.6, depth);
+	var out: DustOut;
+	out.position = clip;
+	out.color = light * (0.4 + h.x * 0.8) * coverage * edgeFade * near * fogTransmittance(depth) * params.envD.w * 22.0;
+	out.corner = corner;
+	return out;
+}
+
+@fragment
+fn fs_dust(in: DustOut) -> @location(0) vec4<f32> {
+	let r2 = dot(in.corner, in.corner);
+	if (r2 > 1.0) { discard; }
+	return vec4<f32>(in.color * exp(-r2 * 3.0), 0.0);
+}
+`;
+
+export const LOOM_VOLUME_WGSL = /* wgsl */ `
+${ENV_COMMON_WGSL}
+${FULLSCREEN_WGSL}
+
+// The participating medium, marched from the camera to the floor (or into the
+// dark). Density: a low layer over the floor plus a thin haze, made wispy by
+// drifting noise that turbulence stirs; it scatters the ribbon light only.
+@fragment
+fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
+	let ray = viewRay(in.uv);
+	let rayLength = length(ray);
+	let eye = vec3<f32>(0.0, 0.0, params.camera.z);
+	var end = 14.0;
+	if (floorVisibility() > 0.002) {
+		let floorAt = floorDepth(ray);
+		if (floorAt > 0.0) { end = min(end, floorAt); }
+	}
+	let start = 0.35;
+	let steps = 16;
+	let stepDepth = max(end - start, 0.0) / f32(steps);
+	let stepLength = stepDepth * rayLength;
+	let jitter = ign(in.position.xy);
+	let floorY = floorStageY();
+	let density = params.envB.x * params.hazeTint.w;
+	let flow = params.postB.w;
+	let stir = params.weave.z;
+	var transmittance = 1.0;
+	var light = vec3<f32>(0.0);
+	for (var i = 0; i < steps; i = i + 1) {
+		let d = start + (f32(i) + jitter) * stepDepth;
+		let pv = eye + ray * d;
+		let ps = viewToStage(pv);
+		let height = ps.y - floorY;
+		let layer = exp(-max(height, 0.0) / max(params.envB.y, 0.05)) + 0.004;
+		let drift = vec3<f32>(flow * 0.05, -flow * 0.015, flow * 0.03);
+		let curl = vec3<f32>(sin(ps.y * 1.3 + flow * 0.4), 0.0, cos(ps.x * 1.1 - flow * 0.3)) * stir * 0.6;
+		// Banks and wisps with clear air between them, so the light shows the
+		// medium's shape instead of a glow round the figure.
+		let n = noise3(ps * vec3<f32>(1.0, 2.2, 1.0) + drift + curl) * 0.65 + noise3(ps * 2.6 - drift * 1.7) * 0.35;
+		let wisps = mix(1.0, smoothstep(0.4, 0.72, n) * 2.4, params.envB.z);
+		// Clear air right in front of the lens: a camera flying in the weave sees
+		// the medium ahead of it, not a fog stuck to the glass.
+		let sigma = density * layer * wisps * 0.3 * smoothstep(0.6, 2.2, d);
+		if (sigma > 1e-4) {
+			// A wide core: the medium right at a strand is lit softly, so the
+			// scattering pools in the mist instead of haloing the figure.
+			let scatter = ribbonLight(pv, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.09, 1.1);
+			light = light + scatter * (transmittance * sigma * stepLength);
+			transmittance = transmittance * exp(-sigma * stepLength);
+		}
+	}
+	let tint = mix(vec3<f32>(1.0), colorPeakEnv(params.hazeTint.rgb), 0.3);
+	return vec4<f32>(light * tint * 5.0, 1.0);
+}
+`;
+
 export const LOOM_COMPOSITE_WGSL = /* wgsl */ `
 ${POST_COMMON_WGSL}
 
@@ -1102,6 +1730,7 @@ ${POST_COMMON_WGSL}
 @group(0) @binding(1) var sceneSampler: sampler;
 @group(0) @binding(2) var feedbackTexture: texture_2d<f32>;
 @group(0) @binding(3) var bloomTexture: texture_2d<f32>;
+@group(0) @binding(4) var volumeTexture: texture_2d<f32>;
 
 fn aces(color: vec3<f32>) -> vec3<f32> {
 	let a = 2.51;
@@ -1110,10 +1739,6 @@ fn aces(color: vec3<f32>) -> vec3<f32> {
 	let d = 0.59;
 	let e = 0.14;
 	return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
-}
-
-fn colorPeakPost(c: vec3<f32>) -> vec3<f32> {
-	return c / max(max(c.r, max(c.g, c.b)), 1e-3);
 }
 
 fn ign(pixel: vec2<f32>, frame: f32) -> f32 {
@@ -1125,7 +1750,6 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let resolution = params.view.xy;
 	let centered = in.uv - 0.5;
 	let r2 = dot(centered, centered);
-	let time = params.view.z;
 
 	// Lens: a touch of barrel curvature, and chromatic aberration that grows
 	// toward the edges and flares on impacts.
@@ -1138,113 +1762,32 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		centreTap.g,
 		textureSampleLevel(feedbackTexture, sceneSampler, warped - direction * caAmount, 0.0).b
 	);
-	let coverage = clamp(centreTap.a, 0.0, 1.0);
-	let paper = clamp(params.postB.w, 0.0, 1.0);
 	let bloom = textureSampleLevel(bloomTexture, sceneSampler, warped, 0.0).rgb;
+	// The medium is marched at low resolution; a small tent filter hides the
+	// march's fixed jitter.
+	let volumeTexel = 1.0 / vec2<f32>(textureDimensions(volumeTexture));
+	var volume = vec3<f32>(0.0);
+	volume = volume + textureSampleLevel(volumeTexture, sceneSampler, warped + vec2<f32>(-0.75, -0.75) * volumeTexel, 0.0).rgb;
+	volume = volume + textureSampleLevel(volumeTexture, sceneSampler, warped + vec2<f32>( 0.75, -0.75) * volumeTexel, 0.0).rgb;
+	volume = volume + textureSampleLevel(volumeTexture, sceneSampler, warped + vec2<f32>(-0.75,  0.75) * volumeTexel, 0.0).rgb;
+	volume = volume + textureSampleLevel(volumeTexture, sceneSampler, warped + vec2<f32>( 0.75,  0.75) * volumeTexel, 0.0).rgb;
+	volume = volume * 0.25;
+	// The medium is a supporting light: it rolls off before it can rival the
+	// ribbons, so dense mist round a low figure never becomes a glowing ball.
+	let volumeLevel = dot(volume, vec3<f32>(0.2126, 0.7152, 0.0722));
+	volume = volume / (1.0 + volumeLevel * 5.0);
 
-	// Environment. uv.y grows downward, so p.y is flipped to read "up is
-	// positive". Colours come from the palette family; which features show is
-	// the genome's environment (chamber, open sky, water, mirror box, fog bank,
-	// starfield), all blended by coefficients so eras crossfade.
+	// No backdrop: the scene already holds the floor, the far threads and the
+	// dust, all lit by the ribbons; the medium adds their scattered light.
 	let aspect = resolution.x / max(resolution.y, 1.0);
 	let p = vec2<f32>((warped.x - 0.5) * aspect, 0.5 - warped.y);
 	let distance = length(p * vec2<f32>(0.72, 1.0));
-	let deep = params.deepTint.rgb;
-	// Family haze tints are deep; lift them toward their own hue so the room
-	// always reads as coloured light, never as black.
-	let haze = mix(params.hazeTint.rgb * 2.2, colorPeakPost(params.hazeTint.rgb) * 0.16, 0.45) * params.hazeTint.w;
-	let glow = params.glowTint.rgb * params.glowTint.w;
-	let floorLine = params.envC.x;
-	let floorAmount = params.envC.z;
-	let above = p.y - floorLine;
-	let energy = params.macroRails.x;
-	let quiet = params.style.w;
-
-	// Deep room: haze that thins toward the edges, a band of light pooling just
-	// above the floor line.
-	let depthHaze = exp(-distance * (2.2 - params.shape.z * 0.3));
-	let pool = exp(-pow((above - 0.05) * 7.0, 2.0));
-	var background = vec3<f32>(0.0016, 0.0022, 0.0044) + deep * 0.35
-		+ haze * 1.25 * depthHaze * (0.8 + energy * 0.2) * (1.0 - quiet * 0.5)
-		+ glow * 0.14 * pool * (0.35 + energy * 0.2 + params.pulse.x * 0.7) * (1.0 - quiet * 0.7) * params.envB.z * floorAmount;
-
-	// Open sky: a gradient that warms toward the horizon and an off-centre
-	// glow source low on one side (never a centred orb).
-	let skyMask = smoothstep(-0.03, 0.03, above);
-	let skyGrad = mix(glow * 0.2 + haze * 0.6, haze * 0.9 + deep * 0.6, smoothstep(0.0, 0.8, above));
-	let sunPos = vec2<f32>(params.envC.y * aspect * 0.5, floorLine + 0.1);
-	let sunDelta = (p - sunPos) * vec2<f32>(1.0, 1.7);
-	let sun = glow * (exp(-length(sunDelta) * 4.5) * 0.32 + exp(-length(sunDelta) * 26.0) * 0.5);
-	background = background + (skyGrad * 0.75 + sun) * params.envB.x * mix(1.0, skyMask, floorAmount);
-
-	// Starfield: sparse twinkling points above the horizon, brighter with air.
-	let cell = floor(in.uv * resolution / 2.5);
-	let starHash = fract(sin(dot(cell, vec2<f32>(12.9898, 78.233))) * 43758.5453);
-	let twinkle = 0.55 + 0.45 * sin(time * (1.5 + starHash * 3.0) + starHash * 80.0);
-	let star = step(0.9965, starHash) * twinkle * (0.9 + params.audioB.z * 1.2);
-	background = background + mix(vec3<f32>(0.85, 0.9, 1.0), colorPeakPost(params.weftTint.rgb), 0.3) * star * params.envA.w
-		* mix(1.0, skyMask, floorAmount) * 0.75;
-
-	// Fog bank: a luminous drifting layer sitting on the floor.
-	let fogNoise = 0.65 + 0.35 * sin(p.x * 3.1 + time * 0.21 + sin(p.x * 7.3 - time * 0.13) * 1.4);
-	let fogBand = exp(-pow((above - 0.05) / 0.2, 2.0)) * fogNoise;
-	background = background + (glow * 0.16 + haze * 0.7) * fogBand * params.envA.z;
-
-	// Floor: the instrument reflects in it, blurred and fading with distance
-	// from the floor line; water adds travelling ripples.
-	let floorMask = smoothstep(floorLine, floorLine - 0.06, p.y) * floorAmount;
-	let below = max(0.0, -above);
-	let rippleAmount = params.envA.y * (0.5 + params.audioA.y * 1.2) * (0.3 + below * 5.0);
-	let ripple = vec2<f32>(
-		sin(p.y * 140.0 / (below + 0.25) - time * 2.4 + sin(p.x * 9.0) * 1.5) * 0.0035,
-		sin(p.x * 38.0 + time * 1.7 + p.y * 22.0) * 0.0025
-	) * rippleAmount;
-	let mirroredUv = vec2<f32>(warped.x, 2.0 * (0.5 - floorLine) - warped.y) + ripple;
-	let mirroredTap = textureSampleLevel(feedbackTexture, sceneSampler, mirroredUv, 0.0);
-	let reflection = mix(
-		mirroredTap.rgb,
-		textureSampleLevel(bloomTexture, sceneSampler, mirroredUv, 0.0).rgb,
-		0.55
-	);
-	let reflectionFade = exp(-below * 5.0);
-	background = background + reflection * floorMask * reflectionFade * (0.22 + params.style.z * 0.1) * params.envA.x;
-	background = background + haze * floorMask * params.envA.y * 0.35 * (0.6 + 0.4 * sin(p.x * 20.0 + time));
-	// Horizon: a soft lit edge where the floor meets the room.
-	background = background + glow * 0.05 * exp(-pow(above * 30.0, 2.0)) * params.envB.w * floorAmount;
-
-	// Mirror box: angled side mirrors. Each panel holds the whole scene,
-	// mirrored and compressed toward the seam and shrinking with depth, so it
-	// reads as a receding reflection instead of a cut-off copy.
-	let halfW = aspect * 0.5;
-	let wallX = halfW * 0.6;
-	let panel = clamp((abs(p.x) - wallX) / max(halfW - wallX, 1e-3), 0.0, 1.0);
-	let inPanel = smoothstep(wallX, wallX + 0.02, abs(p.x));
-	let horizonY = floorLine + 0.2;
-	let srcX = sign(p.x) * wallX * (1.0 - panel) * 1.05;
-	let srcY = horizonY + (p.y - horizonY) * (1.0 + panel * 0.7);
-	let wallUv = vec2<f32>(srcX / aspect + 0.5, 0.5 - srcY);
-	let wallReflection = textureSampleLevel(bloomTexture, sceneSampler, wallUv, 0.0).rgb * 0.55
-		+ textureSampleLevel(feedbackTexture, sceneSampler, wallUv, 0.0).rgb * 0.45;
-	let wallFade = inPanel * (1.0 - panel * 0.55) * params.envB.y;
-	background = background + (wallReflection * 0.5 + haze * 0.2) * wallFade
-		+ glow * 0.04 * exp(-pow((abs(p.x) - wallX) * 90.0, 2.0)) * params.envB.y * (1.0 - smoothstep(0.3, 0.55, abs(p.y)));
-
-	// Paper room (ink tone): a pale sheet tinted by the family, lit from one
-	// side, with the instrument's ink shadow on the floor. Light on dark and
-	// dark on light are the same composite, crossfaded.
-	let paperTint = mix(vec3<f32>(0.84, 0.78, 0.68), colorPeakPost(params.hazeTint.rgb) * 0.8, 0.2);
-	let paperLight = 0.82 + 0.18 * smoothstep(-0.7, 0.7, p.y + p.x * 0.35);
-	var paperRoom = paperTint * paperLight * 0.74 + glow * 0.02;
-	paperRoom = paperRoom * (1.0 - floorMask * reflectionFade * clamp(mirroredTap.a, 0.0, 1.0) * 0.3);
-	paperRoom = paperRoom * (1.0 - floorMask * 0.08) + paperTint * 0.04 * exp(-pow(above * 30.0, 2.0)) * floorAmount;
-	let room = mix(background, paperRoom, paper);
-
 	let vignette = 1.0 - smoothstep(0.54, 1.14, distance);
-	let exposure = (0.94 + energy * 0.2) * params.deepTint.w;
+	let energy = params.macroRails.x;
+	let exposure = (1.12 + energy * 0.22) * params.deepTint.w;
 	// Light budget: bloom is an accent whose weight follows how bright the look is.
 	let bloomTerm = bloom * params.envC.w * (1.0 + params.style.z * 0.3);
-	let inked = room * (1.0 - coverage * paper * 0.94);
-	var color = (inked + scene + bloomTerm) * exposure * (0.70 + vignette * 0.30);
+	var color = (scene + bloomTerm + volume) * exposure * (0.72 + vignette * 0.28);
 	color = aces(color);
 	color = max((color - 0.5) * 1.14 + 0.5, vec3<f32>(0.0));
 	// Soft shoulder: highlights keep their gradation instead of flattening

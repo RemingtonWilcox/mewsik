@@ -15,6 +15,7 @@ import {
 import { Mk2Conductor, type Mk2ConductorFrame } from '$lib/visualizer/mk2/conductor';
 import { LoomConductor, type LoomConductorFrame } from '$lib/visualizer/loom/conductor';
 import { LoomLook } from '$lib/visualizer/loom/look';
+import { CharacterTracker, type MusicCharacter } from '$lib/visualizer/character';
 
 /**
  * Atomic live view of one journey tick. Nested controller outputs and typed
@@ -27,6 +28,11 @@ export type VisualizerJourneySnapshot = {
 	readonly signal: Readonly<SignalConductorFrame>;
 	readonly mk2: Readonly<Mk2ConductorFrame>;
 	readonly loom: Readonly<LoomConductorFrame>;
+	/**
+	 * What kind of music is playing, and when it changes. Outlives sources:
+	 * a new song is measured against the previous one.
+	 */
+	readonly character: MusicCharacter;
 	/** Deterministic per-source visual identity in the 0..1 range. */
 	readonly seed: number;
 	/** Monotonic source generation, so A -> B -> A is three distinct journeys. */
@@ -68,6 +74,7 @@ export class VisualizerJourneyRuntime {
 	private readonly loomLook = new LoomLook(0);
 	private loomLookSeeded = false;
 	private spectrumTracker = new SignalSpectrumTracker();
+	private readonly characterTracker = new CharacterTracker();
 	private signalConductor: SignalConductor;
 	private mk2Conductor: Mk2Conductor;
 	private loomConductor: LoomConductor;
@@ -128,6 +135,7 @@ export class VisualizerJourneyRuntime {
 		this.signalConductor = new SignalConductor(this.seed);
 		this.mk2Conductor = new Mk2Conductor(this.seed);
 		this.loomConductor = new LoomConductor(this.seed, this.continueLoomLook());
+		this.characterTracker.beginSource();
 		this.snapshot = null;
 		return true;
 	}
@@ -152,9 +160,12 @@ export class VisualizerJourneyRuntime {
 		// Advance it first so the director and every engine hear the same real-Hz
 		// bands, flatness, novelty, and centroid in this transaction.
 		const director = this.director.update(features, timelineSeconds, spectrum);
-		const signal = this.signalConductor.update(director, spectrum, dt);
-		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal);
-		const loom = this.loomConductor.update(director, spectrum, dt);
+		// Character before the conductors, so any of them can answer a shift
+		// in the same tick it fires.
+		const character = this.characterTracker.update(director, spectrum, dt);
+		const signal = this.signalConductor.update(director, spectrum, dt, character);
+		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal, character);
+		const loom = this.loomConductor.update(director, spectrum, dt, character);
 		this.updatedAtMs = now;
 		this.snapshot = {
 			director,
@@ -162,6 +173,7 @@ export class VisualizerJourneyRuntime {
 			signal,
 			mk2,
 			loom,
+			character,
 			seed: this.seed,
 			sourceEpoch: this.epoch,
 			timelineSeconds

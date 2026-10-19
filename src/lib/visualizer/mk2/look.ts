@@ -11,6 +11,14 @@
 //   life       - the animal swims, contracts on the beat, grows across a
 //                phrase; a diver-like camera follows it with lag and sway
 //
+// Across all three runs the mood: what kind of music the animal hears (the
+// shared MusicCharacter, read through calm / agitation / pulse / mass /
+// warmth). It steers continuous parameters at once (swim and pulse from
+// tempo, bristling and darting from agitation, body mass and glow from bass,
+// flash sharpness from punch, colour temperature from warmth), and on each
+// new character shift it weights the genome toward species, water and light
+// that fit the new music before calling genome.shift.
+//
 // No reads of wall-clock time: every phase is integrated from dt, so the
 // renderer is deterministic per seed and input stream.
 
@@ -18,26 +26,35 @@ import { VariationGenome, type ChoiceState } from '../variation';
 import type { VisualDirectorFrame } from '../director/types';
 import type { SignalSpectrumProfile } from '../signal/spectrum';
 import type { Mk2ConductorFrame } from './conductor';
+import type { MusicCharacter } from '../character';
 import {
 	SOMA_ANATOMY_KEYS,
 	SOMA_ANATOMY_SIZE,
 	SOMA_AXES,
 	SOMA_BEAT_FORMS,
+	SOMA_BEAT_FORM_MOODS,
 	SOMA_CAMERAS,
+	SOMA_CAMERA_MOODS,
 	SOMA_CAMERA_SPECS,
 	SOMA_ENVIRONMENTS,
+	SOMA_ENVIRONMENT_MOODS,
 	SOMA_ENVIRONMENT_SPECS,
 	SOMA_PALETTES,
+	SOMA_PALETTE_MOODS,
 	SOMA_ROLE_PERMUTATIONS,
 	SOMA_SKINS,
+	SOMA_SKIN_MOODS,
 	SOMA_SPECIES,
+	SOMA_SPECIES_MOODS,
 	somaSpeciesAnatomy,
 	somaSpeciesArms,
 	somaSpeciesFold,
 	type Rgb,
 	type SomaAnatomy,
 	type SomaCameraSpec,
-	type SomaEnvironmentSpec
+	type SomaEnvironmentSpec,
+	type SomaMoodKey,
+	type SomaMoodPrototype
 } from './species';
 
 type Vec3 = [number, number, number];
@@ -94,11 +111,19 @@ export type SomaFrame = {
 		reflect: number;
 		snow: number;
 		shafts: number;
+		/** Per-channel extinction multipliers on the fog (red dies first). */
+		absorb: Rgb;
+		/** Downwelling light reaching this depth (0 = only living light). */
+		down: number;
 		keyDir: Vec3;
 		keyPower: number;
 		ambient: number;
 		exposure: number;
 	};
+	/** The mood the animal is in, 0..1 each. */
+	mood: SomaMood;
+	/** Integrated phases and the animal's light power, for the water. */
+	flow: { snow: number; shiver: number; light: number };
 	keyColor: Rgb;
 	colors: { water: Rgb; haze: Rgb; body: Rgb; glow: Rgb; accent: Rgb; organ: Rgb };
 	organism: {
@@ -159,7 +184,61 @@ export type SomaLookInput = {
 	motionScale?: number;
 	/** Impact multiplier from VISUALIZER_TUNING.mk2. */
 	impactScale?: number;
+	/** What kind of music is playing (journey.character); a new shiftSerial means it just changed. */
+	character?: Readonly<MusicCharacter> | null;
 };
+
+/** Soma's reading of the music character. */
+export type SomaMood = Record<SomaMoodKey, number> & { energy: number; noise: number };
+
+/** What the animal assumes before it has heard anything: a middling, unhurried song. */
+const NEUTRAL_MOOD: SomaMood = { tempo: 0.5, calm: 0.3, agitation: 0.05, pulse: 0.3, mass: 0.5, warmth: 0.45, punch: 0.4, energy: 0.5, noise: 0.3 };
+
+/**
+ * Character -> mood. Tempo and bass are the most trustworthy features; noise
+ * (spectral flatness) only sharpens agitation that tempo already suggests, so
+ * a dense but slow track never reads as frantic.
+ */
+export function somaMoodTarget(c: Readonly<MusicCharacter>, out: SomaMood): SomaMood {
+	const tempo = clamp(finite(c.tempo, 0.5), 0, 1);
+	const energy = clamp(finite(c.energy, 0.5), 0, 1);
+	const noise = clamp(finite(c.noise, 0.3), 0, 1);
+	const punch = clamp(finite(c.punch, 0.4), 0, 1);
+	const bass = clamp(finite(c.bass, 0.5), 0, 1);
+	const agitation = clamp(smoothstep(0.5, 0.92, tempo) * (0.55 + 0.45 * noise) + noise * 0.2 * energy * smoothstep(0.3, 0.6, tempo), 0, 1);
+	const calm = (1 - smoothstep(0.12, 0.5, tempo)) * (1 - agitation) * (1 - 0.5 * punch) * (1 - 0.4 * energy);
+	const pulse = smoothstep(0.3, 0.62, tempo) * (1 - agitation) * (0.35 + 0.65 * bass);
+	// Warmth of the light: happy, punchy, bass-warm music runs warm; agitated
+	// or still music runs cold. (Brightness is timbre, not temperature.)
+	const warmth = clamp(
+		0.5 + (finite(c.valence, 0.5) - 0.6) * 1.2 + (punch - 0.35) * 0.6 + (bass - 0.5) * 0.3 - agitation * 0.35 - calm * 0.2,
+		0,
+		1
+	);
+	out.tempo = tempo;
+	out.energy = energy;
+	out.noise = noise;
+	out.punch = punch;
+	out.mass = bass;
+	out.agitation = agitation;
+	out.calm = clamp(calm, 0, 1);
+	out.pulse = clamp(pulse, 0, 1);
+	out.warmth = warmth;
+	return out;
+}
+
+/** Pick weights for one choice axis from per-option mood prototypes (cf. characterWeights). */
+function moodWeights(prototypes: readonly SomaMoodPrototype[], mood: SomaMood, sharpness: number, floor = 0.08): number[] {
+	return prototypes.map((prototype) => {
+		let distance = 0;
+		let count = 0;
+		for (const key in prototype) {
+			distance += Math.abs((prototype[key as SomaMoodKey] ?? 0) - mood[key as SomaMoodKey]);
+			count += 1;
+		}
+		return floor + Math.exp(-(count ? distance / count : 0.5) * sharpness);
+	});
+}
 
 function clamp(value: number, low: number, high: number): number {
 	return Math.min(high, Math.max(low, value));
@@ -307,6 +386,28 @@ export class SomaLook {
 	private shiftX = 0;
 	private shiftY = 0;
 	private envFloor = -7;
+	// Mood: glided reading of the music character, and the last shift answered.
+	private readonly mood: SomaMood = { ...NEUTRAL_MOOD };
+	private readonly moodTarget: SomaMood = { ...NEUTRAL_MOOD };
+	/** shiftSerial last answered with genome.shift; lives with the look so a remount never re-fires. */
+	private answeredShift = -1;
+	private weightsAge = 0;
+	private snowPhase = 0;
+	private shiverPhase = 0;
+	/**
+	 * The mood's own light: a palette chosen for what is playing, blended over
+	 * the genome's (which keeps walking underneath for variety). Re-chosen on a
+	 * shift, or when the mood has settled somewhere clearly new, and crossfaded.
+	 */
+	private readonly moodPalette: ChoiceState = { from: 0, to: 0, mix: 1 };
+	private moodPaletteWeight = 0;
+	private moodPalettePicks = 0;
+	private readonly moodAtPick: SomaMood = { ...NEUTRAL_MOOD };
+	/** Where the mood is heading: target plus its recent velocity, so a change is read early. */
+	private readonly moodAhead: SomaMood = { ...NEUTRAL_MOOD };
+	private readonly moodVelocity: SomaMood = { ...NEUTRAL_MOOD };
+	private readonly moodPrevious: SomaMood = { ...NEUTRAL_MOOD };
+	private moodPickAge = 1e6;
 	private readonly frame: SomaFrame;
 	private readonly colorScratch: Rgb = [0, 0, 0];
 
@@ -324,7 +425,9 @@ export class SomaLook {
 			palette: { from: 0, to: 0, mix: 1 },
 			camera: { from: 0, to: 0, mix: 1 },
 			beatForm: { from: 0, to: 0, mix: 1 },
-			env: { fog: 0.08, floorY: -7, surfaceY: 30, reflect: 0.1, snow: 1, shafts: 0.3, keyDir: [0, 1, 0], keyPower: 0.5, ambient: 0.05, exposure: 1 },
+			env: { fog: 0.08, floorY: -7, surfaceY: 30, reflect: 0.1, snow: 1, shafts: 0.3, absorb: [1.8, 1, 0.8], down: 0.05, keyDir: [0, 1, 0], keyPower: 0.5, ambient: 0.05, exposure: 1 },
+			mood: { ...NEUTRAL_MOOD },
+			flow: { snow: 0, shiver: 0, light: 1 },
 			keyColor: [0.5, 0.7, 1],
 			colors: {
 				water: [0.002, 0.008, 0.02],
@@ -376,6 +479,11 @@ export class SomaLook {
 		this.orbit = this.seed * Math.PI * 2;
 		this.companionPhase = this.seed * 5;
 		this.lastBeat = -1;
+		Object.assign(this.mood, NEUTRAL_MOOD);
+		this.moodPaletteWeight = 0;
+		this.moodPalettePicks = 0;
+		this.answeredShift = -1;
+		this.weightsAge = 0;
 		this.applyWeights();
 	}
 
@@ -395,7 +503,9 @@ export class SomaLook {
 			this.pos.map(r).join(','),
 			this.camEye.map(r).join(','),
 			r(this.clock),
-			r(this.orbit)
+			r(this.orbit),
+			String(this.answeredShift),
+			Object.values(this.mood).map(r).join(',')
 		].join('|');
 	}
 
@@ -403,18 +513,183 @@ export class SomaLook {
 		return this.clock;
 	}
 
+	/** Compact live state for QA logs. */
+	debugState(): Record<string, string> {
+		const c = (name: string) => {
+			const x = this.pick(name);
+			return `${x.from}>${x.to}@${x.mix.toFixed(2)}`;
+		};
+		const mp = this.moodPalette;
+		const m = this.mood;
+		return {
+			species: c('species'),
+			environment: c('environment'),
+			palette: c('palette'),
+			camera: c('camera'),
+			moodPalette: `${mp.from}>${mp.to}@${mp.mix.toFixed(2)} w${this.moodPaletteWeight.toFixed(2)}`,
+			glide: this.genome.glideSpeed.toFixed(2),
+			anatomy: SOMA_ANATOMY_KEYS.map((key, i) => `${key}=${this.anatomy[i].toFixed(2)}`).join(' '),
+			uniforms: `fold ${this.lobes}/${this.lobeFade.toFixed(2)} arms ${this.arms}/${this.armFade.toFixed(2)} pos ${this.pos.map((v) => v.toFixed(2)).join(',')} pitch ${this.pitch.toFixed(2)} eye ${this.camEye.map((v) => v.toFixed(2)).join(',')}`,
+			body: `arms ${this.arms}@${this.armFade.toFixed(2)} lobes ${this.lobes}@${this.lobeFade.toFixed(2)} bulb ${this.anatomy[A.tipBulb].toFixed(2)} len ${this.anatomy[A.tentLen].toFixed(2)} e ${this.energy.toFixed(2)} grow ${this.growth.toFixed(2)} y ${this.pos[1].toFixed(2)} floor ${this.envFloor.toFixed(2)} life ${this.lifecycle.map((v) => v.toFixed(1)).join('/')} pk ${this.packet.toFixed(2)} kick ${this.kick.toFixed(2)} imp ${this.impact.toFixed(2)} spk ${this.sparkle.toFixed(2)} con ${this.contraction.toFixed(2)} beat ${this.lastBeat} reach ${this.genome.value('reach').toFixed(2)} cam ${this.camDistance.toFixed(2)} el ${this.camElevation.toFixed(2)} eyeY ${this.camEye[1].toFixed(2)} az ${this.camAzimuth.toFixed(2)} hd ${this.heading.toFixed(2)}`,
+			mood: `calm ${m.calm.toFixed(2)} ag ${m.agitation.toFixed(2)} pulse ${m.pulse.toFixed(2)} warm ${m.warmth.toFixed(2)} mass ${m.mass.toFixed(2)}`
+		};
+	}
+
 	private applyWeights(): void {
 		const species = this.pick('species').to;
 		const dwell = somaSpeciesAnatomy(species).dwell;
+		const mood = this.started ? moodWeights(SOMA_CAMERA_MOODS, this.moodTarget, 3) : null;
 		this.genome.setWeights(
 			'camera',
-			SOMA_CAMERAS.map((name) => {
+			SOMA_CAMERAS.map((name, index) => {
 				let weight = CAMERA_WEIGHTS[name];
 				if (name === 'descent') weight *= 1 + dwell * 1.6;
 				if (name === 'below') weight *= 1 - dwell * 0.7;
-				return weight;
+				return weight * (mood ? mood[index] : 1);
 			})
 		);
+	}
+
+	/**
+	 * Bias every big choice toward options that fit what is playing now. A
+	 * deterministic function of the mood, refreshed every few seconds and right
+	 * before a shift, so natural mutations fit the music too.
+	 */
+	private applyMoodWeights(sharpness: number): void {
+		const m = this.moodTarget;
+		this.genome.setWeights('species', moodWeights(SOMA_SPECIES_MOODS, m, sharpness));
+		this.genome.setWeights('environment', moodWeights(SOMA_ENVIRONMENT_MOODS, m, sharpness));
+		this.genome.setWeights('palette', moodWeights(SOMA_PALETTE_MOODS, m, sharpness * 1.4));
+		this.genome.setWeights('skin', moodWeights(SOMA_SKIN_MOODS, m, sharpness * 0.7));
+		this.genome.setWeights('beatForm', moodWeights(SOMA_BEAT_FORM_MOODS, m, sharpness * 0.7));
+		this.applyWeights();
+		this.weightsAge = 0;
+	}
+
+	/** Glide the mood toward the music character (faster right after a shift). */
+	private feel(dt: number, character: Readonly<MusicCharacter> | null | undefined): void {
+		if (character) somaMoodTarget(character, this.moodTarget);
+		const tau = 0.55 / Math.max(1, this.genome.glideSpeed * 0.8);
+		for (const key of Object.keys(this.mood) as (keyof SomaMood)[]) {
+			this.mood[key] = approach(this.mood[key], this.moodTarget[key], tau, dt);
+			// The character's fast envelope lags the music by about a second, so
+			// extrapolate its current velocity most of that way to hear a change early.
+			const velocity = dt > 0 ? (this.moodTarget[key] - this.moodPrevious[key]) / dt : 0;
+			this.moodVelocity[key] = approach(this.moodVelocity[key], clamp(velocity, -3, 3), 0.12, dt);
+			this.moodPrevious[key] = this.moodTarget[key];
+			this.moodAhead[key] = clamp(this.moodTarget[key] + this.moodVelocity[key] * 0.8, 0, 1);
+		}
+	}
+
+	/** How far two moods are apart on the dimensions that change the picture. */
+	private static moodDistance(a: SomaMood, b: SomaMood): number {
+		return Math.max(
+			Math.abs(a.calm - b.calm),
+			Math.abs(a.agitation - b.agitation),
+			Math.abs(a.pulse - b.pulse),
+			Math.abs(a.warmth - b.warmth),
+			Math.abs(a.tempo - b.tempo),
+			Math.abs(a.mass - b.mass) * 0.6
+		);
+	}
+
+	/** Choose the mood palette among the best fits for the music, never the genome's own. */
+	private pickMoodPalette(): void {
+		const weights = moodWeights(SOMA_PALETTE_MOODS, this.moodAhead, 8, 0);
+		const exclude = [this.pick('palette').to, this.moodPalette.to];
+		const ranked = weights
+			.map((weight, index) => ({ weight, index }))
+			.filter((entry) => !exclude.includes(entry.index))
+			.sort((x, y) => y.weight - x.weight || x.index - y.index)
+			.slice(0, 4);
+		this.moodPalettePicks += 1;
+		// Of the fitting palettes, favour the one whose light differs most from
+		// what is lit now (a hash adds variety), so the change is always seen.
+		const glow = this.frame.colors.glow;
+		const accent = this.frame.colors.accent;
+		const chroma = (c: readonly number[]) => {
+			const sum = c[0] + c[1] + c[2] + 1e-4;
+			return [c[0] / sum, c[1] / sum, c[2] / sum];
+		};
+		const now = [chroma(glow), chroma(accent)];
+		let choice = ranked[0].index;
+		let bestScore = -1;
+		for (const entry of ranked) {
+			const p = SOMA_PALETTES[entry.index];
+			const cand = [chroma(p.glow), chroma(p.accent)];
+			let difference = 0;
+			for (let k = 0; k < 2; k += 1) for (let i = 0; i < 3; i += 1) difference += Math.abs(cand[k][i] - now[k][i]) * (k === 0 ? 1 : 0.5);
+			const score = difference + hash01(this.seed, this.moodPalettePicks * 31 + entry.index, 21) * 0.35;
+			if (score > bestScore) {
+				bestScore = score;
+				choice = entry.index;
+			}
+		}
+		const mp = this.moodPalette;
+		if (this.moodPaletteWeight <= 0.001) {
+			mp.from = mp.to = choice;
+			mp.mix = 1;
+		} else {
+			mp.from = mp.mix >= 0.5 ? mp.to : mp.from;
+			mp.to = choice;
+			mp.mix = 0;
+		}
+		Object.assign(this.moodAtPick, this.moodAhead);
+		this.moodPickAge = 0;
+	}
+
+	/** Advance the mood palette: re-pick when the music settled somewhere new. */
+	private moodLight(dt: number, character: Readonly<MusicCharacter> | null | undefined, shifted: boolean): void {
+		if (!character) return;
+		this.moodPickAge += dt;
+		// Re-pick on a shift, or when the mood is heading somewhere clearly new;
+		// right after a pick only a much bigger move counts, so one change of
+		// music never reads as two steps.
+		const moved = SomaLook.moodDistance(this.moodAhead, this.moodAtPick);
+		const needed = this.moodPickAge < 5 ? 0.45 : 0.3;
+		const fresh = this.moodPaletteWeight <= 0.001;
+		if (fresh || (this.moodPickAge > 0.8 && ((shifted && this.moodPickAge > 1.5) || moved > needed))) {
+			// Only a different light family is worth a new pick; within the family
+			// the current one already fits.
+			const weights = moodWeights(SOMA_PALETTE_MOODS, this.moodAhead, 8, 0);
+			let best = 0;
+			for (let i = 1; i < weights.length; i += 1) if (weights[i] > weights[best]) best = i;
+			if (fresh || SOMA_PALETTE_MOODS[best] !== SOMA_PALETTE_MOODS[this.moodPalette.to]) this.pickMoodPalette();
+			else Object.assign(this.moodAtPick, this.moodAhead);
+		}
+		this.moodPaletteWeight = Math.min(1, this.moodPaletteWeight + dt / 2);
+		const mp = this.moodPalette;
+		if (mp.mix < 1) mp.mix = Math.min(1, mp.mix + dt / 1.1);
+	}
+
+	/**
+	 * Answer each new character shift exactly once: weight the picks toward the
+	 * new music, steer the continuous axes the music should own, then let the
+	 * genome mutate now with glides sped up. Nothing jumps; it lands in ~2-3 s.
+	 */
+	private answerShift(character: Readonly<MusicCharacter> | null | undefined): boolean {
+		if (!character) return false;
+		const serial = character.shiftSerial;
+		if (serial === this.answeredShift) return false;
+		this.answeredShift = serial;
+		// A look first seen long after the shift (opening the visualizer mid-song)
+		// adopts it without moving: that music is simply what is playing.
+		if (!this.started || finite(character.sinceShift, 1e6) > 3) return false;
+		const strength = clamp(finite(character.shiftStrength, 0.6), 0, 1);
+		const m = this.moodTarget;
+		this.applyMoodWeights(7);
+		const g = this.genome;
+		const amount = 0.45 + 0.4 * strength;
+		g.pull('murk', clamp(0.25 + m.agitation * 0.5 + m.calm * 0.25, 0, 1), amount);
+		g.pull('snow', clamp(0.3 + m.agitation * 0.6 + m.calm * 0.2, 0, 1), amount);
+		g.pull('reach', clamp(0.75 - m.agitation * 0.5 + m.calm * 0.25, 0, 1), amount);
+		g.pull('sway', clamp(0.25 + m.tempo * 0.6 + m.calm * 0.15, 0, 1), amount);
+		g.pull('innerLight', clamp(0.3 + m.mass * 0.6, 0, 1), amount);
+		g.pull('photophores', clamp(0.2 + m.punch * 0.5 + m.pulse * 0.3, 0, 1), amount);
+		g.pull('bodySize', clamp(0.2 + m.mass * 0.7, 0, 1), amount);
+		g.pull('clarity', clamp(0.8 - m.mass * 0.5, 0, 1), amount);
+		g.shift(strength, Math.max(this.energy, m.energy));
+		return true;
 	}
 
 	private speciesBlend(out: Float32Array, choice: ChoiceState): void {
@@ -460,6 +735,31 @@ export class SomaLook {
 		t[A.oral] *= 0.6 + 0.8 * frill;
 		t[A.fin] *= 0.7 + 0.6 * frill;
 
+		// Mood, continuously: heavy music builds a heavier, denser, brighter-cored
+		// body; agitation bristles it (spines out, tentacles kinked and drawn in,
+		// a ragged margin, sparks of photophores); calm lets it trail long and
+		// slow; a pulsing groove strengthens the jet and the rim.
+		const md = this.mood;
+		const mass = md.mass;
+		const ag = md.agitation;
+		t[A.size] *= 0.86 + 0.3 * mass;
+		t[A.bellR] *= 0.92 + 0.16 * mass;
+		t[A.organGlow] *= 0.55 + 0.9 * mass;
+		t[A.opacity] = clamp(t[A.opacity] + (mass - 0.5) * 0.14, 0.04, 0.97);
+		// Calm music trades flashes for a steady inner glow.
+		t[A.rimGlow] *= 0.8 + 0.25 * mass + 0.35 * md.pulse + 0.45 * md.calm;
+		t[A.organGlow] *= 1 + 0.5 * md.calm;
+		t[A.spines] += ag * 0.8;
+		t[A.tentCurl] += ag * 1.1;
+		t[A.tentWave] *= 1 + ag * 0.9 + md.calm * 0.25;
+		t[A.tentLen] *= 1 - ag * 0.32 + md.calm * 0.2;
+		t[A.lobeAmp] += ag * 0.12;
+		t[A.photoDensity] += ag * 0.5 + md.pulse * 0.2;
+		t[A.photoTentacle] *= 1 + md.pulse * 0.6;
+		t[A.jet] *= 1 + md.pulse * 0.6;
+		// Calm music breathes its light; it does not sparkle on every note.
+		t[A.notesGain] *= (0.7 + 0.6 * md.punch) * (1 - 0.45 * md.calm);
+
 		// Skin: a material crossfade on top of the species' own membrane.
 		const skin = this.pick('skin');
 		this.scratchA.set(t);
@@ -472,7 +772,10 @@ export class SomaLook {
 		// draws the animal in, bloom opens it.
 		const [, sprout, , bloom, shedding, dormancy] = this.lifecycle;
 		const growth = this.growth;
-		if (t[A.chainCount] > 1) t[A.chainCount] = Math.max(1, t[A.chainCount] - 1.1 + growth * 1.6 + sprout * 0.4);
+		// Weighted by how colonial the blend already is, so a solitary animal
+		// morphing into a colony buds smoothly from one member (no jump at 1).
+		const excess = Math.max(0, t[A.chainCount] - 1);
+		t[A.chainCount] = 1 + Math.max(0, excess + (growth * 1.6 + sprout * 0.4 - 1.1) * smoothstep(0, 1, excess));
 		t[A.chainSpacing] *= 0.86 + 0.24 * growth;
 		t[A.tentLen] *= 0.82 + 0.3 * growth + bloom * 0.08 - dormancy * 0.12;
 		t[A.rimGlow] *= 0.75 + 0.35 * bloom + 0.2 * this.energy - 0.25 * dormancy;
@@ -514,6 +817,16 @@ export class SomaLook {
 			g.value('hueDrift') * 0.035 +
 			(finite(context.keyPitchClass, 0.5) - 0.5) * 0.04 * clamp(finite(context.keyConfidence), 0, 1);
 		const colors = this.frame.colors;
+		// Colour temperature of the living light from the music's warmth: a white
+		// balance on the emitters (and a little on the tissue), never a wash.
+		const w = (this.mood.warmth - 0.5) * 2;
+		const wb: Rgb = w >= 0 ? [1 + 0.3 * w, 1 - 0.03 * w, 1 - 0.45 * w] : [1 + 0.3 * w, 1 + 0.03 * w, 1 - 0.3 * w];
+		const mp = this.moodPalette;
+		const moodFrom = SOMA_PALETTES[mp.from];
+		const moodTo = SOMA_PALETTES[mp.to];
+		const moodMix = smoothstep(0, 1, mp.mix);
+		const moodWeight = this.moodPaletteWeight;
+		const moodColor = (key: 'water' | 'haze' | 'body' | 'glow' | 'accent' | 'organ', i: number) => lerp(moodFrom[key][i], moodTo[key][i], moodMix);
 		const permute = (p: typeof from, r: number): [Rgb, Rgb, Rgb] => {
 			const perm = SOMA_ROLE_PERMUTATIONS[r];
 			const lights = [p.glow, p.accent, p.organ];
@@ -525,19 +838,22 @@ export class SomaLook {
 		const lightsToB = permute(to, roles.to);
 		const target = this.colorScratch;
 		const blend = (key: 'water' | 'haze' | 'body', out: Rgb) => {
-			for (let i = 0; i < 3; i += 1) target[i] = lerp(from[key][i], to[key][i], palette.mix);
+			const share = moodWeight * (key === 'body' ? 0.5 : 0.6);
+			for (let i = 0; i < 3; i += 1) target[i] = lerp(lerp(from[key][i], to[key][i], palette.mix), moodColor(key, i), share);
 			hueRotate(target, lean, target);
+			if (key === 'body') for (let i = 0; i < 3; i += 1) target[i] *= lerp(1, wb[i], 0.5);
 			for (let i = 0; i < 3; i += 1) out[i] = approach(out[i], target[i], rate, dt);
 		};
 		blend('water', colors.water);
 		blend('haze', colors.haze);
 		blend('body', colors.body);
 		const lights: Rgb[] = [colors.glow, colors.accent, colors.organ];
+		const lightKeys = ['glow', 'accent', 'organ'] as const;
 		for (let role = 0; role < 3; role += 1) {
 			for (let i = 0; i < 3; i += 1) {
 				const a = lerp(lightsFromA[role][i], lightsFromB[role][i], roles.mix);
 				const b = lerp(lightsToA[role][i], lightsToB[role][i], roles.mix);
-				target[i] = lerp(a, b, palette.mix);
+				target[i] = lerp(lerp(a, b, palette.mix), moodColor(lightKeys[role], i), moodWeight * 0.7) * wb[i];
 			}
 			hueRotate(target, lean, target);
 			for (let i = 0; i < 3; i += 1) lights[role][i] = approach(lights[role][i], target[i], rate, dt);
@@ -553,17 +869,20 @@ export class SomaLook {
 		const env = this.frame.env;
 		const murk = g.value('murk');
 		const dwell = this.anatomy[A.dwell];
-		env.fog = approach(env.fog, lerp(a.fog, b.fog, m) * (0.75 + 0.55 * murk), rate, dt);
+		const md = this.mood;
+		env.fog = approach(env.fog, lerp(a.fog, b.fog, m) * (0.75 + 0.55 * murk) * (1 + md.calm * 0.2 + md.agitation * 0.15), rate, dt);
+		for (let i = 0; i < 3; i += 1) env.absorb[i] = approach(env.absorb[i], lerp(a.absorb[i], b.absorb[i], m), rate, dt);
+		env.down = approach(env.down, lerp(a.down, b.down, m), rate, dt);
 		// The seabed rises to meet a floor-dwelling animal.
-		this.envFloor = approach(this.envFloor, lerp(lerp(a.floorY, b.floorY, m), -2.7, dwell), rate * 2.2, dt);
+		this.envFloor = approach(this.envFloor, lerp(lerp(a.floorY, b.floorY, m), -2.7, dwell), rate * 0.8, dt);
 		env.floorY = this.envFloor;
 		env.surfaceY = approach(env.surfaceY, lerp(a.surfaceY, b.surfaceY, m), rate, dt);
 		env.reflect = approach(env.reflect, lerp(a.reflect, b.reflect, m), rate, dt);
-		env.snow = approach(env.snow, lerp(a.snow, b.snow, m) * (0.5 + g.value('snow')), rate, dt);
-		env.shafts = approach(env.shafts, lerp(a.shafts, b.shafts, m), rate, dt);
+		env.snow = approach(env.snow, lerp(a.snow, b.snow, m) * (0.5 + g.value('snow')) * (0.75 + md.agitation * 0.8 + md.calm * 0.2), rate, dt);
+		env.shafts = approach(env.shafts, lerp(a.shafts, b.shafts, m) * (1 + md.calm * 0.3 - md.agitation * 0.4), rate, dt);
 		env.keyPower = approach(env.keyPower, lerp(a.keyPower, b.keyPower, m), rate, dt);
 		env.ambient = approach(env.ambient, lerp(a.ambient, b.ambient, m), rate, dt);
-		env.exposure = approach(env.exposure, lerp(a.exposure, b.exposure, m), rate, dt);
+		env.exposure = approach(env.exposure, lerp(a.exposure, b.exposure, m) * (1 + md.calm * 0.25), rate, dt);
 		const azimuth = (g.value('lightAzimuth') - 0.5) * 1.4;
 		const ca = Math.cos(azimuth);
 		const sa = Math.sin(azimuth);
@@ -585,10 +904,9 @@ export class SomaLook {
 	}
 
 	/** The animal's extent and bounding sphere in its own body frame. */
-	private bounds(): { centerY: number; centerChain: number; radius: number; extent: number } {
-		const t = this.anatomy;
+	private bounds(t: Float32Array = this.anatomy, armFade = this.armFade): { centerY: number; centerChain: number; radius: number; extent: number } {
 		const R = Math.max(t[A.bellR] * (1 + 0.45 * t[A.fin]), t[A.bellH]);
-		const len = t[A.tentLen] * (0.3 + 0.7 * this.armFade) * (this.arms > 0 ? 1 : 0);
+		const len = t[A.tentLen] * (0.3 + 0.7 * armFade) * (this.arms > 0 ? 1 : 0);
 		const rootR = t[A.tentRoot] * t[A.bellR];
 		const rootY = t[A.tentRootY] * t[A.bellH];
 		const dir = t[A.tentDir];
@@ -614,6 +932,7 @@ export class SomaLook {
 		const motionScale = input.motionScale ?? 1;
 		const impactScale = input.impactScale ?? 1;
 		this.clock += dt;
+		this.feel(dt, input.character);
 
 		// ── Envelopes, owned here so a new source never dips them.
 		const rms = live ? clamp(finite(spectrum.bass * 0.4 + spectrum.mid * 0.4 + spectrum.treble * 0.2), 0, 1) : 0;
@@ -627,18 +946,22 @@ export class SomaLook {
 		this.bass = approach(this.bass, live ? spectrum.bass : 0, 0.09, dt);
 		this.mid = approach(this.mid, live ? spectrum.mid : 0, 0.12, dt);
 		this.treble = approach(this.treble, live ? spectrum.treble : 0, 0.07, dt);
+		// Punchy music flashes sharp (fast release), soft music glows out slowly.
+		const release = lerp(1.35, 0.6, this.mood.punch);
 		const kickTarget = clamp(finite(input.mk2.kick) * impactScale, 0, 1);
-		this.kick = approach(this.kick, kickTarget, kickTarget > this.kick ? 0.015 : 0.16, dt);
+		this.kick = approach(this.kick, kickTarget, kickTarget > this.kick ? 0.015 : 0.16 * release, dt);
 		const sparkleTarget = clamp(finite(input.mk2.sparkle), 0, 1);
-		this.sparkle = approach(this.sparkle, sparkleTarget, sparkleTarget > this.sparkle ? 0.02 : 0.2, dt);
-		const impactTarget = clamp(finite(input.mk2.impact) * impactScale, 0, 1);
-		this.impact = approach(this.impact, impactTarget, impactTarget > this.impact ? 0.015 : 0.2, dt);
+		this.sparkle = approach(this.sparkle, sparkleTarget, sparkleTarget > this.sparkle ? 0.02 : 0.2 * release, dt);
+		// Calm music glows; it does not flash.
+		const impactTarget = clamp(finite(input.mk2.impact) * impactScale * (1 - 0.45 * this.mood.calm), 0, 1);
+		this.impact = approach(this.impact, impactTarget, impactTarget > this.impact ? 0.015 : 0.2 * release, dt);
 
 		const lifeTarget = somaLifecycleTarget(director.section);
 		for (let i = 0; i < 6; i += 1) this.lifecycle[i] = approach(this.lifecycle[i], lifeTarget[i], 3, dt);
 		const phrasePos = clamp(finite(clock.phrasePos), 0, 1);
 		const growthTarget = clamp(
-			0.1 + sectionEnergy * 0.32 + phrasePos * 0.3 + director.drop.buildProgress * 0.2 + this.lifecycle[3] * 0.2 - this.lifecycle[5] * 0.3,
+			// A smooth swell across the phrase (no drop at the phrase boundary).
+			0.1 + sectionEnergy * 0.32 + (0.5 - 0.5 * Math.cos(phrasePos * Math.PI * 2)) * 0.3 + director.drop.buildProgress * 0.2 + this.lifecycle[3] * 0.2 - this.lifecycle[5] * 0.3,
 			0,
 			1
 		);
@@ -655,6 +978,8 @@ export class SomaLook {
 			}
 			this.genome.advance({ phraseIndex, sectionKey: director.section, energy: this.energy, dt: 0 });
 			this.genome.settle();
+			// The first frame already wears the mood of what is playing.
+			if (input.character) Object.assign(this.mood, this.moodTarget);
 			this.started = true;
 			this.resolveAnatomy();
 			this.anatomy.set(this.target);
@@ -669,18 +994,36 @@ export class SomaLook {
 			const env = this.frame.env;
 			this.envFloor = env.floorY;
 			this.placeAnimal();
+			// Whatever shift is current when the look first appears is adopted, not answered.
+			if (input.character) this.answeredShift = input.character.shiftSerial;
 		} else if (input.live) {
 			const speciesBefore = this.pick('species').to;
+			const shifted = this.answerShift(input.character);
+			this.moodLight(dt, input.character, shifted);
+			this.weightsAge += dt;
+			if (input.character && this.weightsAge > 2) this.applyMoodWeights(3);
 			this.genome.advance({ phraseIndex, sectionKey: director.section, energy: this.energy, dt });
 			if (this.pick('species').to !== speciesBefore) this.applyWeights();
 		}
 
-		// ── Resolve: genome -> anatomy, palette, world; then glide again.
+		// ── Resolve: genome -> anatomy, palette, world; then glide again. The
+		// second glide speeds up with the genome's after a shift.
+		const quick = Math.max(1, this.genome.glideSpeed);
 		this.resolveAnatomy();
-		this.resolveCounts(dt);
-		for (let i = 0; i < SOMA_ANATOMY_SIZE; i += 1) this.anatomy[i] = approach(this.anatomy[i], this.target[i], 0.7, dt);
-		this.resolvePalette(dt, director, 1.1);
-		this.resolveEnvironment(dt, 1.4);
+		// Retracting and regrowing appendages keep pace with the genome after a shift.
+		this.resolveCounts(dt * (1 + (quick - 1) * 0.6));
+		const bodyTau = 0.7 / (1 + (quick - 1) * 0.5);
+		// A body changes shape at a living pace even when the genome hurries: each
+		// value moves at most ~80% of its own scale per second, and a colony buds
+		// at most about one member a second.
+		for (let i = 0; i < SOMA_ANATOMY_SIZE; i += 1) {
+			const next = approach(this.anatomy[i], this.target[i], bodyTau, dt);
+			const scale = Math.max(0.5, Math.abs(this.anatomy[i]), Math.abs(this.target[i]) * 0.5);
+			const limit = dt * (i === A.chainCount ? 0.9 : 0.8 * scale);
+			this.anatomy[i] += clamp(next - this.anatomy[i], -limit, limit);
+		}
+		this.resolvePalette(dt, director, 0.7 / quick);
+		this.resolveEnvironment(dt, 1.4 / quick);
 
 		this.live(dt, input, live, motionScale);
 		return this.publish(input.aspect);
@@ -735,7 +1078,9 @@ export class SomaLook {
 	private cameraPose(extent: number): { azimuth: number; elevation: number; distance: number; aperture: number; focal: number } {
 		const spec = this.cameraSpec();
 		const g = this.genome;
-		const elevation = clamp(spec.elevation + g.value('camHeight') * 0.16, -0.75, 0.95);
+		// A floor dweller is filmed from a little above, as a diver would, so the
+		// seabed never pushes the eye up underneath it.
+		const elevation = clamp(spec.elevation + g.value('camHeight') * 0.16 + this.target[A.dwell] * 0.3, -0.75, 0.95);
 		// Heading-relative regimes (profile) track the animal's side; the rest
 		// orbit in world space so the animal turns within the shot.
 		// Both angles are unwrapped; the 2-pi branch only re-anchors while the
@@ -745,8 +1090,13 @@ export class SomaLook {
 		const toHeading = relative - this.followBranch;
 		const azimuth = this.orbit + spec.azimuth + spec.follow * toHeading + g.value('camSide') * 0.55;
 		// Never inside the animal: at least its bounding radius plus a margin.
-		const distance = Math.max(spec.distance * (0.9 + extent * 0.85), this.frame.organism.boundRadius * 1.2 + 0.4);
-		return { azimuth, elevation, distance, aperture: spec.aperture, focal: spec.focal };
+		// Calm music steps back to show the animal in its water; frantic music
+		// moves in close and hand-held; a groove sits a little closer.
+		const md = this.mood;
+		const moodDistance = lerp(1, 1.2, md.calm) * lerp(1, 0.78, md.agitation) * lerp(1, 0.92, md.pulse);
+		const distance = Math.max(spec.distance * moodDistance * (0.9 + extent * 0.85), this.frame.organism.boundRadius * 1.2 + 0.4);
+		// Calm music holds a deeper focus, so the long slow animal stays readable.
+		return { azimuth, elevation, distance, aperture: spec.aperture * 0.85 * (1 - 0.5 * md.calm), focal: spec.focal };
 	}
 
 	private live(dt: number, input: SomaLookInput, live: boolean, motionScale: number): void {
@@ -757,6 +1107,12 @@ export class SomaLook {
 		const tempo = clamp(finite(clock.tempoBpm, 110), 50, 190);
 		const beatPhase = clamp(finite(clock.beatPhase), 0, 1);
 		const awake = 1 - this.silence * 0.85;
+		const md = this.mood;
+		const ag = md.agitation;
+		const calm = md.calm;
+		const pulse = md.pulse;
+		this.snowPhase += dt * (0.6 + md.tempo * 0.9 + ag * 2.4) * motionScale;
+		this.shiverPhase = (this.shiverPhase + dt * Math.PI * 2 * 7.5) % (Math.PI * 2);
 
 		// Muscle: a jet contraction locked to the beat (fast squeeze, slow
 		// refill). Fast tempos contract every other beat, like a real bell.
@@ -764,10 +1120,13 @@ export class SomaLook {
 		const beatIndex = Math.floor(finite(clock.beatIndex));
 		const phase = halfTime ? (((beatIndex % 2) + 2) % 2 + beatPhase) / 2 : beatPhase;
 		const squeeze = phase < 0.14 ? smoothstep(0, 0.14, phase) : 1 - smoothstep(0.14, 0.92, phase);
-		const strength = 0.4 + 0.45 * this.energy + 0.5 * this.kick;
-		this.breathe += dt * (0.28 + this.energy * 0.1);
+		// A groove squeezes hard on every beat; calm music barely flexes; agitation
+		// adds a fine tremor on top, the bell shivering.
+		const strength = (0.4 + 0.45 * this.energy + 0.5 * this.kick) * (0.75 + pulse * 0.7 - calm * 0.2);
+		this.breathe += dt * (0.28 + this.energy * 0.1) * (1 - calm * 0.35);
 		const idle = (0.5 + 0.5 * Math.sin(this.breathe * Math.PI * 2)) * 0.22;
-		const contractionTarget = live ? Math.max(squeeze * strength * awake, idle * 0.6) : idle;
+		const tremor = ag * 0.07 * (0.5 + 0.5 * Math.sin(this.shiverPhase)) * awake;
+		const contractionTarget = (live ? Math.max(squeeze * strength * awake, idle * 0.6) : idle) + (live ? tremor : 0);
 		const previous = this.contraction;
 		this.contraction = approach(this.contraction, contractionTarget, 0.035, dt);
 		const squeezing = Math.max(0, this.contraction - previous) / Math.max(dt, 1e-3);
@@ -777,14 +1136,14 @@ export class SomaLook {
 		if (beatCount !== this.lastBeat) {
 			const downbeat = beatIndex === 0;
 			this.packet = live
-				? clamp((0.3 + director.bassPunch * 0.6 + this.energy * 0.35 + (downbeat ? 0.25 : 0)) * awake, 0, 1.4)
+				? clamp((0.3 + director.bassPunch * 0.6 + this.energy * 0.35 + (downbeat ? 0.25 : 0)) * awake * (1 - 0.5 * this.mood.calm), 0, 1.4)
 				: 0;
 			this.lastBeat = beatCount;
 		}
 		this.packetPhase = beatPhase;
 
 		const energyRate = 0.55 + this.energy * 0.9;
-		this.sway += dt * energyRate * motionScale;
+		this.sway += dt * energyRate * (0.55 + md.tempo * 0.9) * motionScale;
 		this.fin += dt * Math.PI * 2 * (tempo / 60) * 0.5 * (0.4 + this.energy * 0.7) * motionScale * awake + dt * 0.6;
 
 		// ── Locomotion: waypoint steering inside the shot's volume, jet thrust
@@ -799,7 +1158,9 @@ export class SomaLook {
 		const dy = this.goal[1] - this.pos[1];
 		const dz = this.goal[2] - this.pos[2];
 		const dist = Math.hypot(dx, dy, dz);
-		if (this.waypointAge > 9 + hash01(this.seed, this.waypoint, 9) * 7 || dist < 0.3) {
+		// Calm music drifts to far, rare goals; agitated music darts between them.
+		const hold = lerp(9 + hash01(this.seed, this.waypoint, 9) * 7, 0.8 + hash01(this.seed, this.waypoint, 9) * 0.9, ag) * (1 + calm * 0.6);
+		if (this.waypointAge > hold || dist < 0.3) {
 			this.waypoint += 1;
 			this.waypointAge = 0;
 		}
@@ -813,17 +1174,21 @@ export class SomaLook {
 		const yDwell = floor + below + 0.03;
 		this.goal[1] = lerp(lerp(yLow, yHigh, hash01(this.seed, this.waypoint, 2)), yDwell, dwell);
 		this.goal[2] = (hash01(this.seed, this.waypoint, 3) - 0.5) * 3.6;
-		const speed = (0.08 + this.energy * 0.2) * (1 - dwell * 0.7) * awake * motionScale;
+		const speed =
+			(0.08 + this.energy * 0.2) * lerp(1, 0.5, calm) * (1 + ag * 2.8) * (1 + pulse * 0.3) * (1 - dwell * 0.7) * awake * motionScale;
 		const gx = this.goal[0] - this.pos[0];
 		const gy = this.goal[1] - this.pos[1];
 		const gz = this.goal[2] - this.pos[2];
 		const gl = Math.hypot(gx, gy, gz) || 1;
 		const arrive = Math.min(1, gl / 0.8);
 		const axisY = this.frame.organism.axisY;
-		const thrust = t[A.jet] * squeezing * 0.05 * motionScale;
+		const thrust = t[A.jet] * squeezing * 0.05 * (1 + pulse * 1.5) * motionScale;
+		const steer = lerp(1.6, 0.25, ag) * (1 + calm * 0.6);
 		const desired: Vec3 = [(gx / gl) * speed * arrive, (gy / gl) * speed * arrive, (gz / gl) * speed * arrive];
+		// A dweller settles onto the seabed promptly rather than crawling down to it.
+		desired[1] += clamp(gy * 1.2, -1, 1) * dwell * awake;
 		for (let i = 0; i < 3; i += 1) {
-			this.vel[i] = approach(this.vel[i], desired[i], 1.6, dt) + axisY[i] * thrust * dt;
+			this.vel[i] = approach(this.vel[i], desired[i], i === 1 ? lerp(steer, 0.5, dwell) : steer, dt) + axisY[i] * thrust * dt;
 			this.pos[i] += this.vel[i] * dt;
 		}
 		this.pos[1] = clamp(this.pos[1], Math.min(yLow, yDwell) - 0.3, yHigh + 0.3);
@@ -833,7 +1198,7 @@ export class SomaLook {
 		// ── Orientation: heading follows the horizontal velocity; pitch is the
 		// species' posture plus a lean into the swim.
 		const vh = Math.hypot(this.vel[0], this.vel[2]);
-		if (vh > 0.01) this.heading = approachAngle(this.heading, Math.atan2(this.vel[2], this.vel[0]), 2.2, dt);
+		if (vh > 0.01) this.heading = approachAngle(this.heading, Math.atan2(this.vel[2], this.vel[0]), lerp(2.2, 0.45, ag), dt);
 		this.heading += dt * 0.025 * motionScale;
 		const posture = t[A.pitch];
 		const horizontal = Math.sin(Math.min(Math.PI, posture));
@@ -847,7 +1212,7 @@ export class SomaLook {
 		this.companionPhase += dt * (0.04 + this.energy * 0.05) * motionScale;
 		// ── Camera: the diver follows with lag, orbits slowly with the music.
 		const spec = this.cameraSpec();
-		this.orbit += dt * spec.orbit * (0.35 + this.energy) * motionScale * awake;
+		this.orbit += dt * spec.orbit * (0.35 + this.energy) * (0.5 + md.tempo * 1.2 + pulse * 0.4) * motionScale * awake;
 		const focusAlong = spec.focusAlong * b.extent;
 		// Look at the whole animal (colony included), leaning towards the regime's part.
 		const centre = this.frame.organism.boundCenter;
@@ -857,15 +1222,22 @@ export class SomaLook {
 			centre[2] + (this.pos[2] - this.frame.organism.pos[2]) + axisY[2] * focusAlong
 		];
 		for (let i = 0; i < 3; i += 1) {
-			this.camTarget[i] = approach(this.camTarget[i], target[i], 1.1, dt);
-			this.camBase[i] = approach(this.camBase[i], target[i], 2.2, dt);
+			// A darting animal is followed tightly, so it stays in the shot.
+			this.camTarget[i] = approach(this.camTarget[i], target[i], lerp(1.1, 0.35, ag), dt);
+			this.camBase[i] = approach(this.camBase[i], target[i], lerp(2.2, 0.7, ag), dt);
 		}
-		const pose = this.cameraPose(b.extent * t[A.size]);
+		// Frame the body the animal is becoming, not the one it is leaving, so
+		// the shot lands together with the metamorphosis instead of trailing it.
+		const pose = this.cameraPose(this.bounds(this.target, 1).extent * this.target[A.size]);
 		// A diver cannot whip round the animal: cap the rig's angular speed.
 		const limit = (current: number, next: number, rate: number) => current + clamp(next - current, -rate * dt, rate * dt);
-		this.camAzimuth = limit(this.camAzimuth, approach(this.camAzimuth, pose.azimuth, 2.4, dt), 0.2);
-		this.camElevation = limit(this.camElevation, approach(this.camElevation, pose.elevation, 2.4, dt), 0.12);
-		this.camDistance = approach(this.camDistance, pose.distance, 2.0, dt);
+		// After a shift the diver moves to the new shot faster, still as one glide.
+		const quick = 1 + (Math.max(1, this.genome.glideSpeed) - 1) * 0.4;
+		this.camAzimuth = limit(this.camAzimuth, approach(this.camAzimuth, pose.azimuth, 2.4 / quick, dt), 0.2 * quick);
+		this.camElevation = limit(this.camElevation, approach(this.camElevation, pose.elevation, 2.4 / quick, dt), 0.12 * quick);
+		// A dolly, not a zoom cut: the distance changes by at most ~30% a second.
+		const dolly = approach(this.camDistance, pose.distance, 2.0 / quick, dt);
+		this.camDistance = clamp(dolly, this.camDistance * (1 - 0.3 * dt), this.camDistance * (1 + 0.3 * dt));
 		this.placeEye();
 		this.camAperture = approach(this.camAperture, pose.aperture, 1.5, dt);
 		this.camFocal = approach(this.camFocal, pose.focal, 1.5, dt);
@@ -934,10 +1306,12 @@ export class SomaLook {
 		// Camera basis, with a diver's slow sway and roll.
 		const c = f.camera3;
 		const sway = (a: number, b2: number) => Math.sin(this.clock * a + this.seed * 13 + b2);
+		// Agitated music films hand-held: a faster, smaller shake on top of the drift.
+		const shake = this.mood.agitation * (0.4 + 0.6 * this.energy) * 0.014;
 		const eye: Vec3 = [
-			this.camEye[0] + sway(0.37, 0) * 0.04 + sway(0.11, 2) * 0.05,
-			this.camEye[1] + sway(0.29, 1) * 0.03,
-			this.camEye[2] + sway(0.23, 4) * 0.04
+			this.camEye[0] + sway(0.37, 0) * 0.04 + sway(0.11, 2) * 0.05 + sway(3.1, 5) * shake,
+			this.camEye[1] + sway(0.29, 1) * 0.03 + sway(3.7, 6) * shake,
+			this.camEye[2] + sway(0.23, 4) * 0.04 + sway(2.9, 7) * shake
 		];
 		const fwd = normalize([this.camTarget[0] - eye[0], this.camTarget[1] - eye[1], this.camTarget[2] - eye[2]]);
 		const right = normalize(cross(fwd, [0, 1, 0], [0, 0, 0]));
@@ -976,6 +1350,12 @@ export class SomaLook {
 		m.mid = this.mid;
 		m.treble = this.treble;
 		for (let i = 0; i < 6; i += 1) f.lifecycle[i] = this.lifecycle[i];
+		// Agitation sheds fragments: spores torn off into the water.
+		m.shed = Math.max(m.shed, this.mood.agitation * 0.8);
+		Object.assign(f.mood, this.mood);
+		f.flow.snow = this.snowPhase;
+		f.flow.shiver = this.shiverPhase;
+		f.flow.light = 0.8 + this.mood.mass * 0.3 + this.mood.pulse * 0.3 + this.energy * 0.2;
 		let form = 0;
 		for (let i = 1; i < 6; i += 1) if (this.lifecycle[i] > this.lifecycle[form]) form = i;
 		f.names.species = SOMA_SPECIES[f.species.mix >= 0.5 ? f.species.to : f.species.from].name;

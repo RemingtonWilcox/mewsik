@@ -77,6 +77,25 @@ fn aspect() -> f32 {
 	return params.view.x / max(params.view.y, 1.0);
 }
 
+fn hash11(n: f32) -> f32 {
+	return fract(sin(n * 127.1 + 311.7) * 43758.5453);
+}
+
+// Rough music breaks the beam: the stroke is cut into fragments that crawl
+// along it, a few left lit at full strength, the rest dark. 1 means whole.
+fn fractureGate(along: f32, cells: f32, salt: f32) -> f32 {
+	let amount = clamp(params.voice.x, 0.0, 1.0);
+	if (amount < 0.002) {
+		return 1.0;
+	}
+	let cell = along * cells + params.voice.z;
+	let id = floor(cell);
+	let f = fract(cell);
+	let keep = step(amount * 0.32, hash11(id + salt * 17.0));
+	let edges = smoothstep(0.0, 0.1, f) * (1.0 - smoothstep(0.9, 1.0, f));
+	return mix(1.0, keep * mix(1.0, edges, 0.8) * 1.9 + 0.025, amount);
+}
+
 fn toNdc(p: vec2<f32>) -> vec2<f32> {
 	return vec2<f32>(p.x / aspect(), p.y);
 }
@@ -455,7 +474,8 @@ fn vs_main(
 		let screen = params.figureB.w;
 		if (which == 0u) {
 			s.color = heroRgb;
-			s.intensity = heroLevel * dwell * (0.5 + depth * 0.6) * (0.62 + comet * 0.55) * params.figureA.w;
+			s.intensity = heroLevel * dwell * (0.5 + depth * 0.6) * (0.62 + comet * 0.55) * params.figureA.w
+				* fractureGate(u, 46.0, 0.0);
 			s.halfWidth = (0.8 + energy * 0.25 + depth * 0.4) * stroke * pixelScale;
 			s.hot = mix(heroRgb, hotRgb, 0.7) * spot * (0.5 + beat * 1.5 + params.pulse.x) * params.hotColor.w;
 		} else {
@@ -465,7 +485,7 @@ fn vs_main(
 			let ghostLevel = (0.06 + spread * 0.24) * (0.45 + depth * 0.55);
 			let screenLevel = (0.5 + depth * 0.6) * (0.62 + comet * 0.55);
 			s.color = mix(mix(heroRgb, horizonRgb, 0.55), heroRgb, screen * 0.6);
-			s.intensity = heroLevel * dwell * mix(ghostLevel, screenLevel * 0.85, screen);
+			s.intensity = heroLevel * dwell * mix(ghostLevel, screenLevel * 0.85, screen) * fractureGate(u, 46.0, 1.0);
 			s.halfWidth = mix(0.7 + depth * 0.25, 0.8 + depth * 0.4, screen) * stroke * pixelScale;
 			s.hot = mix(heroRgb, hotRgb, 0.7) * spot * (0.5 + beat * 1.5) * params.hotColor.w * screen;
 		}
@@ -493,7 +513,7 @@ fn vs_main(
 		let behindHero = mix(0.3, 1.0, smoothstep(0.35, 1.25, heroDistance));
 		s.intensity = visibility * tail * behindHero * (1.0 - wraps)
 			* (0.5 + level * 0.6 + energy * 0.2) * (1.0 - silence * 0.4) * gain
-			* (1.0 + headLight(mid) * 0.6);
+			* (1.0 + headLight(mid) * 0.6) * fractureGate(s.along, 22.0, f32(k) + 3.0);
 		s.halfWidth = (0.95 + level * 0.3) * stroke * pixelScale;
 		let flare = select(level * 0.6, 0.5 + beat * 1.2, k < 2u);
 		s.hot = mix(traceRgb, hotRgb, 0.5) * tip * visibility * flare * 1.6 * (1.0 - wraps);
@@ -591,7 +611,8 @@ fn vs_main(
 		let radar = params.rings.w * a.ring * (exp(-behindArm * 2.6) * 2.1 - 0.9);
 		s.intensity = fadeIn * fadeOut * edge * (0.05 + max(value.x, 0.0) * 1.4) * (0.45 + age * 0.55)
 			* (1.0 - silence * 0.5) * min(a.valid, b.valid) * gain * params.surface.w
-			* max(1.0 + light * 1.4 + radar, 0.06) * surfaceGain(rowMix);
+			* max(1.0 + light * 1.4 + radar, 0.06) * surfaceGain(rowMix)
+			* fractureGate(u, 30.0, f32(row) + 7.0);
 		s.halfWidth = (0.55 + age * 0.75) * stroke * pixelScale;
 		// The newest row flashes as it is written on the beat tick, and beat
 		// stamps from the beam head ride the rows down the horizon.
@@ -624,8 +645,10 @@ fn vs_main(
 @fragment
 fn fs_main(in: TraceOut) -> @location(0) vec4<f32> {
 	let r = abs(in.local.y) * 3.0;
-	let core = exp(-r * r * 1.6);
-	let halo = exp(-r * r * 0.25) * 0.1;
+	// Punchy music etches a hard core; soft music glows wide and low.
+	let sharp = clamp(params.voice.y, 0.0, 1.0);
+	let core = exp(-r * r * mix(0.95, 3.0, sharp));
+	let halo = exp(-r * r * mix(0.17, 0.4, sharp)) * mix(0.16, 0.05, sharp);
 	// Emissive core: the colour role at HDR intensity with a little white in
 	// the very centre, never a bleached white line.
 	let body = in.color * (core * 1.35 + halo) * in.intensity;
@@ -688,11 +711,16 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let scene = textureSampleLevel(sceneTexture, linearSampler, in.uv, 0.0);
 	// Per-element persistence: the class stored in alpha picks between the
 	// long figure phosphor and the fast phosphor used by traces and rows.
-	let fade = mix(params.post.y, params.post.x, clamp(previous.a, 0.0, 1.0));
+	let luma = vec3<f32>(0.3, 0.5, 0.2);
+	let classFade = mix(params.post.y, params.post.x, clamp(previous.a, 0.0, 1.0));
+	// Persistence comes from the energy the beam left: a hard-driven spot of
+	// phosphor glows on longer than a faint one, so bright strokes leave long
+	// tails and dim ones die fast instead of every trail fading alike.
+	let held = smoothstep(0.04, 1.6, dot(previous.rgb, luma));
+	let fade = pow(max(classFade, 0.0), mix(1.3, 0.8, held));
 	let persistRgb = params.heroColor.rgb;
 	let tint = mix(vec3<f32>(1.0), persistRgb / max(max(persistRgb.r, persistRgb.g), max(persistRgb.b, 0.001)), 0.035);
 	let trail = previous.rgb * fade * tint * border;
-	let luma = vec3<f32>(0.3, 0.5, 0.2);
 	let sceneWins = dot(scene.rgb, luma) >= dot(trail, luma);
 	let persistClass = select(previous.a, scene.a, sceneWins);
 	return vec4<f32>(max(trail, scene.rgb), persistClass);
@@ -867,13 +895,26 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let centered = in.uv - 0.5;
 	let r2 = dot(centered, centered);
 
-	// Lens: tube curvature and chromatic aberration growing with r squared,
-	// flaring on impacts.
-	let warped = 0.5 + centered * (1.0 + r2 * params.display.z);
-	// The tube face ends where curvature pushes past the glass: black, not
-	// a smeared copy of the last row of pixels.
-	let tubeEdge = min(min(warped.x, warped.y), min(1.0 - warped.x, 1.0 - warped.y));
-	let tube = smoothstep(0.0, 0.006, tubeEdge);
+	// ---- Tube geometry ------------------------------------------------------
+	// The frame is the face of one curved tube. The phosphor sits on the inside
+	// of a glass cap, so the picture barrels with the curvature, and the face
+	// ends in rounded corners where the glass meets the bezel.
+	let curvature = params.display.z;
+	let warped = 0.5 + centered * (1.0 + r2 * curvature);
+	let p = vec2<f32>((warped.x - 0.5) * 2.0 * aspectRatio, (0.5 - warped.y) * 2.0);
+	let pixel = 2.0 / max(resolution.y, 1.0);
+	let faceHalf = vec2<f32>(aspectRatio, 1.0) - vec2<f32>(0.006);
+	let faceD = sdRoundBox(p, faceHalf, params.tube.x);
+	let tube = 1.0 - smoothstep(-pixel * 2.0, pixel * 1.5, faceD);
+	// Glass normal: a spherical cap whose tilt grows toward the rim. The angle
+	// sets both the light falloff across the face (obliquity) and how much of
+	// the room the glass reflects (Fresnel). This is the only vignette.
+	let rim = length(centered * vec2<f32>(aspectRatio * 0.8, 1.0)) * 2.0;
+	let tiltSin = clamp(rim * (0.22 + curvature * 1.6) * (0.7 + params.display2.z), 0.0, 0.95);
+	let cosTheta = sqrt(1.0 - tiltSin * tiltSin);
+	let obliquity = pow(cosTheta, 2.0 + params.display2.z * 5.0);
+	let fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
+
 	let caAmount = (0.0004 + r2 * 0.003) * params.display2.y * (1.0 + params.pulse.x * 1.6 + params.pulse.z * 0.6);
 	let direction = normalize(centered + vec2<f32>(1e-4, 1e-4));
 	let phosphor = vec3<f32>(
@@ -881,24 +922,35 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		textureSampleLevel(phosphorTexture, linearSampler, warped, 0.0).g,
 		textureSampleLevel(phosphorTexture, linearSampler, warped - direction * caAmount, 0.0).b
 	);
-	let bloom = textureSampleLevel(bloomTexture, linearSampler, warped, 0.0).rgb * params.display2.x;
+	// Halation: beam light scattered inside the faceplate. Soft-cored music
+	// scatters wider (voice.w), which is what the bloom gain carries.
+	let halation = params.display2.x * (0.7 + params.voice.w * 0.7);
+	let bloom = textureSampleLevel(bloomTexture, linearSampler, warped, 0.0).rgb * halation;
 	let bloomLum = dot(bloom, vec3<f32>(0.3, 0.5, 0.2));
 
-	// Scope space: x across -aspect..aspect, y up -1..1.
-	let p = vec2<f32>((warped.x - 0.5) * 2.0 * aspectRatio, (0.5 - warped.y) * 2.0);
-	let pixel = 2.0 / max(resolution.y, 1.0);
+	// The light the instrument puts into the room: the mean of the bloom over
+	// the face. Everything that is not phosphor (glass, graticule, bezel, the
+	// bench) is lit by this and by the local beam light, and by nothing else.
+	var spill = vec3<f32>(0.0);
+	for (var iy = 0u; iy < 3u; iy = iy + 1u) {
+		for (var ix = 0u; ix < 4u; ix = ix + 1u) {
+			let at = vec2<f32>((f32(ix) + 0.5) / 4.0, (f32(iy) + 0.5) / 3.0);
+			spill = spill + textureSampleLevel(bloomTexture, linearSampler, at, 0.0).rgb;
+		}
+	}
+	spill = spill / 12.0 * params.display2.x * params.tube.z;
+	let spillLum = dot(spill, vec3<f32>(0.3, 0.5, 0.2));
+
 	let heroRgb = params.heroColor.rgb;
 	let horizonRgb = params.horizonColor.rgb;
-	let hotRgb = params.hotColor.rgb;
 
 	// Room values are display-referred (added after tone mapping) so the
 	// darks stay controllable instead of being crushed by the ACES toe.
 	var room = params.roomColor.rgb;
 
-	// One light: the beam head. It lights the glass, the grid and the bench.
+	// The beam head is the brightest light on the bench.
 	let headDistance = length((p - params.head.yz) * vec2<f32>(0.85, 1.0));
 	let headPool = exp(-headDistance * 2.4) * params.head.w;
-	let figureGlow = exp(-length((p - params.figureA.xy) * vec2<f32>(0.7, 1.0)) / max(params.figureA.z, 0.1) * 0.9);
 
 	let faceA = scopeFace(p, params.faceA.xy, params.faceA.zw, params.faceAStyle.x, params.faceAStyle.y, params.faceAStyle.z, params.faceBStyle.y, pixel);
 	let faceB = scopeFace(p, params.faceB.xy, params.faceB.zw, params.faceBStyle.x, 1.0, 0.0, params.faceBStyle.z, pixel);
@@ -910,25 +962,37 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let bezel = max(faceA.bezel * visA, faceB.bezel * visB);
 	let glass = max(faceA.glass * visA, faceB.glass * visB);
 
-	// Screens are a shade lighter than the bench and carry the figure's glow.
-	room = room + heroRgb * inside * (0.004 + figureGlow * (0.01 + params.tone.x * 0.008));
-	room = room + heroRgb * figureGlow * (1.0 - inside) * 0.004;
-	let gridLight = params.post.w * (0.026 + bloomLum * 0.35 + headPool * 0.09 + params.pulse.z * 0.05);
-	room = room + mix(heroRgb, vec3<f32>(0.7, 0.85, 0.8), 0.4) * grid * gridLight;
-	room = room + mix(heroRgb, vec3<f32>(0.8), 0.5) * frame * (0.012 + headPool * 0.03);
-	// Bezel: dark plastic with a faint top highlight and glass edge glint.
-	let bezelShade = vec3<f32>(0.016, 0.017, 0.019) * (0.8 + smoothstep(-0.6, 0.9, p.y) * 0.5);
-	room = mix(room, bezelShade + heroRgb * headPool * 0.01, bezel * 0.92);
-	room = room + vec3<f32>(0.012, 0.014, 0.015) * glass * params.display2.w;
+	// Local light: the halation here plus the beam head's pool and the room
+	// spill. The etched graticule and the screen rims only exist where this
+	// light reaches them; with the beam off they are gone.
+	// A wide light field around this point: the strokes within a hand's
+	// width light the glass and the etching, falling off with distance.
+	var field = vec3<f32>(0.0);
+	for (var k = 0u; k < 12u; k = k + 1u) {
+		let angle = f32(k) * 0.5236 + select(0.0, 0.26, k >= 6u);
+		let radius = select(0.07, 0.17, k >= 6u);
+		let at = warped + vec2<f32>(cos(angle) / aspectRatio, sin(angle)) * radius;
+		field = field + textureSampleLevel(bloomTexture, linearSampler, clamp(at, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).rgb;
+	}
+	field = field / 12.0 * params.display2.x;
+	let localLight = bloom * 0.5 + field * 1.4 + heroRgb * headPool * 0.05 * params.tone.x + spill * 0.8;
+	let localLum = dot(localLight, vec3<f32>(0.3, 0.5, 0.2));
+	// The phosphor coat is pale grey: it shows faintly where light lands on it.
+	room = room + localLight * inside * 0.12;
+	let etch = mix(heroRgb, vec3<f32>(0.75, 0.85, 0.8), 0.4);
+	room = room + etch * grid * params.post.w * sqrt(localLum * 0.2) * (0.6 + params.pulse.z * 0.3);
+	room = room + mix(heroRgb, vec3<f32>(0.8), 0.5) * frame * sqrt(localLum * 0.2) * 0.5;
+	// Bezel plastic: near-black, catching only the spill and the halation,
+	// a little more on its upper lip that faces the screen.
+	let lip = 0.7 + smoothstep(-0.6, 0.9, p.y) * 0.5;
+	let bezelLit = (spill * 0.3 + field * 0.3 + bloom * 0.12) * lip;
+	room = mix(room, bezelLit, bezel * 0.92);
+	room = room + localLight * glass * params.display2.w * 0.08;
 
-	// Horizon seam and haze: only benches with a floor carry them.
+	// Horizon seam: the bench edge glints only where the instrument lights it.
 	let seamY = params.floor.z;
-	let seam = exp(-sq((p.y - seamY) / (pixel * 2.5))) * exp(-sq(p.x - params.head.y) * 0.12) * params.floor.w;
-	room = room + mix(horizonRgb, heroRgb, 0.3) * seam * (0.035 + params.bandsA.x * 0.05 + params.pulse.z * 0.08 + headPool * 0.05);
-	let hazeShape = exp(-sq((p.y - seamY - 0.08) * 2.6)) * exp(-sq(p.x - params.head.y) * 0.14) * params.floor.w;
-	room = room + horizonRgb * hazeShape * (0.01 + params.bandsA.x * 0.012 + params.tone.x * 0.006) * params.roomColor.w;
-	// The bench itself takes a pool of light under the beam.
-	room = room + heroRgb * headPool * 0.012;
+	let seam = exp(-sq((p.y - seamY) / (pixel * 2.5))) * params.floor.w;
+	room = room + mix(horizonRgb, heroRgb, 0.3) * seam * (bloomLum * 0.5 + spillLum * 0.8);
 
 	// Polished floor glass: the screens reflect, blurred and fading with
 	// distance below the reflection line.
@@ -940,24 +1004,32 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let depth = max(reflectY - p.y, 0.0);
 	let reflectionFade = exp(-depth * 2.4) * select(0.0, 1.0, p.y < reflectY) * params.floor.y;
 
-	// Glass sheen: a very faint curved reflection across the screens.
-	let sheen = exp(-sq(length((p - vec2<f32>(-0.55 * aspectRatio, 0.75)) * vec2<f32>(0.6, 1.4)) - 0.55) * 60.0);
-	room = room + vec3<f32>(0.01, 0.016, 0.016) * sheen * inside * params.display2.w;
+	// Front glass. The room is dark, so all the glass can reflect is the room
+	// lit by the screen itself: a broad soft image of the spill, brightest
+	// toward the rim where Fresnel climbs and toward the top, like a ceiling
+	// lit from below. The faceplate thickness also throws a faint ghost of the
+	// bright strokes, displaced outward from the tube axis.
+	let roomImage = spill * (0.45 + 0.55 * smoothstep(-1.0, 0.9, p.y));
+	let glassReflection = roomImage * fresnel * params.tube.y * 4.0;
+	let ghostUv = 0.5 + (warped - 0.5) * (1.012 + curvature * 0.06);
+	let ghost = textureSampleLevel(bloomTexture, linearSampler, ghostUv, 0.0).rgb * params.tube.w * params.display2.x;
 
-	let vignetteShape = 1.0 - smoothstep(0.45, 1.25, length(centered * vec2<f32>(aspectRatio * 0.9, 1.0)) * 1.15);
-	let vignette = 1.0 - params.display2.z * (1.0 - vignetteShape);
-	let exposure = 0.95 + params.tone.x * 0.12;
-	let emissive = (phosphor + bloom * (0.85 + params.tone.x * 0.25) + reflection * reflectionFade * 0.6) * tube;
+	let exposure = 1.22 + params.tone.x * 0.12;
+	let emissive = (phosphor + bloom * (0.85 + params.tone.x * 0.25) + reflection * reflectionFade * 0.6 + ghost) * obliquity * tube;
 	// Raster: scanlines whose pitch and depth are the tube's character.
 	let period = mix(5.0, 2.0, params.display.x);
 	let scanDepth = max(params.display.y, 0.02);
 	let scan = 1.0 - scanDepth * (0.5 - 0.5 * cos(TAU * in.uv.y * resolution.y / period));
-	var color = aces(emissive * exposure * scan) * (0.7 + vignette * 0.3) + room * (0.55 + vignette * 0.45);
+	var color = aces(emissive * exposure * scan) + (room * (0.55 + obliquity * 0.45) + glassReflection) * tube;
+	// Outside the face: the bezel surround, lit only by the spill.
+	color = color + spill * 0.05 * (1.0 - tube) * lip;
 	// Gentle gamma contrast keeps blacks deep without clipping the room.
 	color = pow(max(color, vec3<f32>(0.0)), vec3<f32>(1.06)) * 1.03;
 	let frameIndex = floor(params.view.z * 60.0);
-	let grain = (hash12(in.uv * resolution + vec2<f32>(frameIndex * 13.1, frameIndex * 7.7)) - 0.5) * params.display.w;
-	color = color + vec3<f32>(grain) * (0.6 + vignette * 0.4);
+	// Tube grain rides on light: shot noise shows where the phosphor glows.
+	let grainLight = 0.3 + 0.7 * smoothstep(0.0, 0.2, dot(color, vec3<f32>(0.3, 0.5, 0.2)));
+	let grain = (hash12(in.uv * resolution + vec2<f32>(frameIndex * 13.1, frameIndex * 7.7)) - 0.5) * params.display.w * grainLight;
+	color = color + vec3<f32>(grain) * tube;
 	color = color + (ign(in.uv * resolution, fract(params.view.z) * 60.0) - 0.5) * (1.3 / 255.0);
 	return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);
 }

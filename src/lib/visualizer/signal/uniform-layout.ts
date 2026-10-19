@@ -52,7 +52,12 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['display2', ['bloomGain', 'aberration', 'vignette', 'glass']],
 	['post', ['feedbackFade', 'floorFade', 'bloomThreshold', 'gridLevel']],
 	['floor', ['reflectY', 'reflect', 'seamY', 'seam']],
-	['context', ['gridDensity', 'sectionProgress', 'figurePhase', 'tempo']]
+	['context', ['gridDensity', 'sectionProgress', 'figurePhase', 'tempo']],
+	// The music's character as an instrument: broken beam, stroke core, crawl.
+	['voice', ['fracture', 'sharpness', 'fracturePhase', 'halation']],
+	// Tube geometry: face corner radius, glass reflectance, light spilled into
+	// the room, ghost from the glass thickness.
+	['tube', ['tubeRadius', 'glassReflect', 'roomSpill', 'glassGhost']]
 ] as const;
 
 type Group = (typeof SIGNAL_UNIFORM_GROUPS)[number];

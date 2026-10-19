@@ -102,7 +102,19 @@ export type SignalPaletteContext = {
 	energy: number;
 	/** -1 cool .. 1 warm era grade. */
 	warmth: number;
+	/**
+	 * -1 cool .. 1 warm phosphor temperature from the music (see voice.ts).
+	 * Unlike the hue lean this pulls every role toward one warm or cool hue,
+	 * so an acoustic set burns amber-ish and an ambient one runs cold in any
+	 * family. Optional; 0 leaves the family as authored.
+	 */
+	temperature?: number;
 };
+
+// OKLab chroma directions the temperature pulls toward: sodium amber and a
+// cold cyan-blue.
+const WARM_AB: readonly [number, number] = [0.32, 0.95];
+const COOL_AB: readonly [number, number] = [-0.55, -0.83];
 
 const ROLES = ['hero', 'trace', 'horizon', 'hot'] as const;
 
@@ -118,11 +130,28 @@ export function resolveSignalPalette(
 	const t = Math.min(1, Math.max(0, mix));
 	// Major keys lean warm, minor cool; the genome adds its own small lean.
 	const angle = context.hueLean * 0.16 + context.mode * 0.05 + context.warmth * 0.06;
-	const chroma = 0.9 + context.energy * 0.14;
+	const chroma = 1 + context.energy * 0.12;
 	for (const role of ROLES) {
 		const la = toLab(a[role]);
 		const lb = toLab(b[role]);
 		const blended: Lab = [la[0] + (lb[0] - la[0]) * t, la[1] + (lb[1] - la[1]) * t, la[2] + (lb[2] - la[2]) * t];
+		const temperature = Math.max(-1, Math.min(1, context.temperature ?? 0));
+		if (temperature !== 0) {
+			// Turn the hue toward amber or cold blue along the shorter arc and
+			// keep the colourfulness, so the lean never passes through grey.
+			const direction = temperature > 0 ? WARM_AB : COOL_AB;
+			const pull = Math.abs(temperature) * (role === 'hot' ? 0.3 : 0.6);
+			// Near-grey roles gain a little colour as the lean grows (from zero,
+			// so the lean never switches on with a jump).
+			const own = Math.hypot(blended[1], blended[2]);
+			const c = own + Math.max(0, 0.09 - own) * pull;
+			const hue = Math.atan2(blended[2], blended[1]);
+			const goal = Math.atan2(direction[1], direction[0]);
+			const delta = Math.atan2(Math.sin(goal - hue), Math.cos(goal - hue));
+			const turned = hue + delta * pull;
+			blended[1] = Math.cos(turned) * c;
+			blended[2] = Math.sin(turned) * c;
+		}
 		const rgb = fromLab(lean(blended, role === 'hot' ? angle * 0.5 : angle, role === 'hot' ? 1 : chroma));
 		const peak = Math.max(rgb[0], rgb[1], rgb[2], 1e-4);
 		// Keep each role at full value so the shader owns brightness.
@@ -132,11 +161,11 @@ export function resolveSignalPalette(
 		target[2] = rgb[2] / peak;
 	}
 	out.gain = a.gain + (b.gain - a.gain) * t;
-	// The room takes a whisper of the horizon role over a near-black base, and
-	// warms or cools with the era grade.
-	const warm = context.warmth;
-	out.room[0] = 0.006 + out.horizon[0] * 0.006 + Math.max(0, warm) * 0.003;
-	out.room[1] = 0.009 + out.horizon[1] * 0.008;
-	out.room[2] = 0.009 + out.horizon[2] * 0.008 + Math.max(0, -warm) * 0.003;
+	// The room is dark: only the light the instrument throws lights it (the
+	// composite does that). This is the faint floor of a real blackout room,
+	// a breath of the horizon role so the black is not digital zero.
+	out.room[0] = 0.0015 + out.horizon[0] * 0.0015;
+	out.room[1] = 0.0018 + out.horizon[1] * 0.0018;
+	out.room[2] = 0.002 + out.horizon[2] * 0.0018;
 	return out;
 }

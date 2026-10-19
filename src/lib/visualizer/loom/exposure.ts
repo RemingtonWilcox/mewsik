@@ -33,9 +33,9 @@ export type LoomExposureInput = {
 	/** 0..1 fraction of chorus strands shown. */
 	strandCount: number;
 	/** Tone coefficients (see LOOM_TONES in look.ts). */
-	tone: { emission: number; paper: number; room: number; bloom: number; trail: number };
-	/** Environment brightness terms. */
-	env: { sky: number; fog: number; walls: number; floorMirror: number };
+	tone: { emission: number; room: number; bloom: number; trail: number };
+	/** Environment terms that add light to the frame (scattered or reflected). */
+	env: { mist: number; threads: number; dust: number; reflect: number };
 };
 
 export type LoomExposure = {
@@ -134,7 +134,6 @@ export function resolveLoomExposure(input: LoomExposureInput, out: LoomExposure)
 	const density = clamp(input.density, 0, 1);
 	const strands = clamp(input.strandCount, 0, 1);
 	const tone = input.tone;
-	const paper = clamp(tone.paper, 0, 1);
 
 	// Palette normalisation: the same perceived intensity whatever the family,
 	// so a white-hot family is not twice as bright as a deep one.
@@ -169,14 +168,14 @@ export function resolveLoomExposure(input: LoomExposureInput, out: LoomExposure)
 	const rawLight = paletteLight * materialLight * (0.7 + tone.emission * 0.3) * (1 + busy * 0.6);
 	out.rawLight = rawLight;
 
-	// Room: dense palettes of haze lift the whole frame; keep the room behind
-	// the figure, and lift it on purpose only in the mid-key tone.
+	// Medium: the family's haze is the albedo tint of the mist, normalised so a
+	// deep haze colour does not starve the scattering; thicker tones scatter more.
 	const hazeLight = loomColourIntensity(input.haze) + 1e-3;
 	const roomBase = clamp(0.22 / hazeLight, 0.4, 1.3) * (1 - busy * 0.3);
-	out.hazeGain = clamp(roomBase * (1 + tone.room * 1.6) * (1 - paper * 0.6), 0.25, 3);
+	out.hazeGain = clamp(roomBase * (1 + clamp(tone.room, 0, 1) * 1.6), 0.25, 3);
 	out.glowGain = clamp((0.9 / (loomColourIntensity(input.glow) + 0.2)) * (1 - busy * 0.25), 0.4, 1.1);
 
-	const envLight = input.env.sky * 0.15 + input.env.fog * 0.15 + input.env.walls * 0.2 + input.env.floorMirror * 0.06;
+	const envLight = input.env.mist * 0.15 + input.env.threads * 0.05 + input.env.dust * 0.05 + input.env.reflect * 0.06;
 	out.envGain = clamp(0.92 - envLight * 0.12 - busy * 0.06, 0.7, 1);
 
 	// Bloom is an accent: lighter looks bloom less and from a higher knee.

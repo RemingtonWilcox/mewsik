@@ -6,7 +6,7 @@
 // Usage:
 //   VIS_ENGINE=loom node scripts/visual-cut-detector.mjs <label>
 // Env:
-//   VIS_ENGINE   mk1 | mk2 | signal | loom        (default loom)
+//   VIS_ENGINE   mk1 | mandala | mk2 | signal | loom (default loom)
 //   VIS_SEED     lab seed                          (default soma-qa)
 //   VIS_PROFILE  first track profile               (default club128)
 //   VIS_MINUTES  how long to record                (default 3)
@@ -39,7 +39,8 @@ const ENGINE_CANVAS = {
 	mk1: ['Prism audio visualizer', 'data-prism-ready'],
 	mk2: ['Soma audio visualizer', 'data-soma-ready'],
 	signal: ['Signal audio visualizer', 'data-signal-ready'],
-	loom: ['Loom audio visualizer', 'data-loom-ready']
+	loom: ['Loom audio visualizer', 'data-loom-ready'],
+	mandala: ['Mandala audio visualizer', 'data-mandala-ready']
 };
 const [canvasLabel, readyAttribute] = ENGINE_CANVAS[engine] ?? ENGINE_CANVAS.loom;
 const outDir = `output/${engine}-cuts-${label}`;

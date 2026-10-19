@@ -583,7 +583,7 @@ test.describe('Loom harmony conductor', () => {
 			let hierarchyBroken = 0;
 			const raw: number[] = [];
 			const normalised: number[] = [];
-			const env = { sky: 0.3, fog: 0.2, walls: 0, floorMirror: 1 };
+			const env = { mist: 0.3, threads: 1, dust: 0.4, reflect: 1 };
 			for (const family of look.LOOM_PALETTES) {
 				for (const material of look.LOOM_MATERIALS) {
 					for (const grammar of look.LOOM_GRAMMARS) {
@@ -825,5 +825,85 @@ test.describe('Loom harmony conductor', () => {
 			};
 		});
 		expect(result).toEqual({ loudGlowLeads: true, quietInkBeatsLoud: true, allPositive: true });
+	});
+	test('a character shift is answered once, survives a new source, and the weave follows the music', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const { LoomLook, LOOM_ENVIRONMENTS } = await import('/src/lib/visualizer/loom/look.ts');
+			const { LoomConductor } = await import('/src/lib/visualizer/loom/conductor.ts');
+			const character = (over: Record<string, number>) => ({
+				vector: new Float32Array(8),
+				tempo: 0.5,
+				energy: 0.4,
+				brightness: 0.5,
+				bass: 0.5,
+				noise: 0.4,
+				punch: 0.3,
+				motion: 0.5,
+				valence: 0.6,
+				contrast: 0,
+				shift: 0,
+				shiftSerial: 0,
+				shiftStrength: 0,
+				sinceShift: 1e6,
+				...over
+			});
+			// Medians the shared tracker reports for the lab's ambient and noise rock.
+			const ambient = { tempo: 0.03, energy: 0.26, brightness: 0.65, bass: 0.32, noise: 0.24, punch: 0.07, valence: 0.66 };
+			const noise = { tempo: 0.93, energy: 0.4, brightness: 0.87, bass: 0.12, noise: 0.89, punch: 0.15, valence: 0.61 };
+			const ambientCues = { centroid: 0.16, motion: 0.0, air: 0.82 };
+			const noiseCues = { centroid: 0.21, motion: 0.43, air: 0.91 };
+			const look = new LoomLook('shift-contract');
+			const step = (c: any, listen: any, frames: number) => {
+				let frame: any;
+				for (let i = 0; i < frames; i += 1) {
+					frame = look.advance({ phraseIndex: 3, sectionKey: 'verse', energy: 0.5, mode: 0.2, key: 0.4, dt: 1 / 30, character: c, listen });
+				}
+				return frame;
+			};
+			const calm = step(character(ambient), ambientCues, 90);
+			const calmWeave = { ...calm.weave };
+			const before = JSON.stringify(calm.names);
+			const mutationsBefore = look.genome.mutations;
+			// Noise rock arrives: a strength-1 shift fires once.
+			const loud = character({ ...noise, shiftSerial: 1, shiftStrength: 1, shift: 1, sinceShift: 0 });
+			const after1s = step(loud, noiseCues, 30);
+			const mutationsAfterShift = look.genome.mutations;
+			const after3s = step(loud, noiseCues, 60);
+			const answered = look.answeredShift;
+			const mutationsSettled = look.genome.mutations;
+			// A new source rebuilds the conductor on the same journey-owned look:
+			// the shift it already answered must not fire again.
+			const conductor = new LoomConductor('next-source', look);
+			const frame: any = structuredClone(fixtures.director);
+			frame.clock.phraseIndex = 3;
+			frame.section = 'verse';
+			for (let i = 0; i < 30; i += 1) conductor.update(frame, fixtures.spectrum as any, 1 / 30, loud as any);
+			return {
+				answered,
+				shifted: mutationsAfterShift > mutationsBefore,
+				onlyOnce: mutationsSettled === mutationsAfterShift,
+				noRepeatAfterRemount: look.genome.mutations === mutationsSettled,
+				changedBy3s: JSON.stringify(after3s.names) !== before,
+				environmentKnown: LOOM_ENVIRONMENTS.some((e: any) => e.name === after3s.names.environment),
+				calmWeave,
+				loudWeave: { ...after3s.weave },
+				midFlow: after1s.weave.flow
+			};
+		}, FIXTURES);
+		expect(result.answered).toBe(1);
+		expect(result.shifted).toBe(true);
+		expect(result.onlyOnce).toBe(true);
+		expect(result.noRepeatAfterRemount).toBe(true);
+		expect(result.changedBy3s).toBe(true);
+		expect(result.environmentKnown).toBe(true);
+		// Fast, noisy music flows faster, frays and churns; the weave glides there.
+		expect(result.loudWeave.flow).toBeGreaterThan(result.calmWeave.flow + 0.8);
+		expect(result.midFlow).toBeGreaterThan(result.calmWeave.flow);
+		expect(result.midFlow).toBeLessThan(result.loudWeave.flow + 1e-6);
+		expect(result.loudWeave.fray).toBeGreaterThan(result.calmWeave.fray + 0.3);
+		expect(result.loudWeave.turbulence).toBeGreaterThan(result.calmWeave.turbulence + 0.3);
+		// Ambient has more bass weight here than this noise track.
+		expect(result.calmWeave.weight).toBeGreaterThan(result.loudWeave.weight);
 	});
 });
