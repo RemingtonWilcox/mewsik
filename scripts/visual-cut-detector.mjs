@@ -10,6 +10,8 @@
 //   VIS_SEED     lab seed                          (default soma-qa)
 //   VIS_PROFILE  first track profile               (default club128)
 //   VIS_MINUTES  how long to record                (default 3)
+//   VIS_NEW_SOURCE=1  every track is a new source, like songs in the app
+//                (default: tracks continue one source, like a radio stream)
 //   VIS_BASE_URL dev server (default http://127.0.0.1:5173). Use a
 //                non-watching server while others edit files: HMR reloads
 //                restart the song and are themselves cuts.
@@ -49,7 +51,7 @@ try {
 	const page = await browser.newPage({ viewport: { width: 960, height: 600 } });
 	let loads = 0;
 	page.on('load', () => (loads += 1));
-	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&seed=${seed}&song=1&chrome=0`);
+	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&seed=${seed}&song=1${process.env.VIS_NEW_SOURCE === '1' ? '&newsource=1' : ''}&chrome=0`);
 	await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 20_000 });
 	await page.waitForFunction(
 		([labelText, attribute]) => {

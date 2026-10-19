@@ -116,6 +116,11 @@ type ChoiceRuntime = {
 	held: number;
 	/** Optional per-option pick weights (see setWeights). */
 	weights: readonly number[] | null;
+	/**
+	 * A pick made while a crossfade was still running. It starts when the
+	 * current fade completes, so a retarget never drops a half-shown option.
+	 */
+	pending: number | null;
 };
 
 export class VariationGenome {
@@ -171,7 +176,8 @@ export class VariationGenome {
 					mix: 1,
 					history: [option],
 					held: 0,
-					weights: null
+					weights: null,
+					pending: null
 				});
 			}
 		});
@@ -237,6 +243,10 @@ export class VariationGenome {
 		}
 		for (const state of this.choices.values()) {
 			if (state.mix < 1) state.mix = Math.min(1, state.mix + dt / Math.max(0.05, state.axis.tau));
+			if (state.mix >= 1 && state.pending !== null) {
+				this.startCrossfade(state, state.pending);
+				state.pending = null;
+			}
 		}
 	}
 
@@ -246,7 +256,11 @@ export class VariationGenome {
 	 */
 	settle(): void {
 		for (const state of this.continuous.values()) state.current = state.target;
-		for (const state of this.choices.values()) state.mix = 1;
+		for (const state of this.choices.values()) {
+			if (state.pending !== null) this.startCrossfade(state, state.pending);
+			state.pending = null;
+			state.mix = 1;
+		}
 	}
 
 	/**
@@ -291,7 +305,7 @@ export class VariationGenome {
 			const t = (state.target - state.axis.min) / Math.max(1e-9, state.axis.max - state.axis.min);
 			parts.push(String(Math.min(bins - 1, Math.max(0, Math.floor(t * bins)))));
 		}
-		for (const state of this.choices.values()) parts.push(`c${state.to}`);
+		for (const state of this.choices.values()) parts.push(`c${state.pending ?? state.to}`);
 		return parts.join('.');
 	}
 
@@ -319,7 +333,10 @@ export class VariationGenome {
 	/** Targets in axis order: continuous normalized to 0..1, choices as option ids. */
 	targetVector(): number[] {
 		return this.axes.map((axis) => {
-			if (axis.kind === 'choice') return this.choices.get(axis.name)!.to;
+			if (axis.kind === 'choice') {
+				const choice = this.choices.get(axis.name)!;
+				return choice.pending ?? choice.to;
+			}
 			const state = this.continuous.get(axis.name)!;
 			return (state.target - axis.min) / Math.max(1e-9, axis.max - axis.min);
 		});
@@ -331,6 +348,14 @@ export class VariationGenome {
 
 	get boundaries(): { phrases: number; sections: number; eras: number } {
 		return { phrases: this.phraseEvents, sections: this.sectionEvents, eras: this.eraEvents };
+	}
+
+	private startCrossfade(state: ChoiceRuntime, pick: number): void {
+		state.from = state.to;
+		state.to = pick;
+		state.mix = 0;
+		state.history.push(pick);
+		if (state.history.length > 16) state.history.shift();
 	}
 
 	private wrapValue(axis: ContinuousAxis, value: number): number {
@@ -369,6 +394,7 @@ export class VariationGenome {
 				if (gate > axis.chance && !forced) return;
 				const memory = Math.min(axis.memory ?? 1, axis.options - 1);
 				const recent = state.history.slice(-memory);
+				if (state.pending !== null) recent.push(state.pending);
 				const candidates: number[] = [];
 				for (let option = 0; option < axis.options; option += 1) {
 					if (!recent.includes(option)) candidates.push(option);
@@ -392,12 +418,13 @@ export class VariationGenome {
 					}
 				}
 				state.held = 0;
-				// Retarget from wherever the current crossfade has got to.
-				state.from = state.mix >= 0.5 ? state.to : state.from;
-				state.to = pick;
-				state.mix = 0;
-				state.history.push(pick);
-				if (state.history.length > 16) state.history.shift();
+				if (state.mix < 1) {
+					// Mid-crossfade: queue the pick instead of retargeting, which
+					// would drop the half-shown option in one frame.
+					state.pending = pick;
+				} else {
+					this.startCrossfade(state, pick);
+				}
 				this.mutationCount += 1;
 			}
 		});

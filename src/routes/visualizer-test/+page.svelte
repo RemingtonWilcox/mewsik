@@ -71,6 +71,10 @@
 	// profile at the end without resetting the performance, the way a radio
 	// stream runs for hours. Used to judge visual variety over time.
 	let songMode = $state(false);
+	// ?newsource=1 with song mode: every track is a new source (resetPerformance
+	// with a new identity), exactly what the app does between songs. Without
+	// it, tracks continue one source the way a radio stream does.
+	let songNewSource = $state(false);
 	let songTracks = 0;
 	let activePositionMs = 0;
 	let profileFrameSerial = 0;
@@ -182,6 +186,9 @@
 			songTracks += 1;
 			setActiveScore(SOMA_LAB_PROFILES[activeProfileId].score);
 			activePositionMs = 0;
+			if (songNewSource) {
+				vis.resetPerformance(`visualizer-lab:song:${songTracks}:${activeProfileId}:${labSeed}`, now);
+			}
 		} else {
 			activePositionMs = elapsedMs;
 		}
@@ -299,6 +306,7 @@
 			: vis.engine;
 		chromeVisible = params.get('chrome') !== '0';
 		songMode = params.get('song') === '1';
+		songNewSource = params.get('newsource') === '1';
 		const requestedProfile = getSomaLabProfile(params.get('profile'));
 		labSeed = normalizeSeed(params.get('seed'));
 		vis.active = true;
