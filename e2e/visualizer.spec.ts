@@ -2,7 +2,7 @@ import { expect, test } from '@playwright/test';
 
 async function expectProductionEngine(
 	page: import('@playwright/test').Page,
-	engine: 'mk1' | 'mk2' | 'signal' | 'loom'
+	engine: 'mk1' | 'mandala' | 'mk2' | 'signal' | 'loom'
 ) {
 	await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
 		'data-render-engine',
@@ -128,6 +128,7 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByRole('button', { name: 'Soma · mk2', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Signal', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'Loom', exact: true })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Mandala', exact: true })).toBeVisible();
 		await expect(page.getByRole('button', { name: 'mk3', exact: true })).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'runtime', exact: true })).toHaveCount(0);
 		// Lab engines are embedded canvases, not fake full-screen buttons.
@@ -150,9 +151,12 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByText(/Prism · mk1/).last()).toBeVisible();
 		await page.keyboard.press('r');
 		await expect(page.getByText(/Loom · harmonic weave/).last()).toBeVisible();
+		await page.keyboard.press('t');
+		await expect(page.getByText(/Mandala · endless vortex/).last()).toBeVisible();
+		await expect(page.getByLabel('Mandala audio visualizer')).toHaveCount(1);
 	});
 
-	test('the overlay names four engines; arrows, clicks and Escape route them', async ({ page }) => {
+	test('the overlay names five engines; arrows, clicks and Escape route them', async ({ page }) => {
 		await page.addInitScript(() => {
 			localStorage.setItem('mewsik.visualizer.engine', 'auto');
 		});
@@ -170,7 +174,7 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.locator('[data-player-bar]')).toHaveAttribute('aria-hidden', 'true');
 
 		const engines = page.getByRole('radiogroup', { name: 'Visualizer' }).getByRole('radio');
-		await expect(engines).toHaveText(['Prism', 'Soma', 'Signal', 'Loom']);
+		await expect(engines).toHaveText(['Prism', 'Mandala', 'Soma', 'Signal', 'Loom']);
 		await expect(page.getByRole('radio', { name: 'Prism' })).toHaveAttribute('aria-checked', 'true');
 		await expect(page.getByRole('button', { name: 'Exit visualizer' })).toBeVisible();
 
@@ -184,6 +188,22 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'mk1');
 
 		await page.keyboard.press('ArrowRight');
+		await expectProductionEngine(page, 'mandala');
+		await expect(host).toHaveAttribute('data-engine-name', 'Mandala');
+		await expect(page.getByRole('radio', { name: 'Mandala' })).toHaveAttribute('aria-checked', 'true');
+		const mandalaCanvas = page.getByLabel('Mandala audio visualizer');
+		await expect(mandalaCanvas).toHaveAttribute('data-mandala-render-passes', '9');
+		await expect(mandalaCanvas).toHaveAttribute('data-mandala-uniform-bytes', '576');
+		if (await hasUsableWebGpu(page)) {
+			await expect(mandalaCanvas).toHaveAttribute('data-mandala-ready', 'true', { timeout: 15_000 });
+			await expect(mandalaCanvas).toHaveAttribute(
+				'data-mandala-wall',
+				/^(truchet|flower|yantra|girih|lace|apollonian|hyperbolic|phyllotaxis|rings):/
+			);
+			await expect(page.getByText('Mandala unavailable', { exact: true })).toHaveCount(0);
+		}
+
+		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'mk2');
 		await expect(host).toHaveAttribute('data-engine-name', 'Soma');
 		await expect(page.getByRole('radio', { name: 'Soma' })).toHaveAttribute('aria-checked', 'true');
@@ -191,10 +211,10 @@ test.describe('visualizer engine roster', () => {
 			'data-mk2-render-passes',
 			'8'
 		);
-		// 47 vec4 slots in the rebuilt organism renderer.
+		// 49 vec4 slots in the rebuilt organism renderer.
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'752'
+			'784'
 		);
 		// The species is reported once the GPU renderer is running.
 		if (await hasUsableWebGpu(page)) {
@@ -283,12 +303,12 @@ test.describe('visualizer engine roster', () => {
 		await page.waitForTimeout(2_800);
 		await expectVisualizerChrome(page, true, 1_000);
 		await page.keyboard.press('ArrowRight');
-		await expectProductionEngine(page, 'mk2');
-		await expect(page.getByRole('radio', { name: 'Soma' })).toBeFocused();
+		await expectProductionEngine(page, 'mandala');
+		await expect(page.getByRole('radio', { name: 'Mandala' })).toBeFocused();
 		await page.keyboard.press('Shift+Tab');
 		await expect(page.getByRole('button', { name: 'Exit visualizer' })).toBeFocused();
 		await page.keyboard.press('Tab');
-		await expect(page.getByRole('radio', { name: 'Soma' })).toBeFocused();
+		await expect(page.getByRole('radio', { name: 'Mandala' })).toBeFocused();
 
 		await page.keyboard.press('Escape');
 		await expect(page.getByRole('button', { name: 'Visualizer' })).toBeFocused();
@@ -311,8 +331,8 @@ test.describe('visualizer engine roster', () => {
 		await page.mouse.move(80, 180);
 		await page.mouse.move(360, 420);
 		await page.keyboard.press('ArrowRight');
-		await expectProductionEngine(page, 'mk2');
-		await expect(page.locator('[data-visualizer-engine-flash]')).toHaveText('Soma');
+		await expectProductionEngine(page, 'mandala');
+		await expect(page.locator('[data-visualizer-engine-flash]')).toHaveText('Mandala');
 		await page.waitForTimeout(350);
 		await expectVisualizerChrome(page, false, 500);
 
@@ -450,7 +470,7 @@ test.describe('visualizer engine roster', () => {
 			);
 
 		await swipe(700, 300);
-		await expectProductionEngine(page, 'mk2');
+		await expectProductionEngine(page, 'mandala');
 		await swipe(300, 700);
 		await expectProductionEngine(page, 'mk1');
 		await expectVisualizerChrome(page, true);

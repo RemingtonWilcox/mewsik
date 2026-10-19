@@ -1,4 +1,4 @@
-export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal', 'loom'] as const;
+export const VISUALIZER_ENGINES = ['mk1', 'mandala', 'mk2', 'signal', 'loom'] as const;
 
 export type VisualizerEngine = (typeof VISUALIZER_ENGINES)[number];
 
@@ -21,6 +21,14 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 		description: 'Beats travel as light through a turning rose window.',
 		accent: '#e9d5ff',
 		accentMuted: 'rgba(216, 180, 254, 0.46)'
+	},
+	mandala: {
+		name: 'Mandala',
+		subtitle: 'Endless vortex',
+		role: 'Infinity',
+		description: 'An endless flight through sacred geometry that folds in on itself forever.',
+		accent: '#fda4af',
+		accentMuted: 'rgba(251, 113, 133, 0.46)'
 	},
 	mk2: {
 		name: 'Soma',
@@ -53,6 +61,7 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 // picture; the switch is gone and every engine runs its authored baseline.
 export const VISUALIZER_TUNING = {
 	mk1: { motion: 1, impact: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
+	mandala: { motion: 1, impact: 1 },
 	mk2: { motion: 1, impact: 1, fog: 1, shafts: 1 },
 	signal: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
 	loom: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 }

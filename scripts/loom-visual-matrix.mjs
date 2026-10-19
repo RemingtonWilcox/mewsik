@@ -15,7 +15,7 @@ import { spawn } from 'node:child_process';
 import { mkdir } from 'node:fs/promises';
 
 const label = process.argv[2] ?? process.env.LOOM_SHOT_DIR ?? 'matrix';
-// VIS_ENGINE=mk1|mk2|signal|loom captures another engine with the same matrix.
+// VIS_ENGINE=mk1|mandala|mk2|signal|loom captures another engine with the same matrix.
 const engine = process.env.VIS_ENGINE ?? 'loom';
 const seed = process.env.VIS_SEED ?? 'loom-audit';
 // Each engine labels its canvas and readiness attribute differently.
@@ -23,7 +23,8 @@ const ENGINE_CANVAS = {
 	mk1: ['Prism audio visualizer', 'data-prism-ready'],
 	mk2: ['Soma audio visualizer', 'data-soma-ready'],
 	signal: ['Signal audio visualizer', 'data-signal-ready'],
-	loom: ['Loom audio visualizer', 'data-loom-ready']
+	loom: ['Loom audio visualizer', 'data-loom-ready'],
+	mandala: ['Mandala audio visualizer', 'data-mandala-ready']
 };
 const [canvasLabel, readyAttribute] = ENGINE_CANVAS[engine] ?? ENGINE_CANVAS.loom;
 const outDir = `output/${engine}-${label}`;

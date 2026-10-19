@@ -4,6 +4,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { replaceState } from '$app/navigation';
 	import VisualizerMk1 from '$lib/components/visualizer/visualizer.svelte';
+	import VisualizerMandala from '$lib/components/visualizer/visualizer-mandala.svelte';
 	import VisualizerMk2 from '$lib/components/visualizer/visualizer-mk2.svelte';
 	import VisualizerSignal from '$lib/components/visualizer/visualizer-signal.svelte';
 	import VisualizerLoom from '$lib/components/visualizer/visualizer-loom.svelte';
@@ -375,6 +376,7 @@
 		else if (event.key.toLowerCase() === 'w') setEngine('mk2');
 		else if (event.key.toLowerCase() === 'e') setEngine('signal');
 		else if (event.key.toLowerCase() === 'r') setEngine('loom');
+		else if (event.key.toLowerCase() === 't') setEngine('mandala');
 		else if (event.key.toLowerCase() === 'c') setChromeVisible(!chromeVisible);
 	}}
 />
@@ -420,6 +422,12 @@
 						class={`border-l border-white/20 px-3 py-1 ${engine === 'loom' ? 'bg-blue-200 text-black' : 'bg-black/40 text-blue-100 hover:bg-white/10'}`}
 					>
 						{VISUALIZER_CATALOG.loom.name}
+					</button>
+					<button
+						onclick={() => setEngine('mandala')}
+						class={`border-l border-white/20 px-3 py-1 ${engine === 'mandala' ? 'bg-rose-300 text-black' : 'bg-black/40 text-rose-200 hover:bg-white/10'}`}
+					>
+						{VISUALIZER_CATALOG.mandala.name}
 					</button>
 				</div>
 				<label class="flex items-center gap-2 rounded border border-white/20 bg-black/40 px-2 py-1">
@@ -521,6 +529,8 @@
 					<span class="text-amber-200"><strong>{VISUALIZER_CATALOG.mk2.name} · mk2</strong> · living fractal</span>
 				{:else if engine === 'signal'}
 					<span><strong>{VISUALIZER_CATALOG.signal.name}</strong> · phosphor score</span>
+				{:else if engine === 'mandala'}
+					<span class="text-rose-200"><strong>{VISUALIZER_CATALOG.mandala.name}</strong> · endless vortex</span>
 				{:else}
 					<span class="text-blue-100"><strong>{VISUALIZER_CATALOG.loom.name}</strong> · harmonic weave</span>
 				{/if}
@@ -528,7 +538,7 @@
 					<span class="text-emerald-200">{activeProfile.label} · {activeStage.label}</span>
 					<span class="max-w-80 truncate text-white/40">{activeProfile.description}</span>
 				{/if}
-				<span class="text-white/45">keys: q/w/e/r engines · c chrome · 0–4 prism scenes</span>
+				<span class="text-white/45">keys: q/w/e/r/t engines · c chrome · 0–4 prism scenes</span>
 				<span class="text-white/40">|</span>
 				{#if vis.latest}
 					<span>bpm {vis.latest.bpm.toFixed(0)}</span>
@@ -551,6 +561,8 @@
 			<VisualizerMk2 />
 		{:else if engine === 'signal'}
 			<VisualizerSignal />
+		{:else if engine === 'mandala'}
+			<VisualizerMandala />
 		{:else}
 			<VisualizerLoom />
 		{/if}
