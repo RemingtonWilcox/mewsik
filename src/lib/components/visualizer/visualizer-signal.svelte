@@ -121,6 +121,11 @@
 	let spectralMotion = 0;
 	let spinAngle = 0;
 	let dollyTime = 0;
+	let lockStep = 0;
+	let breathPhase = 0;
+	let grainClock = 0;
+	let fracturePhase = 0;
+	let reactBoost = 1;
 	const renderDetailBins = new Float32Array(64);
 	// Session memory: the figure, the horizon history, the look morphs and the
 	// conductor carry outlive this component, so a remount resumes the picture.
@@ -135,6 +140,7 @@
 
 	// The instrument model shared by every element on the bench.
 	const figureEngine = memory.figure;
+	const voiceTracker = memory.voice;
 	const paletteOut = createSignalPaletteOut();
 	const layoutMix = createSignalLayout();
 	/** This frame's conductor rails as drawn (see SignalCarry). */
@@ -262,6 +268,17 @@
 		return clock.phraseIndex * BEATS_PER_PHRASE + clock.phrasePos * BEATS_PER_PHRASE;
 	}
 
+	/**
+	 * Club lock clock: whole beats plus an eased step inside each one, so a
+	 * locked figure moves in one gliding stride per beat and rests between.
+	 */
+	function steppedBeats(beats: number) {
+		const whole = Math.floor(beats);
+		const t = beats - whole;
+		const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+		return whole + eased;
+	}
+
 	/** Smooth level profile: interpolate between band centres, no plateaus. */
 	function bandLevelAt(position: number) {
 		let previousCenter = 0;
@@ -339,7 +356,11 @@
 			terrainHead,
 			mode,
 			asymmetry,
-			renderBpm
+			renderBpm,
+			breathPhase,
+			grainClock,
+			fracturePhase,
+			reactBoost
 		};
 	}
 
@@ -378,13 +399,27 @@
 			renderBeats = beatAnchor(shared.director.clock) ?? 0;
 			tickFlash = 0;
 			pendingRowFresh = true;
+			lockStep = steppedBeats(renderBeats);
 			const saved = memory.scalars;
 			// The figure turns on from where it was left, whatever the shared
 			// phase did while Signal was away.
 			lastTracePhase = shared.signal.tracePhase;
 			if (saved) {
-				({ figurePhase, spinAngle, dollyTime, sweepPhase, tickPhase, terrainHead, mode, asymmetry, renderBpm } =
-					saved);
+				({
+					figurePhase,
+					spinAngle,
+					dollyTime,
+					sweepPhase,
+					tickPhase,
+					terrainHead,
+					mode,
+					asymmetry,
+					renderBpm,
+					breathPhase,
+					grainClock,
+					fracturePhase,
+					reactBoost
+				} = saved);
 			} else {
 				// First Signal frame of the session.
 				figurePhase = shared.signal.tracePhase * 1.6;
@@ -401,6 +436,7 @@
 			// A new source mid-view: the conductor restarted its monotonic phase.
 			lastTracePhase = shared.signal.tracePhase;
 			renderBeats = beatAnchor(shared.director.clock) ?? renderBeats;
+			lockStep = steppedBeats(renderBeats);
 		}
 		if (newSource) carry.rebase();
 		lastHudUpdateAt = 0;
@@ -740,6 +776,20 @@
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
 
+		// ---- Character: what kind of music this is, as an instrument. --------
+		if (!variation) {
+			variation = signalVariationFor(shared.seed, shared.sourceEpoch);
+			variation.setOverride(lookOverride);
+		}
+		const genome = variation;
+		// The music's character: weights fitted to it, character-led axes
+		// pulled toward it, and every new shift answered once (genome.shift).
+		const character = shared.character;
+		const shiftEvent = genome.respond(character, directed.energy, dt);
+		if (shiftEvent) reactBoost = Math.max(reactBoost, 1 + 4.5 * Math.max(0.65, shiftEvent.strength));
+		reactBoost = 1 + (reactBoost - 1) * Math.exp(-dt / 4);
+		const voice = voiceTracker.update(character, dt, Math.max(reactBoost * 0.75, genome.genome.glideSpeed));
+
 		// Audio envelopes at render rate.
 		const rmsTarget = clamp(feature?.rms ?? 0, 0, 1);
 		rms = approach(rms, rmsTarget, rmsTarget > rms ? 18 : 7, dt);
@@ -793,9 +843,21 @@
 
 		// Hero rotation integrates the conductor's monotonic trace phase so
 		// remounts and response changes never jump the figure.
+		// Tempo sets how fast the beam writes; a club lock trades the smooth
+		// drift for one stride per beat.
 		const traceDelta = clamp(journey.tracePhase - lastTracePhase, 0, 0.5);
 		lastTracePhase = journey.tracePhase;
-		figurePhase += traceDelta * 1.6 * responseMotion;
+		const stepped = steppedBeats(renderBeats);
+		// A clock resync (a jump of many beats) is not a stride: skip it.
+		const lockRaw = stepped - lockStep;
+		const lockDelta = lockRaw > 0 && lockRaw < 0.5 ? lockRaw : 0;
+		lockStep = stepped;
+		figurePhase +=
+			traceDelta * 1.6 * responseMotion * voice.speed * (1 - voice.lock * 0.8) +
+			lockDelta * 0.32 * voice.lock * responseMotion;
+		breathPhase += dt * 0.75;
+		grainClock += dt * voice.speed;
+		fracturePhase += dt * (0.8 + voice.speed * 2.2);
 
 		const energy = clamp(
 			journey.energy * 0.58 + rms * 0.24 + bands.body * 0.08 + spectralMotion * 0.1,
@@ -812,11 +874,6 @@
 		const elapsed = (performance.now() - startTime) / 1000;
 
 		// ---- Genome: the look walks forward at musical boundaries. ----------
-		if (!variation) {
-			variation = signalVariationFor(shared.seed, shared.sourceEpoch);
-			variation.setOverride(lookOverride);
-		}
-		const genome = variation;
 		genome.advance({
 			phraseIndex: clock.phraseIndex,
 			section: directed.section,
@@ -827,13 +884,18 @@
 		// The genome decides; the morphs make each decision one finished,
 		// staggered, eased move (see SignalChoiceMorph). They pause in silence
 		// with the genome, so a quiet gap never lands half a move.
+		// Right after a shift they run several times faster, so the answer
+		// lands in one or two seconds and still glides. Colour may turn fast;
+		// moves that rearrange the bench (layout, camera) keep at least about
+		// three seconds so the composition travels instead of cutting.
 		const morphDt = directed.silence || !feature ? 0 : dt;
-		const layoutChoice = morphs.layout.update(genome.choice('layout').to, morphDt);
-		const familyChoice = morphs.family.update(genome.choice('family').to, morphDt);
-		const paletteChoice = morphs.palette.update(genome.choice('palette').to, morphDt);
-		const cameraChoice = morphs.camera.update(genome.choice('camera').to, morphDt);
-		const displayChoice = morphs.display.update(genome.choice('display').to, morphDt);
-		const traceMapChoice = morphs.traceMap.update(genome.choice('traceMap').to, morphDt);
+		const structural = 1 + (reactBoost - 1) * 0.3;
+		const layoutChoice = morphs.layout.update(genome.choice('layout').to, morphDt, structural);
+		const familyChoice = morphs.family.update(genome.choice('family').to, morphDt, 1 + (reactBoost - 1) * 0.8);
+		const paletteChoice = morphs.palette.update(genome.choice('palette').to, morphDt, reactBoost * 1.15);
+		const cameraChoice = morphs.camera.update(genome.choice('camera').to, morphDt, structural);
+		const displayChoice = morphs.display.update(genome.choice('display').to, morphDt, reactBoost);
+		const traceMapChoice = morphs.traceMap.update(genome.choice('traceMap').to, morphDt, reactBoost);
 		const layoutFrom = layoutFor(layoutChoice.from, aspect);
 		const layoutTo = layoutFor(layoutChoice.to, aspect);
 		// Panels, traces and faces travel to their new places.
@@ -884,8 +946,14 @@
 			0.22,
 			0.56
 		);
+		// Bass sets the figure's weight; ambient breathes it slowly, a club lock
+		// kicks it on the beat.
 		const scaleFactor =
-			clamp(conductorScale / 0.4, 0.72, 1.3) * (0.86 + gene('figureScale') * 0.26);
+			clamp(conductorScale / 0.4, 0.72, 1.3) *
+			(0.86 + gene('figureScale') * 0.26) *
+			voice.scale *
+			(1 + voice.breathe * 0.07 * Math.sin(breathPhase)) *
+			(1 + voice.lock * (beatGlow * 0.06 + bands.kick * 0.03));
 		const figAScale = layout.figAScale * scaleFactor;
 		const figAX = layout.figAX + driftX;
 		const figAY =
@@ -897,7 +965,7 @@
 
 		// ---- Figure polyline: the one signal everything else reads. -----------
 		const spin = gene('spin');
-		spinAngle += dt * spin * 0.18 * (0.4 + journey.motion);
+		spinAngle += dt * spin * 0.18 * (0.4 + journey.motion) * voice.speed;
 		const spread =
 			0.02 + bands.air * 0.1 + journey.release * 0.07 + ringOut * 0.25 + spectrum.flatness * 0.05;
 		const figureInput: SignalFigureInput = {
@@ -925,7 +993,11 @@
 			spectralMotion,
 			energy,
 			detail: renderDetailBins,
-			yaw: asymmetry * 0.55 + Math.sin(figurePhase * 0.23) * 0.32 + spinAngle,
+			yaw:
+				asymmetry * 0.55 +
+				Math.sin(figurePhase * 0.23) * 0.32 +
+				spinAngle +
+				voice.organic * 0.22 * Math.sin(grainClock * 0.29),
 			tilt:
 				0.34 +
 				journey.tension * 0.2 -
@@ -935,7 +1007,10 @@
 			roll: figurePhase * 0.05 + spinAngle * 0.6,
 			partner: layout.partner,
 			dt,
-			pace: (beatsPerSecond / 2) * (0.5 + journey.motion)
+			pace: (beatsPerSecond / 2) * (0.5 + journey.motion),
+			jitter: voice.jitter,
+			wander: voice.organic,
+			grainTime: grainClock
 		};
 		const figurePoints = figureEngine.evaluate(figureInput);
 		const headU = sweepPhase;
@@ -996,7 +1071,7 @@
 			paletteChoice.from,
 			paletteChoice.to,
 			paletteChoice.mix,
-			{ hueLean: gene('hueLean'), mode, energy, warmth: gene('warmth') },
+			{ hueLean: gene('hueLean'), mode, energy, warmth: gene('warmth'), temperature: voice.temperature },
 			paletteOut
 		);
 
@@ -1009,9 +1084,10 @@
 				impact * 0.04 +
 				response.persistenceOffset +
 				display.persist +
-				(gene('persistence') - 0.5) * 0.04,
-			0.8,
-			0.962
+				(gene('persistence') - 0.5) * 0.04 +
+				voice.persistence,
+			0.78,
+			0.972
 		);
 		const feedbackFade =
 			feedbackResetFrames > 0 ? 0 : Math.pow(persistence * (1 - silence * 0.04), dt * 60);
@@ -1054,12 +1130,13 @@
 				response.stroke *
 				(1 + bands.presence * 0.08) *
 				display.stroke *
-				(0.86 + gene('stroke') * 0.28),
+				(0.86 + gene('stroke') * 0.28) *
+				voice.weight,
 			beatPhase: clamp(clock.beatPhase, 0, 1),
 			heroR: paletteOut.hero[0],
 			heroG: paletteOut.hero[1],
 			heroB: paletteOut.hero[2],
-			paletteGain: paletteOut.gain,
+			paletteGain: paletteOut.gain * voice.gain,
 			traceR: paletteOut.trace[0],
 			traceG: paletteOut.trace[1],
 			traceB: paletteOut.trace[2],
@@ -1171,7 +1248,9 @@
 			ringInnerB: layoutTo.ringInner,
 			ringOuterB: layoutTo.ringOuter,
 			ringZB: layoutTo.ringZ,
-			surfaceRipple: SURFACE_RIPPLE,
+			// A sped-up bench change ripples less, so no single row re-forms faster
+			// than it does in an ordinary scene change.
+			surfaceRipple: Math.max(0, (1 + SURFACE_RIPPLE) / structural - 1),
 			wfXB: rigB.anchorX,
 			wfYB: rigB.anchorY,
 			wfDxB: layoutTo.wfDx,
@@ -1195,7 +1274,7 @@
 			scanDensity: display.scanDensity,
 			scanStrength: display.scanStrength * (0.5 + scanAxis),
 			curvature: display.curvature * (0.6 + gene('curvature') * 0.8),
-			grain: display.grain * (0.6 + gene('grain') * 0.8),
+			grain: display.grain * (0.6 + gene('grain') * 0.8) + voice.grain * 0.03,
 			bloomGain: display.bloom,
 			aberration: display.aberration,
 			vignette: display.vignette,
@@ -1211,7 +1290,17 @@
 			gridDensity: gene('grid'),
 			sectionProgress: directed.context.sectionProgress,
 			figurePhase,
-			tempo: journey.tempo
+			tempo: journey.tempo,
+			fracture: voice.fracture,
+			sharpness: voice.sharpness,
+			fracturePhase,
+			halation: voice.halation,
+			// Worn and raster tubes have rounder faces; the glass reflects in
+			// step with how much glass the display shows.
+			tubeRadius: 0.05 + display.curvature * 0.7,
+			glassReflect: 0.35 + display.glass * 0.9,
+			roomSpill: 1,
+			glassGhost: 0.03 + display.glass * 0.09
 		};
 		packSignalUniforms(state.uniforms, values);
 

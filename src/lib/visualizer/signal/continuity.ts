@@ -21,6 +21,7 @@
 //                      picture instead of restarting it.
 
 import { SignalFigureEngine } from './figures';
+import { SignalVoice } from './voice';
 import { SIGNAL_TERRAIN_BINS, SIGNAL_TERRAIN_FLOATS } from './shaders';
 
 /** Quintic ease: zero velocity and acceleration at both ends. */
@@ -69,7 +70,9 @@ export class SignalChoiceMorph {
 
 	/**
 	 * Follow the genome's current target. `speed` scales how fast the running
-	 * morph advances (1 = `seconds` per morph).
+	 * morph advances (1 = `seconds` per morph) and how fast a queued target's
+	 * delay runs out; right after the music changes character Signal runs its
+	 * morphs several times faster so the new look lands in a second or two.
 	 */
 	update(target: number, dt: number, speed = 1): SignalMorph {
 		if (!this.settled) this.settle(target);
@@ -91,7 +94,7 @@ export class SignalChoiceMorph {
 			this.wait = this.delay;
 		}
 		if (this.pending !== null) {
-			this.wait -= step;
+			this.wait -= step * Math.max(0, speed);
 			if (this.wait <= 0 && this.progress >= 1) {
 				this.fromOption = this.toOption;
 				this.toOption = this.pending;
@@ -114,14 +117,16 @@ export class SignalChoiceMorph {
  * Morph lengths and stagger for each choice axis, in seconds. A scene change
  * lands on the genome all at once; these spread it over roughly ten seconds:
  * the phosphor turns first, the camera and bench rearrange, the figure
- * re-forms last, and the tube character drifts on its own slow clock.
+ * re-forms last, and the tube character drifts on its own slow clock. When the
+ * music changes character the renderer runs the same staggered move several
+ * times faster (see SignalChoiceMorph.update), so it lands in two or three.
  */
 export const SIGNAL_MORPH_TIMING = {
 	palette: { seconds: 6, delay: 0 },
-	camera: { seconds: 8, delay: 1.2 },
+	camera: { seconds: 7, delay: 1.2 },
 	layout: { seconds: 7.5, delay: 0.6 },
 	family: { seconds: 6.5, delay: 2.8 },
-	display: { seconds: 11, delay: 0 },
+	display: { seconds: 8, delay: 0 },
 	traceMap: { seconds: 4.5, delay: 0.4 }
 } as const;
 
@@ -204,6 +209,12 @@ export type SignalRendererScalars = {
 	mode: number;
 	asymmetry: number;
 	renderBpm: number;
+	/** Ambient breath, grain and fracture clocks. */
+	breathPhase: number;
+	grainClock: number;
+	fracturePhase: number;
+	/** Morph speed multiplier after a shift, easing back to 1. */
+	reactBoost: number;
 };
 
 export type SignalRendererMemory = {
@@ -213,6 +224,8 @@ export type SignalRendererMemory = {
 	readonly morphs: Record<SignalMorphAxis, SignalChoiceMorph>;
 	readonly carry: SignalCarry;
 	readonly figure: SignalFigureEngine;
+	/** The music's character as an instrument, glided (see voice.ts). */
+	readonly voice: SignalVoice;
 	/** Horizon history: interleaved height, heat per bin, one row per tick. */
 	readonly terrainRows: Float32Array;
 	readonly pendingRow: Float32Array;
@@ -226,8 +239,11 @@ export function signalRendererMemory(): SignalRendererMemory {
 		epoch: -1,
 		scalars: null,
 		morphs: createSignalMorphs(),
-		carry: new SignalCarry(5),
+		// Three seconds: long enough that a new song's rails glide in, short
+		// enough that the new music's own rails show by the time it is heard.
+		carry: new SignalCarry(3),
 		figure: new SignalFigureEngine(),
+		voice: new SignalVoice(),
 		terrainRows: new Float32Array(SIGNAL_TERRAIN_FLOATS),
 		pendingRow: new Float32Array(SIGNAL_TERRAIN_BINS * 2)
 	};
