@@ -10,8 +10,9 @@
 //                   queues instead of snapping)
 //   MosaicDraft     the glass re-drafts at phrase ends; any phrase-clock jump
 //                   (new song, re-sync) glides instead of re-cutting
-//   PrismMotion     clock, rose turn, sway, drift and dolly owned by the look,
-//                   so a source reset (timeline, trace phase, seed) moves nothing
+//   PrismMotion     clock, rose turn and sway owned by the look (the camera
+//                   rig lives in camera.ts), so a source reset (timeline,
+//                   trace phase, seed) moves nothing
 //   StructureMorph  window structure changes ride a cell-level dissolve that
 //                   washes outward and finishes with a global fade
 
@@ -64,6 +65,8 @@ export class ChoiceFollower {
 	to: number;
 	/** Linear progress 0..1 of from -> to. */
 	mix = 1;
+	/** Counts every fade that starts (or reverses), so a caller can tell fades apart. */
+	starts = 0;
 
 	constructor(option: number) {
 		this.from = option;
@@ -81,10 +84,12 @@ export class ChoiceFollower {
 			this.from = this.to;
 			this.to = goal;
 			this.mix = Math.min(1, 1 - this.mix + step);
+			this.starts += 1;
 		} else if (this.mix >= 1) {
 			this.from = this.to;
 			this.to = goal;
 			this.mix = Math.min(1, step);
+			this.starts += 1;
 		} else {
 			// A third option is waiting: finish this fade first, a little faster.
 			this.mix = Math.min(1, this.mix + step * 1.8);
@@ -102,6 +107,16 @@ export class ChoiceFollower {
 	state(): ChoiceState {
 		const m = this.mix;
 		return { from: this.from, to: this.to, mix: m * m * (3 - 2 * m) };
+	}
+
+	/**
+	 * The same fade eased out instead of smoothstepped: it shows from its first
+	 * frame and lands softly. For a fade answering a change of music; use it
+	 * for a whole fade (from its start), never switch to it mid-fade.
+	 */
+	stateEagerly(): ChoiceState {
+		const m = this.mix;
+		return { from: this.from, to: this.to, mix: 1 - (1 - m) * (1 - m) * (1 - m) };
 	}
 }
 
@@ -150,7 +165,7 @@ export type PrismMotionInput = {
 	/** VISUALIZER_TUNING.mk1.motion. */
 	motion: number;
 	energy: number;
-	/** 0..1; the gallery dolly is music-driven and stops in silence. */
+	/** 0..1. */
 	silence: number;
 };
 
@@ -167,7 +182,6 @@ export class PrismMotion {
 	/** Turn direction, easing toward the current song's preference. */
 	turn: number;
 	turnTarget: number;
-	dollyPhase: number;
 	readonly phase: number;
 	private lastTrace: number | null = null;
 
@@ -176,7 +190,6 @@ export class PrismMotion {
 		this.phase = s;
 		this.turn = s > 0.5 ? 1 : -1;
 		this.turnTarget = this.turn;
-		this.dollyPhase = s * 6.28;
 	}
 
 	/** A new source: a new turn preference, eased in; nothing else moves. */
@@ -202,17 +215,6 @@ export class PrismMotion {
 		this.turn = approach(this.turn, this.turnTarget, 0.18, dt);
 		this.previousRotation = this.rotation;
 		this.rotation += (dTrace * 0.22 * this.turn + (this.sway(this.clock) - this.sway(before))) * input.motion;
-		this.dollyPhase +=
-			dt * (0.035 + clamp(finite(input.energy), 0, 1) * 0.05) * (1 - clamp(finite(input.silence), 0, 1)) * input.motion;
-	}
-
-	drift(motion: number): { x: number; y: number } {
-		const t = this.clock;
-		const p = this.phase;
-		return {
-			x: (Math.sin(t * 0.043 + p * 9) * 0.011 + Math.sin(t * 0.019 + 1.3) * 0.007) * motion,
-			y: Math.cos(t * 0.031 + p * 4) * 0.006 * motion
-		};
 	}
 }
 

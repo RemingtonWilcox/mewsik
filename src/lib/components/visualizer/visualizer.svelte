@@ -14,39 +14,62 @@
 		PRISM_BLUR_V_WGSL,
 		PRISM_CATHEDRAL_WGSL,
 		PRISM_COMPOSITE_WGSL,
+		PRISM_EXPOSURE_WGSL,
 		PRISM_FEEDBACK_WGSL,
+		PRISM_LIGHTMAP_HEIGHT,
+		PRISM_LIGHTMAP_WGSL,
+		PRISM_LIGHTMAP_WIDTH,
 		PRISM_NEBULAE_WGSL,
 		PRISM_ROSE_WGSL,
 		PRISM_UNIFORM_BYTES,
 		PRISM_UNIFORM_FLOATS,
 		PRISM_UNIFORM_OFFSETS as O,
+		PRISM_VOLUME_WGSL,
 		PRISM_VORONOI_WGSL
 	} from '$lib/visualizer/prism/shaders';
 	import {
 		PRISM_AXES,
+		PRISM_BEAT_FORM_PROTOTYPES,
 		PRISM_CAMERAS,
+		PRISM_CAMERA_PROTOTYPES,
 		PRISM_ENVIRONMENTS,
+		PRISM_ENVIRONMENT_PROTOTYPES,
 		PRISM_FAMILY_DRIVE,
+		PRISM_FLOOR_Y,
 		PRISM_GRAMMARS,
+		PRISM_GRAMMAR_PROTOTYPES,
+		PRISM_MOSAIC_PROTOTYPES,
 		PRISM_PALETTES,
+		PRISM_PALETTE_PROTOTYPES,
 		PRISM_ROSE_R,
 		PRISM_ROSE_Y,
 		prismBaySpacing,
-		prismCamera,
 		prismCameraBasis,
 		prismDaylight,
 		prismFamily,
+		prismFeel,
 		prismFold,
 		prismGrammarIsRadial,
+		prismHueAway,
 		prismLive,
 		prismPalette,
 		prismProject,
 		prismSoftSign,
 		prismStructure,
+		prismTemper,
+		type PrismCameraBasis,
 		type PrismFamily,
+		type PrismPrototype,
 		type PrismStructure,
 		type Rgb
 	} from '$lib/visualizer/prism/composition';
+	import { PrismCameraRig } from '$lib/visualizer/prism/camera';
+	import {
+		CHARACTER_FEATURES,
+		characterWeights,
+		type CharacterFeature,
+		type MusicCharacter
+	} from '$lib/visualizer/character';
 	import {
 		ChoiceFollower,
 		MosaicDraft,
@@ -62,7 +85,7 @@
 	const vis = useVisualizer();
 
 	const BINS_BYTES = PRISM_BIN_COUNT * 4;
-	const RENDER_PASSES = 8;
+	const RENDER_PASSES = 11;
 
 	let canvas = $state<HTMLCanvasElement | null>(null);
 	let errorMsg = $state<string | null>(null);
@@ -117,9 +140,58 @@
 		draft: MosaicDraft;
 		motion: PrismMotion;
 		choices: Record<Followed, ChoiceFollower>;
+		/** The travelling camera. */
+		rig: PrismCameraRig;
+		/** The music character, smoothed into glides of a second or two. */
+		feel: Record<CharacterFeature, number>;
+		/** 1 right after a shift, easing to 0: every smoother hurries in step. */
+		hurry: number;
+		/**
+		 * Seconds a new source holds the window's structure, so the morph it
+		 * runs is the one that answers the new music's shift (about a second
+		 * later), not a section-family change that would make it wait.
+		 */
+		holdMorph: number;
+		/** Seconds the hurry holds at full before it starts to ease off. */
+		hurryHold: number;
+		/** Crossfades started by an answered change of music: they stay fast until they land. */
+		fastFades: Record<Followed, boolean>;
+		/** Which fade (ChoiceFollower.starts) of each axis is an answering one, shown eased out. */
+		eagerFade: Record<Followed, number>;
+		/** The running structure morph answers a change of music. */
+		morphFast: boolean;
+		/**
+		 * Seconds after an answer during which the look keeps tracking the new
+		 * music closely, while its tempo estimate and envelopes are still
+		 * settling, so the new look has fully arrived before it starts to drift.
+		 */
+		feelSettle: number;
+		/** Seconds since character weights and pulls were last refreshed. */
+		weightClock: number;
+		/**
+		 * Prism's own memory of the music's pace, weight and grain (about 20 s),
+		 * so a change of tempo the shared detector does not count as a change
+		 * of character still reads as a new piece of music, and a mild answer
+		 * can be upgraded when the change turns out to be a whole new genre.
+		 */
+		pace: {
+			memory: Record<PaceFeature, number>;
+			/** The memory as it was before the latest answer. */
+			before: Record<PaceFeature, number>;
+			/** Seconds left in which a mild answer may become a new reel. */
+			upgradeFor: number;
+			primed: boolean;
+			since: number;
+		};
 		/** Look salt for beat packets and clouds; compositions carry their own. */
 		salt: number;
 		beatSerial: number;
+		/**
+		 * Age of the current beat's light, 0..1, on the look's own clock: the
+		 * shared beat phase can jump when a station changes tempo, and a beat
+		 * packet must fade out, never vanish.
+		 */
+		beatAge: number;
 		lastBeatCount: number;
 		resyncBeat: boolean;
 	};
@@ -130,21 +202,24 @@
 	const lookState = vis.persistentLook('prism', () => ({
 		genome: new VariationGenome(PRISM_AXES, 0.5),
 		epoch: -1,
-		run: null as PrismRun | null
+		run: null as PrismRun | null,
+		/** The music-character shift this look last answered (null: not seen yet). */
+		answeredShift: null as number | null
 	}));
 	const genome = lookState.genome;
 
-	// The far view and the candle-lit apse and crypt shrink the window to a
-	// small light in a black frame. Keep them in the space but rarer, and lift
+	// The far nave and the candle-lit apse and crypt shrink the window to a
+	// small light in a dark frame. Keep them in the space but rarer, and lift
 	// their exposure so a dark regime still reads as lit glass.
 	const CAMERA_WEIGHTS: Record<(typeof PRISM_CAMERAS)[number], number> = {
-		straight: 1.4,
-		receding: 1,
-		low: 1,
-		macro: 1.1,
+		orbit: 1.3,
+		arcade: 1,
+		crane: 1,
+		glass: 1.1,
 		gallery: 1,
 		flooded: 1,
-		far: 0.35
+		nave: 0.7,
+		dutch: 0.8
 	};
 	const ENVIRONMENT_WEIGHTS: Record<(typeof PRISM_ENVIRONMENTS)[number], number> = {
 		nave: 1.3,
@@ -154,13 +229,14 @@
 		void: 1
 	};
 	const CAMERA_EXPOSURE: Record<(typeof PRISM_CAMERAS)[number], number> = {
-		straight: 1,
-		receding: 1.05,
-		low: 1.05,
-		macro: 1,
+		orbit: 1,
+		arcade: 1.05,
+		crane: 1.04,
+		glass: 1,
 		gallery: 1.08,
 		flooded: 1.05,
-		far: 1.5
+		nave: 1.35,
+		dutch: 1.02
 	};
 	const ENVIRONMENT_EXPOSURE: Record<(typeof PRISM_ENVIRONMENTS)[number], number> = {
 		nave: 1,
@@ -169,12 +245,100 @@
 		apse: 1.35,
 		void: 1.1
 	};
+	// The arcade in front of the wall, per room: presence, plane depth, column
+	// radius, capital height. The apse and the void stand open.
+	const ARCADE: Record<(typeof PRISM_ENVIRONMENTS)[number], [number, number, number, number]> = {
+		nave: [1, -0.52, 0.05, 0.44],
+		crypt: [1, -0.44, 0.075, 0.25],
+		ruin: [0.9, -0.52, 0.055, 0.44],
+		apse: [0, -0.52, 0.05, 0.44],
+		void: [0, -0.52, 0.05, 0.44]
+	};
 
-	function applyLookWeights() {
-		genome.setWeights('camera', PRISM_CAMERAS.map((name) => CAMERA_WEIGHTS[name]));
-		genome.setWeights('environment', PRISM_ENVIRONMENTS.map((name) => ENVIRONMENT_WEIGHTS[name]));
+	const CAMERA_PROTOS = PRISM_CAMERAS.map((name) => PRISM_CAMERA_PROTOTYPES[name]);
+	const ENVIRONMENT_PROTOS = PRISM_ENVIRONMENTS.map((name) => PRISM_ENVIRONMENT_PROTOTYPES[name]);
+
+	/** Character weights times the authored weights for one choice axis. */
+	function weighted(prototypes: readonly PrismPrototype[], character: MusicCharacter, base?: readonly number[]) {
+		return characterWeights(prototypes, character, 3.5, 0.08).map((weight, index) => weight * (base?.[index] ?? 1));
+	}
+
+	/**
+	 * Bias future picks toward options that fit the music: the camera regime,
+	 * the room, the window grammar, the mosaic cut, the beat form and both
+	 * palette families. With no character yet, only the authored weights.
+	 */
+	function applyLookWeights(character?: MusicCharacter, awayFrom?: Rgb) {
+		const cameraBase = PRISM_CAMERAS.map((name) => CAMERA_WEIGHTS[name]);
+		const environmentBase = PRISM_ENVIRONMENTS.map((name) => ENVIRONMENT_WEIGHTS[name]);
+		if (!character) {
+			genome.setWeights('camera', cameraBase);
+			genome.setWeights('environment', environmentBase);
+			return;
+		}
+		genome.setWeights('camera', weighted(CAMERA_PROTOS, character, cameraBase));
+		genome.setWeights('environment', weighted(ENVIRONMENT_PROTOS, character, environmentBase));
+		genome.setWeights('grammar', weighted(PRISM_GRAMMAR_PROTOTYPES, character));
+		genome.setWeights('mosaic', weighted(PRISM_MOSAIC_PROTOTYPES, character));
+		genome.setWeights('beatForm', weighted(PRISM_BEAT_FORM_PROTOTYPES, character));
+		// Answering a change of music, steer away from the hue on screen too.
+		const away = awayFrom ? prismHueAway(awayFrom) : null;
+		const palettes = weighted(PRISM_PALETTE_PROTOTYPES, character, away ?? undefined);
+		genome.setWeights('palette', palettes);
+		genome.setWeights('guest', palettes);
 	}
 	applyLookWeights();
+
+	/**
+	 * Steer the continuous axes the music's character should own: how finely
+	 * the glass is cut, the hour of the light, haze, dust and the clerestory.
+	 */
+	function pullToCharacter(c: Record<CharacterFeature, number>, amount: number) {
+		genome.pull('cellScale', clamp(0.1 + c.tempo * 0.6 + c.punch * 0.3, 0, 1), amount);
+		genome.pull('fog', clamp(0.85 - c.tempo * 0.5 - c.punch * 0.25, 0, 1), amount);
+		genome.pull('dust', clamp(0.15 + c.tempo * 0.5 + c.energy * 0.3, 0, 1), amount);
+		genome.pull('timeOfDay', clamp(0.86 - c.tempo * 0.4 - c.punch * 0.25, 0, 1), amount);
+		genome.pull('sideShaft', clamp(c.energy * 0.7 + c.punch * 0.4, 0, 1), amount);
+		genome.pull('sunCount', clamp(c.energy * 0.8 + c.tempo * 0.2, 0, 1), amount);
+		genome.pull('tint', clamp(0.5 + (c.tempo - 0.45) * 0.8, 0, 1), amount * 0.6);
+		genome.pull('petalWidth', clamp(0.8 - c.tempo * 0.6, 0, 1), amount * 0.5);
+		genome.pull('tracery', clamp(c.bass * 0.8, 0, 1), amount * 0.5);
+	}
+
+	/** What Prism's own change detector listens to, and how much each counts. */
+	const PACE_WEIGHTS = { tempo: 1, punch: 0.6, bass: 0.4, noise: 0.4, brightness: 0.3 } as const;
+	type PaceFeature = keyof typeof PACE_WEIGHTS;
+	const PACE_FEATURES = Object.keys(PACE_WEIGHTS) as PaceFeature[];
+
+	function paceRecord(): Record<PaceFeature, number> {
+		return { tempo: 0.5, punch: 0.3, bass: 0.4, noise: 0.4, brightness: 0.5 };
+	}
+
+	/**
+	 * How far the music has moved from a memory. The tempo-only reading is what
+	 * Prism answers on its own (a new tempo is new music even when the timbre
+	 * stays, and the shared detector weighs timbre); the full reading decides
+	 * whether a mild answer was really a new genre.
+	 */
+	function paceDistance(memory: Record<PaceFeature, number>, c: MusicCharacter, paceOnly = false): number {
+		let d = 0;
+		for (const name of PACE_FEATURES) {
+			if (paceOnly && (name === 'noise' || name === 'brightness')) continue;
+			d += Math.abs(finite(c[name], memory[name]) - memory[name]) * PACE_WEIGHTS[name];
+		}
+		return d;
+	}
+
+	/** True once the music has been quiet long enough to hold the look. */
+	function silenceHeld(env: { silence: number }) {
+		return env.silence > 0.5;
+	}
+
+	function characterRecord(c: MusicCharacter | undefined): Record<CharacterFeature, number> {
+		const out = {} as Record<CharacterFeature, number>;
+		for (const name of CHARACTER_FEATURES) out[name] = finite(c?.[name] ?? 0.5, 0.5);
+		return out;
+	}
 
 	/** Exposure lift for the current camera/environment crossfade (>= 1). */
 	function regimeExposure(camera: ChoiceState, environment: ChoiceState, energy: number): number {
@@ -192,8 +356,14 @@
 	let rendererSourceEpoch = -1;
 	let run: PrismRun | null = lookState.run;
 	let feedbackResetFrames = 2;
+	/** Fade from black after the GPU (re)starts. */
+	let fadeIn = 0;
+	/** The previous frame's camera, for reprojected history (not part of the look). */
+	let prevBasis: PrismCameraBasis | null = null;
 	let frameIndex = 0;
 	let hudLook = $state('');
+	let hudDebug = $state('');
+	let localAnswers = 0;
 
 	function clamp(value: number, low: number, high: number) {
 		return Math.min(high, Math.max(low, value));
@@ -218,12 +388,26 @@
 		feedbackView: [GPUTextureView, GPUTextureView];
 		bloom: [GPUTexture, GPUTexture];
 		bloomView: [GPUTextureView, GPUTextureView];
+		/** The nave's air at half resolution, ping-ponged for its history. */
+		volume: [GPUTexture, GPUTexture];
+		volumeView: [GPUTextureView, GPUTextureView];
+		/** What the glass transmits, in wall coordinates. */
+		lightmap: GPUTexture;
+		lightmapView: GPUTextureView;
+		/** The metered exposure, 1x1, ping-ponged so it adapts over time. */
+		exposure: [GPUTexture, GPUTexture];
+		exposureView: [GPUTextureView, GPUTextureView];
 		width: number;
 		height: number;
 	};
 
 	type BindGroups = {
+		lightmap: GPUBindGroup;
 		scenes: GPUBindGroup[];
+		/** Indexed by the parity of the frame being read. */
+		volume: [GPUBindGroup, GPUBindGroup];
+		/** Indexed by the parity of the frame just written. */
+		exposure: [GPUBindGroup, GPUBindGroup];
 		/** Indexed by the parity of the frame being read. */
 		feedback: [GPUBindGroup, GPUBindGroup];
 		/** Indexed by the parity of the frame just written. */
@@ -242,7 +426,10 @@
 		binsBuf: GPUBuffer;
 		uniformData: Float32Array;
 		pipelines: {
+			lightmap: GPURenderPipeline;
 			scenes: GPURenderPipeline[];
+			volume: GPURenderPipeline;
+			exposure: GPURenderPipeline;
 			feedback: GPURenderPipeline;
 			bloomDown: GPURenderPipeline;
 			blurH: GPURenderPipeline;
@@ -270,6 +457,9 @@
 		t.scene.destroy();
 		for (const texture of t.feedback) texture.destroy();
 		for (const texture of t.bloom) texture.destroy();
+		for (const texture of t.volume) texture.destroy();
+		for (const texture of t.exposure) texture.destroy();
+		t.lightmap.destroy();
 	}
 
 	function ensureTargets(g: GPU, w: number, h: number) {
@@ -287,6 +477,15 @@
 			createTarget(device, 'Prism bloom A', halfW, halfH),
 			createTarget(device, 'Prism bloom B', halfW, halfH)
 		];
+		const volume: [GPUTexture, GPUTexture] = [
+			createTarget(device, 'Prism air A', halfW, halfH),
+			createTarget(device, 'Prism air B', halfW, halfH)
+		];
+		const lightmap = createTarget(device, 'Prism light map', PRISM_LIGHTMAP_WIDTH, PRISM_LIGHTMAP_HEIGHT);
+		const exposure: [GPUTexture, GPUTexture] = [
+			createTarget(device, 'Prism exposure A', 1, 1),
+			createTarget(device, 'Prism exposure B', 1, 1)
+		];
 		const t: Targets = {
 			scene,
 			sceneView: scene.createView(),
@@ -294,6 +493,12 @@
 			feedbackView: [feedback[0].createView(), feedback[1].createView()],
 			bloom,
 			bloomView: [bloom[0].createView(), bloom[1].createView()],
+			volume,
+			volumeView: [volume[0].createView(), volume[1].createView()],
+			lightmap,
+			lightmapView: lightmap.createView(),
+			exposure,
+			exposureView: [exposure[0].createView(), exposure[1].createView()],
 			width: w,
 			height: h
 		};
@@ -311,14 +516,33 @@
 					...views.map((view, index) => ({ binding: 2 + index, resource: view }))
 				]
 			});
+		const binsEntry = { binding: 1, resource: { buffer: binsBuf } };
 		g.bindGroups = {
+			lightmap: device.createBindGroup({
+				label: 'Prism light map',
+				layout: pipelines.lightmap.getBindGroupLayout(0),
+				entries: [uniform, binsEntry]
+			}),
+			// The rose reads the light map for the arcade and the clerestory
+			// beams; the legacy lab scenes only take the uniforms and bins.
 			scenes: pipelines.scenes.map((pipeline, index) =>
 				device.createBindGroup({
 					label: `Prism scene ${index}`,
 					layout: pipeline.getBindGroupLayout(0),
-					entries: [uniform, { binding: 1, resource: { buffer: binsBuf } }]
+					entries:
+						index === 0
+							? [uniform, binsEntry, { binding: 2, resource: t.lightmapView }, { binding: 3, resource: sampler }]
+							: [uniform, binsEntry]
 				})
 			),
+			volume: [
+				bind(pipelines.volume, 'Prism air reads A', [t.lightmapView, t.volumeView[0]]),
+				bind(pipelines.volume, 'Prism air reads B', [t.lightmapView, t.volumeView[1]])
+			],
+			exposure: [
+				bind(pipelines.exposure, 'Prism exposure writes A', [t.feedbackView[0], t.exposureView[1]]),
+				bind(pipelines.exposure, 'Prism exposure writes B', [t.feedbackView[1], t.exposureView[0]])
+			],
 			feedback: [
 				bind(pipelines.feedback, 'Prism feedback reads A', [t.sceneView, t.feedbackView[0]]),
 				bind(pipelines.feedback, 'Prism feedback reads B', [t.sceneView, t.feedbackView[1]])
@@ -330,8 +554,20 @@
 			blurH: bind(pipelines.blurH, 'Prism bloom blur H', [t.bloomView[0]]),
 			blurV: bind(pipelines.blurV, 'Prism bloom blur V', [t.bloomView[1]]),
 			composite: [
-				bind(pipelines.composite, 'Prism present A', [t.feedbackView[0], t.bloomView[0]]),
-				bind(pipelines.composite, 'Prism present B', [t.feedbackView[1], t.bloomView[0]])
+				bind(pipelines.composite, 'Prism present A', [
+					t.feedbackView[0],
+					t.bloomView[0],
+					t.volumeView[0],
+					t.lightmapView,
+					t.exposureView[0]
+				]),
+				bind(pipelines.composite, 'Prism present B', [
+					t.feedbackView[1],
+					t.bloomView[0],
+					t.volumeView[1],
+					t.lightmapView,
+					t.exposureView[1]
+				])
 			]
 		};
 		// Fresh history textures are undefined; never let a stale trail bleed in.
@@ -354,6 +590,8 @@
 			context.configure({ device, format, alphaMode: 'opaque' });
 
 			const sources: [string, string][] = [
+				['Prism light map', PRISM_LIGHTMAP_WGSL],
+				['Prism air', PRISM_VOLUME_WGSL],
 				['Prism rose', PRISM_ROSE_WGSL],
 				['Prism cathedral (lab)', PRISM_CATHEDRAL_WGSL],
 				['Prism voronoi (lab)', PRISM_VORONOI_WGSL],
@@ -362,7 +600,8 @@
 				['Prism bloom prefilter', PRISM_BLOOM_DOWN_WGSL],
 				['Prism bloom blur H', PRISM_BLUR_H_WGSL],
 				['Prism bloom blur V', PRISM_BLUR_V_WGSL],
-				['Prism presentation', PRISM_COMPOSITE_WGSL]
+				['Prism presentation', PRISM_COMPOSITE_WGSL],
+				['Prism exposure', PRISM_EXPOSURE_WGSL]
 			];
 			const modules = sources.map(([label, code]) => device.createShaderModule({ label, code }));
 			await Promise.all(
@@ -387,15 +626,18 @@
 				});
 			const hdr: GPUTextureFormat = 'rgba16float';
 			const built = await Promise.all([
-				pipeline('Prism rose pipeline', modules[0], hdr),
-				pipeline('Prism cathedral pipeline', modules[1], hdr),
-				pipeline('Prism voronoi pipeline', modules[2], hdr),
-				pipeline('Prism nebulae pipeline', modules[3], hdr),
-				pipeline('Prism feedback pipeline', modules[4], hdr),
-				pipeline('Prism bloom prefilter pipeline', modules[5], hdr),
-				pipeline('Prism blur H pipeline', modules[6], hdr),
-				pipeline('Prism blur V pipeline', modules[7], hdr),
-				pipeline('Prism presentation pipeline', modules[8], format)
+				pipeline('Prism light map pipeline', modules[0], hdr),
+				pipeline('Prism air pipeline', modules[1], hdr),
+				pipeline('Prism rose pipeline', modules[2], hdr),
+				pipeline('Prism cathedral pipeline', modules[3], hdr),
+				pipeline('Prism voronoi pipeline', modules[4], hdr),
+				pipeline('Prism nebulae pipeline', modules[5], hdr),
+				pipeline('Prism feedback pipeline', modules[6], hdr),
+				pipeline('Prism bloom prefilter pipeline', modules[7], hdr),
+				pipeline('Prism blur H pipeline', modules[8], hdr),
+				pipeline('Prism blur V pipeline', modules[9], hdr),
+				pipeline('Prism presentation pipeline', modules[10], format),
+				pipeline('Prism exposure pipeline', modules[11], hdr)
 			]);
 
 			uniformBuf = device.createBuffer({
@@ -420,12 +662,15 @@
 				binsBuf,
 				uniformData: new Float32Array(PRISM_UNIFORM_FLOATS),
 				pipelines: {
-					scenes: built.slice(0, 4),
-					feedback: built[4],
-					bloomDown: built[5],
-					blurH: built[6],
-					blurV: built[7],
-					composite: built[8]
+					lightmap: built[0],
+					volume: built[1],
+					scenes: built.slice(2, 6),
+					feedback: built[6],
+					bloomDown: built[7],
+					blurH: built[8],
+					blurV: built[9],
+					composite: built[10],
+					exposure: built[11]
 				},
 				targets: null,
 				bindGroups: null,
@@ -489,7 +734,12 @@
 
 	function pick(r: PrismRun, name: Followed): ChoiceState {
 		const value = forced()?.[name];
-		return value === undefined ? r.choices[name].state() : { from: value, to: value, mix: 1 };
+		if (value !== undefined) return { from: value, to: value, mix: 1 };
+		const follower = r.choices[name];
+		// An answering fade shows from its first frame (the camera keeps its
+		// smoothstep: a reframing should ease in, not lurch).
+		const eager = name !== 'camera' && follower.starts === r.eagerFade[name] && follower.mix < 1;
+		return eager ? follower.stateEagerly() : follower.state();
 	}
 
 	function val(name: string): number {
@@ -544,15 +794,28 @@
 			draft: new MosaicDraft(),
 			motion: new PrismMotion(seed),
 			choices,
+			rig: new PrismCameraRig(seed),
+			feel: characterRecord(undefined),
+			hurry: 0,
+			holdMorph: 0,
+			hurryHold: 0,
+			fastFades: Object.fromEntries(FOLLOWED.map((name) => [name, false])) as Record<Followed, boolean>,
+			eagerFade: Object.fromEntries(FOLLOWED.map((name) => [name, -1])) as Record<Followed, number>,
+			morphFast: false,
+			feelSettle: 0,
+			weightClock: 0,
+			pace: { memory: paceRecord(), before: paceRecord(), upgradeFor: 0, primed: false, since: 0 },
 			salt,
 			beatSerial: 0,
+			beatAge: 1,
 			lastBeatCount: -1,
 			resyncBeat: true
 		};
 	}
 
-	function writeShape(u: Float32Array, offset: number, comp: PrismComp) {
-		writeVec4(u, offset, comp.petalWidth, comp.petalReach, comp.cellScale, comp.outerLit);
+	/** Shape uniforms; the music's fragmentation scales the mosaic live. */
+	function writeShape(u: Float32Array, offset: number, comp: PrismComp, frag: number) {
+		writeVec4(u, offset, comp.petalWidth, comp.petalReach, comp.cellScale * frag, comp.outerLit);
 	}
 
 	function writeGrammar(u: Float32Array, offset: number, comp: PrismComp) {
@@ -604,17 +867,130 @@
 			// turn, its mosaic draft, its trails and every crossfade carry on. The
 			// same source again is a remount and resumes exactly where it was.
 			prismEnterSource(lookState, journey.sourceEpoch, songSeed, () => {
-				applyLookWeights();
+				applyLookWeights(journey.character);
 				return createRun(songSeed, family, !!feat, directed.context);
 			});
-			applyLookWeights();
+			applyLookWeights(journey.character);
 			run = lookState.run;
+			// A new source answers through the shared shift that follows it;
+			// the pace detector waits so the same change is not answered twice.
+			// Its music is heard within a second, though: let the character-driven
+			// glides hurry from the first frame.
+			if (run) {
+				run.pace.since = Math.min(run.pace.since, 4);
+				run.hurry = Math.max(run.hurry, 0.6);
+				run.holdMorph = 1.6;
+			}
 		}
 		const r = run;
 		if (!r) return;
 		const env = r.env;
 		const palette = r.palette;
 		const motion = r.motion;
+
+		// ── Music character. The look follows what kind of music it is through
+		// glides of a second or two, and answers a change of character (a new
+		// song, a station moving genre) at once: weights that fit the new music
+		// first, then an immediate genome shift, a camera surge, and every
+		// smoother hurrying in step. One answer per shift serial, remembered in
+		// the look so a remount never answers the same change twice.
+		const character = journey.character;
+		r.hurryHold = Math.max(0, r.hurryHold - dt);
+		if (r.hurryHold <= 0) r.hurry = Math.max(0, r.hurry - dt / 3);
+		const pace = r.pace;
+		pace.since += dt;
+		const reelAnswer = (strength: number) => {
+			genome.shift(Math.max(strength, 0.8), Math.max(env.energy, character.energy));
+			r.hurry = Math.max(r.hurry, 0.4 + strength * 0.6);
+			r.hurryHold = 2.2;
+		};
+		const answer = (strength: number) => {
+			applyLookWeights(character, palette.hero);
+			pullToCharacter(characterRecord(character), 0.5 + strength * 0.4);
+			// A change of genre is a new reel, not just a new scene: a clear shift
+			// also moves the era (palette family, room, hour). A milder one (the
+			// music changing character inside a song) re-sets the scene only,
+			// unless the music keeps moving away over the next seconds.
+			const reel = strength >= 0.62;
+			if (reel) reelAnswer(strength);
+			else {
+				genome.shift(strength, Math.max(env.energy, character.energy));
+				r.hurry = Math.max(r.hurry, 0.5);
+				r.hurryHold = 1;
+			}
+			r.rig.shift(strength);
+			r.weightClock = 0;
+			r.holdMorph = 0;
+			r.feelSettle = 6;
+			// Remember what was playing before this change (the memory as it was),
+			// then start remembering the new music.
+			if (pace.upgradeFor <= 0) Object.assign(pace.before, pace.memory);
+			pace.upgradeFor = reel ? 0 : 2.5;
+			for (const name of PACE_FEATURES) pace.memory[name] = character[name];
+			pace.since = 0;
+		};
+		if (lookState.answeredShift === null) {
+			lookState.answeredShift = character.shiftSerial;
+		} else if (character.shiftSerial !== lookState.answeredShift) {
+			lookState.answeredShift = character.shiftSerial;
+			// Already answered a moment ago by Prism's own pace detector: the
+			// look is mid-change, so only refresh the weights for what follows.
+			if (pace.since < 3) applyLookWeights(character);
+			else answer(clamp(finite(character.shiftStrength, 1), 0, 1));
+		} else if (pace.upgradeFor > 0) {
+			// A mild answer that turns out to be the start of a whole new piece of
+			// music (an early detection, the change still under way): make it a
+			// new reel while the first crossfades are still running.
+			pace.upgradeFor -= dt;
+			if (paceDistance(pace.before, character) > 0.35) {
+				applyLookWeights(character, palette.hero);
+				reelAnswer(0.8);
+				r.rig.shift(0.6);
+				pace.upgradeFor = 0;
+				localAnswers += 1;
+			}
+		} else if (feat && pace.primed && pace.since > 10 && character.sinceShift > 4) {
+			// A new tempo (or a new weight of beat) is new music even when the
+			// timbre stays: answer it the same way, scaled by how far it moved.
+			const moved = paceDistance(pace.memory, character, true);
+			if (moved > 0.18) {
+				answer(clamp(0.45 + (moved - 0.18) * 2, 0.45, 0.9));
+				localAnswers += 1;
+			}
+		}
+		if (feat && !silenceHeld(env)) {
+			if (!pace.primed) {
+				for (const name of PACE_FEATURES) pace.memory[name] = character[name];
+				pace.primed = true;
+			}
+			// Right after an answer the tempo estimate is still re-locking onto
+			// the new music; let the memory catch up quickly, then slow down.
+			const k = 1 - Math.exp(-dt / (pace.since < 7 ? 1.5 : 20));
+			for (const name of PACE_FEATURES) pace.memory[name] += (character[name] - pace.memory[name]) * k;
+		}
+		// Within a piece the look follows its character slowly (a couple of
+		// seconds), so the music's moment-to-moment texture does not churn the
+		// glass; answering a change of music it follows within half a second.
+		r.feelSettle = Math.max(0, r.feelSettle - dt);
+		const feelRate = 0.45 + Math.max(r.hurry * 4, r.feelSettle > 0 ? 2.5 : 0);
+		for (const name of CHARACTER_FEATURES) {
+			r.feel[name] = approach(r.feel[name], finite(character[name], r.feel[name]), feelRate, dt);
+		}
+		r.weightClock += dt;
+		if (r.weightClock > 1.5 && feat) {
+			r.weightClock = 0;
+			applyLookWeights(character);
+			pullToCharacter(r.feel, 0.06);
+		}
+		const feel = prismFeel(r.feel);
+		const feelForce = forced();
+		if (feelForce) {
+			for (const key of Object.keys(feel) as (keyof typeof feel)[]) {
+				const value = feelForce[key];
+				if (value !== undefined) feel[key] = value;
+			}
+		}
+		const glide = Math.max(1, genome.glideSpeed);
 
 		// ── Envelopes
 		const incoming = feat?.bins ?? [];
@@ -653,14 +1029,46 @@
 		}
 		// Every discrete axis is shown through a follower that owns its own
 		// crossfade, so a retarget mid-fade can never drop a half-shown option.
-		for (const name of FOLLOWED) r.choices[name].update(genome.choice(name).to, FOLLOW_TAU[name], dt);
+		// Natural changes (phrase, section, era) take their time; a crossfade
+		// that starts while Prism is answering a change of music runs several
+		// times faster, and keeps that pace until it lands, so the answer is
+		// complete within a few seconds instead of trailing on for half a minute.
+		const answering = r.hurry > 0.2;
+		for (const name of FOLLOWED) {
+			const follower = r.choices[name];
+			const target = genome.choice(name).to;
+			if (target !== follower.to && answering) {
+				r.fastFades[name] = true;
+				// The next fade this axis starts is the answering one.
+				r.eagerFade[name] = follower.starts + 1;
+			}
+			if (follower.mix >= 1 && target === follower.to) r.fastFades[name] = false;
+			// The camera keeps a longer blend even when hurried: a reframing, not a
+			// whip. A section recolouring the glass (roles, guest) drifts in slowly.
+			const natural = (FOLLOW_TAU[name] * (name === 'roles' || name === 'guest' ? 2.4 : 1.4)) / glide;
+			// Fast, but never a flick: at least 1.6 s (2.6 s for the camera).
+			const fast = name === 'camera' ? Math.max(2.6, FOLLOW_TAU[name] * 0.26) : Math.max(1.6, FOLLOW_TAU[name] * 0.17);
+			follower.update(target, r.fastFades[name] ? Math.min(fast, natural) : natural, dt);
+		}
 
 		// Section choreography: a new structure (grammar, fold, cut, tiers,
 		// outline) or a new section family re-sets the window piece by piece in
 		// a lit dissolve that washes outward. One morph at a time; a change that
-		// lands mid-morph waits for it.
+		// lands mid-morph waits for it. A morph that answers a change of music
+		// (or that such a change is waiting on) runs at twice the pace.
 		const live = prismLive(genome);
-		r.morph.update(forceStructure(prismStructure(genome, family)), family, live, dt);
+		r.holdMorph = Math.max(0, r.holdMorph - dt);
+		const held = r.holdMorph > 0;
+		const serialBefore = r.morph.serial;
+		if (answering && r.morph.morphing) r.morphFast = true;
+		r.morph.update(
+			held ? r.morph.b : forceStructure(prismStructure(genome, family)),
+			held ? r.morph.family : family,
+			live,
+			dt * (r.morphFast ? 1.6 : 0.7)
+		);
+		if (r.morph.serial !== serialBefore) r.morphFast = answering;
+		if (!r.morph.morphing) r.morphFast = false;
 		const compA = r.morph.a;
 		const compB = r.morph.b;
 		const morph = r.morph.uniforms();
@@ -669,32 +1077,36 @@
 		r.draft.update(phraseIndex, phrasePos, dt);
 
 		// Organism: cells divide as a phrase builds and as the section climbs,
-		// then fold back and re-draft when the next phrase begins.
+		// then fold back and re-draft when the next phrase begins. Noisy, punchy
+		// music keeps the glass more divided.
 		const growthTarget =
 			clamp(
 				0.08 +
 					sectionEnergy * 0.32 +
 					directed.drop.buildProgress * 0.22 +
-					phrasePos * 0.38 +
-					directed.density * 0.12,
+					phrasePos * 0.22 +
+					directed.density * 0.12 +
+					feel.divide * 0.45,
 				0,
 				1
 			) *
 			(1 - env.silence * 0.6);
-		env.growth = approach(env.growth, growthTarget, 0.9, dt);
+		env.growth = approach(env.growth, growthTarget, 0.5 * (1 + r.hurry * 3), dt);
 
 		const daylight = prismDaylight(val('timeOfDay'));
 		const lightTarget =
 			(drive.light * (0.55 + env.energy * 0.6) + directed.drop.anticipation * 0.12) *
 			(1 - env.silence * 0.72) *
-			daylight.power;
-		env.backlight = approach(env.backlight, lightTarget, 1.4, dt);
+			daylight.power *
+			feel.light;
+		env.backlight = approach(env.backlight, lightTarget, 1.4 * (1 + r.hurry * 1.5), dt);
 		env.air = approach(env.air, drive.air * (1 - env.silence * 0.4), 0.8, dt);
 
 		// Beat light: strength is latched as each beat starts and then carried
 		// through the window by the shader over the beat's own phase. The serial
 		// the shader hashes is the look's own, so a new song's beat counter
-		// restarting at zero does not jump the beat forms.
+		// restarting at zero does not jump the beat forms. Kicks and downbeats
+		// also push the camera in on its spring.
 		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex)));
 		if (r.resyncBeat) {
 			r.lastBeatCount = beatCount;
@@ -702,9 +1114,13 @@
 		}
 		if (beatCount !== r.lastBeatCount) {
 			const isDownbeat = Math.floor(finite(clock.beatIndex)) === 0;
+			// Very fast music lands its beats a little lighter, so 170 bpm reads as
+			// a pulse in the glass rather than a strobe.
+			const beatWeight = 1 - 0.35 * smooth01(r.feel.tempo, 0.6, 1);
 			env.packetStrength = feat
 				? clamp(
 						(0.3 + directed.bassPunch * 0.7 + env.energy * 0.35 + (isDownbeat ? 0.25 : 0)) *
+							beatWeight *
 							response.impact *
 							drive.packet *
 							(1 - env.silence),
@@ -712,19 +1128,30 @@
 						1.6
 					)
 				: 0;
+			r.rig.punch(env.packetStrength * (isDownbeat ? 0.8 : 0.35) * (0.4 + directed.bassPunch * 0.6) * response.motion);
 			r.lastBeatCount = beatCount;
 			r.beatSerial += 1;
+			r.beatAge = 0;
+		} else {
+			const beatSeconds = 60 / clamp(finite(clock.tempoBpm, 120), 50, 200);
+			r.beatAge = Math.min(1, r.beatAge + dt / beatSeconds);
 		}
 		const beatForm = pick(r, 'beatForm');
 
 		// Suns behind the glass: where they sit and how many are phrase moves.
+		// The light itself is a direction: it sets where the shafts fall, and it
+		// wanders slowly, so the beams sweep the nave between phrases too.
 		const sunAngle = val('sunAngle') * Math.PI * 2;
 		const sunX = Math.cos(sunAngle) * 0.2;
 		const sunY = 0.06 + Math.sin(sunAngle) * 0.15;
 		const sunPower = 0.45 + env.energy * 0.7;
+		const lightX = -Math.cos(sunAngle) * 0.42 + 0.14 * Math.sin(motion.clock * 0.019 + r.salt);
+		const lightY = 0.52 + Math.sin(sunAngle) * 0.16 + 0.05 * Math.sin(motion.clock * 0.013 + 1.7);
+		const lightLen = Math.hypot(lightX, lightY, 1);
 
 		// Palette: family (era) and roles (section) crossfade; harmony and
-		// energy lean it; the result glides.
+		// energy lean it; the music tempers it (warm or cold, bright or deep,
+		// greyed by noise); the result glides, faster right after a shift.
 		const roles = prismPalette(
 			pick(r, 'palette'),
 			pick(r, 'roles'),
@@ -738,10 +1165,13 @@
 			pick(r, 'guest'),
 			smooth01(val('guestMix'), 0.3, 0.75)
 		);
-		approachRgb(palette.hero, roles.hero, 1.2, dt);
-		approachRgb(palette.support, roles.support, 1.2, dt);
-		approachRgb(palette.accent, roles.accent, 1.2, dt);
-		approachRgb(palette.field, roles.field, 1.2, dt);
+		const paletteRate = 1.2 * (1 + r.hurry * 2.5);
+		approachRgb(palette.hero, prismTemper(roles.hero, feel), paletteRate, dt);
+		approachRgb(palette.support, prismTemper(roles.support, feel), paletteRate, dt);
+		approachRgb(palette.accent, prismTemper(roles.accent, feel), paletteRate, dt);
+		approachRgb(palette.field, prismTemper(roles.field, feel, 0.4), paletteRate, dt);
+		// The light behind the glass takes the music's temperature too.
+		const sky = prismTemper(daylight.color, { temperature: feel.temperature * 0.7, value: 1, saturation: 1 }, 1);
 
 		// The rose turns with the shared trace phase (music-driven, stops in
 		// silence) plus a slow sway. The look integrates the phase's increments
@@ -756,42 +1186,29 @@
 		});
 		const tSec = motion.clock;
 		const rotationDelta = clamp(motion.rotation - motion.previousRotation, -0.02, 0.02);
-		const drift = motion.drift(response.motion);
-		const driftX = drift.x;
-		const driftY = drift.y;
 
-		// ── Camera: the regime crossfade is a real camera move. The gallery
-		// dolly advances with the music and stops in silence.
+		// ── Camera: always travelling. The regime crossfade blends two moving
+		// paths; tempo sets the travel rate, a shift surges it, beats push it.
 		const spacing = prismBaySpacing(val('baySpacing'));
 		const camSide = val('camSide');
 		const camera = pick(r, 'camera');
-		const cam = prismCamera(
-			camera,
-			camSide,
-			val('camFocus'),
-			val('camDrift'),
-			Math.sin(motion.dollyPhase) * 1.4 * spacing
-		);
-		cam.tx += driftX * 1.6;
-		cam.ty += driftY * 1.6;
-		cam.yaw += driftX * 0.6;
+		const cam = r.rig.update({
+			dt,
+			regime: camera,
+			side: camSide,
+			focus: val('camFocus'),
+			drift: val('camDrift'),
+			spacing,
+			tempo: r.feel.tempo,
+			energy: env.energy,
+			silence: env.silence,
+			motion: response.motion
+		});
 		const basis = prismCameraBasis(cam);
-		// The hero window glides from bay to bay as the dolly passes between
-		// them, so the light shafts and trails centred on it never jump.
-		const bayPos = cam.tx / spacing;
-		const bayLow = Math.floor(bayPos);
-		const bayMix = smooth01(bayPos - bayLow, 0.3, 0.7);
-		const heroAt = (bay: number) => {
-			const centre = prismProject(basis, [bay * spacing, PRISM_ROSE_Y, 0]);
-			const edge = prismProject(basis, [bay * spacing + PRISM_ROSE_R, PRISM_ROSE_Y, 0]);
-			if (!centre) return null;
-			const radius = edge ? Math.hypot(edge[0] - centre[0], edge[1] - centre[1]) : 0.32;
-			return [centre[0], centre[1], radius] as const;
-		};
-		const heroA = heroAt(bayLow) ?? heroAt(bayLow + 1) ?? ([0, 4, 0.32] as const);
-		const heroB = heroAt(bayLow + 1) ?? heroA;
-		const heroCentre = [heroA[0] + (heroB[0] - heroA[0]) * bayMix, heroA[1] + (heroB[1] - heroA[1]) * bayMix];
-		const heroRadius = Math.max(0.02, heroA[2] + (heroB[2] - heroA[2]) * bayMix);
+		const anchorX = r.rig.anchorBay * spacing;
+		const heroCentre = prismProject(basis, [anchorX, PRISM_ROSE_Y, 0]) ?? [0, 4];
+		const heroEdge = prismProject(basis, [anchorX + PRISM_ROSE_R, PRISM_ROSE_Y, 0]);
+		const heroRadius = heroEdge ? Math.max(0.02, Math.hypot(heroEdge[0] - heroCentre[0], heroEdge[1] - heroCentre[1])) : 0.32;
 		// Trails follow the rose's turn only when the camera sees it square-on.
 		const squareOn = Math.pow(Math.cos(cam.yaw), 6) * Math.pow(Math.cos(cam.pitch), 2);
 		const trailTurn = radial ? rotationDelta * squareOn : 0;
@@ -800,11 +1217,32 @@
 		const environment = pick(r, 'environment');
 		const rain = smooth01(val('rain'), 0.55, 0.9);
 		const wetness = clamp(Math.max(val('wetness') * 0.55, cam.wet, rain * 0.85), 0, 1);
-		const sideShaft = smooth01(val('sideShaft'), 0.55, 0.98);
+		const sideShaft = smooth01(val('sideShaft'), 0.35, 0.95);
+		const roomWeight = (index: number) =>
+			(environment.from === index ? 1 - environment.mix : 0) + (environment.to === index ? environment.mix : 0);
+		const arcade = [0, 0, 0, 0];
+		PRISM_ENVIRONMENTS.forEach((name, index) => {
+			const weight = roomWeight(index);
+			if (weight <= 0) return;
+			const params = ARCADE[name];
+			for (let k = 0; k < 4; k++) arcade[k] += params[k] * weight;
+		});
+		// Haze: the music's own (thick and soft for slow quiet music, gritty for
+		// noise) times the section's fog; it thins in silence but never clears.
+		const haze = (0.1 + feel.haze * 0.55) * (0.55 + val('fog') * 0.9) * (1 - env.silence * 0.3);
+		const dust = clamp(val('dust') * 0.45 + feel.dust * 0.65, 0, 1);
+		const shaftPower = (0.45 + env.energy * 0.55) * daylight.power * (1 - env.silence * 0.5);
+		// The clerestory light comes from behind the camera on the side away
+		// from the camera's wall, so its beams cross the nave toward the glass.
+		const sideX = -prismSoftSign(camSide) * 0.32 + val('shaftAngle') * 0.25;
+		const sideLen = Math.hypot(sideX, 0.62, 0.8);
+		const sideStrength = sideShaft * (0.25 + env.energy * 0.4) * (1 - env.silence * 0.6);
 
 		// Post: trails shorten on impact and in silence; the bloom knee drops
-		// with energy so peaks glow and quiet sections stay graphic. History is
-		// only cleared for fresh render targets (a resize or a new canvas).
+		// with energy so peaks glow and quiet sections stay graphic; punchy music
+		// keeps a higher knee so edges stay crisp. History is only cleared for
+		// fresh render targets (a resize or a new canvas).
+		const historyValid = feedbackResetFrames > 0 || !prevBasis ? 0 : 1;
 		const feedbackFade =
 			feedbackResetFrames > 0
 				? 0
@@ -816,8 +1254,9 @@
 					);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 		const feedbackZoom = 1 - (0.0012 + env.bass * 0.0022) * response.motion;
-		const bloomThreshold = 0.82 - env.energy * 0.18 + response.bloomThresholdOffset;
+		const bloomThreshold = 0.82 - env.energy * 0.18 + feel.edge * 0.08 + response.bloomThresholdOffset;
 		const aberration = 1 + env.impact * 1.5;
+		const prev = prevBasis ?? basis;
 
 		// Lab-only preset override; production is always the rose.
 		const selectedPreset = Math.max(0, Math.min(3, vis.forcedPreset >= 0 ? vis.forcedPreset : 0));
@@ -839,24 +1278,25 @@
 		u[11] = motion.rotation;
 		u[12] = feedbackZoom;
 		u[13] = 1;
-		u[14] = 0;
+		fadeIn = Math.min(1, fadeIn + dt / 2.5);
+		u[14] = fadeIn * fadeIn * (3 - 2 * fadeIn);
 		u[15] = clamp(finite(clock.beatPhase), 0, 1);
 		u[16] = clamp(finite(directed.context.keyPitchClass), 0, 1);
 		u[17] = clamp(finite(directed.context.keyConfidence), 0, 1);
 		u[18] = clamp((finite(clock.tempoBpm) - 60) / 120, 0, 1);
 		u[19] = songSeed;
-		u[20] = 0;
+		u[20] = forced()?.debugView ?? 0;
 		u[21] = 1;
 		u[22] = journey.signal.tracePhase;
 		u[23] = sectionEnergy;
 		writeVec4(u, O.comp, compA.fold, compB.fold, morph.front, morph.glow);
-		writeShape(u, O.shapeA, compA);
-		writeShape(u, O.shapeB, compB);
+		writeShape(u, O.shapeA, compA, feel.frag);
+		writeShape(u, O.shapeB, compB, feel.frag);
 		writeGrammar(u, O.gramA, compA);
 		writeGrammar(u, O.gramB, compB);
-		writeVec4(u, O.detail, live.tracery, live.cusp, live.sprinkle, cam.bays);
+		writeVec4(u, O.detail, clamp(live.tracery * 0.5 + feel.weight * 0.6, 0, 1), live.cusp, live.sprinkle, cam.bays);
 		writeVec4(u, O.organism, env.growth, r.draft.phrase, r.draft.mix, r.salt);
-		writeVec4(u, O.light, env.backlight, env.packetStrength, clamp(finite(clock.beatPhase), 0, 1), r.beatSerial);
+		writeVec4(u, O.light, env.backlight, env.packetStrength, r.beatAge, r.beatSerial);
 		writeVec4(u, O.modes, beatForm.from, beatForm.to, beatForm.mix, family === 'drift' ? 1 : 0);
 		writeVec4(u, O.sun, sunX, sunY, sunPower, env.air);
 		writeVec4(u, O.heroCol, ...palette.hero, 0);
@@ -864,7 +1304,7 @@
 		writeVec4(u, O.accentCol, ...palette.accent, 0);
 		writeVec4(u, O.fieldCol, ...palette.field, 0);
 		writeVec4(u, O.post, feedbackFade, feedbackZoom, bloomThreshold, aberration);
-		writeVec4(u, O.env, driftX, driftY, env.silence, motion.rotation);
+		writeVec4(u, O.env, 0, 0, env.silence, motion.rotation);
 		writeVec4(u, O.bands, env.bass, env.mid, env.treble, env.impact);
 		writeVec4(u, O.motion, trailTurn, frameIndex % 60, env.energy, regimeExposure(camera, environment, env.energy));
 		writeVec4(u, O.camPos, basis.pos[0], basis.pos[1], basis.pos[2], basis.focal);
@@ -873,18 +1313,22 @@
 		writeVec4(u, O.camFwd, basis.fwd[0], basis.fwd[1], basis.fwd[2], wetness);
 		writeVec4(u, O.roseScreen, heroCentre[0], heroCentre[1], heroRadius, 0);
 		writeVec4(u, O.world, environment.from, environment.to, environment.mix, rain);
-		writeVec4(u, O.sky, daylight.color[0], daylight.color[1], daylight.color[2], daylight.night);
-		writeVec4(
-			u,
-			O.atmos,
-			val('fog'),
-			clamp(val('dust') + env.energy * 0.2, 0, 1),
-			val('caustics'),
-			val('sunCount')
-		);
-		// The off-screen shaft swings across with the camera side, never flips.
+		writeVec4(u, O.sky, sky[0], sky[1], sky[2], daylight.night);
+		writeVec4(u, O.atmos, val('fog'), dust, val('caustics'), val('sunCount'));
 		writeVec4(u, O.shaft, sideShaft, val('shaftAngle'), -prismSoftSign(camSide) * 0.7, 0);
 		writeVec4(u, O.morph, compA.salt, compB.salt, morph.globalMix, 0);
+		writeVec4(u, O.prevPos, prev.pos[0], prev.pos[1], prev.pos[2], historyValid);
+		writeVec4(u, O.prevRight, prev.right[0], prev.right[1], prev.right[2], 0);
+		writeVec4(u, O.prevUp, prev.up[0], prev.up[1], prev.up[2], 0);
+		writeVec4(u, O.prevFwd, prev.fwd[0], prev.fwd[1], prev.fwd[2], 0);
+		writeVec4(u, O.sunDir, lightX / lightLen, lightY / lightLen, 1 / lightLen, shaftPower);
+		writeVec4(u, O.vol, haze, 0.55 + feel.edge * 0.2, dust, 0.9 + env.energy * 0.4);
+		writeVec4(u, O.lightBox, anchorX - 3.6, PRISM_FLOOR_Y - 0.01, 7.2, 1.35);
+		writeVec4(u, O.arcade, arcade[0], arcade[1], arcade[2], arcade[3]);
+		writeVec4(u, O.side, sideX / sideLen, 0.62 / sideLen, -0.8 / sideLen, sideStrength);
+		writeVec4(u, O.feel, feel.edge, roomWeight(2), 0.22, frameIndex % 64);
+		writeVec4(u, O.rig, anchorX, dt, r.rig.kick, 0);
+		prevBasis = basis;
 		frameIndex += 1;
 
 		g.device.queue.writeBuffer(g.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
@@ -898,8 +1342,18 @@
 			PRISM_PALETTES[pick(r, 'palette').to].name,
 			PRISM_ENVIRONMENTS[environment.to]
 		].join(' ');
+		if (frameIndex % (forced()?.debugEvery ?? 15) === 0) {
+			hudDebug = [
+				`cam ${PRISM_CAMERAS[camera.from]}>${PRISM_CAMERAS[camera.to]}@${camera.mix.toFixed(2)} pal ${PRISM_PALETTES[pick(r, 'palette').from].name}>${PRISM_PALETTES[pick(r, 'palette').to].name}@${pick(r, 'palette').mix.toFixed(2)} env ${environment.from}>${environment.to}@${environment.mix.toFixed(2)} morph ${morph.front.toFixed(2)}`,
+				`travel ${r.rig.travel.toFixed(2)} rate ${r.rig.rate.toFixed(3)} surge ${r.rig.surge.toFixed(2)}`,
+				`shift ${lookState.answeredShift}+${localAnswers} hurry ${r.hurry.toFixed(2)} pace ${PACE_FEATURES.map((name) => r.pace.memory[name].toFixed(2)).join(',')}`,
+				`temp ${feel.temperature.toFixed(2)} frag ${feel.frag.toFixed(2)} haze ${haze.toFixed(2)}`,
+				`pose ${[cam.yaw, cam.pitch, cam.roll, cam.dist, cam.tx, cam.ty].map((v) => v.toFixed(3)).join(',')}`
+			].join(' | ');
+		}
 
-		// ── Render graph: scene → feedback → prefilter → 2× (H, V) blur → present
+		// ── Render graph: light map → scene → air → feedback → exposure →
+		// prefilter → 2× (H, V) blur → present
 		const encoder = g.device.createCommandEncoder({ label: 'Prism frame' });
 		const fullscreen = (
 			label: string,
@@ -921,6 +1375,7 @@
 		};
 		const previous = g.parity;
 		const next: 0 | 1 = previous === 0 ? 1 : 0;
+		fullscreen('Prism light map', t.lightmapView, g.pipelines.lightmap, bg.lightmap, 6);
 		fullscreen(
 			'Prism scene',
 			t.sceneView,
@@ -928,7 +1383,9 @@
 			bg.scenes[selectedPreset],
 			6
 		);
+		fullscreen('Prism air', t.volumeView[next], g.pipelines.volume, bg.volume[previous], 3);
 		fullscreen('Prism feedback', t.feedbackView[next], g.pipelines.feedback, bg.feedback[previous], 3);
+		fullscreen('Prism exposure', t.exposureView[next], g.pipelines.exposure, bg.exposure[next], 3);
 		fullscreen('Prism bloom prefilter', t.bloomView[0], g.pipelines.bloomDown, bg.bloomDown[next], 3);
 		for (let round = 0; round < 2; round++) {
 			fullscreen('Prism bloom blur H', t.bloomView[1], g.pipelines.blurH, bg.blurH, 3);
@@ -982,6 +1439,7 @@
 					return;
 				}
 				gpu = state;
+				fadeIn = 0;
 				frameScheduler.reset();
 				feedbackResetFrames = 2;
 				ready = true;
@@ -1032,6 +1490,7 @@
 			data-prism-section={hudSection}
 			data-prism-fold={hudFold}
 			data-prism-look={hudLook}
+			data-prism-debug={hudDebug}
 			data-prism-ready={String(ready)}
 		></canvas>
 		{#if errorMsg}

@@ -8,6 +8,7 @@
 // Pure functions only: the renderer stays deterministic and the choices are
 // testable without WebGPU.
 
+import type { CharacterFeature } from '../character';
 import type { ChoiceState, VariationAxis, VariationGenome } from '../variation';
 
 export type PrismFamily = 'quiet' | 'verse' | 'rise' | 'peak' | 'drift';
@@ -86,13 +87,14 @@ export const PRISM_MOSAICS = ['organic', 'quarry', 'segments', 'slivers', 'slabs
 export const PRISM_BEAT_FORMS = ['rings', 'wheel', 'pairs', 'spiral', 'cascade', 'lightning'] as const;
 export const PRISM_ENVIRONMENTS = ['nave', 'crypt', 'ruin', 'apse', 'void'] as const;
 export const PRISM_CAMERAS = [
-	'straight', // the window square-on, the original framing
-	'receding', // the window on a side wall, its neighbours receding
-	'low', // from the nave floor, looking up into the window
-	'macro', // close into one petal: the facets become the picture
-	'gallery', // a slow dolly along a wall of windows
-	'flooded', // a flooded floor mirroring the window
-	'far' // the far end of the nave: bays, piers, long shafts
+	'orbit', // a slow orbit around the window, square-on at the start of its path
+	'arcade', // from one side, the window at an angle and its neighbours receding
+	'crane', // from the floor looking up into the window to above it looking down
+	'glass', // a close pass over the glass: the facets and tracery become the picture
+	'gallery', // a lateral dolly along a wall of windows
+	'flooded', // low over a flooded floor that mirrors the window
+	'nave', // from the far end of the nave, pushing in through the arcade
+	'dutch' // a mid-distance arc with the horizon rolled off level
 ] as const;
 
 export type Rgb = [number, number, number];
@@ -161,7 +163,7 @@ export const PRISM_AXES: readonly VariationAxis[] = [
 	// Section: a new scene in the same film. Window, cut, camera, beat form.
 	{ kind: 'choice', name: 'grammar', options: PRISM_GRAMMARS.length, scale: 'section', chance: 0.8, memory: 4, tau: 3 },
 	{ kind: 'choice', name: 'fold', options: 8, scale: 'section', chance: 0.85, memory: 2, tau: 3 },
-	{ kind: 'choice', name: 'camera', options: PRISM_CAMERAS.length, scale: 'section', chance: 0.72, memory: 3, tau: 7 },
+	{ kind: 'choice', name: 'camera', options: PRISM_CAMERAS.length, scale: 'section', chance: 0.72, memory: 3, tau: 11 },
 	{ kind: 'choice', name: 'beatForm', options: PRISM_BEAT_FORMS.length, scale: 'section', chance: 0.75, memory: 2, tau: 2.5 },
 	{ kind: 'choice', name: 'mosaic', options: PRISM_MOSAICS.length, scale: 'section', chance: 0.6, memory: 2, tau: 3 },
 	{ kind: 'choice', name: 'roles', options: ROLE_PERMUTATIONS.length, scale: 'section', chance: 0.55, memory: 2, tau: 5 },
@@ -414,70 +416,6 @@ export function prismSoftSign(side: number, width = 0.3): number {
 	return t * (1.5 - 0.5 * t * t);
 }
 
-/** One regime's camera given the section's side/focus and the phrase drift. */
-export function prismCameraRegime(
-	regime: number,
-	side: number,
-	focus: number,
-	drift: number,
-	dolly: number
-): PrismCameraParams {
-	// The side swings the camera through square-on instead of flipping it
-	// from one wall to the other the moment camSide crosses zero.
-	const sgn = prismSoftSign(side);
-	const mag = Math.abs(side);
-	switch (Math.round(regime)) {
-		case 1:
-			return { yaw: sgn * (0.42 + 0.18 * mag) + drift * 0.04, pitch: -0.04, roll: 0, dist: 1.65, tx: sgn * 0.1, ty: 0.04, bays: 2.5, wet: 0 };
-		case 2:
-			return { yaw: drift * 0.12, pitch: 0.3 + 0.05 * focus, roll: side * 0.05, dist: 1.15, tx: drift * 0.04, ty: 0.13, bays: 1, wet: 0 };
-		case 3: {
-			const a = focus * Math.PI * 2;
-			return {
-				yaw: side * 0.14,
-				pitch: 0.04,
-				roll: side * 0.18 + drift * 0.05,
-				dist: 0.55,
-				tx: Math.cos(a) * PRISM_ROSE_R * 0.5,
-				ty: PRISM_ROSE_Y + Math.sin(a) * PRISM_ROSE_R * 0.5,
-				bays: 0,
-				wet: 0
-			};
-		}
-		case 4:
-			return { yaw: sgn * (0.78 + 0.12 * mag), pitch: -0.03, roll: 0, dist: 1.9, tx: dolly, ty: 0.03, bays: 4.5, wet: 0.2 };
-		case 5:
-			return { yaw: drift * 0.12, pitch: -0.12, roll: 0, dist: 1.85, tx: drift * 0.05, ty: -0.04, bays: 1.5, wet: 1 };
-		case 6:
-			return { yaw: side * 0.12, pitch: 0.02, roll: 0, dist: 2.25, tx: drift * 0.1, ty: 0.02, bays: 3, wet: 0.3 };
-		default:
-			return { yaw: drift * 0.05, pitch: 0, roll: 0, dist: 1.8, tx: 0, ty: 0, bays: 0, wet: 0 };
-	}
-}
-
-export function prismCamera(
-	regime: ChoiceState,
-	side: number,
-	focus: number,
-	drift: number,
-	dolly: number
-): PrismCameraParams {
-	const a = prismCameraRegime(regime.from, side, focus, drift, dolly);
-	const b = prismCameraRegime(regime.to, side, focus, drift, dolly);
-	const t = regime.mix;
-	return {
-		yaw: lerp(a.yaw, b.yaw, t),
-		pitch: lerp(a.pitch, b.pitch, t),
-		roll: lerp(a.roll, b.roll, t),
-		// Distance blends in log space so a dolly from macro to far feels even.
-		dist: Math.exp(lerp(Math.log(a.dist), Math.log(b.dist), t)),
-		tx: lerp(a.tx, b.tx, t),
-		ty: lerp(a.ty, b.ty, t),
-		bays: lerp(a.bays, b.bays, t),
-		wet: lerp(a.wet, b.wet, t)
-	};
-}
-
 export type Vec3 = [number, number, number];
 export type PrismCameraBasis = { pos: Vec3; right: Vec3; up: Vec3; fwd: Vec3; focal: number };
 
@@ -520,4 +458,181 @@ export function prismProject(b: PrismCameraBasis, point: Vec3): [number, number]
 /** Bay spacing in world units for the genome's baySpacing axis. */
 export function prismBaySpacing(value: number): number {
 	return 1.12 + Math.min(1, Math.max(0, value)) * 0.55;
+}
+
+// ── Music character ───────────────────────────────────────────────────────
+// What kind of music each option suits. The renderer turns these into pick
+// weights (characterWeights in character.ts), so a shift to fast punchy music
+// lands on fragmented windows, close passes and hot glass, and a shift to
+// slow ambient music lands on wide slow orbits over a flooded floor in cold
+// glass. Tempo, punch, bass and energy carry most of the identity; noise and
+// brightness lean it where the analysis separates them.
+export type PrismPrototype = Partial<Record<CharacterFeature, number>>;
+
+// Measured lab medians (tempo / brightness / bass / noise / punch): club
+// .57/.50/.76/.59/.21, swing .22/.11/.88/.25/.47, indie .48/.50/.43/.49/.31,
+// ambient .03/.65/.32/.24/.07, acoustic .28/.55/.18/.40/.88, noise
+// .93/.87/.12/.89/.15, cinematic .10/.53/.48/.23/.43. Each option leans to
+// one or two of these worlds; characterWeights keeps a floor for the rest.
+export const PRISM_CAMERA_PROTOTYPES: Record<(typeof PRISM_CAMERAS)[number], PrismPrototype> = {
+	orbit: { tempo: 0.35, punch: 0.3, bass: 0.45 },
+	arcade: { tempo: 0.48, bass: 0.43, noise: 0.49 },
+	crane: { tempo: 0.22, bass: 0.88, punch: 0.47 },
+	glass: { punch: 0.88, tempo: 0.28, bass: 0.18 },
+	gallery: { tempo: 0.57, bass: 0.76, punch: 0.21 },
+	flooded: { tempo: 0.03, punch: 0.07, noise: 0.24 },
+	nave: { tempo: 0.1, bass: 0.48, punch: 0.43 },
+	dutch: { tempo: 0.93, noise: 0.89, bass: 0.12 }
+};
+
+export const PRISM_ENVIRONMENT_PROTOTYPES: Record<(typeof PRISM_ENVIRONMENTS)[number], PrismPrototype> = {
+	nave: { tempo: 0.3, bass: 0.6, punch: 0.4 },
+	crypt: { tempo: 0.03, punch: 0.07, energy: 0.25 },
+	ruin: { tempo: 0.93, noise: 0.89, bass: 0.12 },
+	apse: { punch: 0.88, tempo: 0.28, bass: 0.18 },
+	void: { tempo: 0.57, bass: 0.76, noise: 0.59 }
+};
+
+export const PRISM_GRAMMAR_PROTOTYPES: readonly PrismPrototype[] = [
+	{ tempo: 0.3, bass: 0.5 }, // gothic
+	{ tempo: 0.48, brightness: 0.5, bass: 0.43 }, // rayonnant
+	{ tempo: 0.93, noise: 0.89 }, // flamboyant
+	{ tempo: 0.1, bass: 0.48, punch: 0.43 }, // romanesque
+	{ tempo: 0.57, bass: 0.76, punch: 0.21 }, // girih
+	{ punch: 0.88, tempo: 0.28 }, // nouveau
+	{ tempo: 0.22, bass: 0.88, punch: 0.47 }, // deco
+	{ tempo: 0.03, punch: 0.07, brightness: 0.65 } // modern
+];
+
+export const PRISM_MOSAIC_PROTOTYPES: readonly PrismPrototype[] = [
+	{ tempo: 0.3, punch: 0.4 }, // organic
+	{ tempo: 0.55, bass: 0.7 }, // quarry
+	{ punch: 0.85, tempo: 0.28 }, // segments
+	{ tempo: 0.93, noise: 0.89 }, // slivers
+	{ tempo: 0.05, punch: 0.07, noise: 0.24 } // slabs
+];
+
+export const PRISM_BEAT_FORM_PROTOTYPES: readonly PrismPrototype[] = [
+	{ tempo: 0.05, punch: 0.07 }, // rings
+	{ tempo: 0.57, bass: 0.76 }, // wheel
+	{ punch: 0.88, bass: 0.18 }, // pairs
+	{ tempo: 0.22, bass: 0.88, punch: 0.47 }, // spiral
+	{ tempo: 0.48, punch: 0.31, bass: 0.43 }, // cascade
+	{ tempo: 0.93, noise: 0.89 } // lightning
+];
+
+/**
+ * Palette prototypes from the glass itself: hot families suit fast music,
+ * cold deep ones slow music, saturated ones punchy music, luminous ones loud
+ * music, warm ones happy music.
+ */
+export const PRISM_PALETTE_PROTOTYPES: readonly PrismPrototype[] = PRISM_PALETTES.map(({ colors }) => {
+	const [hero, support, accent] = colors;
+	const warmth = (hero[0] - hero[2]) * 0.6 + (accent[0] - accent[2]) * 0.4;
+	const value = Math.max(...hero) * 0.5 + Math.max(...accent) * 0.3 + Math.max(...support) * 0.2;
+	const chroma = (c: Rgb) => (Math.max(...c) - Math.min(...c)) / Math.max(1e-3, Math.max(...c));
+	const sat = chroma(hero) * 0.6 + chroma(accent) * 0.4;
+	const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+	const warm = clamp01(0.5 + warmth * 0.95);
+	return {
+		tempo: warm,
+		valence: warm,
+		punch: clamp01((sat - 0.6) * 2.5),
+		energy: clamp01((value - 0.3) * 1.8)
+	};
+});
+
+/** Continuous look parameters that always follow the playing music. */
+export type PrismFeel = {
+	/** Glass fragmentation: mosaic cells per radius multiplier. */
+	frag: number;
+	/** Extra cell division (the mosaic divides as fragmentation rises). */
+	divide: number;
+	/** Tracery and lead weight, 0..1. */
+	weight: number;
+	/** Edge contrast, 0..1: lead sharpness and bloom knee. */
+	edge: number;
+	/** Palette temperature, -1 cold .. 1 hot. */
+	temperature: number;
+	/** Palette value multiplier. */
+	value: number;
+	/** Saturation, 0..1.2 (1 = authored). */
+	saturation: number;
+	/** Nave haze density, 0..1. */
+	haze: number;
+	/** Dust in the air, 0..1. */
+	dust: number;
+	/** Light behind the glass, multiplier. */
+	light: number;
+};
+
+/** Map a (smoothed) music character to the look's continuous parameters. */
+export function prismFeel(c: Readonly<Record<CharacterFeature, number>>): PrismFeel {
+	const f = (name: CharacterFeature, fallback = 0.5) => {
+		const v = c[name];
+		return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : fallback;
+	};
+	const tempo = f('tempo');
+	const energy = f('energy');
+	const bright = f('brightness', 0.5);
+	const bass = f('bass', 0.3);
+	const noise = f('noise', 0.3);
+	const punch = f('punch', 0.3);
+	const valence = f('valence');
+	const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
+	return {
+		frag: 0.5 + tempo * 0.9 + punch * 0.45 + noise * 0.45,
+		divide: clamp01(tempo * 0.45 + punch * 0.35 + noise * 0.3),
+		weight: clamp01(0.08 + bass * 0.7 + (1 - tempo) * 0.25),
+		edge: clamp01(0.1 + punch * 0.6 + tempo * 0.3),
+		temperature: Math.max(-1, Math.min(1, (tempo - 0.42) * 1.7 + (valence - 0.5) * 0.5 + (bright - 0.5) * 0.3)),
+		value: 0.6 + energy * 0.5 + bright * 0.25,
+		saturation: Math.min(1.2, 0.78 + punch * 0.4 - noise * 0.2 + (1 - bright) * 0.1),
+		haze: clamp01(0.95 - tempo * 0.6 - punch * 0.35 + (1 - energy) * 0.15),
+		dust: clamp01(0.1 + tempo * 0.35 + noise * 0.45),
+		light: 0.6 + energy * 0.55 + bright * 0.2
+	};
+}
+
+/**
+ * Temper the glass with the music: hot music pushes it toward amber and red,
+ * cold music toward steel and blue (a white balance, so a curated family keeps
+ * its relationships), saturation follows
+ * punch, value follows loudness.
+ */
+export function prismTemper(c: Rgb, feel: Pick<PrismFeel, 'temperature' | 'value' | 'saturation'>, cap = 0.78): Rgb {
+	const t = Number.isFinite(feel.temperature) ? Math.max(-1, Math.min(1, feel.temperature)) : 0;
+	const gain: Rgb = t >= 0 ? [1 + 0.35 * t, 1 + 0.04 * t, 1 - 0.6 * t] : [1 + 0.5 * t, 1 + 0.04 * t, 1 - 0.45 * t];
+	const leaned = c;
+	const grey = 0.2126 * leaned[0] + 0.7152 * leaned[1] + 0.0722 * leaned[2];
+	const sat = Number.isFinite(feel.saturation) ? feel.saturation : 1;
+	const value = Number.isFinite(feel.value) ? feel.value : 1;
+	return [0, 1, 2].map((i) => Math.min(cap, Math.max(0, (grey + (leaned[i] - grey) * sat) * gain[i] * value))) as Rgb;
+}
+
+/** Hue of a colour in degrees, 0..360 (0 for grey). */
+export function prismHue(c: Rgb): number {
+	const [r, g, b] = c;
+	const max = Math.max(r, g, b);
+	const chroma = max - Math.min(r, g, b);
+	if (!(chroma > 1e-5)) return 0;
+	let h: number;
+	if (max === r) h = ((g - b) / chroma + 6) % 6;
+	else if (max === g) h = (b - r) / chroma + 2;
+	else h = (r - g) / chroma + 4;
+	return h * 60;
+}
+
+/**
+ * Pick-weight multipliers that keep a change of music from landing on glass
+ * of the same hue as the glass on screen: families whose hero sits within
+ * ~30 degrees are nearly ruled out, those beyond ~90 are untouched.
+ */
+export function prismHueAway(current: Rgb): number[] {
+	const hue = prismHue(current);
+	return PRISM_PALETTES.map(({ colors }) => {
+		const d = Math.abs(((prismHue(colors[0]) - hue + 540) % 360) - 180);
+		const t = Math.min(1, Math.max(0, (d - 25) / 65));
+		return 0.06 + t * t * (3 - 2 * t);
+	});
 }
