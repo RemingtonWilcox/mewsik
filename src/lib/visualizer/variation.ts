@@ -48,6 +48,12 @@ export type ChoiceAxis = {
 	chance: number;
 	/** Do not return to any of the last `memory` options. */
 	memory?: number;
+	/**
+	 * Force a change after this many boundaries of the axis's scale without
+	 * one, so an unlucky run of failed `chance` rolls cannot hold a look for
+	 * minutes. Unset means no limit.
+	 */
+	maxHold?: number;
 	/** Seconds to crossfade from the previous option to the new one. */
 	tau: number;
 };
@@ -100,7 +106,17 @@ function seedWord(seed: number | string): number {
 }
 
 type ContinuousState = { axis: ContinuousAxis; target: number; current: number };
-type ChoiceRuntime = { axis: ChoiceAxis; from: number; to: number; mix: number; history: number[] };
+type ChoiceRuntime = {
+	axis: ChoiceAxis;
+	from: number;
+	to: number;
+	mix: number;
+	history: number[];
+	/** Boundaries of this axis's scale since it last changed. */
+	held: number;
+	/** Optional per-option pick weights (see setWeights). */
+	weights: readonly number[] | null;
+};
 
 export class VariationGenome {
 	private readonly axes: readonly VariationAxis[];
@@ -148,7 +164,15 @@ export class VariationGenome {
 				this.continuous.set(axis.name, { axis, target: value, current: value });
 			} else {
 				const option = Math.floor(r * axis.options) % axis.options;
-				this.choices.set(axis.name, { axis, from: option, to: option, mix: 1, history: [option] });
+				this.choices.set(axis.name, {
+					axis,
+					from: option,
+					to: option,
+					mix: 1,
+					history: [option],
+					held: 0,
+					weights: null
+				});
 			}
 		});
 	}
@@ -202,6 +226,27 @@ export class VariationGenome {
 		for (const state of this.choices.values()) {
 			if (state.mix < 1) state.mix = Math.min(1, state.mix + dt / Math.max(0.05, state.axis.tau));
 		}
+	}
+
+	/**
+	 * Jump every axis to its target with no glide. For a first frame that
+	 * should already show the genome's state instead of easing in from it.
+	 */
+	settle(): void {
+		for (const state of this.continuous.values()) state.current = state.target;
+		for (const state of this.choices.values()) state.mix = 1;
+	}
+
+	/**
+	 * Bias future picks of a choice axis: `weights[option]` >= 0, relative.
+	 * Options with weight 0 are only picked when nothing else is allowed.
+	 * Keep weights a deterministic function of musical context so the walk
+	 * stays reproducible. Pass null to clear.
+	 */
+	setWeights(name: string, weights: readonly number[] | null): void {
+		const state = this.choices.get(name);
+		if (!state) throw new Error(`Unknown choice variation axis "${name}"`);
+		state.weights = weights;
 	}
 
 	/** Eased value of a continuous axis. */
@@ -306,8 +351,10 @@ export class VariationGenome {
 				state.target = next;
 				this.mutationCount += 1;
 			} else {
-				if (gate > axis.chance) return;
 				const state = this.choices.get(axis.name)!;
+				state.held += 1;
+				const forced = axis.maxHold !== undefined && state.held >= axis.maxHold;
+				if (gate > axis.chance && !forced) return;
 				const memory = Math.min(axis.memory ?? 1, axis.options - 1);
 				const recent = state.history.slice(-memory);
 				const candidates: number[] = [];
@@ -315,7 +362,24 @@ export class VariationGenome {
 					if (!recent.includes(option)) candidates.push(option);
 				}
 				if (candidates.length === 0) return;
-				const pick = candidates[Math.floor(unit(this.seed, index, event, scaleId * 7 + 3) * candidates.length) % candidates.length];
+				const roll = unit(this.seed, index, event, scaleId * 7 + 3);
+				let pick = candidates[Math.floor(roll * candidates.length) % candidates.length];
+				if (state.weights) {
+					const weights = state.weights;
+					const weightOf = (option: number) => Math.max(0, weights[option] ?? 1);
+					const total = candidates.reduce((sum, option) => sum + weightOf(option), 0);
+					if (total > 0) {
+						let cursor = roll * total;
+						for (const option of candidates) {
+							cursor -= weightOf(option);
+							if (cursor < 0) {
+								pick = option;
+								break;
+							}
+						}
+					}
+				}
+				state.held = 0;
 				// Retarget from wherever the current crossfade has got to.
 				state.from = state.mix >= 0.5 ? state.to : state.from;
 				state.to = pick;

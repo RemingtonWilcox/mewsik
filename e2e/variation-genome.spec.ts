@@ -75,7 +75,48 @@ test.describe('visual variation genome', () => {
 				if (palettePicks.slice(Math.max(0, i - 6), i).includes(palettePicks[i])) memoryViolations += 1;
 			}
 
+			// maxHold: a low-chance axis still changes within the limit.
+			const holdAxes = [
+				{ kind: 'choice', name: 'rare', options: 10, scale: 'section', chance: 0.05, memory: 3, maxHold: 2, tau: 1 }
+			];
+			const holdGenome = new VariationGenome(holdAxes as never, 'hold');
+			// The first frame is never a boundary; start counting after it.
+			holdGenome.advance({ phraseIndex: 0, sectionKey: 's0', energy: 0.5, dt: 0.1 });
+			let longestHold = 0;
+			let currentHold = 0;
+			let lastRare = holdGenome.choice('rare').to;
+			for (let section = 1; section < 400; section += 1) {
+				holdGenome.advance({ phraseIndex: section, sectionKey: 's' + section, energy: 0.5, dt: 0.1 });
+				const rare = holdGenome.choice('rare').to;
+				currentHold = rare === lastRare ? currentHold + 1 : 0;
+				longestHold = Math.max(longestHold, currentHold);
+				lastRare = rare;
+			}
+
+			// Weights: an option weighted 0 is never chosen while others are
+			// allowed, and a heavily weighted option dominates.
+			const weightAxes = [{ kind: 'choice', name: 'pick', options: 4, scale: 'phrase', chance: 1, memory: 1, tau: 1 }];
+			const weighted = new VariationGenome(weightAxes as never, 'weights');
+			weighted.setWeights('pick', [0, 1, 8, 1]);
+			const counts = [0, 0, 0, 0];
+			for (let phrase = 0; phrase < 800; phrase += 1) {
+				weighted.advance({ phraseIndex: phrase, sectionKey: 's', energy: 0.5, dt: 0.1 });
+				counts[weighted.choice('pick').to] += 1;
+			}
+
+			// settle(): values sit on their targets with no glide left.
+			const settling = new VariationGenome(axes as never, 'settle');
+			for (let phrase = 0; phrase < 5; phrase += 1) {
+				settling.advance({ phraseIndex: phrase, sectionKey: 's' + phrase, energy: 0.8, dt: 0 });
+			}
+			settling.settle();
+			const target = settling.targetVector();
+
 			return {
+				longestHold,
+				weightCounts: counts,
+				settledGap: Math.abs(settling.value('density') - target[4]),
+				settledMix: settling.choice('motif').mix,
 				deterministic: JSON.stringify(a.signatures) === JSON.stringify(a2.signatures),
 				seedsDiffer: a.signatures.filter((s, i) => s !== b.signatures[i]).length,
 				distinct: new Set(a.signatures).size,
@@ -110,5 +151,14 @@ test.describe('visual variation genome', () => {
 		expect(result.paletteChanges).toBeGreaterThan(60);
 		expect(result.hueInRange).toBe(true);
 		expect(result.space).toBeGreaterThan(1_000_000);
+		// maxHold 2: never more than one extra boundary without a change.
+		expect(result.longestHold).toBeLessThanOrEqual(1);
+		expect(result.weightCounts[0]).toBe(0);
+		// Memory 1 forbids picking the heavy option twice in a row, so it tops
+		// out near half the picks; it must still clearly beat each light option.
+		expect(result.weightCounts[2]).toBeGreaterThan(result.weightCounts[1] * 1.5);
+		expect(result.weightCounts[2]).toBeGreaterThan(result.weightCounts[3] * 1.5);
+		expect(result.settledGap).toBeLessThan(1e-9);
+		expect(result.settledMix).toBe(1);
 	});
 });

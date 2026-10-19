@@ -222,7 +222,7 @@ export const LOOM_THICKNESS = [
 
 export const LOOM_LOOK_AXES: readonly VariationAxis[] = [
 	{ kind: 'choice', name: 'grammar', options: LOOM_GRAMMARS.length, scale: 'section', chance: 0.85, memory: 6, tau: 3.2 },
-	{ kind: 'choice', name: 'palette', options: LOOM_PALETTES.length, scale: 'section', chance: 0.8, memory: 12, tau: 4.5 },
+	{ kind: 'choice', name: 'palette', options: LOOM_PALETTES.length, scale: 'section', chance: 0.8, memory: 12, maxHold: 2, tau: 4.5 },
 	{ kind: 'choice', name: 'roles', options: LOOM_ROLE_ORDERS.length, scale: 'phrase', chance: 0.2, memory: 2, tau: 3.5 },
 	{ kind: 'choice', name: 'camera', options: LOOM_CAMERAS.length, scale: 'phrase', chance: 0.42, memory: 3, tau: 4.5 },
 	{ kind: 'choice', name: 'material', options: LOOM_MATERIALS.length, scale: 'section', chance: 0.45, memory: 3, tau: 3.5 },
@@ -542,14 +542,13 @@ export class LoomLook {
 			}
 			// The last virtual step lands on the real phrase/section, so the
 			// first real frame is not itself a boundary.
-			for (let i = 0; i < 80; i += 1) {
-				this.genome.advance({
-					phraseIndex: context.phraseIndex,
-					sectionKey: context.sectionKey,
-					energy: 0.5,
-					dt: 0.5
-				});
-			}
+			this.genome.advance({
+				phraseIndex: context.phraseIndex,
+				sectionKey: context.sectionKey,
+				energy: 0.5,
+				dt: 0
+			});
+			this.genome.settle();
 		}
 		this.genome.advance({
 			phraseIndex: context.phraseIndex,
