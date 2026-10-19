@@ -10,6 +10,10 @@
 //   VIS_PROFILE  first track profile               (default club128)
 //   VIS_MINUTES  how long to run                   (default 4)
 //   VIS_EVERY    seconds between frames            (default 8)
+//   VIS_BASE_URL dev server                        (default http://127.0.0.1:5173)
+//                Use a separate, non-watching server when other people or
+//                agents are editing files: HMR reloads restart the lab and
+//                the genome mid-run. Reloads are counted and reported.
 // Output: output/<engine>-timelapse-<label>/NNN-<profile>-<stage>.jpg and sheet.jpg
 //
 // Headed Chromium (headless has no WebGPU on this machine); needs the dev
@@ -33,7 +37,7 @@ const ENGINE_CANVAS = {
 };
 const [canvasLabel, readyAttribute] = ENGINE_CANVAS[engine] ?? ENGINE_CANVAS.loom;
 const outDir = `output/${engine}-timelapse-${label}`;
-const baseURL = 'http://127.0.0.1:5173';
+const baseURL = process.env.VIS_BASE_URL ?? 'http://127.0.0.1:5173';
 
 async function serverUp() {
 	try {
@@ -58,6 +62,11 @@ const browser = await chromium.launch({ headless: false, args: ['--enable-unsafe
 const files = [];
 try {
 	const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+	let loads = 0;
+	page.on('load', () => {
+		loads += 1;
+		if (loads > 1) console.warn(`WARNING: page reloaded (${loads - 1}x); frames after this restarted the song and genome`);
+	});
 	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=${profile}&seed=${seed}&song=1&chrome=0`);
 	await page.getByLabel(canvasLabel).waitFor({ state: 'attached', timeout: 20_000 });
 	await page.waitForFunction(
@@ -108,7 +117,7 @@ try {
 	);
 	await sheet.screenshot({ path: `${outDir}/sheet.jpg`, type: 'jpeg', quality: 80, fullPage: true });
 	await writeFile(`${outDir}/frames.json`, JSON.stringify(files, null, 2));
-	console.log(`sheet -> ${outDir}/sheet.jpg`);
+	console.log(`sheet -> ${outDir}/sheet.jpg (${Math.max(0, loads - 1)} reloads during capture)`);
 } finally {
 	await browser.close();
 	devServer?.kill();

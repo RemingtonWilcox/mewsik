@@ -14,6 +14,7 @@
 		SIGNAL_RENDER_PASSES,
 		SIGNAL_SCENE_WGSL,
 		SIGNAL_TERRAIN_BINS,
+		SIGNAL_TERRAIN_FLOATS,
 		SIGNAL_TERRAIN_ROWS,
 		SIGNAL_TRACE_INSTANCES,
 		SIGNAL_VERTEX_COUNT
@@ -24,11 +25,37 @@
 		packSignalUniforms,
 		type SignalUniformValues
 	} from '$lib/visualizer/signal/uniform-layout';
+	import {
+		SIGNAL_FAMILY_NAMES,
+		SIGNAL_FIGURE_FLOATS,
+		SignalFigureEngine,
+		type SignalFigureInput
+	} from '$lib/visualizer/signal/figures';
+	import {
+		SIGNAL_CAMERAS,
+		SIGNAL_DISPLAYS,
+		SIGNAL_LAYOUT_NAMES,
+		SURFACE_FLOOR,
+		SURFACE_RING,
+		SURFACE_TUNNEL,
+		buildSignalLayout,
+		createSignalLayout,
+		lerpPreset,
+		lerpSignalLayout,
+		type SignalLayout
+	} from '$lib/visualizer/signal/layouts';
+	import { SIGNAL_PALETTES, createSignalPaletteOut, resolveSignalPalette } from '$lib/visualizer/signal/palettes';
+	import {
+		parseSignalLookOverride,
+		signalVariationFor,
+		type SignalLookOverride,
+		type SignalVariation
+	} from '$lib/visualizer/signal/genome';
 
 	const vis = useVisualizer();
 
 	const DETAIL_BYTES = 64 * 4;
-	const TERRAIN_FLOATS = SIGNAL_TERRAIN_ROWS * SIGNAL_TERRAIN_BINS;
+	const TERRAIN_FLOATS = SIGNAL_TERRAIN_FLOATS;
 	const TARGET_FRAME_RATE = 60;
 	const INTERNAL_SCALE = 0.75;
 	const MAX_INTERNAL_PIXELS = 1920 * 1080;
@@ -44,6 +71,12 @@
 	let hudTempo = $state(0);
 	let hudContext = $state<'live' | 'score'>('live');
 	let hudChannels = $state(1);
+	let hudLayout = $state('bench');
+	let hudFamily = $state('lissajous');
+	let hudPalette = $state('P31 bench');
+	let hudScene = $state(0);
+	let hudFrameMs = $state(0);
+	let frameCpuMs = 0;
 	let activeFrameStride = $state(1);
 	let measuredRefreshRate = $state(60);
 	let internalPixels = $state(0);
@@ -80,10 +113,50 @@
 	let mode = 0;
 	let asymmetry = 0;
 	let spectralMotion = 0;
+	let spinAngle = 0;
+	let dollyTime = 0;
 	const renderDetailBins = new Float32Array(64);
 	const terrainRows = new Float32Array(TERRAIN_FLOATS);
-	const pendingRow = new Float32Array(SIGNAL_TERRAIN_BINS);
+	// Interleaved height, heat per bin.
+	const pendingRow = new Float32Array(SIGNAL_TERRAIN_BINS * 2);
+	const silhouette = new Float32Array(SIGNAL_TERRAIN_BINS);
 	let pendingRowFresh = true;
+
+	// The instrument model shared by every element on the bench.
+	const figureEngine = new SignalFigureEngine();
+	const paletteOut = createSignalPaletteOut();
+	const layoutMix = createSignalLayout();
+	const layoutCache = new Map<string, SignalLayout>();
+	const headLocal: [number, number] = [0, 0];
+	let lookOverride: SignalLookOverride = {};
+	let variation: SignalVariation | null = null;
+
+	function layoutFor(index: number, aspectRatio: number) {
+		const key = `${index}:${aspectRatio.toFixed(3)}`;
+		let layout = layoutCache.get(key);
+		if (!layout) {
+			if (layoutCache.size > 64) layoutCache.clear();
+			layout = buildSignalLayout(index, aspectRatio);
+			layoutCache.set(key, layout);
+		}
+		return layout;
+	}
+
+	// Band traces 2 and 3 by genome trace map: [level band, bin lo, bin hi, cycles].
+	const TRACE_MAPS = [
+		[
+			['kick', 6, 15, 2.5],
+			['sub', 0, 7, 1.25]
+		],
+		[
+			['mids', 22, 40, 5],
+			['presence', 40, 56, 13]
+		],
+		[
+			['body', 12, 24, 3.5],
+			['air', 50, 63, 17]
+		]
+	] as const;
 
 	type SignalTargets = {
 		scene: GPUTexture;
@@ -104,6 +177,7 @@
 		uniformBuffer: GPUBuffer;
 		detailBuffer: GPUBuffer;
 		terrainBuffer: GPUBuffer;
+		figureBuffer: GPUBuffer;
 		uniforms: Float32Array;
 		scenePipeline: GPURenderPipeline;
 		feedbackPipeline: GPURenderPipeline;
@@ -174,26 +248,50 @@
 		return previousLevel;
 	}
 
-	/** Peak-hold the spectrum between horizon ticks so no transient is lost. */
-	function accumulateTerrainRow() {
-		const last = SIGNAL_TERRAIN_BINS - 1;
+	function spectrumAt(position: number) {
+		const last = renderDetailBins.length - 1;
+		const scaled = clamp(position, 0, 1) * last;
+		const bin = Math.round(scaled);
+		const detail =
+			renderDetailBins[Math.max(bin - 1, 0)] * 0.25 +
+			renderDetailBins[bin] * 0.5 +
+			renderDetailBins[Math.min(bin + 1, last)] * 0.25;
+		const drive = bandLevelAt(position) * 0.45 + detail * 1.8;
+		// Soft saturation: loud bands round off instead of flat-topping.
+		return drive >= 0 ? 1 - Math.exp(-drive * 1.6) : Math.max(drive, -0.3);
+	}
+
+	/**
+	 * The horizon remembers the figure: each row is the figure's polar
+	 * silhouette (its farthest reach per angle) shaped by the live spectrum,
+	 * with the bass under the figure. Beat stamps from the beam head ride in a
+	 * second channel. Peak-held between ticks so no transient is lost.
+	 */
+	function accumulateTerrainRow(coupling: number, headTurn: number, stamp: number) {
+		figureEngine.silhouette(silhouette);
+		let mean = 0;
+		for (let bin = 0; bin < SIGNAL_TERRAIN_BINS; bin += 1) mean += silhouette[bin];
+		mean = Math.max(0.15, mean / SIGNAL_TERRAIN_BINS);
 		for (let bin = 0; bin < SIGNAL_TERRAIN_BINS; bin += 1) {
-			const position = bin / last;
-			const detail =
-				renderDetailBins[Math.max(bin - 1, 0)] * 0.25 +
-				renderDetailBins[bin] * 0.5 +
-				renderDetailBins[Math.min(bin + 1, last)] * 0.25;
-			const drive = bandLevelAt(position) * 0.45 + detail * 1.8;
-			// Soft saturation: loud bands round off instead of flat-topping.
-			const value = drive >= 0 ? 1 - Math.exp(-drive * 1.6) : Math.max(drive, -0.3);
-			pendingRow[bin] = pendingRowFresh ? value : Math.max(pendingRow[bin], value);
+			const turn = bin / SIGNAL_TERRAIN_BINS;
+			// Distance round the circle from the figure's underside (0.75 turn).
+			const fromBottom = Math.abs(((turn - 0.75 + 1.5) % 1) - 0.5) * 2;
+			const spectral = spectrumAt(fromBottom);
+			const shape = silhouette[bin] / mean;
+			const figureValue = (shape * 0.75 - 0.05) * (0.6 + Math.max(spectral, 0) * 0.8);
+			const value = spectral + (figureValue - spectral) * coupling;
+			const heatDistance = Math.abs(((turn - headTurn + 1.5) % 1) - 0.5) * SIGNAL_TERRAIN_BINS;
+			const heat = stamp * Math.exp(-heatDistance * heatDistance * 0.35);
+			const o = bin * 2;
+			pendingRow[o] = pendingRowFresh ? value : Math.max(pendingRow[o], value);
+			pendingRow[o + 1] = pendingRowFresh ? heat : Math.max(pendingRow[o + 1], heat);
 		}
 		pendingRowFresh = false;
 	}
 
 	function commitTerrainRow() {
 		terrainHead = (terrainHead + 1) % SIGNAL_TERRAIN_ROWS;
-		terrainRows.set(pendingRow, terrainHead * SIGNAL_TERRAIN_BINS);
+		terrainRows.set(pendingRow, terrainHead * SIGNAL_TERRAIN_BINS * 2);
 		pendingRowFresh = true;
 	}
 
@@ -219,6 +317,11 @@
 		for (let index = 0; index < renderDetailBins.length; index += 1) {
 			renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
 		}
+		spinAngle = 0;
+		dollyTime = 0;
+		figureEngine.resetAttractor();
+		variation = signalVariationFor(shared.seed, shared.sourceEpoch);
+		variation.setOverride(lookOverride);
 		feedbackResetFrames = 2;
 		lastHudUpdateAt = 0;
 	}
@@ -329,6 +432,7 @@
 		let uniformBuffer: GPUBuffer | null = null;
 		let detailBuffer: GPUBuffer | null = null;
 		let terrainBuffer: GPUBuffer | null = null;
+		let figureBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
 			if (!context) throw new Error('The WebGPU canvas context could not be created.');
@@ -404,13 +508,19 @@
 				size: TERRAIN_FLOATS * 4,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 			});
+			figureBuffer = device.createBuffer({
+				label: 'Signal figure polyline',
+				size: SIGNAL_FIGURE_FLOATS * 4,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
 			const sceneBindGroup = device.createBindGroup({
 				label: 'Signal beams',
 				layout: pipelines[0].getBindGroupLayout(0),
 				entries: [
 					{ binding: 0, resource: { buffer: uniformBuffer } },
 					{ binding: 1, resource: { buffer: detailBuffer } },
-					{ binding: 2, resource: { buffer: terrainBuffer } }
+					{ binding: 2, resource: { buffer: terrainBuffer } },
+					{ binding: 3, resource: { buffer: figureBuffer } }
 				]
 			});
 			const state: SignalGpu = {
@@ -426,6 +536,7 @@
 				uniformBuffer,
 				detailBuffer,
 				terrainBuffer,
+				figureBuffer,
 				uniforms: new Float32Array(SIGNAL_UNIFORM_FLOATS),
 				scenePipeline: pipelines[0],
 				feedbackPipeline: pipelines[1],
@@ -454,6 +565,7 @@
 			uniformBuffer?.destroy();
 			detailBuffer?.destroy();
 			terrainBuffer?.destroy();
+			figureBuffer?.destroy();
 			try {
 				context?.unconfigure();
 			} catch {
@@ -470,6 +582,7 @@
 		state.uniformBuffer.destroy();
 		state.detailBuffer.destroy();
 		state.terrainBuffer.destroy();
+		state.figureBuffer.destroy();
 		try {
 			state.context.unconfigure();
 		} catch {
@@ -580,8 +693,142 @@
 		lastTracePhase = journey.tracePhase;
 		figurePhase += traceDelta * 1.6 * responseMotion;
 
-		// Spectral horizon: rows are written on beat ticks and flow forward.
-		accumulateTerrainRow();
+		const energy = clamp(
+			directed.energy * 0.58 + rms * 0.24 + bands.body * 0.08 + spectralMotion * 0.1,
+			0,
+			1
+		);
+		const impact = clamp(journey.impact * responseImpact, 0, 1);
+		const ringOut = journey.ringOut;
+		const modeTarget =
+			(directed.context.keyMode === 'major' ? 1 : directed.context.keyMode === 'minor' ? -1 : 0) *
+			clamp(0.4 + directed.context.keyConfidence, 0, 1);
+		mode = approach(mode, modeTarget, 0.8, dt);
+		const aspect = size.width / Math.max(size.height, 1);
+		const elapsed = (performance.now() - startTime) / 1000;
+
+		// ---- Genome: the look walks forward at musical boundaries. ----------
+		if (!variation) {
+			variation = signalVariationFor(shared.seed, shared.sourceEpoch);
+			variation.setOverride(lookOverride);
+		}
+		const genome = variation;
+		genome.advance({
+			phraseIndex: clock.phraseIndex,
+			section: directed.section,
+			energy: directed.energy,
+			silence: directed.silence || !feature,
+			dt
+		});
+		const layoutChoice = genome.choice('layout');
+		const familyChoice = genome.choice('family');
+		const paletteChoice = genome.choice('palette');
+		const cameraChoice = genome.choice('camera');
+		const displayChoice = genome.choice('display');
+		const traceMapChoice = genome.choice('traceMap');
+		const layoutFrom = layoutFor(layoutChoice.from, aspect);
+		const layoutTo = layoutFor(layoutChoice.to, aspect);
+		const layout = lerpSignalLayout(layoutFrom, layoutTo, layoutChoice.mix, layoutMix);
+		const camera = lerpPreset(
+			SIGNAL_CAMERAS[cameraChoice.from],
+			SIGNAL_CAMERAS[cameraChoice.to],
+			cameraChoice.mix
+		);
+		const display = lerpPreset(
+			SIGNAL_DISPLAYS[displayChoice.from],
+			SIGNAL_DISPLAYS[displayChoice.to],
+			displayChoice.mix
+		);
+		const gene = (name: Parameters<SignalVariation['value']>[0]) => genome.value(name);
+
+		// ---- Camera ------------------------------------------------------------
+		const freedom = layout.freedom;
+		dollyTime += dt * (0.4 + journey.motion * 0.6);
+		const drift = gene('drift');
+		const sway = camera.sway * Math.sin(dollyTime * 0.11) + (drift - 0.5) * 0.12;
+		const camPitch = layout.pitch + (camera.pitch + (drift - 0.5) * 0.06) * freedom;
+		const camHeight =
+			layout.camHeight *
+			(1 + (camera.height - 1) * freedom) *
+			(1 + camera.dolly * 0.12 * Math.sin(dollyTime * 0.07) * freedom);
+		const focal = layout.focal * (1 + (camera.focal - 1) * freedom);
+		const camYaw = sway * freedom;
+
+		// ---- Figure placement ----------------------------------------------------
+		const driftX = clamp(asymmetry * 0.62, -0.4, 0.4) * aspect * layout.drift;
+		const conductorScale = clamp(
+			0.29 +
+				journey.openness * 0.21 +
+				journey.release * 0.05 -
+				journey.tension * 0.05 +
+				ringOut * 0.03,
+			0.22,
+			0.56
+		);
+		const scaleFactor =
+			clamp(conductorScale / 0.4, 0.72, 1.3) * (0.86 + gene('figureScale') * 0.26);
+		const figAScale = layout.figAScale * scaleFactor;
+		const figAX = layout.figAX + driftX;
+		const figAY =
+			layout.figAY + (journey.openness * 0.04 - journey.tension * 0.03) * layout.drift;
+		const screen = clamp(layout.figBScreen, 0, 1);
+		const figBX = figAX + (layout.figBX - figAX) * screen;
+		const figBY = figAY + (layout.figBY - figAY) * screen;
+		const figBScale = figAScale + (layout.figBScale * scaleFactor - figAScale) * screen;
+
+		// ---- Figure polyline: the one signal everything else reads. -----------
+		const spin = gene('spin');
+		spinAngle += dt * spin * 0.18 * (0.4 + journey.motion);
+		const spread =
+			0.02 + bands.air * 0.1 + journey.release * 0.07 + ringOut * 0.25 + spectrum.flatness * 0.05;
+		const figureInput: SignalFigureInput = {
+			familyFrom: familyChoice.from,
+			familyTo: familyChoice.to,
+			familyMix: familyChoice.mix,
+			phase: figurePhase,
+			complexity: journey.complexity,
+			mode,
+			p1: gene('p1'),
+			p2: gene('p2'),
+			ellipse: journey.shapeWeights.ellipse,
+			lissajous: journey.shapeWeights.lissajous,
+			ribbon: journey.shapeWeights.ribbon,
+			rosette: journey.shapeWeights.rosette,
+			tension: journey.tension,
+			release: journey.release,
+			spread,
+			sub: bands.sub,
+			kick: bands.kick,
+			body: bands.body,
+			mids: bands.mids,
+			presence: bands.presence,
+			air: bands.air,
+			spectralMotion,
+			energy,
+			detail: renderDetailBins,
+			yaw: asymmetry * 0.55 + Math.sin(figurePhase * 0.23) * 0.32 + spinAngle,
+			tilt:
+				0.34 +
+				journey.tension * 0.2 -
+				journey.release * 0.08 +
+				(gene('tilt') - 0.5) * 0.5 +
+				camPitch * 0.35,
+			roll: figurePhase * 0.05 + spinAngle * 0.6,
+			partner: layout.partner,
+			dt,
+			pace: (beatsPerSecond / 2) * (0.5 + journey.motion)
+		};
+		const figurePoints = figureEngine.evaluate(figureInput);
+		const headU = sweepPhase;
+		figureEngine.sample(0, headU, headLocal);
+		const headX = figAX + headLocal[0] * figAScale;
+		const headY = figAY + headLocal[1] * figAScale;
+		const headTurn = (Math.atan2(headLocal[1], headLocal[0]) / (Math.PI * 2) + 1) % 1;
+
+		// ---- Horizon: the figure's history, written on beat ticks. ------------
+		const coupling = clamp(0.5 + gene('coupling') * 0.42, 0, 1);
+		const stamp = clamp(beatGlow * 1.3 + impact * 0.4 - 0.25, 0, 1.6);
+		accumulateTerrainRow(coupling, headTurn, stamp);
 		const tickRate = clamp(journey.tickRate, 0.125, 3);
 		tickPhase += dt * beatsPerSecond * tickRate * (feature ? 1 : 0.25);
 		if (tickPhase >= 1) {
@@ -591,28 +838,41 @@
 		}
 		tickFlash *= Math.exp(-dt * 7);
 
-		const energy = clamp(
-			directed.energy * 0.58 + rms * 0.24 + bands.body * 0.08 + spectralMotion * 0.1,
-			0,
-			1
-		);
-		const impact = clamp(journey.impact * responseImpact, 0, 1);
-		const ringOut = journey.ringOut;
-		const contextKeyStrength =
-			directed.context.source === 'score' ? directed.context.keyConfidence : 0;
-		const keyStrength = clamp(
-			Math.max(directed.context.keyConfidence * 0.6, contextKeyStrength * 0.86),
-			0,
-			1
-		);
-		const modeTarget =
-			(directed.context.keyMode === 'major' ? 1 : directed.context.keyMode === 'minor' ? -1 : 0) *
-			clamp(0.4 + directed.context.keyConfidence, 0, 1);
-		mode = approach(mode, modeTarget, 0.8, dt);
-		const lookaheadDelta = clamp(
-			directed.context.energyLookahead - directed.context.energyCurrent,
-			-1,
-			1
+		// Screen offsets: put each surface's anchor (vanishing point, ring
+		// centre, waterfall origin) where the layout wants it.
+		const anchorX = layout.anchorX + driftX * layout.anchorFollow;
+		const anchorY = layout.anchorY;
+		const surfaceOffset = (kind: number): [number, number] => {
+			if (kind === SURFACE_RING) {
+				const cp = Math.cos(camPitch);
+				const sp = Math.sin(camPitch);
+				const cy = Math.cos(camYaw);
+				const sy = Math.sin(camYaw);
+				const wy = -camHeight;
+				const wz = layout.ringZ;
+				const x1 = wz * sy;
+				const z1 = wz * cy;
+				const y2 = wy * cp + z1 * sp;
+				const z2 = Math.max(0.03, -wy * sp + z1 * cp);
+				return [anchorX - (x1 * focal) / z2, anchorY - (y2 * focal) / z2];
+			}
+			if (kind === SURFACE_FLOOR || kind === SURFACE_TUNNEL) {
+				return [anchorX - focal * Math.tan(camYaw), anchorY - focal * Math.tan(camPitch)];
+			}
+			return [anchorX, anchorY];
+		};
+		const surfaceA = layoutFrom.surface;
+		const surfaceB = layoutTo.surface;
+		const offsetA = surfaceOffset(surfaceA);
+		const offsetB = surfaceOffset(surfaceB);
+
+		// ---- Phosphor ------------------------------------------------------------
+		resolveSignalPalette(
+			paletteChoice.from,
+			paletteChoice.to,
+			paletteChoice.mix,
+			{ hueLean: gene('hueLean'), mode, energy, warmth: gene('warmth') },
+			paletteOut
 		);
 
 		// Phosphor persistence per 60 Hz frame, converted to this frame's dt.
@@ -622,9 +882,11 @@
 				(1 - journey.motion) * 0.012 -
 				journey.release * 0.01 -
 				impact * 0.04 +
-				response.persistenceOffset,
+				response.persistenceOffset +
+				display.persist +
+				(gene('persistence') - 0.5) * 0.04,
 			0.8,
-			0.955
+			0.962
 		);
 		const feedbackFade =
 			feedbackResetFrames > 0 ? 0 : Math.pow(persistence * (1 - silence * 0.04), dt * 60);
@@ -633,24 +895,21 @@
 		const floorFade = feedbackResetFrames > 0 ? 0 : Math.pow(0.6, dt * 60);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 
-		const aspect = size.width / Math.max(size.height, 1);
-		const heroX = clamp(asymmetry * 0.62, -0.4, 0.4) * aspect;
-		const heroScale = clamp(
-			0.29 +
-				journey.openness * 0.21 +
-				journey.release * 0.05 -
-				journey.tension * 0.05 +
-				ringOut * 0.03,
-			0.22,
-			0.56
-		);
-		const spread =
-			0.02 + bands.air * 0.1 + journey.release * 0.07 + ringOut * 0.25 + spectrum.flatness * 0.05;
+		// Band traces follow the genome's trace map on the shared time base.
+		const mapA = TRACE_MAPS[traceMapChoice.from];
+		const mapB = TRACE_MAPS[traceMapChoice.to];
+		const mapMix = traceMapChoice.mix;
+		const bandParam = (slot: 0 | 1, field: 1 | 2 | 3) =>
+			(mapA[slot][field] as number) +
+			((mapB[slot][field] as number) - (mapA[slot][field] as number)) * mapMix;
+		const bandLevel = (slot: 0 | 1) =>
+			bands[mapA[slot][0]] + (bands[mapB[slot][0]] - bands[mapA[slot][0]]) * mapMix;
 
+		const scanAxis = gene('scan');
 		const values: SignalUniformValues = {
 			width: size.width,
 			height: size.height,
-			elapsed: (performance.now() - startTime) / 1000,
+			elapsed,
 			dt,
 			sub: bands.sub,
 			kick: bands.kick,
@@ -664,51 +923,153 @@
 			beatGlow,
 			sectionPulse: clamp(journey.sectionPulse * responseImpact, 0, 1),
 			ringOut,
-			tension: journey.tension,
-			release: journey.release,
-			openness: journey.openness,
-			asymmetry,
-			ellipse: journey.shapeWeights.ellipse,
-			lissajous: journey.shapeWeights.lissajous,
-			ribbon: journey.shapeWeights.ribbon,
-			rosette: journey.shapeWeights.rosette,
-			figurePhase,
-			complexity: journey.complexity,
-			mode,
-			spread,
-			sweepPhase,
-			channels: clamp(journey.channels * (0.85 + responseMotion * 0.15), 0, 4),
-			sweepStep,
-			packetPhase: (((renderBeats / 4) % 1) + 1) % 1,
-			baseHue: directed.palette.baseHue,
-			accentHue: directed.palette.accentHue,
-			rimHue: directed.palette.rimHue,
-			saturation: clamp(directed.palette.saturation * response.saturation, 0.3, 0.95),
-			keyStrength,
 			energy: clamp(energy * responseMotion, 0, 1),
 			silence,
-			stroke: response.stroke * (1 + bands.presence * 0.08),
+			stroke:
+				response.stroke *
+				(1 + bands.presence * 0.08) *
+				display.stroke *
+				(0.86 + gene('stroke') * 0.28),
+			beatPhase: clamp(clock.beatPhase, 0, 1),
+			heroR: paletteOut.hero[0],
+			heroG: paletteOut.hero[1],
+			heroB: paletteOut.hero[2],
+			paletteGain: paletteOut.gain,
+			traceR: paletteOut.trace[0],
+			traceG: paletteOut.trace[1],
+			traceB: paletteOut.trace[2],
+			ghostSpread: spread,
+			horizonR: paletteOut.horizon[0],
+			horizonG: paletteOut.horizon[1],
+			horizonB: paletteOut.horizon[2],
+			coupling,
+			hotR: paletteOut.hot[0],
+			hotG: paletteOut.hot[1],
+			hotB: paletteOut.hot[2],
+			headGlow: 0.9 + energy * 0.4,
+			roomR: paletteOut.room[0],
+			roomG: paletteOut.room[1],
+			roomB: paletteOut.room[2],
+			haze: display.haze,
+			figAX,
+			figAY,
+			figAScale,
+			figAVis: 1,
+			figBX,
+			figBY,
+			figBScale,
+			figBScreen: screen,
+			headU,
+			headX,
+			headY,
+			lightLevel: (0.55 + energy * 0.35 + beatGlow * 0.35) * (1 - silence * 0.6),
+			sweepPhase,
+			channels: clamp(journey.channels * (0.85 + responseMotion * 0.15), 0, 4),
+			feed: layout.feed,
+			feedPhase: clamp(clock.beatPhase, 0, 1),
+			t0ox: layout.t0ox,
+			t0oy: layout.t0oy,
+			t0tx: layout.t0tx,
+			t0ty: layout.t0ty,
+			t0vx: layout.t0vx,
+			t0vy: layout.t0vy,
+			t0scroll: layout.t0scroll,
+			t0vis: layout.t0vis,
+			t1ox: layout.t1ox,
+			t1oy: layout.t1oy,
+			t1tx: layout.t1tx,
+			t1ty: layout.t1ty,
+			t1vx: layout.t1vx,
+			t1vy: layout.t1vy,
+			t1scroll: layout.t1scroll,
+			t1vis: layout.t1vis,
+			t2ox: layout.t2ox,
+			t2oy: layout.t2oy,
+			t2tx: layout.t2tx,
+			t2ty: layout.t2ty,
+			t2vx: layout.t2vx,
+			t2vy: layout.t2vy,
+			t2scroll: layout.t2scroll,
+			t2vis: layout.t2vis,
+			t3ox: layout.t3ox,
+			t3oy: layout.t3oy,
+			t3tx: layout.t3tx,
+			t3ty: layout.t3ty,
+			t3vx: layout.t3vx,
+			t3vy: layout.t3vy,
+			t3scroll: layout.t3scroll,
+			t3vis: layout.t3vis,
+			band2Level: bandLevel(0),
+			band2Lo: bandParam(0, 1),
+			band2Hi: bandParam(0, 2),
+			band2Cycles: bandParam(0, 3),
+			band3Level: bandLevel(1),
+			band3Lo: bandParam(1, 1),
+			band3Hi: bandParam(1, 2),
+			band3Cycles: bandParam(1, 3),
+			surfaceA,
+			surfaceB,
+			surfaceMix: layoutChoice.mix,
+			terrainVis: layout.terrainVis,
+			tickPhase,
+			headIndex: terrainHead,
+			tickFlash,
+			relief: layout.relief * (0.75 + gene('relief') * 0.5) * (0.8 + energy * 0.35),
+			camHeight,
+			camPitch,
+			camYaw,
+			focal,
+			offAX: offsetA[0],
+			offAY: offsetA[1],
+			offBX: offsetB[0],
+			offBY: offsetB[1],
+			near: layout.near,
+			far: layout.far,
+			span: layout.span,
+			rails: layout.rails,
+			ringInner: layout.ringInner,
+			ringOuter: layout.ringOuter,
+			ringZ: layout.ringZ,
+			radarArm: layout.radarArm,
+			wfX: anchorX,
+			wfY: anchorY,
+			wfDx: layout.wfDx,
+			wfDy: layout.wfDy,
+			faceAX: layout.faceAX,
+			faceAY: layout.faceAY,
+			faceAW: layout.faceAW,
+			faceAH: layout.faceAH,
+			faceARadius: layout.faceARadius,
+			faceARepeat: layout.faceARepeat,
+			faceAGap: layout.faceAGap,
+			faceAVis: layout.faceAVis,
+			faceBX: layout.faceBX,
+			faceBY: layout.faceBY,
+			faceBW: layout.faceBW,
+			faceBH: layout.faceBH,
+			faceBRadius: layout.faceBRadius,
+			faceABezel: layout.faceABezel,
+			faceBBezel: layout.faceBBezel,
+			faceBVis: layout.faceBVis,
+			scanDensity: display.scanDensity,
+			scanStrength: display.scanStrength * (0.5 + scanAxis),
+			curvature: display.curvature * (0.6 + gene('curvature') * 0.8),
+			grain: display.grain * (0.6 + gene('grain') * 0.8),
+			bloomGain: display.bloom,
+			aberration: display.aberration,
+			vignette: display.vignette,
+			glass: display.glass,
 			feedbackFade,
 			floorFade,
 			bloomThreshold: 1.0 - energy * 0.25,
-			aberration: 1 + impact * 1.6 + journey.sectionPulse * 0.6,
-			// The horizon rises as the instrument fills: calm sections give the
-			// face the room, drops hand more of the frame to the spectral floor.
-			horizon: -0.5 + clamp(journey.channels / 4, 0, 1) * 0.16,
-			heroX,
-			heroY: 0.2 + journey.openness * 0.04 - journey.tension * 0.03,
-			heroScale,
-			yaw: asymmetry * 0.55 + Math.sin(figurePhase * 0.23) * 0.32,
-			spectralMotion,
-			crest: spectrum.crestFactor,
-			flatness: spectrum.flatness,
-			tickPhase,
-			headIndex: terrainHead,
-			terrainLift: energy,
-			tickFlash,
+			gridLevel: 0.75 + gene('grid') * 0.5,
+			reflectY: layout.reflectY,
+			reflect: layout.reflect,
+			seamY: layout.seamY,
+			seam: layout.seam,
+			gridDensity: gene('grid'),
 			sectionProgress: directed.context.sectionProgress,
-			energySlope: directed.context.energySlope,
-			lookahead: lookaheadDelta,
+			figurePhase,
 			tempo: journey.tempo
 		};
 		packSignalUniforms(state.uniforms, values);
@@ -735,6 +1096,13 @@
 			terrainRows.byteOffset,
 			terrainRows.byteLength
 		);
+		queue.writeBuffer(
+			state.figureBuffer,
+			0,
+			figurePoints.buffer,
+			figurePoints.byteOffset,
+			figurePoints.byteLength
+		);
 
 		const now = performance.now();
 		if (now - lastHudUpdateAt >= 250) {
@@ -743,6 +1111,11 @@
 			hudTempo = directed.clock.tempoBpm;
 			hudContext = directed.context.source;
 			hudChannels = Math.round(journey.channels);
+			hudLayout = SIGNAL_LAYOUT_NAMES[layoutChoice.to];
+			hudFamily = SIGNAL_FAMILY_NAMES[familyChoice.to];
+			hudPalette = SIGNAL_PALETTES[paletteChoice.to].name;
+			hudScene = genome.scene;
+			hudFrameMs = Math.round(frameCpuMs * 100) / 100;
 		}
 
 		const encoder = state.device.createCommandEncoder({ label: 'Signal frame' });
@@ -835,7 +1208,9 @@
 		const elapsedMs = lastRenderedAt ? now - lastRenderedAt : refreshIntervalMs * activeFrameStride;
 		lastRenderedAt = now;
 		try {
+			const cpuStart = performance.now();
 			renderFrame(gpu, clamp(elapsedMs / 1000, 0.001, 0.25));
+			frameCpuMs += (performance.now() - cpuStart - frameCpuMs) * 0.05;
 		} catch (error) {
 			errorMsg = error instanceof Error ? error.message : String(error);
 			teardownGpu();
@@ -884,6 +1259,8 @@
 	onMount(async () => {
 		running = true;
 		startTime = performance.now();
+		lookOverride = parseSignalLookOverride(new URLSearchParams(location.search).get('signalLook'));
+		variation?.setOverride(lookOverride);
 		unsubscribe = await vis.subscribe();
 		if (!running) {
 			unsubscribe();
@@ -913,6 +1290,11 @@
 			data-signal-context={hudContext}
 			data-signal-tempo={Math.round(hudTempo)}
 			data-signal-channels={hudChannels}
+			data-signal-layout={hudLayout}
+			data-signal-family={hudFamily}
+			data-signal-palette={hudPalette}
+			data-signal-scene={hudScene}
+			data-signal-frame-ms={hudFrameMs}
 			data-signal-render-passes={SIGNAL_RENDER_PASSES}
 			data-signal-frame-stride={activeFrameStride}
 			data-signal-refresh-rate={measuredRefreshRate}
