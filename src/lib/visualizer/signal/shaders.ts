@@ -218,9 +218,46 @@ fn traceHead(k: u32) -> vec2<f32> {
 
 // ---- Horizon surfaces --------------------------------------------------------
 
-fn project(world: vec3<f32>, offset: vec2<f32>) -> vec3<f32> {
-	let yaw = params.camera.z;
-	let pitch = params.camera.y;
+// A surface rig: the camera and geometry one bench sees its horizon with. A
+// bench change keeps the leaving bench's rig (slot 0) and the arriving one's
+// (slot 1) and blends what they project on screen. Interpolating one camera
+// between two benches instead swings it through poses where the horizon
+// falls behind the lens and bursts back: a jump cut in all but name.
+struct Rig {
+	camera: vec4<f32>,
+	offset: vec2<f32>,
+	nearFar: vec2<f32>,
+	span: f32,
+	relief: f32,
+	rings: vec3<f32>,
+	waterfall: vec4<f32>,
+};
+
+fn surfaceRig(slot: u32) -> Rig {
+	var r: Rig;
+	if (slot == 0u) {
+		r.camera = params.camera;
+		r.offset = params.anchors.xy;
+		r.nearFar = params.depth.xy;
+		r.span = params.depth.z;
+		r.relief = params.terrain.w;
+		r.rings = params.rings.xyz;
+		r.waterfall = params.waterfall;
+	} else {
+		r.camera = params.cameraB;
+		r.offset = params.anchors.zw;
+		r.nearFar = params.depthB.xy;
+		r.span = params.depthB.z;
+		r.relief = params.depthB.w;
+		r.rings = params.ringsB.xyz;
+		r.waterfall = params.waterfallB;
+	}
+	return r;
+}
+
+fn project(world: vec3<f32>, rig: Rig) -> vec3<f32> {
+	let yaw = rig.camera.z;
+	let pitch = rig.camera.y;
 	let cy = cos(yaw);
 	let sy = sin(yaw);
 	var p = vec3<f32>(world.x * cy + world.z * sy, world.y, -world.x * sy + world.z * cy);
@@ -228,11 +265,11 @@ fn project(world: vec3<f32>, offset: vec2<f32>) -> vec3<f32> {
 	let sp = sin(pitch);
 	p = vec3<f32>(p.x, p.y * cp + p.z * sp, -p.y * sp + p.z * cp);
 	let z = max(p.z, 0.03);
-	return vec3<f32>(p.xy * params.camera.w / z + offset, select(0.0, 1.0, p.z > 0.06));
+	return vec3<f32>(p.xy * rig.camera.w / z + rig.offset, select(0.0, 1.0, p.z > 0.06));
 }
 
-fn rowDepth(age: f32) -> f32 {
-	return 1.0 / mix(1.0 / params.depth.y, 1.0 / params.depth.x, pow(age, 1.45));
+fn rowDepth(age: f32, rig: Rig) -> f32 {
+	return 1.0 / mix(1.0 / rig.nearFar.y, 1.0 / rig.nearFar.x, pow(age, 1.45));
 }
 
 // Map the along-row coordinate to a turn around the figure. Floors and
@@ -245,34 +282,34 @@ fn rowTurn(kind: u32, u: f32) -> f32 {
 	return fract(u);
 }
 
-fn surfacePoint(kind: u32, u: f32, age: f32, height: f32, offset: vec2<f32>) -> vec3<f32> {
-	let relief = params.terrain.w;
+fn surfacePoint(kind: u32, u: f32, age: f32, height: f32, rig: Rig) -> vec3<f32> {
+	let relief = rig.relief;
 	switch kind {
 		case 1u: {
 			// Ring: concentric silhouettes expanding out from under the figure.
 			let theta = u * TAU;
-			let radius = mix(params.rings.x, params.rings.y, pow(age, 0.85)) * (1.0 + height * relief * 0.45);
-			let world = vec3<f32>(radius * cos(theta), -params.camera.x + height * relief * 0.6, params.rings.z + radius * sin(theta));
-			return project(world, offset);
+			let radius = mix(rig.rings.x, rig.rings.y, pow(age, 0.85)) * (1.0 + height * relief * 0.45);
+			let world = vec3<f32>(radius * cos(theta), -rig.camera.x + height * relief * 0.6, rig.rings.z + radius * sin(theta));
+			return project(world, rig);
 		}
 		case 2u: {
 			// Waterfall: rows stacked obliquely, newest nearest the figure.
 			let shrink = 1.0 - age * 0.3;
-			let x = (u * 2.0 - 1.0) * params.depth.z * shrink;
-			let p = params.waterfall.xy + vec2<f32>(x, height * relief) + params.waterfall.zw * age;
+			let x = (u * 2.0 - 1.0) * rig.span * shrink;
+			let p = rig.waterfall.xy + vec2<f32>(x, height * relief) + rig.waterfall.zw * age;
 			return vec3<f32>(p, 1.0);
 		}
 		case 3u: {
 			// Canyon: a half-pipe running away to the figure; each row is the
 			// silhouette bent into a U, walls lifting with the figure's reach.
 			let theta = TAU * 0.5 + u * TAU * 0.5;
-			let radius = params.rings.x * (1.0 - clamp(height, -0.3, 1.5) * relief * 0.4);
-			let world = vec3<f32>(radius * cos(theta) * 1.3, radius * sin(theta) + params.camera.x, rowDepth(age));
-			return project(world, offset);
+			let radius = rig.rings.x * (1.0 - clamp(height, -0.3, 1.5) * relief * 0.4);
+			let world = vec3<f32>(radius * cos(theta) * 1.3, radius * sin(theta) + rig.camera.x, rowDepth(age, rig));
+			return project(world, rig);
 		}
 		default: {
-			let world = vec3<f32>((u * 2.0 - 1.0) * params.depth.z, -params.camera.x + height * relief, rowDepth(age));
-			return project(world, offset);
+			let world = vec3<f32>((u * 2.0 - 1.0) * rig.span, -rig.camera.x + height * relief, rowDepth(age, rig));
+			return project(world, rig);
 		}
 	}
 }
@@ -293,18 +330,27 @@ struct SurfaceOut {
 	ring: f32,
 };
 
+// A bench change does not re-lay the whole horizon at once: the new surface
+// is written in from the newest row and the old scene's rows age out on the
+// old surface, so the change ripples down the history like new signal does.
+fn surfaceMix(age: f32) -> f32 {
+	let global = clamp(params.surface.z, 0.0, 1.0);
+	let ripple = max(params.ringsB.w, 0.0);
+	return smoothstep(0.0, 1.0, clamp(global * (1.0 + ripple) - clamp(age, 0.0, 1.0) * ripple, 0.0, 1.0));
+}
+
 fn blendedSurface(u: f32, age: f32, row: u32, sampled: bool) -> SurfaceOut {
 	let kindA = u32(params.surface.x + 0.5);
 	let kindB = u32(params.surface.y + 0.5);
-	let mixAB = clamp(params.surface.z, 0.0, 1.0);
+	let mixAB = surfaceMix(age);
 	var valueA = vec2<f32>(0.0);
 	var valueB = vec2<f32>(0.0);
 	if (sampled) {
 		valueA = rowSample(row, rowTurn(kindA, u));
 		valueB = rowSample(row, rowTurn(kindB, u));
 	}
-	let a = surfacePoint(kindA, u, age, valueA.x, params.anchors.xy);
-	let b = surfacePoint(kindB, u, age, valueB.x, params.anchors.zw);
+	let a = surfacePoint(kindA, u, age, valueA.x, surfaceRig(0u));
+	let b = surfacePoint(kindB, u, age, valueB.x, surfaceRig(1u));
 	var out: SurfaceOut;
 	out.p = mix(a.xy, b.xy, mixAB);
 	out.valid = min(mix(a.z, 1.0, mixAB), mix(1.0, b.z, mixAB));
@@ -316,28 +362,33 @@ fn blendedSurface(u: f32, age: f32, row: u32, sampled: bool) -> SurfaceOut {
 }
 
 // How much a surface's near rows sprawl across the frame (rings, canyons).
-fn surfaceDensity() -> f32 {
+fn surfaceDensity(mixAB: f32) -> f32 {
 	var density = array<f32, 4>(0.0, 0.3, 0.0, 0.55);
 	let kindA = min(u32(params.surface.x + 0.5), 3u);
 	let kindB = min(u32(params.surface.y + 0.5), 3u);
-	return mix(density[kindA], density[kindB], clamp(params.surface.z, 0.0, 1.0)) * (1.0 - params.rings.w);
+	return mix(density[kindA], density[kindB], mixAB) * (1.0 - params.rings.w);
 }
 
 // Surfaces differ in how much line they put on screen; dense ones run lower.
-fn surfaceGain() -> f32 {
+fn surfaceGain(mixAB: f32) -> f32 {
 	var gains = array<f32, 4>(1.0, 0.64, 0.46, 0.5);
 	let kindA = min(u32(params.surface.x + 0.5), 3u);
 	let kindB = min(u32(params.surface.y + 0.5), 3u);
-	return mix(gains[kindA], gains[kindB], clamp(params.surface.z, 0.0, 1.0)) * (1.0 - params.rings.w * 0.4);
+	return mix(gains[kindA], gains[kindB], mixAB) * (1.0 - params.rings.w * 0.4);
 }
 
-fn edgeFade(u: f32) -> f32 {
+fn edgeFade(u: f32, mixAB: f32) -> f32 {
 	let kindA = u32(params.surface.x + 0.5);
 	let kindB = u32(params.surface.y + 0.5);
 	let flatFade = 1.0 - smoothstep(0.55, 1.0, abs(u * 2.0 - 1.0));
 	let fadeA = select(1.0, flatFade, kindA == 0u || kindA == 2u);
 	let fadeB = select(1.0, flatFade, kindB == 0u || kindB == 2u);
-	return mix(fadeA, fadeB, clamp(params.surface.z, 0.0, 1.0));
+	return mix(fadeA, fadeB, mixAB);
+}
+
+// Where along a row the beam head's turn lands on one surface kind.
+fn landingU(kind: u32, turn: f32) -> f32 {
+	return select(fract(turn - 0.25), turn, kind == 1u);
 }
 
 // Light from the beam head: one source for the whole bench.
@@ -458,6 +509,7 @@ fn vs_main(
 		// figure.
 		let k = instance - FEED_BASE;
 		s.persist = 0.0;
+		var dripFade = 1.0;
 		let figureHead = figureScreen(0u, headU);
 		var source = vec2<f32>(0.0);
 		var goal = figureHead;
@@ -467,11 +519,19 @@ fn vs_main(
 		} else {
 			let headLocal = figureLocal(0u, headU);
 			let turn = fract(atan2(headLocal.y, headLocal.x) / TAU + 1.0);
-			let kindB = u32(params.surface.y + 0.5);
-			let rowU = select(fract(turn - 0.25), turn, kindB == 1u);
-			let landing = blendedSurface(rowU, 0.5 / f32(ROWS), 0u, true);
+			// Land on both surfaces and blend, so a bench change carries the drip
+			// across instead of re-pointing it.
+			let landingAge = 0.5 / f32(ROWS);
+			let landingMix = surfaceMix(landingAge);
+			let rowUA = landingU(u32(params.surface.x + 0.5), turn);
+			let rowUB = landingU(u32(params.surface.y + 0.5), turn);
+			let landingA = blendedSurface(rowUA, landingAge, 0u, true);
+			let landingB = blendedSurface(rowUB, landingAge, 0u, true);
 			source = figureHead;
-			goal = landing.p;
+			goal = mix(landingA.p, landingB.p, landingMix);
+			// On flat surfaces the landing wraps from one edge to the other once a
+			// revolution; it fades out at the edges so the wrap is never seen.
+			dripFade = mix(edgeFade(rowUA, 0.0), edgeFade(rowUB, 1.0), landingMix);
 		}
 		s.start = mix(source, goal, f0);
 		s.end = mix(source, goal, f1);
@@ -479,7 +539,7 @@ fn vs_main(
 		let dash = smoothstep(0.18, 0.32, abs(fract(along * 26.0 - params.view.z * 0.7) - 0.5));
 		let travel = smoothstep(0.0, 0.62, params.sweep.w);
 		let dotGlow = exp(-sq((along - travel) / 0.03)) * (1.0 - smoothstep(0.62, 0.8, params.sweep.w));
-		let visibility = select(traceVisibility(min(k, 1u)) * params.sweep.z, params.sweep.z * params.surface.w * 0.8, k == 2u);
+		let visibility = select(traceVisibility(min(k, 1u)) * params.sweep.z, params.sweep.z * params.surface.w * 0.8 * dripFade, k == 2u);
 		s.color = select(mix(traceRgb, heroRgb, 0.5), mix(heroRgb, horizonRgb, along), k == 2u);
 		s.intensity = visibility * (0.13 + energy * 0.08) * dash * gain * smoothstep(0.0, 0.06, along) * (1.0 - smoothstep(0.94, 1.0, along));
 		s.halfWidth = 0.6 * stroke * pixelScale;
@@ -512,11 +572,12 @@ fn vs_main(
 		s.start = a.p;
 		s.end = b.p;
 		let fadeIn = smoothstep(0.0, 0.22, age);
-		let dense = clamp(surfaceDensity(), 0.0, 1.0);
+		let rowMix = surfaceMix(age);
+		let dense = clamp(surfaceDensity(rowMix), 0.0, 1.0);
 		let fadeOut = 1.0 - smoothstep(mix(0.78, 0.5, dense), mix(1.0, 0.82, dense), age);
 		let u = s.along;
 		let value = select(a.value, b.value, useEnd);
-		let edge = edgeFade(u);
+		let edge = edgeFade(u, rowMix);
 		// Fresh rows carry the figure's own phosphor and cool into the horizon
 		// role as they age: the floor is the figure's memory.
 		s.color = mix(heroRgb, horizonRgb, smoothstep(0.04, 0.42, age));
@@ -530,7 +591,7 @@ fn vs_main(
 		let radar = params.rings.w * a.ring * (exp(-behindArm * 2.6) * 2.1 - 0.9);
 		s.intensity = fadeIn * fadeOut * edge * (0.05 + max(value.x, 0.0) * 1.4) * (0.45 + age * 0.55)
 			* (1.0 - silence * 0.5) * min(a.valid, b.valid) * gain * params.surface.w
-			* max(1.0 + light * 1.4 + radar, 0.06) * surfaceGain();
+			* max(1.0 + light * 1.4 + radar, 0.06) * surfaceGain(rowMix);
 		s.halfWidth = (0.55 + age * 0.75) * stroke * pixelScale;
 		// The newest row flashes as it is written on the beat tick, and beat
 		// stamps from the beam head ride the rows down the horizon.
@@ -745,10 +806,9 @@ struct Face {
 
 // One scope face: a rounded screen with an etched graticule. A face whose
 // corner radius reaches its half size is round and carries range rings and
-// a crosshair instead of a division grid; repeat stacks strips vertically.
-fn scopeFace(p: vec2<f32>, center: vec2<f32>, halfSize: vec2<f32>, radius: f32, stack: f32, gap: f32, bezelAmount: f32, pixel: f32) -> Face {
+// a crosshair instead of a division grid; count stacks strips vertically.
+fn scopeFaceStack(p: vec2<f32>, center: vec2<f32>, halfSize: vec2<f32>, radius: f32, count: f32, gap: f32, bezelAmount: f32, pixel: f32) -> Face {
 	var lp = p - center;
-	let count = max(1.0, floor(stack + 0.5));
 	let pitch = halfSize.y * 2.0 + gap;
 	let index = clamp(floor(lp.y / pitch + (count - 1.0) * 0.5 + 0.5), 0.0, count - 1.0);
 	lp.y = lp.y - (index - (count - 1.0) * 0.5) * pitch;
@@ -774,6 +834,30 @@ fn scopeFace(p: vec2<f32>, center: vec2<f32>, halfSize: vec2<f32>, radius: f32, 
 	face.bezel = select(0.0, (1.0 - smoothstep(bezelWidth - pixel, bezelWidth + pixel, d)) * smoothstep(-pixel, pixel, d), bezelAmount > 0.01);
 	face.glass = face.inside * exp(-max(-d, 0.0) * 18.0);
 	return face;
+}
+
+fn mixFace(a: Face, b: Face, t: f32) -> Face {
+	var face: Face;
+	face.inside = mix(a.inside, b.inside, t);
+	face.grid = mix(a.grid, b.grid, t);
+	face.frame = mix(a.frame, b.frame, t);
+	face.bezel = mix(a.bezel, b.bezel, t);
+	face.glass = mix(a.glass, b.glass, t);
+	return face;
+}
+
+// A fractional strip count (a bench rearranging into a strip bank) blends
+// the two neighbouring whole stacks, so strips divide in instead of popping.
+fn scopeFace(p: vec2<f32>, center: vec2<f32>, halfSize: vec2<f32>, radius: f32, stack: f32, gap: f32, bezelAmount: f32, pixel: f32) -> Face {
+	let count = max(stack, 1.0);
+	let low = floor(count);
+	let t = smoothstep(0.0, 1.0, count - low);
+	let a = scopeFaceStack(p, center, halfSize, radius, low, gap, bezelAmount, pixel);
+	if (t < 0.002) {
+		return a;
+	}
+	let b = scopeFaceStack(p, center, halfSize, radius, low + 1.0, gap, bezelAmount, pixel);
+	return mixFace(a, b, t);
 }
 
 @fragment

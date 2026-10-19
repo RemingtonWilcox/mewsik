@@ -28,7 +28,6 @@
 	import {
 		SIGNAL_FAMILY_NAMES,
 		SIGNAL_FIGURE_FLOATS,
-		SignalFigureEngine,
 		type SignalFigureInput
 	} from '$lib/visualizer/signal/figures';
 	import {
@@ -51,6 +50,10 @@
 		type SignalLookOverride,
 		type SignalVariation
 	} from '$lib/visualizer/signal/genome';
+	import {
+		signalRendererMemory,
+		type SignalRendererScalars
+	} from '$lib/visualizer/signal/continuity';
 
 	const vis = useVisualizer();
 
@@ -60,6 +63,9 @@
 	const INTERNAL_SCALE = 0.75;
 	const MAX_INTERNAL_PIXELS = 1920 * 1080;
 	const BEATS_PER_PHRASE = 32;
+	// How far a bench change ripples down the horizon history: rows nearest the
+	// figure take the new surface first, the old scene's rows age out on the old.
+	const SURFACE_RIPPLE = 1.4;
 	// Log-frequency position of each analyzer band edge across the 64 bins
 	// (20 Hz .. 20 kHz): sub, kick, body, mids, presence, air.
 	const BAND_EDGES = [0, 0.16, 0.29, 0.43, 0.66, 0.82, 1];
@@ -116,16 +122,43 @@
 	let spinAngle = 0;
 	let dollyTime = 0;
 	const renderDetailBins = new Float32Array(64);
-	const terrainRows = new Float32Array(TERRAIN_FLOATS);
+	// Session memory: the figure, the horizon history, the look morphs and the
+	// conductor carry outlive this component, so a remount resumes the picture.
+	const memory = signalRendererMemory();
+	const morphs = memory.morphs;
+	const carry = memory.carry;
+	const terrainRows = memory.terrainRows;
 	// Interleaved height, heat per bin.
-	const pendingRow = new Float32Array(SIGNAL_TERRAIN_BINS * 2);
+	const pendingRow = memory.pendingRow;
 	const silhouette = new Float32Array(SIGNAL_TERRAIN_BINS);
 	let pendingRowFresh = true;
 
 	// The instrument model shared by every element on the bench.
-	const figureEngine = new SignalFigureEngine();
+	const figureEngine = memory.figure;
 	const paletteOut = createSignalPaletteOut();
 	const layoutMix = createSignalLayout();
+	/** This frame's conductor rails as drawn (see SignalCarry). */
+	const carriedJourney = {
+		tension: 0,
+		release: 0,
+		openness: 0,
+		motion: 0,
+		channels: 0,
+		complexity: 0,
+		sweepBeats: 1,
+		tickRate: 1,
+		tempo: 0.5,
+		signedAsymmetry: 0,
+		ellipse: 0,
+		lissajous: 1,
+		ribbon: 0,
+		rosette: 0,
+		energy: 0,
+		impact: 0,
+		ringOut: 0,
+		sectionPulse: 0,
+		tracePhase: 0
+	};
 	const layoutCache = new Map<string, SignalLayout>();
 	const headLocal: [number, number] = [0, 0];
 	let lookOverride: SignalLookOverride = {};
@@ -295,35 +328,83 @@
 		pendingRowFresh = true;
 	}
 
-	function resetRendererState(shared: VisualizerJourneySnapshot, live: boolean) {
+	function rendererScalars(): SignalRendererScalars {
+		return {
+			figurePhase,
+			lastTracePhase,
+			spinAngle,
+			dollyTime,
+			sweepPhase,
+			tickPhase,
+			terrainHead,
+			mode,
+			asymmetry,
+			renderBpm
+		};
+	}
+
+	/** Keep the session memory current so a remount picks up exactly here. */
+	function rememberRenderer() {
+		if (rendererSourceEpoch < 0) return;
+		memory.epoch = rendererSourceEpoch;
+		memory.scalars = rendererScalars();
+	}
+
+	/**
+	 * Bring the renderer onto the journey's current source. Nothing visual is
+	 * reset here: the very first frame of a session starts from the journey,
+	 * a remount resumes the remembered picture, and a new source (next song,
+	 * new station) carries the picture on while the conductor rails it reads
+	 * glide from where they were to the new source's (see SignalCarry). The
+	 * phosphor feedback only clears when its textures are rebuilt (resize).
+	 */
+	function syncRendererSource(shared: VisualizerJourneySnapshot, live: boolean) {
+		const mounting = rendererSourceEpoch === -1;
+		const newSource = mounting ? memory.epoch !== -1 && memory.epoch !== shared.sourceEpoch : true;
 		rendererSourceEpoch = shared.sourceEpoch;
-		const levels = shared.spectrum.levels;
-		for (const key of BAND_KEYS) bands[key] = live ? levels[key] : 0;
-		rms = 0;
-		silence = live ? 0 : 1;
-		quietFor = live ? 0 : 0.5;
-		renderBeats = beatAnchor(shared.director.clock) ?? 0;
-		sweepPhase = 0;
-		figurePhase = shared.signal.tracePhase * 1.6;
-		lastTracePhase = shared.signal.tracePhase;
-		tickPhase = 0;
-		tickFlash = 0;
-		terrainHead = 0;
-		terrainRows.fill(0);
-		pendingRow.fill(0);
-		pendingRowFresh = true;
-		asymmetry = shared.signal.signedAsymmetry;
-		spectralMotion = shared.spectrum.spectralMotion;
-		for (let index = 0; index < renderDetailBins.length; index += 1) {
-			renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
-		}
-		spinAngle = 0;
-		dollyTime = 0;
-		figureEngine.resetAttractor();
 		variation = signalVariationFor(shared.seed, shared.sourceEpoch);
 		variation.setOverride(lookOverride);
-		feedbackResetFrames = 2;
+		if (mounting) {
+			// Audio envelopes always start from what is playing now.
+			const levels = shared.spectrum.levels;
+			for (const key of BAND_KEYS) bands[key] = live ? levels[key] : 0;
+			rms = 0;
+			silence = live ? 0 : 1;
+			quietFor = live ? 0 : 0.5;
+			spectralMotion = shared.spectrum.spectralMotion;
+			for (let index = 0; index < renderDetailBins.length; index += 1) {
+				renderDetailBins[index] = shared.spectrum.detailBins[index] ?? 0;
+			}
+			renderBeats = beatAnchor(shared.director.clock) ?? 0;
+			tickFlash = 0;
+			pendingRowFresh = true;
+			const saved = memory.scalars;
+			// The figure turns on from where it was left, whatever the shared
+			// phase did while Signal was away.
+			lastTracePhase = shared.signal.tracePhase;
+			if (saved) {
+				({ figurePhase, spinAngle, dollyTime, sweepPhase, tickPhase, terrainHead, mode, asymmetry, renderBpm } =
+					saved);
+			} else {
+				// First Signal frame of the session.
+				figurePhase = shared.signal.tracePhase * 1.6;
+				asymmetry = shared.signal.signedAsymmetry;
+				sweepPhase = 0;
+				tickPhase = 0;
+				terrainHead = 0;
+				spinAngle = 0;
+				dollyTime = 0;
+				terrainRows.fill(0);
+				pendingRow.fill(0);
+			}
+		} else {
+			// A new source mid-view: the conductor restarted its monotonic phase.
+			lastTracePhase = shared.signal.tracePhase;
+			renderBeats = beatAnchor(shared.director.clock) ?? renderBeats;
+		}
+		if (newSource) carry.rebase();
 		lastHudUpdateAt = 0;
+		rememberRenderer();
 	}
 
 	function backingSize(targetCanvas: HTMLCanvasElement) {
@@ -615,7 +696,7 @@
 		const sampleAt = performance.now();
 		const feature = vis.getLatest(sampleAt);
 		const shared = vis.getJourney(sampleAt);
-		if (shared.sourceEpoch !== rendererSourceEpoch) resetRendererState(shared, feature !== null);
+		if (shared.sourceEpoch !== rendererSourceEpoch) syncRendererSource(shared, feature !== null);
 
 		ensureTargets(state, size.width, size.height);
 		const targets = state.targets;
@@ -631,8 +712,31 @@
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
-		const journey = shared.signal;
 		const response = VISUALIZER_TUNING.signal;
+		// Conductor rails, carried across a new source so a song change glides.
+		// Transients (impact, ring-out, section pulse) pass through untouched.
+		carry.advance(dt);
+		const conductor = shared.signal;
+		const journey = carriedJourney;
+		journey.tension = carry.apply('tension', conductor.tension);
+		journey.release = carry.apply('release', conductor.release);
+		journey.openness = carry.apply('openness', conductor.openness);
+		journey.motion = carry.apply('motion', conductor.motion);
+		journey.channels = carry.apply('channels', conductor.channels);
+		journey.complexity = carry.apply('complexity', conductor.complexity);
+		journey.sweepBeats = carry.apply('sweepBeats', conductor.sweepBeats);
+		journey.tickRate = carry.apply('tickRate', conductor.tickRate);
+		journey.tempo = carry.apply('tempo', conductor.tempo);
+		journey.signedAsymmetry = carry.apply('signedAsymmetry', conductor.signedAsymmetry);
+		journey.ellipse = carry.apply('ellipse', conductor.shapeWeights.ellipse);
+		journey.lissajous = carry.apply('lissajous', conductor.shapeWeights.lissajous);
+		journey.ribbon = carry.apply('ribbon', conductor.shapeWeights.ribbon);
+		journey.rosette = carry.apply('rosette', conductor.shapeWeights.rosette);
+		journey.energy = carry.apply('energy', directed.energy);
+		journey.impact = conductor.impact;
+		journey.ringOut = conductor.ringOut;
+		journey.sectionPulse = conductor.sectionPulse;
+		journey.tracePhase = conductor.tracePhase;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
 
@@ -694,7 +798,7 @@
 		figurePhase += traceDelta * 1.6 * responseMotion;
 
 		const energy = clamp(
-			directed.energy * 0.58 + rms * 0.24 + bands.body * 0.08 + spectralMotion * 0.1,
+			journey.energy * 0.58 + rms * 0.24 + bands.body * 0.08 + spectralMotion * 0.1,
 			0,
 			1
 		);
@@ -720,14 +824,19 @@
 			silence: directed.silence || !feature,
 			dt
 		});
-		const layoutChoice = genome.choice('layout');
-		const familyChoice = genome.choice('family');
-		const paletteChoice = genome.choice('palette');
-		const cameraChoice = genome.choice('camera');
-		const displayChoice = genome.choice('display');
-		const traceMapChoice = genome.choice('traceMap');
+		// The genome decides; the morphs make each decision one finished,
+		// staggered, eased move (see SignalChoiceMorph). They pause in silence
+		// with the genome, so a quiet gap never lands half a move.
+		const morphDt = directed.silence || !feature ? 0 : dt;
+		const layoutChoice = morphs.layout.update(genome.choice('layout').to, morphDt);
+		const familyChoice = morphs.family.update(genome.choice('family').to, morphDt);
+		const paletteChoice = morphs.palette.update(genome.choice('palette').to, morphDt);
+		const cameraChoice = morphs.camera.update(genome.choice('camera').to, morphDt);
+		const displayChoice = morphs.display.update(genome.choice('display').to, morphDt);
+		const traceMapChoice = morphs.traceMap.update(genome.choice('traceMap').to, morphDt);
 		const layoutFrom = layoutFor(layoutChoice.from, aspect);
 		const layoutTo = layoutFor(layoutChoice.to, aspect);
+		// Panels, traces and faces travel to their new places.
 		const layout = lerpSignalLayout(layoutFrom, layoutTo, layoutChoice.mix, layoutMix);
 		const camera = lerpPreset(
 			SIGNAL_CAMERAS[cameraChoice.from],
@@ -742,17 +851,27 @@
 		const gene = (name: Parameters<SignalVariation['value']>[0]) => genome.value(name);
 
 		// ---- Camera ------------------------------------------------------------
-		const freedom = layout.freedom;
 		dollyTime += dt * (0.4 + journey.motion * 0.6);
 		const drift = gene('drift');
 		const sway = camera.sway * Math.sin(dollyTime * 0.11) + (drift - 0.5) * 0.12;
-		const camPitch = layout.pitch + (camera.pitch + (drift - 0.5) * 0.06) * freedom;
-		const camHeight =
-			layout.camHeight *
-			(1 + (camera.height - 1) * freedom) *
-			(1 + camera.dolly * 0.12 * Math.sin(dollyTime * 0.07) * freedom);
-		const focal = layout.focal * (1 + (camera.focal - 1) * freedom);
-		const camYaw = sway * freedom;
+		/** One bench's camera under the current camera regime. */
+		const benchCamera = (bench: SignalLayout) => {
+			const freedom = bench.freedom;
+			return {
+				pitch: bench.pitch + (camera.pitch + (drift - 0.5) * 0.06) * freedom,
+				height:
+					bench.camHeight *
+					(1 + (camera.height - 1) * freedom) *
+					(1 + camera.dolly * 0.12 * Math.sin(dollyTime * 0.07) * freedom),
+				focal: bench.focal * (1 + (camera.focal - 1) * freedom),
+				yaw: sway * freedom
+			};
+		};
+		// The blended bench drives the figure's tilt; each horizon surface keeps
+		// its own bench's camera (rigs A and B below).
+		const camPitch = benchCamera(layout).pitch;
+		const rigCameraA = benchCamera(layoutFrom);
+		const rigCameraB = benchCamera(layoutTo);
 
 		// ---- Figure placement ----------------------------------------------------
 		const driftX = clamp(asymmetry * 0.62, -0.4, 0.4) * aspect * layout.drift;
@@ -790,10 +909,10 @@
 			mode,
 			p1: gene('p1'),
 			p2: gene('p2'),
-			ellipse: journey.shapeWeights.ellipse,
-			lissajous: journey.shapeWeights.lissajous,
-			ribbon: journey.shapeWeights.ribbon,
-			rosette: journey.shapeWeights.rosette,
+			ellipse: journey.ellipse,
+			lissajous: journey.lissajous,
+			ribbon: journey.ribbon,
+			rosette: journey.rosette,
 			tension: journey.tension,
 			release: journey.release,
 			spread,
@@ -838,33 +957,39 @@
 		}
 		tickFlash *= Math.exp(-dt * 7);
 
-		// Screen offsets: put each surface's anchor (vanishing point, ring
-		// centre, waterfall origin) where the layout wants it.
-		const anchorX = layout.anchorX + driftX * layout.anchorFollow;
-		const anchorY = layout.anchorY;
-		const surfaceOffset = (kind: number): [number, number] => {
-			if (kind === SURFACE_RING) {
-				const cp = Math.cos(camPitch);
-				const sp = Math.sin(camPitch);
-				const cy = Math.cos(camYaw);
-				const sy = Math.sin(camYaw);
-				const wy = -camHeight;
-				const wz = layout.ringZ;
+		// Surface rigs. Each bench projects its own horizon with its own camera;
+		// a bench change blends the two projections on screen (rows nearest
+		// the figure first), so the horizon re-forms instead of the camera
+		// swinging through poses where it falls behind the lens.
+		const driftBase = clamp(asymmetry * 0.62, -0.4, 0.4) * aspect;
+		const reliefDrive = (0.75 + gene('relief') * 0.5) * (0.8 + energy * 0.35);
+		const surfaceRig = (bench: SignalLayout, cam: ReturnType<typeof benchCamera>) => {
+			// Put the surface's anchor (vanishing point, ring centre, waterfall
+			// origin) where the bench wants it.
+			const anchorX = bench.anchorX + driftBase * bench.drift * bench.anchorFollow;
+			const anchorY = bench.anchorY;
+			let offset: [number, number] = [anchorX, anchorY];
+			if (bench.surface === SURFACE_RING) {
+				const cp = Math.cos(cam.pitch);
+				const sp = Math.sin(cam.pitch);
+				const cy = Math.cos(cam.yaw);
+				const sy = Math.sin(cam.yaw);
+				const wy = -cam.height;
+				const wz = bench.ringZ;
 				const x1 = wz * sy;
 				const z1 = wz * cy;
 				const y2 = wy * cp + z1 * sp;
 				const z2 = Math.max(0.03, -wy * sp + z1 * cp);
-				return [anchorX - (x1 * focal) / z2, anchorY - (y2 * focal) / z2];
+				offset = [anchorX - (x1 * cam.focal) / z2, anchorY - (y2 * cam.focal) / z2];
+			} else if (bench.surface === SURFACE_FLOOR || bench.surface === SURFACE_TUNNEL) {
+				offset = [anchorX - cam.focal * Math.tan(cam.yaw), anchorY - cam.focal * Math.tan(cam.pitch)];
 			}
-			if (kind === SURFACE_FLOOR || kind === SURFACE_TUNNEL) {
-				return [anchorX - focal * Math.tan(camYaw), anchorY - focal * Math.tan(camPitch)];
-			}
-			return [anchorX, anchorY];
+			return { cam, offset, anchorX, anchorY, relief: bench.relief * reliefDrive };
 		};
+		const rigA = surfaceRig(layoutFrom, rigCameraA);
+		const rigB = surfaceRig(layoutTo, rigCameraB);
 		const surfaceA = layoutFrom.surface;
 		const surfaceB = layoutTo.surface;
-		const offsetA = surfaceOffset(surfaceA);
-		const offsetB = surfaceOffset(surfaceB);
 
 		// ---- Phosphor ------------------------------------------------------------
 		resolveSignalPalette(
@@ -1014,27 +1139,43 @@
 			tickPhase,
 			headIndex: terrainHead,
 			tickFlash,
-			relief: layout.relief * (0.75 + gene('relief') * 0.5) * (0.8 + energy * 0.35),
-			camHeight,
-			camPitch,
-			camYaw,
-			focal,
-			offAX: offsetA[0],
-			offAY: offsetA[1],
-			offBX: offsetB[0],
-			offBY: offsetB[1],
-			near: layout.near,
-			far: layout.far,
-			span: layout.span,
+			relief: rigA.relief,
+			camHeight: rigA.cam.height,
+			camPitch: rigA.cam.pitch,
+			camYaw: rigA.cam.yaw,
+			focal: rigA.cam.focal,
+			offAX: rigA.offset[0],
+			offAY: rigA.offset[1],
+			offBX: rigB.offset[0],
+			offBY: rigB.offset[1],
+			near: layoutFrom.near,
+			far: layoutFrom.far,
+			span: layoutFrom.span,
 			rails: layout.rails,
-			ringInner: layout.ringInner,
-			ringOuter: layout.ringOuter,
-			ringZ: layout.ringZ,
+			ringInner: layoutFrom.ringInner,
+			ringOuter: layoutFrom.ringOuter,
+			ringZ: layoutFrom.ringZ,
 			radarArm: layout.radarArm,
-			wfX: anchorX,
-			wfY: anchorY,
-			wfDx: layout.wfDx,
-			wfDy: layout.wfDy,
+			wfX: rigA.anchorX,
+			wfY: rigA.anchorY,
+			wfDx: layoutFrom.wfDx,
+			wfDy: layoutFrom.wfDy,
+			camHeightB: rigB.cam.height,
+			camPitchB: rigB.cam.pitch,
+			camYawB: rigB.cam.yaw,
+			focalB: rigB.cam.focal,
+			nearB: layoutTo.near,
+			farB: layoutTo.far,
+			spanB: layoutTo.span,
+			reliefB: rigB.relief,
+			ringInnerB: layoutTo.ringInner,
+			ringOuterB: layoutTo.ringOuter,
+			ringZB: layoutTo.ringZ,
+			surfaceRipple: SURFACE_RIPPLE,
+			wfXB: rigB.anchorX,
+			wfYB: rigB.anchorY,
+			wfDxB: layoutTo.wfDx,
+			wfDyB: layoutTo.wfDy,
 			faceAX: layout.faceAX,
 			faceAY: layout.faceAY,
 			faceAW: layout.faceAW,
@@ -1271,6 +1412,7 @@
 	});
 
 	onDestroy(() => {
+		rememberRenderer();
 		running = false;
 		initVersion += 1;
 		cancelAnimationFrame(raf);
