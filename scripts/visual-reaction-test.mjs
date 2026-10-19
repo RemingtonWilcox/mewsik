@@ -3,14 +3,19 @@
 //
 // For each engine and each pair of contrasting lab profiles, play A for a
 // while, switch to B, and capture frames every ~250 ms around the switch.
-// Frames are averaged over 1 s windows (so beat flashes and motion blur out
-// and what remains is palette, composition and lighting), then compared:
-//   drift     window [-4 s, -3 s] vs [-1 s, 0 s]: how much the look changes
-//             in 3 s on its own
+// Each frame is reduced to a layout-invariant *look* descriptor (RGB colour
+// histogram, luminance histogram, edge density), so camera travel and motion
+// do not count as change but a new palette, lighting, texture or density
+// does. Descriptors are averaged over 1 s windows, then compared:
+//   drift     median over three 3 s spans before the switch ([-7,-6] vs
+//             [-4,-3], [-6,-5] vs [-3,-2], [-4,-3] vs [-1,0]): how much the
+//             look changes in 3 s on its own
 //   react@1.5 [-1 s, 0 s] vs [+1 s, +2 s]
 //   react@3   [-1 s, 0 s] vs [+2.5 s, +3.5 s]
-// ratio = react / drift. The engine passes when react@3 >= 2.5x drift and
-// react@1.5 >= 1.5x drift, and no frame pair in the capture is a cut (same
+// ratio = react / max(drift, 3). The pixel-layout distance of the same
+// windows is reported too (pix@3) for information. The engine passes when react@3 >= 2.5x drift and
+// react@1.5 >= 1.5x drift, react@3 is at least MIN_REACT (12 of 100) in
+// absolute terms, and no frame pair in the capture is a cut (same
 // criterion as visual-cut-detector.mjs).
 //
 // Two modes per pair:
@@ -52,7 +57,9 @@ const PAIRS = [
 	['club128', 'cinematic72']
 ];
 const SETTLE_MS = 12_000;
-const PRE_MS = 4_500;
+// The look must also move by an absolute amount: a tiny drift makes any ratio easy.
+const MIN_REACT = 12;
+const PRE_MS = 8_000;
 const POST_MS = 6_000;
 const outDir = `output/reaction-${label}`;
 
@@ -73,7 +80,7 @@ async function capture(page, durationMs, t0, into) {
 }
 
 async function shiftSerial(page) {
-	return page.evaluate(() => window.__MEWSIK_LAB__?.snapshot().journey?.cachedSnapshot?.character?.shiftSerial ?? -1);
+	return page.evaluate(() => window.__MEWSIK_LAB__?.snapshot().journey?.character?.shiftSerial ?? -1);
 }
 
 async function analyse(frames) {
@@ -99,6 +106,75 @@ async function analyse(frames) {
 		}
 		return out;
 	}, frames.map((f) => f.data));
+}
+
+// Look descriptor of one frame, built to ignore plain exposure: a hue
+// histogram weighted by chroma (palette identity), the luminance histogram
+// of the frame divided by its own mean (tonal shape and contrast), and edge
+// density relative to mean luminance (texture, fragmentation, line weight).
+// A wash that brightens everything barely moves it; a new palette, a harsh
+// fractured texture or a different tonal world does.
+function descriptor(px) {
+	const n = px.length / 4;
+	const W = 48;
+	const hue = new Float32Array(12);
+	const tone = new Float32Array(12);
+	const l = new Float32Array(n);
+	let mean = 0;
+	let chromaSum = 0;
+	for (let i = 0; i < n; i += 1) {
+		const r = px[i * 4] / 255;
+		const g = px[i * 4 + 1] / 255;
+		const b = px[i * 4 + 2] / 255;
+		l[i] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		mean += l[i] / n;
+		const max = Math.max(r, g, b);
+		const min = Math.min(r, g, b);
+		const chroma = max - min;
+		if (chroma > 0.02) {
+			let h;
+			if (max === r) h = ((g - b) / chroma + 6) % 6;
+			else if (max === g) h = (b - r) / chroma + 2;
+			else h = (r - g) / chroma + 4;
+			hue[Math.floor(h * 2) % 12] += chroma;
+			chromaSum += chroma;
+		}
+	}
+	if (chromaSum > 0) for (let i = 0; i < 12; i += 1) hue[i] /= chromaSum;
+	const m = Math.max(0.02, mean);
+	let edge = 0;
+	for (let i = 0; i < n; i += 1) {
+		tone[Math.min(11, Math.floor((l[i] / m) * 3))] += 1 / n;
+		const x = i % W;
+		if (x + 1 < W && i + W < n) edge += Math.abs(l[i + 1] - l[i]) + Math.abs(l[i + W] - l[i]);
+	}
+	return { hue, tone, edge: edge / n / m, colourful: chromaSum / n };
+}
+
+function windowDescriptor(frames, pixels, from, to) {
+	const picked = pixels.filter((_, i) => frames[i].t >= from && frames[i].t < to).map(descriptor);
+	if (!picked.length) return null;
+	const out = { hue: new Float32Array(12), tone: new Float32Array(12), edge: 0, colourful: 0 };
+	for (const d of picked) {
+		for (let i = 0; i < 12; i += 1) out.hue[i] += d.hue[i] / picked.length;
+		for (let i = 0; i < 12; i += 1) out.tone[i] += d.tone[i] / picked.length;
+		out.edge += d.edge / picked.length;
+		out.colourful += d.colourful / picked.length;
+	}
+	return out;
+}
+
+// 0..100: 40 % palette (hue mix), 30 % tonal shape, 30 % texture.
+function lookDistance(a, b) {
+	if (!a || !b) return NaN;
+	let hue = 0;
+	let tone = 0;
+	for (let i = 0; i < 12; i += 1) hue += Math.abs(a.hue[i] - b.hue[i]);
+	for (let i = 0; i < 12; i += 1) tone += Math.abs(a.tone[i] - b.tone[i]);
+	// A near-grey frame has no meaningful hue; weight palette by colourfulness.
+	const hueWeight = Math.min(1, Math.min(a.colourful, b.colourful) * 20);
+	const edge = Math.abs(a.edge - b.edge) / Math.max(0.15, a.edge, b.edge);
+	return 100 * (0.4 * (hue / 2) * hueWeight + 0.3 * (tone / 2) + 0.3 * edge);
 }
 
 // Mean image over frames with t in [from, to).
@@ -205,11 +281,17 @@ try {
 				const serialAfter = await shiftSerial(page);
 				for (const f of frames) f.t -= switchedAt;
 				const pixels = await analyse(frames);
-				const base = windowMean(frames, pixels, -1, 0);
-				const drift = distance(windowMean(frames, pixels, -4, -3), base);
-				const react15 = distance(base, windowMean(frames, pixels, 1, 2));
-				const react3 = distance(base, windowMean(frames, pixels, 2.5, 3.5));
-				const floor = Math.max(drift, 2);
+				const look = (from, to) => windowDescriptor(frames, pixels, from, to);
+				const base = look(-1, 0);
+				const drifts = [lookDistance(look(-7, -6), look(-4, -3)), lookDistance(look(-6, -5), look(-3, -2)), lookDistance(look(-4, -3), base)]
+					.filter(Number.isFinite)
+					.sort((x, y) => x - y);
+				const drift = drifts[Math.floor(drifts.length / 2)] ?? 0;
+				const react15 = lookDistance(base, look(1, 2));
+				const react3 = lookDistance(base, look(2.5, 3.5));
+				const pixel3 = distance(windowMean(frames, pixels, -1, 0), windowMean(frames, pixels, 2.5, 3.5));
+				const pixelDrift = distance(windowMean(frames, pixels, -4, -3), windowMean(frames, pixels, -1, 0));
+				const floor = Math.max(drift, 3);
 				const cuts = cutsIn(frames, pixels);
 				const result = {
 					engine,
@@ -220,15 +302,16 @@ try {
 					react3: Number(react3.toFixed(2)),
 					ratio15: Number((react15 / floor).toFixed(2)),
 					ratio3: Number((react3 / floor).toFixed(2)),
+					pixelRatio3: Number((pixel3 / Math.max(pixelDrift, 2)).toFixed(2)),
 					shiftFired: serialAfter > serialBefore,
 					cuts
 				};
-				result.pass = result.ratio3 >= 2.5 && result.ratio15 >= 1.5 && cuts.length === 0;
+				result.pass = result.ratio3 >= 2.5 && result.ratio15 >= 1.5 && result.react3 >= MIN_REACT && cuts.length === 0;
 				if (!result.pass) failed = true;
 				results.push(result);
 				await strip(frames, `${outDir}/${engine}-${mode}-${from}-${to}.jpg`);
 				console.log(
-					`${engine.padEnd(7)} ${mode.padEnd(6)} ${result.pair.padEnd(24)} drift ${result.drift.toFixed(1).padStart(5)}  @1.5s ${result.ratio15.toFixed(1).padStart(4)}x  @3s ${result.ratio3.toFixed(1).padStart(4)}x  shift ${result.shiftFired ? 'yes' : 'NO '}  ${cuts.length ? `CUTS ${cuts.map((c) => c.t).join(',')}` : 'no cuts'}  ${result.pass ? 'PASS' : 'FAIL'}`
+					`${engine.padEnd(7)} ${mode.padEnd(6)} ${result.pair.padEnd(24)} drift ${result.drift.toFixed(1).padStart(5)}  look@3 ${result.react3.toFixed(1).padStart(5)}  @1.5s ${result.ratio15.toFixed(1).padStart(4)}x  @3s ${result.ratio3.toFixed(1).padStart(4)}x  pix@3 ${result.pixelRatio3.toFixed(1).padStart(4)}x  shift ${result.shiftFired ? 'yes' : 'NO '}  ${cuts.length ? `CUTS ${cuts.map((c) => c.t).join(',')}` : 'no cuts'}  ${result.pass ? 'PASS' : 'FAIL'}`
 				);
 			}
 		}

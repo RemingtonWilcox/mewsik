@@ -56,10 +56,23 @@ export type MusicCharacter = {
 const FEATURE_COUNT = CHARACTER_FEATURES.length;
 const FAST_TAU_S = 1.1;
 const SLOW_TAU_S = 25;
-const SHIFT_THRESHOLD = 0.16;
+const SHIFT_THRESHOLD = 0.13;
+/**
+ * Tempo is one feature among eight in the contrast, so a pure tempo change
+ * (same band, 90 -> 140 bpm) can never reach SHIFT_THRESHOLD alone; it gets
+ * its own trigger: ~14 bpm of sustained change.
+ */
+const TEMPO_SHIFT = 0.12;
 const SHIFT_REFRACTORY_S = 8;
 const SHIFT_DECAY_TAU_S = 0.7;
 const SOURCE_SHIFT_DELAY_S = 0.8;
+/**
+ * After a shift the fast envelope is still converging on the new music, so
+ * for a few seconds the remembered character follows it closely instead of
+ * freezing a half-arrived value (which would fire a second shift later).
+ */
+const SHIFT_SETTLE_S = 5;
+const SETTLE_TAU_S = 1.2;
 /** Per-feature weights in the contrast distance: tempo and timbre say "genre". */
 const WEIGHTS = new Float32Array([1.3, 1.0, 1.2, 1.0, 1.1, 0.8, 0.7, 0.5]);
 const WEIGHT_SUM = WEIGHTS.reduce((sum, w) => sum + w, 0);
@@ -129,9 +142,19 @@ export class CharacterTracker {
 		const audible = !director.silence && director.energy > 0.04;
 		this.raw[0] = tempoUnit(director.clock.tempoBpm);
 		this.raw[1] = clamp01(director.energy);
-		this.raw[2] = clamp01((spectrum.centroid - 0.15) / 0.6);
-		this.raw[3] = clamp01((spectrum.levels.sub + spectrum.levels.kick) * 0.6);
-		this.raw[4] = clamp01(spectrum.flatness * 1.6);
+		// Timbre from where the energy sits, as shares of the six bands, so a
+		// loud and a quiet mix of the same music read alike. Calibrated on the
+		// lab profiles: centroid lives in ~0.03..0.21 and flatness is high for
+		// almost everything, so neither is used raw.
+		const levels = spectrum.levels;
+		const total = levels.sub + levels.kick + levels.body + levels.mids + levels.presence + levels.air;
+		const high = total > 1e-4 ? (levels.presence + levels.air) / total : 0.3;
+		const low = total > 1e-4 ? (levels.sub + levels.kick) / total : 0.3;
+		const highShare = clamp01((high - 0.12) / 0.4);
+		this.raw[2] = clamp01(highShare * 0.7 + clamp01((spectrum.centroid - 0.02) / 0.22) * 0.3);
+		this.raw[3] = clamp01((low - 0.1) / 0.4);
+		// Noise: a restless, churning spectrum plus a hissing top end.
+		this.raw[4] = clamp01((spectrum.spectralMotion / 0.55) * 0.55 + clamp01((high - 0.25) / 0.25) * 0.45);
 		this.raw[5] = clamp01(spectrum.crestFactor);
 		this.raw[6] = clamp01(director.motion);
 		this.raw[7] = clamp01(director.valence);
@@ -150,7 +173,7 @@ export class CharacterTracker {
 			// the new music is heard before the armed shift fires.
 			const fastTau = this.sourceArmed ? FAST_TAU_S * 0.4 : FAST_TAU_S;
 			const kf = 1 - Math.exp(-step / fastTau);
-			const ks = 1 - Math.exp(-step / SLOW_TAU_S);
+			const ks = 1 - Math.exp(-step / (this.sinceShiftS < SHIFT_SETTLE_S ? SETTLE_TAU_S : SLOW_TAU_S));
 			for (let i = 0; i < FEATURE_COUNT; i += 1) {
 				this.fast[i] += (this.raw[i] - this.fast[i]) * kf;
 				this.slow[i] += (this.raw[i] - this.slow[i]) * ks;
@@ -164,13 +187,18 @@ export class CharacterTracker {
 		if (this.sourceArmed && this.audibleSeconds >= SOURCE_SHIFT_DELAY_S) {
 			this.sourceArmed = false;
 			this.fire(1);
-		} else if (
-			!this.sourceArmed &&
-			audible &&
-			this.sinceShiftS > SHIFT_REFRACTORY_S &&
-			this.contrastValue > SHIFT_THRESHOLD
-		) {
-			this.fire(clamp01(0.45 + (this.contrastValue - SHIFT_THRESHOLD) * 3));
+		} else if (!this.sourceArmed && audible && this.sinceShiftS > SHIFT_REFRACTORY_S) {
+			const tempoChange = Math.abs(this.fast[0] - this.slow[0]);
+			if (this.contrastValue > SHIFT_THRESHOLD || tempoChange > TEMPO_SHIFT) {
+				this.fire(
+					clamp01(
+						Math.max(
+							0.45 + (this.contrastValue - SHIFT_THRESHOLD) * 3,
+							0.45 + (tempoChange - TEMPO_SHIFT) * 2
+						)
+					)
+				);
+			}
 		}
 
 		const f = this.frame;

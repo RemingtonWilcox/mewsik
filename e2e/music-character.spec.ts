@@ -50,7 +50,13 @@ test.describe('music character', () => {
 			// Stay on it: no more shifts.
 			play(25, (k) => frame(0.85, 0.8, 0.75, 172, k));
 			const steadyAfterNoise = shifts.length;
-			return { ambientCount, ambientShiftAt, reactedAfter, steadyAfterNoise, shifts };
+			// Same sound, only the tempo moves (124 -> 150 bpm): its own trigger.
+			play(15, (k) => frame(0.6, 0.4, 0.5, 124, k));
+			const beforeTempo = shifts.length;
+			const tempoAt = now / 1000;
+			play(6, (k) => frame(0.6, 0.4, 0.5, 150, k));
+			const tempoReactedAfter = shifts.length > beforeTempo ? shifts[beforeTempo] - tempoAt : null;
+			return { ambientCount, ambientShiftAt, reactedAfter, steadyAfterNoise, tempoReactedAfter, shifts };
 		});
 		// The new source fires once, after ~0.8 s of audio, and steady music never re-fires.
 		expect(result.ambientCount).toBe(1);
@@ -59,6 +65,8 @@ test.describe('music character', () => {
 		expect(result.reactedAfter).not.toBeNull();
 		expect(result.reactedAfter!).toBeLessThan(2.5);
 		expect(result.steadyAfterNoise).toBe(2);
+		expect(result.tempoReactedAfter).not.toBeNull();
+		expect(result.tempoReactedAfter!).toBeLessThan(3);
 	});
 
 	test('genome shift moves targets at once and glides faster, without a jump', async ({ page }) => {
