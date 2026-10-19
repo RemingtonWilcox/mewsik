@@ -23,13 +23,31 @@
 		PRISM_VORONOI_WGSL
 	} from '$lib/visualizer/prism/shaders';
 	import {
-		prismComposition,
+		PRISM_AXES,
+		PRISM_CAMERAS,
+		PRISM_ENVIRONMENTS,
+		PRISM_FAMILY_DRIVE,
+		PRISM_GRAMMARS,
+		PRISM_PALETTES,
+		PRISM_ROSE_R,
+		PRISM_ROSE_Y,
+		prismBaySpacing,
+		prismCamera,
+		prismCameraBasis,
+		prismDaylight,
 		prismFamily,
-		prismPaletteRoles,
-		type PrismComposition,
+		prismFold,
+		prismGrammarIsRadial,
+		prismLive,
+		prismPalette,
+		prismProject,
+		prismStructure,
+		prismStructureKey,
 		type PrismFamily,
+		type PrismStructure,
 		type Rgb
 	} from '$lib/visualizer/prism/composition';
+	import { VariationGenome, type ChoiceState } from '$lib/visualizer/variation';
 
 	const vis = useVisualizer();
 
@@ -66,17 +84,12 @@
 		growth: 0,
 		backlight: 0,
 		air: 0.8,
-		rings: 0,
-		spiral: 0,
-		petals: 1,
 		silence: 1,
 		quietFor: 0,
-		sunX: 0,
-		sunY: 0.1,
-		sunPower: 0.6,
 		packetStrength: 0,
 		rotation: 0,
-		previousRotation: 0
+		previousRotation: 0,
+		dollyPhase: 0
 	};
 	const palette = {
 		hero: [0.3, 0.02, 0.04] as Rgb,
@@ -85,19 +98,91 @@
 		field: [0.02, 0.05, 0.2] as Rgb
 	};
 
+	/** A composition the re-leading wave carries: structure plus proportions. */
+	type Comp = PrismStructure & { petalWidth: number; petalReach: number; outerLit: number };
+
+	// The variation genome: Prism's look walks through it at musical boundaries.
+	const genome = new VariationGenome(PRISM_AXES, 0.5);
+
+	// The far view and the candle-lit apse and crypt shrink the window to a
+	// small light in a black frame. Keep them in the space but rarer, and lift
+	// their exposure so a dark regime still reads as lit glass.
+	const CAMERA_WEIGHTS: Record<(typeof PRISM_CAMERAS)[number], number> = {
+		straight: 1.4,
+		receding: 1,
+		low: 1,
+		macro: 1.1,
+		gallery: 1,
+		flooded: 1,
+		far: 0.35
+	};
+	const ENVIRONMENT_WEIGHTS: Record<(typeof PRISM_ENVIRONMENTS)[number], number> = {
+		nave: 1.3,
+		crypt: 0.55,
+		ruin: 1,
+		apse: 0.5,
+		void: 1
+	};
+	const CAMERA_EXPOSURE: Record<(typeof PRISM_CAMERAS)[number], number> = {
+		straight: 1,
+		receding: 1.05,
+		low: 1.05,
+		macro: 1,
+		gallery: 1.08,
+		flooded: 1.05,
+		far: 1.5
+	};
+	const ENVIRONMENT_EXPOSURE: Record<(typeof PRISM_ENVIRONMENTS)[number], number> = {
+		nave: 1,
+		crypt: 1.3,
+		ruin: 1.05,
+		apse: 1.35,
+		void: 1.1
+	};
+
+	function applyLookWeights() {
+		genome.setWeights('camera', PRISM_CAMERAS.map((name) => CAMERA_WEIGHTS[name]));
+		genome.setWeights('environment', PRISM_ENVIRONMENTS.map((name) => ENVIRONMENT_WEIGHTS[name]));
+	}
+	applyLookWeights();
+
+	/** Exposure lift for the current camera/environment crossfade (>= 1). */
+	function regimeExposure(energy: number): number {
+		const camera = genome.choice('camera');
+		const environment = genome.choice('environment');
+		const cam =
+			CAMERA_EXPOSURE[PRISM_CAMERAS[camera.from]] * (1 - camera.mix) +
+			CAMERA_EXPOSURE[PRISM_CAMERAS[camera.to]] * camera.mix;
+		const room =
+			ENVIRONMENT_EXPOSURE[PRISM_ENVIRONMENTS[environment.from]] * (1 - environment.mix) +
+			ENVIRONMENT_EXPOSURE[PRISM_ENVIRONMENTS[environment.to]] * environment.mix;
+		// Quiet passages stay dimmer than drops, but never collapse to black.
+		const quietFloor = 1 + 0.18 * (1 - clamp(energy, 0, 1));
+		return cam * room * quietFloor;
+	}
 	let songSeed = 0.5;
 	let seedSalt = 0;
 	let rendererSourceEpoch = -1;
 	let lastBeatCount = -1;
-	let lastSection = '';
-	let familyVisits: Record<PrismFamily, number> = { quiet: 0, verse: 0, rise: 0, peak: 0, drift: 0 };
-	let compA: PrismComposition = prismComposition('quiet', 0.5, 0);
-	let compB: PrismComposition = compA;
-	let pendingComp: PrismComposition | null = null;
+	let compA: Comp = makeComp(prismStructure(genome, 'quiet'), 'quiet');
+	let compB: Comp = { ...compA };
+	let compKey = prismStructureKey(compA);
+	let compFamily: PrismFamily = 'quiet';
 	let transitionFront = TRANSITION_END;
 	let transitionGlow = 0;
 	let feedbackResetFrames = 2;
 	let frameIndex = 0;
+	let hudLook = $state('');
+
+	function makeComp(structure: PrismStructure, family: PrismFamily): Comp {
+		const live = prismLive(genome);
+		return {
+			...structure,
+			petalWidth: live.petalWidth,
+			petalReach: live.petalReach,
+			outerLit: PRISM_FAMILY_DRIVE[family].outerLit
+		};
+	}
 
 	function clamp(value: number, low: number, high: number) {
 		return Math.min(high, Math.max(low, value));
@@ -383,21 +468,50 @@
 		u[offset + 3] = d;
 	}
 
-	function writeShape(u: Float32Array, offset: number, comp: PrismComposition) {
+	// Dev-only look override for the lab and capture scripts:
+	// window.__PRISM_FORCE__ = { grammar: 5, camera: 3, palette: 12, ... }.
+	type PrismForce = Partial<Record<string, number>>;
+	function forced(): PrismForce | null {
+		if (!import.meta.env.DEV) return null;
+		return (globalThis as { __PRISM_FORCE__?: PrismForce }).__PRISM_FORCE__ ?? null;
+	}
+
+	function pick(name: string): ChoiceState {
+		const value = forced()?.[name];
+		return value === undefined ? genome.choice(name) : { from: value, to: value, mix: 1 };
+	}
+
+	function val(name: string): number {
+		const value = forced()?.[name];
+		return value === undefined ? genome.value(name) : value;
+	}
+
+	function forceStructure(structure: PrismStructure): PrismStructure {
+		const force = forced();
+		if (!force) return structure;
+		const grammar = force.grammar ?? structure.grammar;
+		return {
+			...structure,
+			grammar,
+			fold: force.fold !== undefined ? prismFold(grammar, force.fold) : force.grammar !== undefined ? prismFold(grammar, 3) : structure.fold,
+			mosaic: force.mosaic ?? structure.mosaic,
+			tiers: force.tiers ?? structure.tiers,
+			outline: force.outline ?? structure.outline
+		};
+	}
+
+	function writeShape(u: Float32Array, offset: number, comp: Comp) {
 		writeVec4(u, offset, comp.petalWidth, comp.petalReach, comp.cellScale, comp.outerLit);
 	}
 
-	/** Start (or queue) the outward re-leading wave toward a new composition. */
-	function requestComposition(next: PrismComposition) {
-		if (transitionFront >= TRANSITION_END) {
-			compB = next;
-			transitionFront = 0;
-			transitionGlow = 1;
-		} else {
-			pendingComp = next;
-		}
+	function writeGrammar(u: Float32Array, offset: number, comp: Comp) {
+		writeVec4(u, offset, comp.grammar, comp.mosaic, comp.tiers, comp.outline);
 	}
 
+	function smooth01(value: number, low: number, high: number) {
+		const t = clamp((value - low) / (high - low), 0, 1);
+		return t * t * (3 - 2 * t);
+	}
 	function renderFrame(g: GPU, now: number, dt: number) {
 		if (!canvas) return;
 		const { width: w, height: h } = prismBackingSize(
@@ -427,63 +541,40 @@
 		const clock = directed.clock;
 		const sectionNow = directed.section;
 		const family = prismFamily(sectionNow);
+		const drive = PRISM_FAMILY_DRIVE[family];
+		const phrasePos = clamp(finite(clock.phrasePos), 0, 1);
+		const phraseIndex = Math.max(0, Math.floor(finite(clock.phraseIndex)));
 
 		if (journey.sourceEpoch !== rendererSourceEpoch) {
 			rendererSourceEpoch = journey.sourceEpoch;
 			songSeed = journey.seed;
 			seedSalt = Math.floor(clamp(songSeed, 0, 1) * 65_535);
-			familyVisits = { quiet: 0, verse: 0, rise: 0, peak: 0, drift: 0 };
-			lastSection = sectionNow;
-			compA = prismComposition(family, songSeed, 0);
-			compB = compA;
-			pendingComp = null;
+			genome.reset(songSeed);
+			applyLookWeights();
+			compA = makeComp(prismStructure(genome, family), family);
+			compB = { ...compA };
+			compKey = prismStructureKey(compA);
+			compFamily = family;
 			transitionFront = TRANSITION_END;
 			transitionGlow = 0;
-			env.rings = compA.rings;
-			env.spiral = compA.spiral;
-			env.petals = compA.petals;
-			env.air = compA.air;
+			env.air = drive.air;
 			env.silence = feat ? 0 : 1;
 			env.quietFor = feat ? 0 : 0.5;
 			env.packetStrength = 0;
+			env.dollyPhase = songSeed * 6.28;
 			lastBeatCount = -1;
-			const roles = prismPaletteRoles(
-				directed.context.keyPitchClass,
-				directed.context.keyMode === 'minor',
-				directed.context.keyConfidence,
-				directed.palette.baseHue,
-				family
-			);
+			const roles = prismPalette(pick('palette'), pick('roles'), val('tint'), {
+				keyPitchClass: directed.context.keyPitchClass,
+				keyMinor: directed.context.keyMode === 'minor',
+				keyConfidence: directed.context.keyConfidence,
+				energy: 0
+			});
 			palette.hero = [...roles.hero];
 			palette.support = [...roles.support];
 			palette.accent = [...roles.accent];
 			palette.field = [...roles.field];
 			feedbackResetFrames = 2;
 		}
-
-		// ── Section choreography: each section family re-leads the window.
-		if (sectionNow !== lastSection) {
-			const previousFamily = prismFamily(lastSection);
-			lastSection = sectionNow;
-			if (family !== previousFamily) {
-				familyVisits[family] += 1;
-				requestComposition(prismComposition(family, songSeed, familyVisits[family]));
-			}
-		}
-		if (transitionFront < TRANSITION_END) {
-			transitionFront = Math.min(TRANSITION_END, transitionFront + dt * TRANSITION_SPEED);
-			if (transitionFront >= TRANSITION_END) {
-				compA = compB;
-				transitionGlow = 0;
-				if (pendingComp) {
-					compB = pendingComp;
-					pendingComp = null;
-					transitionFront = 0;
-					transitionGlow = 1;
-				}
-			}
-		}
-		const activeComp = compB;
 
 		// ── Envelopes
 		const incoming = feat?.bins ?? [];
@@ -515,10 +606,41 @@
 			: 0;
 		env.impact = approach(env.impact, impactTarget * response.impact, impactTarget > env.impact ? 30 : 6, dt);
 
+		// ── Variety: the genome only moves at phrase and section boundaries and
+		// glides from there. Silence holds the look where it is.
+		if (feat) {
+			genome.advance({ phraseIndex, sectionKey: sectionNow, energy: env.energy, dt });
+		}
+
+		// Section choreography: a new structure (grammar, fold, cut, tiers,
+		// outline) or a new section family re-leads the window with an outward
+		// wave. One wave at a time; a change that lands mid-wave waits for it.
+		const structure = forceStructure(prismStructure(genome, family));
+		const key = prismStructureKey(structure);
+		if (transitionFront < TRANSITION_END) {
+			transitionFront = Math.min(TRANSITION_END, transitionFront + dt * TRANSITION_SPEED);
+			if (transitionFront >= TRANSITION_END) {
+				compA = { ...compB };
+				transitionGlow = 0;
+			}
+		}
+		if (transitionFront >= TRANSITION_END && (key !== compKey || family !== compFamily)) {
+			compA = { ...compB };
+			compB = makeComp(structure, family);
+			compKey = key;
+			compFamily = family;
+			transitionFront = 0;
+			transitionGlow = 1;
+		}
+		// The live composition keeps breathing with the genome's proportions.
+		const live = prismLive(genome);
+		compB.petalWidth = approach(compB.petalWidth, live.petalWidth, 2, dt);
+		compB.petalReach = approach(compB.petalReach, live.petalReach, 2, dt);
+		compB.outerLit = approach(compB.outerLit, drive.outerLit, 1.2, dt);
+		const radial = prismGrammarIsRadial(compB.grammar);
+
 		// Organism: cells divide as a phrase builds and as the section climbs,
 		// then fold back and re-draft when the next phrase begins.
-		const phrasePos = clamp(finite(clock.phrasePos), 0, 1);
-		const phraseIndex = Math.max(0, Math.floor(finite(clock.phraseIndex)));
 		const growthTarget =
 			clamp(
 				0.08 +
@@ -532,17 +654,16 @@
 			(1 - env.silence * 0.6);
 		env.growth = approach(env.growth, growthTarget, 0.9, dt);
 
+		const daylight = prismDaylight(val('timeOfDay'));
 		const lightTarget =
-			(activeComp.light * (0.55 + env.energy * 0.6) + directed.drop.anticipation * 0.12) *
-			(1 - env.silence * 0.72);
+			(drive.light * (0.55 + env.energy * 0.6) + directed.drop.anticipation * 0.12) *
+			(1 - env.silence * 0.72) *
+			daylight.power;
 		env.backlight = approach(env.backlight, lightTarget, 1.4, dt);
-		env.rings = approach(env.rings, activeComp.rings, 1.2, dt);
-		env.spiral = approach(env.spiral, activeComp.spiral, 1.2, dt);
-		env.petals = approach(env.petals, activeComp.petals, 1.2, dt);
-		env.air = approach(env.air, activeComp.air * (1 - env.silence * 0.4), 0.8, dt);
+		env.air = approach(env.air, drive.air * (1 - env.silence * 0.4), 0.8, dt);
 
 		// Beat light: strength is latched as each beat starts and then carried
-		// through the facets by the shader over the beat's own phase.
+		// through the window by the shader over the beat's own phase.
 		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex)));
 		if (beatCount !== lastBeatCount) {
 			const isDownbeat = Math.floor(finite(clock.beatIndex)) === 0;
@@ -550,6 +671,7 @@
 				? clamp(
 						(0.3 + directed.bassPunch * 0.7 + env.energy * 0.35 + (isDownbeat ? 0.25 : 0)) *
 							response.impact *
+							drive.packet *
 							(1 - env.silence),
 						0,
 						1.6
@@ -557,27 +679,33 @@
 				: 0;
 			lastBeatCount = beatCount;
 		}
+		const beatForm = pick('beatForm');
 
-		// Sun behind the glass wanders to a new phrase-chosen place, slowly.
-		const sunAngle = ((Math.imul(phraseIndex + 1, 0x9e3779b1) ^ seedSalt) >>> 0) / 0x1_0000_0000;
-		const sunTargetX = Math.cos(sunAngle * Math.PI * 2) * 0.2;
-		const sunTargetY = 0.06 + Math.sin(sunAngle * Math.PI * 2) * 0.15;
-		env.sunX = approach(env.sunX, sunTargetX, 0.14, dt);
-		env.sunY = approach(env.sunY, sunTargetY, 0.14, dt);
-		env.sunPower = approach(env.sunPower, 0.45 + env.energy * 0.7, 0.8, dt);
+		// Suns behind the glass: where they sit and how many are phrase moves.
+		const sunAngle = val('sunAngle') * Math.PI * 2;
+		const sunX = Math.cos(sunAngle) * 0.2;
+		const sunY = 0.06 + Math.sin(sunAngle) * 0.15;
+		const sunPower = 0.45 + env.energy * 0.7;
 
-		// Palette roles glide with harmony; the drift family leans cooler.
-		const roles = prismPaletteRoles(
-			directed.context.keyPitchClass,
-			directed.context.keyMode === 'minor',
-			directed.context.keyConfidence,
-			directed.palette.baseHue,
-			family
+		// Palette: family (era) and roles (section) crossfade in the genome;
+		// harmony and energy lean it; the result glides.
+		const roles = prismPalette(
+			pick('palette'),
+			pick('roles'),
+			val('tint'),
+			{
+				keyPitchClass: directed.context.keyPitchClass,
+				keyMinor: directed.context.keyMode === 'minor',
+				keyConfidence: directed.context.keyConfidence,
+				energy: env.energy
+			},
+			pick('guest'),
+			smooth01(val('guestMix'), 0.3, 0.75)
 		);
-		approachRgb(palette.hero, roles.hero, 0.7, dt);
-		approachRgb(palette.support, roles.support, 0.7, dt);
-		approachRgb(palette.accent, roles.accent, 0.7, dt);
-		approachRgb(palette.field, roles.field, 0.7, dt);
+		approachRgb(palette.hero, roles.hero, 1.2, dt);
+		approachRgb(palette.support, roles.support, 1.2, dt);
+		approachRgb(palette.accent, roles.accent, 1.2, dt);
+		approachRgb(palette.field, roles.field, 1.2, dt);
 
 		// The rose turns with the shared trace phase (music-driven, stops in
 		// silence) plus a slow seeded sway; switching engines resumes the pose.
@@ -592,6 +720,36 @@
 			(Math.sin(tSec * 0.043 + songSeed * 9) * 0.011 + Math.sin(tSec * 0.019 + 1.3) * 0.007) *
 			response.motion;
 		const driftY = Math.cos(tSec * 0.031 + songSeed * 4) * 0.006 * response.motion;
+
+		// ── Camera: the regime crossfade in the genome is a real camera move.
+		// The gallery dolly advances with the music and stops in silence.
+		const spacing = prismBaySpacing(val('baySpacing'));
+		env.dollyPhase += dt * (0.035 + env.energy * 0.05) * (1 - env.silence) * response.motion;
+		const camSide = val('camSide');
+		const cam = prismCamera(
+			pick('camera'),
+			camSide,
+			val('camFocus'),
+			val('camDrift'),
+			Math.sin(env.dollyPhase) * 1.4 * spacing
+		);
+		cam.tx += driftX * 1.6;
+		cam.ty += driftY * 1.6;
+		cam.yaw += driftX * 0.6;
+		const basis = prismCameraBasis(cam);
+		const heroBay = Math.round(cam.tx / spacing) * spacing;
+		const heroCentre = prismProject(basis, [heroBay, PRISM_ROSE_Y, 0]) ?? [0, 4];
+		const heroEdge = prismProject(basis, [heroBay + PRISM_ROSE_R, PRISM_ROSE_Y, 0]) ?? [heroCentre[0] + 0.32, heroCentre[1]];
+		const heroRadius = Math.max(0.02, Math.hypot(heroEdge[0] - heroCentre[0], heroEdge[1] - heroCentre[1]));
+		// Trails follow the rose's turn only when the camera sees it square-on.
+		const squareOn = Math.pow(Math.cos(cam.yaw), 6) * Math.pow(Math.cos(cam.pitch), 2);
+		const trailTurn = radial ? rotationDelta * squareOn : 0;
+
+		// ── World: the building, the hour, the weather, the air.
+		const environment = pick('environment');
+		const rain = smooth01(val('rain'), 0.55, 0.9);
+		const wetness = clamp(Math.max(val('wetness') * 0.55, cam.wet, rain * 0.85), 0, 1);
+		const sideShaft = smooth01(val('sideShaft'), 0.55, 0.98);
 
 		// Post: trails shorten on impact and in silence; the bloom knee drops
 		// with energy so peaks glow and quiet sections stay graphic.
@@ -642,10 +800,13 @@
 		writeVec4(u, O.comp, compA.fold, compB.fold, transitionFront, transitionGlow * Math.min(1, (TRANSITION_END - transitionFront) * 2));
 		writeShape(u, O.shapeA, compA);
 		writeShape(u, O.shapeB, compB);
+		writeGrammar(u, O.gramA, compA);
+		writeGrammar(u, O.gramB, compB);
+		writeVec4(u, O.detail, live.tracery, live.cusp, live.sprinkle, cam.bays);
 		writeVec4(u, O.organism, env.growth, phraseIndex, phrasePos, seedSalt);
 		writeVec4(u, O.light, env.backlight, env.packetStrength, clamp(finite(clock.beatPhase), 0, 1), beatCount);
-		writeVec4(u, O.modes, env.rings, env.spiral, env.petals, family === 'drift' ? 1 : 0);
-		writeVec4(u, O.sun, env.sunX, env.sunY, env.sunPower, env.air);
+		writeVec4(u, O.modes, beatForm.from, beatForm.to, beatForm.mix, family === 'drift' ? 1 : 0);
+		writeVec4(u, O.sun, sunX, sunY, sunPower, env.air);
 		writeVec4(u, O.heroCol, ...palette.hero, 0);
 		writeVec4(u, O.supportCol, ...palette.support, 0);
 		writeVec4(u, O.accentCol, ...palette.accent, 0);
@@ -653,7 +814,23 @@
 		writeVec4(u, O.post, feedbackFade, feedbackZoom, bloomThreshold, aberration);
 		writeVec4(u, O.env, driftX, driftY, env.silence, env.rotation);
 		writeVec4(u, O.bands, env.bass, env.mid, env.treble, env.impact);
-		writeVec4(u, O.motion, rotationDelta, frameIndex % 60, env.energy, 0);
+		writeVec4(u, O.motion, trailTurn, frameIndex % 60, env.energy, regimeExposure(env.energy));
+		writeVec4(u, O.camPos, basis.pos[0], basis.pos[1], basis.pos[2], basis.focal);
+		writeVec4(u, O.camRight, basis.right[0], basis.right[1], basis.right[2], spacing);
+		writeVec4(u, O.camUp, basis.up[0], basis.up[1], basis.up[2], 0);
+		writeVec4(u, O.camFwd, basis.fwd[0], basis.fwd[1], basis.fwd[2], wetness);
+		writeVec4(u, O.roseScreen, heroCentre[0], heroCentre[1], heroRadius, 0);
+		writeVec4(u, O.world, environment.from, environment.to, environment.mix, rain);
+		writeVec4(u, O.sky, daylight.color[0], daylight.color[1], daylight.color[2], daylight.night);
+		writeVec4(
+			u,
+			O.atmos,
+			val('fog'),
+			clamp(val('dust') + env.energy * 0.2, 0, 1),
+			val('caustics'),
+			val('sunCount')
+		);
+		writeVec4(u, O.shaft, sideShaft, val('shaftAngle'), -Math.sign(camSide || 1) * 0.7, 0);
 		frameIndex += 1;
 
 		g.device.queue.writeBuffer(g.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
@@ -661,6 +838,12 @@
 
 		hudSection = directed.section;
 		hudFold = compB.fold;
+		hudLook = [
+			PRISM_GRAMMARS[compB.grammar],
+			PRISM_CAMERAS[pick('camera').to],
+			PRISM_PALETTES[pick('palette').to].name,
+			PRISM_ENVIRONMENTS[pick('environment').to]
+		].join(' ');
 
 		// ── Render graph: scene → feedback → prefilter → 2× (H, V) blur → present
 		const encoder = g.device.createCommandEncoder({ label: 'Prism frame' });
@@ -794,6 +977,7 @@
 			data-prism-render-passes={RENDER_PASSES}
 			data-prism-section={hudSection}
 			data-prism-fold={hudFold}
+			data-prism-look={hudLook}
 			data-prism-ready={String(ready)}
 		></canvas>
 		{#if errorMsg}
