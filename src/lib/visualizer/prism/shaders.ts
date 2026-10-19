@@ -4,8 +4,9 @@
 // tracery in front of it, the wall architecture in front of both, and a floor
 // that mirrors and catches the light. The glass is a living mosaic: its cells
 // divide as a phrase grows and re-draft at phrase boundaries, beats travel
-// through the facets as packets of light, and each section re-leads the window
-// with a new composition that washes outward from its centre.
+// through the facets as packets of light, and each section re-sets the window
+// as a new composition, piece by piece, in a lit dissolve that washes outward
+// from its centre. Nothing in the picture ever cuts.
 //
 // The look is a point in Prism's variation genome (composition.ts): eight
 // window grammars, five mosaic cuts, six beat forms, five environments, seven
@@ -18,8 +19,8 @@
 
 export const PRISM_BIN_COUNT = 64;
 
-/** Uniform floats: 24 legacy scalars + 27 vec4 groups. */
-export const PRISM_UNIFORM_FLOATS = 132;
+/** Uniform floats: 24 legacy scalars + 28 vec4 groups. */
+export const PRISM_UNIFORM_FLOATS = 136;
 export const PRISM_UNIFORM_BYTES = PRISM_UNIFORM_FLOATS * 4;
 
 /** Float offsets of each vec4 group, mirrored by the WGSL Uniforms struct. */
@@ -50,7 +51,8 @@ export const PRISM_UNIFORM_OFFSETS = {
 	world: 116,
 	sky: 120,
 	atmos: 124,
-	shaft: 128
+	shaft: 128,
+	morph: 132
 } as const;
 
 const COMMON_WGSL = /* wgsl */ `
@@ -79,7 +81,7 @@ struct Uniforms {
 	sceneWeight: f32,
 	longPhase: f32,
 	sectionEnergy: f32,
-	// foldA, foldB, transition front (window radii), transition glow
+	// foldA, foldB, morph front (window radii), light at the front
 	comp: vec4<f32>,
 	// petalWidth, petalReach, cellScale, outerLit (composition A)
 	shapeA: vec4<f32>,
@@ -91,7 +93,7 @@ struct Uniforms {
 	gramB: vec4<f32>,
 	// tracery weight, cusp depth, sprinkle, lit neighbour bays
 	detail: vec4<f32>,
-	// growth, phraseIndex, phrasePos, seedSalt
+	// growth, mosaic draft, eased progress into the next draft, look salt
 	organism: vec4<f32>,
 	// backlight, packetStrength, beatAge, beatCount
 	light: vec4<f32>,
@@ -129,6 +131,8 @@ struct Uniforms {
 	atmos: vec4<f32>,
 	// side shaft strength, side shaft angle, side shaft position, unused
 	shaft: vec4<f32>,
+	// composition A salt, composition B salt, global finishing fade, unused
+	morph: vec4<f32>,
 };
 
 const TAU: f32 = 6.28318530718;
@@ -681,12 +685,14 @@ struct Cell {
 // One mosaic seed. xy: position in cell space, z: division progress. Each grid
 // cell owns a mother and a daughter; the daughter only exists once the phrase
 // growth passes the cell's own threshold, then drifts apart from its mother so
-// the cell visibly divides. Positions re-draft at the end of every phrase.
+// the cell visibly divides. Positions glide into the next draft at the end of
+// every phrase; the CPU owns the draft counter and its eased progress, so a
+// phrase-clock jump (a new song, a re-sync) glides instead of re-cutting.
 fn mosaicSeed(g: vec2<f32>, which: u32, salt: u32, jitter: f32) -> vec3<f32> {
 	let phrase = u32(max(u.organism.y, 0.0));
 	let jNow = hcell(g, salt ^ (phrase * 0x9e3779b1u));
 	let jNext = hcell(g, salt ^ ((phrase + 1u) * 0x9e3779b1u));
-	let redraft = smoothstep(0.82, 1.0, u.organism.z);
+	let redraft = clamp(u.organism.z, 0.0, 1.0);
 	let j = mix(jNow, jNext, redraft);
 	let base = g + 0.5 + (j - 0.5) * jitter;
 	let dv = hcell(g, salt ^ 0x51ed270bu);
@@ -1073,62 +1079,48 @@ fn wallFor(e: f32, w: WallIn) -> vec3<f32> {
 	return wallVoid(w);
 }
 
-@fragment
-fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-	let res = vec2<f32>(u.resolutionX, u.resolutionY);
-	let p = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / res.y;
-	let ro = u.camPos.xyz;
-	let rd = camRay(p);
-	// The floor and everything below it belong to the presentation pass.
-	if (rd.z <= 1e-3) {
-		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-	}
-	let tWall = -ro.z / rd.z;
-	let wall = ro + rd * tWall;
-	// Pixel footprint on the wall in window radii: distant and grazing windows
-	// fold their mosaic detail away instead of shimmering.
-	let footprint = tWall / (u.camPos.w * res.y * max(rd.z, 0.2) * ROSE_R);
-	if (wall.y < FLOOR_Y) {
-		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
-	}
+// Where one composition is evaluated: the pixel's ray and its landing points
+// on the wall, the carved stone and the recessed glass of its bay.
+struct PaneIn {
+	rd: vec3<f32>,
+	wall: vec3<f32>,
+	wallRel: vec2<f32>,
+	stoneRel: vec2<f32>,
+	glassRel: vec2<f32>,
+	lx: f32,
+	bay: f32,
+	spacing: f32,
+	footprint: f32,
+	back: f32,
+	lit: f32,
+};
 
-	// Three planes: glass recessed deepest, carved tracery in front of it, the
-	// wall surface in front of both, so the camera reveals the window's depth.
-	let stoneW = (ro + rd * ((STONE_Z - ro.z) / rd.z)).xy;
-	let glassW = (ro + rd * ((GLASS_Z - ro.z) / rd.z)).xy;
-	let spacing = u.camRight.w;
-	let bay = floor(wall.x / spacing + 0.5);
-	let center = vec2<f32>(bay * spacing, ROSE_Y);
-	let wallRel = wall.xy - center;
-	let stoneRel = stoneW - center;
-	let glassRel = glassW - center;
-	let rnW = length(wallRel) / ROSE_R;
-
-	let useB = rnW < u.comp.z;
-	let n = select(u.comp.x, u.comp.y, useB);
-	let shape = select(u.shapeA, u.shapeB, useB);
-	let gram = select(u.gramA, u.gramB, useB);
+// One complete window (glass, tracery, the wall around it) for one
+// composition. xyz: colour, w: the dissolve key of what this pixel shows (one
+// value per glass piece, so a morph re-sets the window piece by piece).
+fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u32) -> vec4<f32> {
 	let grammar = gram.x;
 	let radial = grammar < 4.5;
-	// Neighbouring bays light up as the camera reveals them; unlit ones hang
-	// as dark tracery silhouettes.
-	let bayLit = clamp(u.detail.w - abs(bay) + 1.0, 0.0, 1.0);
-	let lit = mix(0.06, 1.0, bayLit);
-	let salt = seedSalt() ^ select(0u, pmix(u32(i32(bay) + 4096)), abs(bay) > 0.5);
+	let salt = baseSalt ^ select(0u, pmix(u32(i32(pi.bay) + 4096)), abs(pi.bay) > 0.5);
 	// Only round roses turn; arched outlines stay upright.
 	let round = radial && !(grammar > 3.5 && gram.w > 0.5);
-	let rot = select(0.0, u.env.w + bay * 0.37, round);
-	let stoneP = rot2(rot) * stoneRel / ROSE_R;
-	var glassP = rot2(rot) * glassRel / ROSE_R;
-	let back = backlight(glassRel) * lit;
+	let rot = select(0.0, u.env.w + pi.bay * 0.37, round);
+	let stoneP = rot2(rot) * pi.stoneRel / ROSE_R;
+	var glassP = rot2(rot) * pi.glassRel / ROSE_R;
+	let back = pi.back;
+	let lit = pi.lit;
+	let footprint = pi.footprint;
+	let rd = pi.rd;
+	let glassRel = pi.glassRel;
 	let hero = u.heroCol.rgb;
 	let support = u.supportCol.rgb;
 	let accent = u.accentCol.rgb;
 	let field = u.fieldCol.rgb;
 	let lightCol = u.sky.rgb;
-	let seam = u.comp.w * exp(-pow((rnW - u.comp.z) * 9.0, 2.0));
 	let lead = vec3<f32>(0.004, 0.0035, 0.005);
 	let od = outlineSd(stoneP, grammar, gram.w);
+	// Stone and wall dissolve in soft blotches; glass pieces override below.
+	var key = vnoise(pi.wallRel / ROSE_R * 5.0 + vec2<f32>(f32(baseSalt & 255u) * 0.37, 0.0));
 
 	var col = vec3<f32>(0.0);
 
@@ -1217,8 +1209,7 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			let tail = pow(1.0 - clamp(u.light.z, 0.0, 1.0), 1.3) * u.light.y * lit;
 			let pk = pkv.x * tail * (0.35 + 0.65 * tierLit);
 			var g = glass * (transmitted + pk * 2.4) * 3.0
-				+ mix(glass, accent, 0.5) * cell.birth * (0.5 + back * 1.4)
-				+ glass * seam * 2.2;
+				+ mix(glass, accent, 0.5) * cell.birth * (0.5 + back * 1.4);
 
 			// Ruins have lost pieces: the night shows through.
 			let ruinW = envWeight(2.0);
@@ -1248,18 +1239,21 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 			}
 			let opening = smoothstep(0.006, -0.002, ts.sd) * smoothstep(-0.012, -0.024, od);
 			col = mix(col, g, opening);
+			// Each glass piece is re-set as one: its key is the piece's own
+			// (decorrelated from the hash that picks its colour).
+			key = mix(key, fract(cell.id.x * 7.31 + cell.id.y * 3.17), opening);
 		}
 	} else {
 		var w: WallIn;
-		w.P = wall.xy;
-		w.wl = wallRel;
+		w.P = pi.wall.xy;
+		w.wl = pi.wallRel;
 		w.od = od;
 		w.n = n;
 		w.back = back;
-		w.lx = wall.x - center.x;
-		w.spacing = spacing;
+		w.lx = pi.lx;
+		w.spacing = pi.spacing;
 		w.rd = rd;
-		w.seam = seam;
+		w.seam = 0.0;
 		let envMix = u.world.z;
 		if (envMix > 0.995 || abs(u.world.x - u.world.y) < 0.5) {
 			col = wallFor(u.world.y, w);
@@ -1268,6 +1262,81 @@ fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
 		} else {
 			col = mix(wallFor(u.world.x, w), wallFor(u.world.y, w), envMix);
 		}
+	}
+	return vec4<f32>(col, key);
+}
+
+// Morph weights, mirrored by prismMorphWeight in continuity.ts.
+const MORPH_BAND: f32 = 0.5;
+const MORPH_SPREAD: f32 = 1.2;
+
+@fragment
+fn fs_main(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+	let res = vec2<f32>(u.resolutionX, u.resolutionY);
+	let p = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / res.y;
+	let ro = u.camPos.xyz;
+	let rd = camRay(p);
+	// The floor and everything below it belong to the presentation pass.
+	if (rd.z <= 1e-3) {
+		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+	}
+	let tWall = -ro.z / rd.z;
+	let wall = ro + rd * tWall;
+	// Pixel footprint on the wall in window radii: distant and grazing windows
+	// fold their mosaic detail away instead of shimmering.
+	let footprint = tWall / (u.camPos.w * res.y * max(rd.z, 0.2) * ROSE_R);
+	if (wall.y < FLOOR_Y) {
+		return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+	}
+
+	// Three planes: glass recessed deepest, carved tracery in front of it, the
+	// wall surface in front of both, so the camera reveals the window's depth.
+	let stoneW = (ro + rd * ((STONE_Z - ro.z) / rd.z)).xy;
+	let glassW = (ro + rd * ((GLASS_Z - ro.z) / rd.z)).xy;
+	let spacing = u.camRight.w;
+	let bay = floor(wall.x / spacing + 0.5);
+	let center = vec2<f32>(bay * spacing, ROSE_Y);
+	var pi: PaneIn;
+	pi.rd = rd;
+	pi.wall = wall;
+	pi.wallRel = wall.xy - center;
+	pi.stoneRel = stoneW - center;
+	pi.glassRel = glassW - center;
+	pi.lx = wall.x - center.x;
+	pi.bay = bay;
+	pi.spacing = spacing;
+	pi.footprint = footprint;
+	// Neighbouring bays light up as the camera reveals them; unlit ones hang
+	// as dark tracery silhouettes.
+	let bayLit = clamp(u.detail.w - abs(bay) + 1.0, 0.0, 1.0);
+	pi.lit = mix(0.06, 1.0, bayLit);
+	pi.back = backlight(pi.glassRel) * pi.lit;
+	let rnW = length(pi.wallRel) / ROSE_R;
+
+	// Structure morph: composition B re-sets the window piece by piece as a
+	// front washes outward (each piece on its own staggered threshold, lit as
+	// it is set), then a global fade finishes whatever lies beyond the front.
+	// Outside a morph both compositions are the same and only B is drawn.
+	let front = u.comp.z;
+	let finish = clamp(u.morph.z, 0.0, 1.0);
+	let reach = (front - rnW) / MORPH_BAND - MORPH_SPREAD * 0.5;
+	var col: vec3<f32>;
+	if (finish >= 0.999 || reach - MORPH_SPREAD * 0.5 >= 1.0) {
+		col = windowPane(pi, u.comp.y, u.shapeB, u.gramB, u32(max(u.morph.y, 0.0))).rgb;
+	} else if (reach + MORPH_SPREAD * 0.5 <= 0.0 && finish <= 0.001) {
+		col = windowPane(pi, u.comp.x, u.shapeA, u.gramA, u32(max(u.morph.x, 0.0))).rgb;
+	} else {
+		let paneB = windowPane(pi, u.comp.y, u.shapeB, u.gramB, u32(max(u.morph.y, 0.0)));
+		let spatial = smoothstep(0.0, 1.0, reach + (paneB.w - 0.5) * MORPH_SPREAD);
+		let wB = max(spatial, finish);
+		var mixed = paneB.rgb;
+		if (wB < 0.999) {
+			let paneA = windowPane(pi, u.comp.x, u.shapeA, u.gramA, u32(max(u.morph.x, 0.0)));
+			mixed = mix(paneA.rgb, paneB.rgb, wB);
+		}
+		// Light leads the reveal: a piece glows while it is being set.
+		let seam = u.comp.w * 4.0 * spatial * (1.0 - spatial);
+		col = mixed + paneB.rgb * seam * 1.1;
 	}
 
 	return vec4<f32>(col * u.sceneWeight, 1.0);
