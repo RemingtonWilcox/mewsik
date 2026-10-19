@@ -2,6 +2,8 @@ export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal', 'loom'] as const;
 
 export type VisualizerEngine = (typeof VISUALIZER_ENGINES)[number];
 
+/** How an engine is presented to a listener. `subtitle` and `description`
+ * are listener-facing copy: evocative, never technical. */
 export type VisualizerIdentity = {
 	name: string;
 	subtitle: string;
@@ -14,33 +16,33 @@ export type VisualizerIdentity = {
 export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = {
 	mk1: {
 		name: 'Prism',
-		subtitle: 'Rhythmic geometry',
+		subtitle: 'Rose window',
 		role: 'Impact',
-		description: 'An obsidian rose window; beats travel as light through jewel glass.',
+		description: 'Beats travel as light through a turning rose window.',
 		accent: '#e9d5ff',
 		accentMuted: 'rgba(216, 180, 254, 0.46)'
 	},
 	mk2: {
 		name: 'Soma',
-		subtitle: 'Living fractal',
+		subtitle: 'Deep-sea organism',
 		role: 'Evolution',
-		description: 'A bioluminescent deep-sea organism; beats travel as light along its body and tendrils.',
+		description: 'A deep-sea creature that glows and breathes with the song.',
 		accent: '#fde68a',
 		accentMuted: 'rgba(251, 191, 36, 0.46)'
 	},
 	signal: {
 		name: 'Signal',
-		subtitle: 'Phosphor score',
+		subtitle: 'Phosphor scope',
 		role: 'Flow',
-		description: 'A night phosphor scope: an XY figure tuned to harmony, beat-swept channel traces and a spectral horizon.',
+		description: 'A phosphor scope that draws the music as living traces.',
 		accent: '#a7f3d0',
 		accentMuted: 'rgba(52, 211, 153, 0.46)'
 	},
 	loom: {
 		name: 'Loom',
-		subtitle: 'Harmonic weave',
+		subtitle: 'Woven light',
 		role: 'Harmony',
-		description: 'A lit ribbon manifold that reweaves its topology as harmony, phrases, and releases unfold.',
+		description: 'Ribbons of light that reweave themselves as the harmony shifts.',
 		accent: '#bfdbfe',
 		accentMuted: 'rgba(96, 165, 250, 0.46)'
 	}
