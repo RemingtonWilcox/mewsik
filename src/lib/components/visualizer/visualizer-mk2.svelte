@@ -66,6 +66,8 @@
 
 	// The look: the animal, its world and the camera, owned by the journey.
 	const lookState = vis.persistentLook('soma', createSomaLookState);
+	// Dev-only handle for QA scripts that log the look over time.
+	if (import.meta.env.DEV) (globalThis as { __SOMA_LOOK__?: unknown }).__SOMA_LOOK__ = lookState;
 	let rendererSourceEpoch = -1;
 
 	// Note levels (fast attack) and onsets (positive spectral detail), uploaded per frame.
@@ -464,14 +466,17 @@
 			dt,
 			aspect,
 			motionScale: tuning.motion,
-			impactScale: tuning.impact
+			impactScale: tuning.impact,
+			character: journey.character
 		});
 
 		// Notes: levels with a fast attack, onsets from positive spectral detail.
 		const incoming = feat?.bins ?? [];
 		const detail = journey.spectrum.detailBins;
-		const rise = 1 - Math.exp(-dt / 0.03);
-		const fall = 1 - Math.exp(-dt / 0.22);
+		// Calm music lets the notes swell and fade slowly; everything else stays tight.
+		const calm = f.mood.calm;
+		const rise = 1 - Math.exp(-dt / (0.03 + calm * 0.25));
+		const fall = 1 - Math.exp(-dt / (0.22 + calm * 0.6));
 		for (let i = 0; i < 64; i += 1) {
 			const level = clamp(finite(incoming[i] ?? 0), 0, 1);
 			bins[i] += (level - bins[i]) * (level > bins[i] ? rise : fall);
@@ -520,7 +525,7 @@
 			(f.environment.from === bayIndex ? 1 - f.environment.mix : 0) + (f.environment.to === bayIndex ? f.environment.mix : 0);
 		const mirrorSurface = wBay > 0.5;
 		const mirrorFade = Math.abs(wBay - 0.5) * 2;
-		put(u, 'envB', env.surfaceY, env.reflect * mirrorFade, env.snow, env.shafts);
+		put(u, 'envB', env.surfaceY, env.reflect * mirrorFade, env.snow, env.shafts * tuning.shafts);
 		put3(u, 'keyDir', env.keyDir, env.keyPower * (1 - m.silence * 0.3));
 		put3(u, 'keyCol', f.keyColor, env.ambient);
 		put3(u, 'water', f.colors.water);
@@ -532,11 +537,12 @@
 		put(u, 'post', feedbackFade, bloomThreshold, aberration, bloomGain);
 		const orgUv = projectUv(f, aspect, o.boundCenter);
 		put(u, 'orgScreen', orgUv[0], orgUv[1], 0.2, orgUv[2] > 0 ? 1 : 0);
-		const lightPoint = [c.pos[0] + env.keyDir[0] * 40, c.pos[1] + env.keyDir[1] * 40, c.pos[2] + env.keyDir[2] * 40];
-		const lightUv = projectUv(f, aspect, lightPoint);
-		const facing = env.keyDir[0] * c.fwd[0] + env.keyDir[1] * c.fwd[1] + env.keyDir[2] * c.fwd[2];
-		const lightVisible = lightUv[2] > 0 ? smooth01(facing, -0.05, 0.45) : 0;
-		put(u, 'lightScreen', lightUv[0], lightUv[1], lightVisible, env.shafts * tuning.shafts);
+		const md = f.mood;
+		put(u, 'mood', md.agitation, md.punch, md.calm, md.pulse);
+		// The water as a medium: per-channel extinction, and how much daylight reaches this depth.
+		const fog = env.fog * tuning.fog;
+		put(u, 'medium', fog * env.absorb[0], fog * env.absorb[1], fog * env.absorb[2], env.down);
+		put(u, 'flow', f.flow.snow, f.flow.light, md.warmth, f.flow.shiver);
 		put(u, 'march', profile.raymarchSteps, profile.shadowSteps, profile.interiorSteps, profile.particleCells);
 		put3(u, 'comp', f.companion.pos, f.companion.scale);
 		put3(u, 'drag', f.drag);

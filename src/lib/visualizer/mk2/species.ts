@@ -558,8 +558,15 @@ export type SomaEnvironmentSpec = {
 	reflect: number;
 	/** Marine snow density. */
 	snow: number;
-	/** Light shafts from the key light. */
+	/** Light shafts from the key light (only where a real source is above). */
 	shafts: number;
+	/**
+	 * Per-channel extinction relative to the fog: water swallows red first, so
+	 * far things turn blue (or green in kelp water). Multiplies the fog.
+	 */
+	absorb: Rgb;
+	/** Downwelling light that reaches this depth, 0 = only living light. */
+	down: number;
 	/** Key light direction (towards the light), world space. */
 	keyDir: [number, number, number];
 	keyPower: number;
@@ -578,7 +585,9 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		surfaceY: 30,
 		reflect: 0.15,
 		snow: 1,
-		shafts: 0.35,
+		shafts: 0.05,
+		absorb: [1.9, 1.0, 0.78],
+		down: 0.05,
 		keyDir: [0.18, 1, 0.12],
 		keyPower: 0.55,
 		keyTint: [0.35, 0.6, 1],
@@ -592,7 +601,9 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		surfaceY: 30,
 		reflect: 0.25,
 		snow: 0.75,
-		shafts: 0.55,
+		shafts: 0.12,
+		absorb: [1.25, 1.05, 1.15],
+		down: 0,
 		keyDir: [-0.2, -1, 0.3],
 		keyPower: 0.95,
 		keyTint: [1, 0.36, 0.08],
@@ -607,6 +618,8 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		reflect: 0.2,
 		snow: 0.55,
 		shafts: 1,
+		absorb: [1.75, 0.85, 1.3],
+		down: 1,
 		keyDir: [0.3, 1, -0.2],
 		keyPower: 1,
 		keyTint: [0.75, 0.95, 0.45],
@@ -620,7 +633,9 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		surfaceY: 4.6,
 		reflect: 0.85,
 		snow: 0.5,
-		shafts: 0.85,
+		shafts: 0.8,
+		absorb: [1.8, 1.0, 0.85],
+		down: 0.7,
 		keyDir: [0.1, 1, 0.25],
 		keyPower: 0.85,
 		keyTint: [0.5, 0.75, 1],
@@ -635,6 +650,8 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		reflect: 0.45,
 		snow: 0.35,
 		shafts: 0.7,
+		absorb: [1.6, 0.9, 0.7],
+		down: 0.8,
 		keyDir: [-0.25, 1, 0.15],
 		keyPower: 0.9,
 		keyTint: [0.7, 0.92, 1],
@@ -648,7 +665,9 @@ export const SOMA_ENVIRONMENT_SPECS: Record<SomaEnvironment, SomaEnvironmentSpec
 		surfaceY: 30,
 		reflect: 0.1,
 		snow: 0.85,
-		shafts: 0.1,
+		shafts: 0,
+		absorb: [1.4, 1.1, 1.0],
+		down: 0,
 		keyDir: [0.4, 0.8, 0.45],
 		keyPower: 0.35,
 		keyTint: [0.6, 0.6, 0.75],
@@ -779,14 +798,14 @@ export const SOMA_ROLE_PERMUTATIONS: readonly [number, number, number][] = [
 // ── Genome ─────────────────────────────────────────────────────────────────
 export const SOMA_AXES: readonly VariationAxis[] = [
 	// Era: the world changes. Environment, the water's light.
-	{ kind: 'choice', name: 'environment', options: SOMA_ENVIRONMENTS.length, scale: 'era', chance: 0.9, memory: 3, maxHold: 2, tau: 12 },
+	{ kind: 'choice', name: 'environment', options: SOMA_ENVIRONMENTS.length, scale: 'era', chance: 0.9, memory: 3, maxHold: 2, tau: 6 },
 	{ kind: 'continuous', name: 'lightAzimuth', min: 0, max: 1, wrap: true, scale: 'era', step: 0.3, tau: 14 },
 	{ kind: 'continuous', name: 'murk', min: 0, max: 1, scale: 'era', step: 0.4, tau: 12 },
 	{ kind: 'continuous', name: 'snow', min: 0, max: 1, scale: 'era', step: 0.45, tau: 10 },
 	// Section: a new animal, a new colour family, a new way of filming it.
-	{ kind: 'choice', name: 'species', options: SOMA_SPECIES.length, scale: 'section', chance: 0.6, memory: 6, maxHold: 2, tau: 16 },
-	{ kind: 'choice', name: 'palette', options: SOMA_PALETTES.length, scale: 'section', chance: 0.75, memory: 12, maxHold: 2, tau: 9 },
-	{ kind: 'choice', name: 'camera', options: SOMA_CAMERAS.length, scale: 'section', chance: 0.7, memory: 3, maxHold: 2, tau: 10 },
+	{ kind: 'choice', name: 'species', options: SOMA_SPECIES.length, scale: 'section', chance: 0.6, memory: 6, maxHold: 2, tau: 7 },
+	{ kind: 'choice', name: 'palette', options: SOMA_PALETTES.length, scale: 'section', chance: 0.75, memory: 12, maxHold: 2, tau: 6 },
+	{ kind: 'choice', name: 'camera', options: SOMA_CAMERAS.length, scale: 'section', chance: 0.7, memory: 3, maxHold: 2, tau: 7 },
 	{ kind: 'choice', name: 'beatForm', options: SOMA_BEAT_FORMS.length, scale: 'section', chance: 0.6, memory: 2, tau: 3 },
 	{ kind: 'choice', name: 'skin', options: SOMA_SKINS.length, scale: 'section', chance: 0.45, memory: 2, tau: 6 },
 	{ kind: 'choice', name: 'fold', options: 6, scale: 'section', chance: 0.4, memory: 2, tau: 2 },
@@ -811,3 +830,118 @@ export const SOMA_AXES: readonly VariationAxis[] = [
 	{ kind: 'continuous', name: 'framing', min: -1, max: 1, scale: 'phrase', step: 0.35, tau: 8 },
 	{ kind: 'continuous', name: 'tilt', min: -1, max: 1, scale: 'phrase', step: 0.3, tau: 7 }
 ];
+
+// ── Mood: what kind of music the animal is hearing ─────────────────────────
+// Soma reads the shared music character through a few derived dimensions
+// (see somaMoodTarget in look.ts): how calm, how agitated, how rhythmically
+// pulsing, how heavy and how warm the music is. Each option of the big choice
+// axes has a prototype mood; on a character shift the genome is weighted
+// toward the options that fit, so the new animal, water and light belong to
+// the new music. Every option keeps a floor, so variety never collapses.
+export const SOMA_MOOD_KEYS = ['tempo', 'calm', 'agitation', 'pulse', 'mass', 'warmth', 'punch'] as const;
+export type SomaMoodKey = (typeof SOMA_MOOD_KEYS)[number];
+export type SomaMoodPrototype = Partial<Record<SomaMoodKey, number>>;
+
+/** In SOMA_SPECIES order. */
+export const SOMA_SPECIES_MOODS: readonly SomaMoodPrototype[] = [
+	{ pulse: 0.8, mass: 0.7, agitation: 0.1 }, // medusa: the club pulse
+	{ calm: 0.6, tempo: 0.3, agitation: 0.1 }, // siphonophore
+	{ warmth: 0.5, tempo: 0.45, calm: 0.4 }, // ctenophore
+	{ agitation: 0.9, tempo: 0.9 }, // radiolarian: bristling
+	{ tempo: 0.5, pulse: 0.4, warmth: 0.5 }, // cuttlefish
+	{ warmth: 0.8, calm: 0.35, punch: 0.8 }, // nudibranch
+	{ calm: 0.9, mass: 0.5, tempo: 0.05 }, // mycelial bloom
+	{ warmth: 0.7, punch: 0.7, tempo: 0.3 }, // polyp colony
+	{ mass: 0.5, calm: 0.6, warmth: 0.5, tempo: 0.1 }, // anglerfish: cinematic dark
+	{ calm: 1, tempo: 0, mass: 0.5 }, // salp chain: ambient drift
+	{ agitation: 0.7, tempo: 0.75 }, // cell colony
+	{ pulse: 0.9, mass: 0.8, tempo: 0.55 } // pyrosome
+];
+
+/** In SOMA_ENVIRONMENTS order. */
+export const SOMA_ENVIRONMENT_MOODS: readonly SomaMoodPrototype[] = [
+	{ calm: 0.8, warmth: 0.2 }, // abyss
+	{ agitation: 0.9, tempo: 0.85 }, // vent
+	{ warmth: 0.75, punch: 0.7 }, // kelp
+	{ pulse: 0.8, tempo: 0.55 }, // bay
+	{ calm: 0.7, warmth: 0.15, mass: 0.5 }, // ice
+	{ calm: 0.6, warmth: 0.5, tempo: 0.1 } // void: cinematic dark
+];
+
+/** In SOMA_CAMERAS order. */
+export const SOMA_CAMERA_MOODS: readonly SomaMoodPrototype[] = [
+	{ tempo: 0.45, warmth: 0.5 }, // companion
+	{ mass: 0.5, calm: 0.6, tempo: 0.1 }, // below
+	{ agitation: 0.9, tempo: 0.85 }, // macro
+	{ pulse: 0.8 }, // orbit
+	{ tempo: 0.5, warmth: 0.65 }, // profile
+	{ calm: 1, agitation: 0 }, // wide
+	{ calm: 0.7, mass: 0.6 } // descent
+];
+
+/** In SOMA_SKINS order. */
+export const SOMA_SKIN_MOODS: readonly SomaMoodPrototype[] = [
+	{},
+	{ agitation: 0.7 },
+	{ mass: 0.8, calm: 0.6 },
+	{ warmth: 0.6, calm: 0.4 },
+	{ warmth: 0.9, pulse: 0.5 }
+];
+
+/** In SOMA_BEAT_FORMS order. */
+export const SOMA_BEAT_FORM_MOODS: readonly SomaMoodPrototype[] = [
+	{ calm: 0.5 },
+	{ pulse: 0.85 },
+	{ agitation: 0.7 },
+	{ mass: 0.9, punch: 0.6 },
+	{ tempo: 0.6, pulse: 0.5 }
+];
+
+// Palette moods: six light families, each a different world for a different
+// kind of music. Assigned by hand from the colours (warmth alone would send
+// every slow, mid-valence track to the same blues).
+const PALETTE_FAMILY: Record<string, SomaMoodPrototype> = {
+	deep: { calm: 0.85, agitation: 0, pulse: 0.1 }, // ambient: cold, still, blue-cyan
+	harsh: { agitation: 0.9, calm: 0 }, // noise: acid lime, alarm red, glaring white
+	electric: { pulse: 0.75, agitation: 0.1, calm: 0 }, // club: magenta, violet, electric
+	warm: { warmth: 0.75, calm: 0.35, pulse: 0.1 }, // acoustic, swing: amber, gold, copper
+	ember: { calm: 0.6, warmth: 0.5, mass: 0.5, tempo: 0.1 }, // cinematic: crimson and embers in the dark
+	jade: { tempo: 0.48, pulse: 0.4, calm: 0.05 } // indie: greens, teals, lilac
+};
+const PALETTE_FAMILIES: Record<string, keyof typeof PALETTE_FAMILY> = {
+	'abyssal-cyan': 'deep',
+	'midnight-violet': 'electric',
+	'vent-ember': 'ember',
+	'kelp-gold': 'warm',
+	dinoflagellate: 'deep',
+	'ice-aqua': 'deep',
+	'void-pearl': 'harsh',
+	'lure-amber': 'ember',
+	'comb-spectral': 'electric',
+	'coral-magenta': 'electric',
+	'tangerine-dusk': 'warm',
+	'siphon-rose': 'electric',
+	'bathyal-crimson': 'harsh',
+	'plankton-green': 'jade',
+	'sea-angel': 'warm',
+	'pyro-teal': 'jade',
+	'cephalopod-copper': 'warm',
+	'oceanic-lilac': 'jade',
+	'nightfall-indigo': 'deep',
+	'thermocline-jade': 'jade',
+	'phosphor-lime': 'harsh',
+	'bruise-abyss': 'electric',
+	'pacific-cobalt': 'deep',
+	'mariana-ice': 'deep',
+	'reef-night': 'warm',
+	'ghost-white': 'harsh',
+	'ember-sea': 'ember',
+	'lagoon-electric': 'electric',
+	'umber-silt': 'warm',
+	'cerulean-ghost': 'deep',
+	'aurora-deep': 'jade',
+	'abyssal-rose-gold': 'ember'
+};
+export const SOMA_PALETTE_MOODS: readonly SomaMoodPrototype[] = SOMA_PALETTES.map(
+	(p) => PALETTE_FAMILY[PALETTE_FAMILIES[p.name] ?? 'deep']
+);

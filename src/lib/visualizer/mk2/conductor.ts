@@ -110,8 +110,9 @@ export class Mk2Conductor {
 		spectrum: Readonly<SignalSpectrumProfile>,
 		dtSeconds: number,
 		signal?: Readonly<SignalConductorFrame> | null,
-		// What kind of music is playing; a new shiftSerial means it just changed.
-		_character?: Readonly<MusicCharacter> | null
+		// What kind of music is playing. Its shifts are answered by SomaLook (which
+		// outlives this conductor); here punch only shapes the flash envelopes.
+		character?: Readonly<MusicCharacter> | null
 	): Readonly<Mk2ConductorFrame> {
 		const dt = clamp(finite(dtSeconds, 1 / 60), 1 / 1000, 0.25);
 		const silent = frame.silence;
@@ -139,10 +140,13 @@ export class Mk2Conductor {
 					0,
 					1
 				);
-		this.impact = approachAsymmetric(this.impact, impactTarget, 0.018, 0.3, dt);
+		// Punchy music (high crest) flashes sharp and short; soft dynamics glow out.
+		const punch = clamp(finite(character?.punch, 0.4), 0, 1);
+		const release = 1.35 - punch * 0.75;
+		this.impact = approachAsymmetric(this.impact, impactTarget, 0.018, 0.3 * release, dt);
 
 		const kickTarget = silent ? 0 : clamp(Math.max(kickDelta * 1.1 + kickRise * 2.4, finite(frame.bassPunch) * 0.7), 0, 1);
-		this.kick = approachAsymmetric(this.kick, kickTarget, 0.015, 0.22, dt);
+		this.kick = approachAsymmetric(this.kick, kickTarget, 0.015, 0.22 * release, dt);
 		const sparkleTarget = silent ? 0 : clamp(airDelta * 1.2 + trebleRise * 3 + finite(frame.trebleSparkle) * 0.25, 0, 1);
 		this.sparkle = approachAsymmetric(this.sparkle, sparkleTarget, 0.02, 0.25, dt);
 
