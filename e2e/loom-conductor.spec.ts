@@ -448,4 +448,124 @@ test.describe('Loom harmony conductor', () => {
 		expect(result.first.topologyPhase).toBeGreaterThan(Math.PI * 2);
 		expect(result.first.weavePhase).toBeGreaterThan(Math.PI * 2);
 	});
+	test('the long-listen look genome is huge, deterministic and keeps moving', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async (fixtures) => {
+			const { LoomConductor } = await import('/src/lib/visualizer/loom/conductor.ts');
+			const look = await import('/src/lib/visualizer/loom/look.ts');
+			const sections = ['intro', 'verse', 'pre_chorus', 'build', 'drop', 'breakdown', 'chorus', 'bridge', 'outro'];
+			const run = (seed: string, phrases: number, live = false) => {
+				const conductor = new LoomConductor(seed);
+				const frame: any = structuredClone(fixtures.director);
+				const spectrum: any = structuredClone(fixtures.spectrum);
+				frame.context.source = live ? 'live' : 'score';
+				const triples: string[] = [];
+				const trace: string[] = [];
+				let maxStepJump = 0;
+				let previousHero: number[] | null = null;
+				let invalid = 0;
+				let sectionIndex = 0;
+				let phrasesLeft = 0;
+				for (let phrase = 0; phrase < phrases; phrase += 1) {
+					if (!live && phrasesLeft <= 0) {
+						sectionIndex += 1;
+						// Sections last 3..8 phrases, like real songs.
+						phrasesLeft = 3 + ((sectionIndex * 7) % 6);
+						frame.section = sections[sectionIndex % sections.length];
+					}
+					phrasesLeft -= 1;
+					if (live) frame.section = 'verse';
+					frame.clock.phraseIndex = phrase;
+					frame.context.sectionEnergy = 0.35 + 0.5 * Math.abs(Math.sin(phrase * 0.31));
+					for (let i = 0; i < 40; i += 1) {
+						frame.clock.phrasePos = i / 40;
+						const out: any = conductor.update(frame, spectrum, 1 / 8);
+						const hero = [...out.look.hero];
+						if (previousHero) {
+							for (let c = 0; c < 3; c += 1) maxStepJump = Math.max(maxStepJump, Math.abs(hero[c] - previousHero[c]));
+						}
+						previousHero = hero;
+					}
+					const l: any = conductor.update(frame, spectrum, 1 / 8).look;
+					for (const value of Object.values(l)) {
+						if (typeof value === 'number' && !Number.isFinite(value)) invalid += 1;
+					}
+					triples.push(`${l.paletteIndex}/${l.grammarTo}/${l.cameraIndex}`);
+					trace.push(`${l.names.grammar}|${l.names.palette}|${l.names.camera}|${l.names.material}|${l.names.environment}|${l.names.beatForm}`);
+				}
+				return { triples, trace, maxStepJump, invalid };
+			};
+			const a = run('look-a', 300);
+			const a2 = run('look-a', 300);
+			const b = run('look-b', 300);
+			const live = run('radio-night', 300, true);
+
+			// Beats and band hits alone never move the look.
+			const steady = new LoomConductor('steady-look');
+			const frame: any = structuredClone(fixtures.director);
+			const spectrum: any = structuredClone(fixtures.spectrum);
+			for (let i = 0; i < 120; i += 1) steady.update(frame, spectrum, 1 / 60);
+			const before = JSON.stringify(steady.update(frame, spectrum, 1 / 60).look.names);
+			const beforeGrammar = steady.update(frame, spectrum, 1 / 60).look.grammarTo;
+			for (let i = 0; i < 600; i += 1) {
+				frame.clock.beatPhase = (i % 30) / 30;
+				frame.clock.beatPulse = i % 30 === 0 ? 1 : 0;
+				spectrum.deltas.kick = i % 30 === 0 ? 1 : 0;
+				steady.update(frame, spectrum, 1 / 60);
+			}
+			const after = steady.update(frame, spectrum, 1 / 60).look;
+
+			const distinct = (list: string[]) => new Set(list).size;
+			const field = (trace: string[], index: number) => new Set(trace.map((t) => t.split('|')[index])).size;
+			return {
+				space: look.LOOM_LOOK_SPACE_SIZE,
+				deterministic: JSON.stringify(a.trace) === JSON.stringify(a2.trace),
+				seedsDiffer: a.trace.filter((t, i) => t !== b.trace[i]).length,
+				triples: distinct(a.triples),
+				liveTriples: distinct(live.triples),
+				grammars: field(a.trace, 0),
+				palettes: field(a.trace, 1),
+				cameras: field(a.trace, 2),
+				materials: field(a.trace, 3),
+				environments: field(a.trace, 4),
+				beatForms: field(a.trace, 5),
+				liveGrammars: field(live.trace, 0),
+				livePalettes: field(live.trace, 1),
+				maxStepJump: a.maxStepJump,
+				invalid: a.invalid + live.invalid,
+				beatStable: before === JSON.stringify(after.names) && beforeGrammar === after.grammarTo,
+				// Longest run of identical (palette, grammar, camera) phrases.
+				longestHold: a.triples.reduce(
+					(acc: { run: number; max: number; last: string }, t: string) => {
+						const runLength = t === acc.last ? acc.run + 1 : 1;
+						return { run: runLength, max: Math.max(acc.max, runLength), last: t };
+					},
+					{ run: 0, max: 0, last: '' }
+				).max,
+				grammarCount: look.LOOM_GRAMMARS.length,
+				paletteCount: look.LOOM_PALETTES.length
+			};
+		}, FIXTURES);
+
+		expect(result.space).toBeGreaterThan(1_000_000);
+		expect(result.deterministic).toBe(true);
+		expect(result.seedsDiffer).toBeGreaterThan(250);
+		// 300 phrases (about 75 minutes at 128 bpm) visit many distinct scenes.
+		expect(result.triples).toBeGreaterThanOrEqual(40);
+		expect(result.liveTriples).toBeGreaterThanOrEqual(40);
+		expect(result.grammars).toBe(result.grammarCount);
+		expect(result.palettes).toBeGreaterThan(24);
+		expect(result.cameras).toBe(7);
+		expect(result.materials).toBe(7);
+		expect(result.environments).toBe(6);
+		expect(result.beatForms).toBe(5);
+		expect(result.liveGrammars).toBeGreaterThanOrEqual(10);
+		expect(result.livePalettes).toBeGreaterThanOrEqual(15);
+		// Colour glides: at 8 updates per second no colour channel jumps.
+		expect(result.maxStepJump).toBeLessThan(0.2);
+		expect(result.invalid).toBe(0);
+		expect(result.beatStable).toBe(true);
+		// No scene holds for more than eight phrases (two minutes at 128 bpm).
+		expect(result.longestHold).toBeLessThanOrEqual(8);
+	});
 });

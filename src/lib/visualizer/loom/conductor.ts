@@ -7,6 +7,7 @@ import type {
 	SignalBandVector,
 	SignalSpectrumProfile
 } from '$lib/visualizer/signal/spectrum';
+import { LoomLook, type LoomLookFrame } from '$lib/visualizer/loom/look';
 
 export type LoomSeed = SignalSeed;
 
@@ -99,6 +100,12 @@ export type LoomConductorFrame = {
 	cameraPitch: number;
 	cameraDistance: number;
 	cameraRoll: number;
+	/**
+	 * Long-listen look (topology grammar, palette family, material, camera
+	 * regime, environment, beat form), driven by the shared variation genome.
+	 * One reused object; it never moves on a beat, only across boundaries.
+	 */
+	look: Readonly<LoomLookFrame>;
 };
 
 export const LOOM_CONDUCTOR_LIMITS = {
@@ -509,6 +516,7 @@ export class LoomConductor {
 	private cameraPitch = SECTION_PROFILES.intro.cameraPitch;
 	private cameraDistance = SECTION_PROFILES.intro.cameraDistance;
 	private cameraRoll = 0;
+	private readonly look = new LoomLook(0);
 
 	private readonly output: LoomConductorFrame = {
 		section: 'intro',
@@ -547,7 +555,8 @@ export class LoomConductor {
 		cameraYaw: 0,
 		cameraPitch: SECTION_PROFILES.intro.cameraPitch,
 		cameraDistance: SECTION_PROFILES.intro.cameraDistance,
-		cameraRoll: 0
+		cameraRoll: 0,
+		look: this.look.frame
 	};
 
 	constructor(seed: LoomSeed = 0) {
@@ -558,6 +567,7 @@ export class LoomConductor {
 		this.seed = seed;
 		this.seedWord = signalSeedWord(seed);
 		this.rotationDirection = (this.seedWord & 1) === 0 ? 1 : -1;
+		this.look.reset(seed);
 		const seedUnit = this.seedWord / 0x1_0000_0000;
 		const intro = SECTION_PROFILES.intro;
 
@@ -964,6 +974,14 @@ export class LoomConductor {
 		this.output.cameraPitch = this.cameraPitch;
 		this.output.cameraDistance = this.cameraDistance;
 		this.output.cameraRoll = this.cameraRoll;
+		this.look.advance({
+			phraseIndex,
+			sectionKey: frame.section,
+			energy: this.macroEnergy,
+			mode: this.mode,
+			key: this.key,
+			dt
+		});
 
 		return this.output;
 	}

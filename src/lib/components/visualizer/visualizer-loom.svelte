@@ -9,7 +9,10 @@
 		LOOM_BLOOM_BLUR_H_WGSL,
 		LOOM_BLOOM_BLUR_V_WGSL,
 		LOOM_BLOOM_DOWN_WGSL,
+		LOOM_CHORUS_STRANDS,
+		LOOM_CHORUS_VERTEX_COUNT,
 		LOOM_COMPOSITE_WGSL,
+		LOOM_FIRST_CHORUS,
 		LOOM_FEEDBACK_WGSL,
 		LOOM_INSTANCES,
 		LOOM_SCENE_WGSL,
@@ -22,6 +25,7 @@
 		packLoomUniforms,
 		type LoomUniformValues
 	} from '$lib/visualizer/loom/uniform-layout';
+	import { parseLoomLookOverride, setLoomLookOverride } from '$lib/visualizer/loom/look';
 
 	const vis = useVisualizer();
 
@@ -38,6 +42,12 @@
 	let internalPixels = $state(0);
 	let hudSection = $state('intro');
 	let hudTopology = $state('torus');
+	let hudGrammar = $state('ribbon');
+	let hudPalette = $state('');
+	let hudCamera = $state('');
+	let hudMaterial = $state('');
+	let hudEnvironment = $state('');
+	let hudBeatForm = $state('');
 	let raf = 0;
 	let running = false;
 	let unsubscribe: (() => void) | null = null;
@@ -581,7 +591,10 @@
 			1
 		);
 		const impact = clamp(pose.impact * responseImpact, 0, 1);
-		const cameraYaw = pose.cameraYaw + Math.sin(driftPhase * 0.5) * 0.045;
+		// The long-listen look (genome) supplies camera regime, grammar, palette,
+		// material and environment; the conductor's patient rails ride on top.
+		const look = loom.look;
+		const cameraYaw = pose.cameraYaw + Math.sin(driftPhase * 0.5) * 0.045 + look.camYaw;
 
 		// Post stack: trails shorten on impact and in silence; the bloom knee
 		// drops with energy so drops glow and verses stay graphic.
@@ -589,14 +602,20 @@
 			feedbackResetFrames > 0
 				? 0
 				: clamp(
-						(0.88 + energy * 0.05 - impact * 0.16 + response.feedbackFadeOffset) *
+						(0.86 +
+							look.trail * 0.05 +
+							look.material.trail +
+							energy * 0.05 -
+							impact * 0.16 +
+							response.feedbackFadeOffset) *
 							(1 - silence * 0.35),
 						0.4,
-						0.95
+						0.955
 					);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 		const feedbackZoom = 1 - (0.0025 + renderBands.sub * 0.004) * responseMotion;
-		const bloomThreshold = 0.75 - energy * 0.2 + response.bloomThresholdOffset;
+		const bloomThreshold =
+			0.75 - energy * 0.2 + (0.5 - look.bloom) * 0.14 + response.bloomThresholdOffset;
 		const aberration = 1 + impact * 1.8;
 
 		const values: LoomUniformValues = {
@@ -637,9 +656,9 @@
 			rimHue: renderPalette.rimHue,
 			saturation: renderPalette.saturation,
 			yaw: cameraYaw,
-			pitch: pose.cameraPitch,
-			distance: pose.cameraDistance,
-			roll: pose.cameraRoll,
+			pitch: pose.cameraPitch + look.camPitch,
+			distance: pose.cameraDistance * look.camDistance,
+			roll: pose.cameraRoll + look.camRoll,
 			beatConveyor: renderBeats,
 			swayPhase,
 			weftSparse: pose.weftSparse,
@@ -659,7 +678,95 @@
 			feedbackFade,
 			feedbackZoom,
 			bloomThreshold,
-			aberration
+			aberration,
+			topoFrom: look.grammarFrom,
+			topoTo: look.grammarTo,
+			topoMix: look.grammarMix,
+			strandCount: look.strandCount,
+			formTwist: look.twist,
+			crossDensity: look.crossings,
+			spread: look.spread,
+			symmetry: look.symmetry,
+			curvature: look.curvature,
+			taper: look.taper,
+			bead: look.bead,
+			swell: look.swell,
+			frameScale: look.frameScale,
+			nearFade: 1,
+			widthScale: look.material.width,
+			frameSpare: 0,
+			focal: look.focal,
+			lensShiftX: look.lensShiftX,
+			lensShiftY: look.lensShiftY,
+			orbitYaw: look.orbit,
+			heroR: look.hero[0],
+			heroG: look.hero[1],
+			heroB: look.hero[2],
+			heroGain: 1,
+			supportR: look.support[0],
+			supportG: look.support[1],
+			supportB: look.support[2],
+			supportGain: 1,
+			weftR: look.weft[0],
+			weftG: look.weft[1],
+			weftB: look.weft[2],
+			weftGain: 1,
+			deepR: look.deep[0],
+			deepG: look.deep[1],
+			deepB: look.deep[2],
+			envGain: 1,
+			hazeR: look.haze[0],
+			hazeG: look.haze[1],
+			hazeB: look.haze[2],
+			hazeGain: 1,
+			glowR: look.glow[0],
+			glowG: look.glow[1],
+			glowB: look.glow[2],
+			glowGain: 1,
+			diffuse: look.material.diffuse,
+			gloss: look.material.gloss,
+			sharpness: look.material.sharpness,
+			aniso: look.material.aniso,
+			fresnel: look.material.fresnel,
+			emissive: look.material.emissive,
+			mirror: look.material.mirror,
+			whiteCore: look.material.whiteCore,
+			sheen: look.material.sheen,
+			stripes: look.material.stripes,
+			translucency: look.material.translucency,
+			hotspot: look.material.hotspot,
+			iridescence: look.material.iridescence,
+			glint: look.material.glint,
+			chorusLevel: 1,
+			pale: look.material.pale,
+			floorMirror: look.env.floorMirror,
+			ripple: look.env.ripple,
+			fog: look.env.fog,
+			stars: look.env.stars,
+			sky: look.env.sky,
+			walls: look.env.walls,
+			pool: look.env.pool,
+			horizon: look.env.horizon,
+			floorLine: look.floorLine,
+			sunX: look.env.sunX,
+			floorAmount: look.floorAmount,
+			envSpare: 0,
+			keyAzimuth: look.keyAzimuth,
+			keyElevation: look.keyElevation,
+			lightWarmth: look.lightWarmth,
+			fillLevel: look.fillLevel,
+			packets: look.beat[0],
+			pluck: look.beat[1],
+			crossPulse: look.beat[2],
+			shuttle: look.beat[3],
+			sparks: look.beat[4],
+			beatGain: responseImpact,
+			beatSpareA: 0,
+			beatSpareB: 0,
+			driftX: look.drift * 0.0011,
+			driftY: Math.abs(look.drift) * 0.0005 - 0.00025,
+			spin: look.drift * 0.0016,
+			trailBoost: 0
 		};
 		packLoomUniforms(state.uniforms, values);
 
@@ -680,6 +787,12 @@
 
 		hudSection = loom.section;
 		hudTopology = dominantTopology(loom.topologyWeights);
+		hudGrammar = look.names.grammar;
+		hudPalette = look.names.palette;
+		hudCamera = look.names.camera;
+		hudMaterial = look.names.material;
+		hudEnvironment = look.names.environment;
+		hudBeatForm = look.names.beatForm;
 		const encoder = state.device.createCommandEncoder({ label: 'Loom frame' });
 		{
 			const pass = encoder.beginRenderPass({
@@ -702,6 +815,9 @@
 			pass.setPipeline(state.scenePipeline);
 			pass.setBindGroup(0, state.sceneBindGroup);
 			pass.draw(LOOM_VERTEX_COUNT, LOOM_INSTANCES);
+			// Chorus strands: fewer segments and sides, same pipeline; the shader
+			// collapses the ones the current grammar does not show.
+			pass.draw(LOOM_CHORUS_VERTEX_COUNT, LOOM_CHORUS_STRANDS, 0, LOOM_FIRST_CHORUS);
 			pass.end();
 		}
 		const previous = state.parity;
@@ -826,6 +942,8 @@
 
 	onMount(async () => {
 		running = true;
+		// QA: ?loomLook=grammar=3,palette=5,camera=2 pins genome choices.
+		setLoomLookOverride(parseLoomLookOverride(new URL(location.href).searchParams.get('loomLook')));
 		startTime = performance.now();
 		unsubscribe = await vis.subscribe();
 		if (!running) {
@@ -838,6 +956,7 @@
 
 	onDestroy(() => {
 		running = false;
+		setLoomLookOverride(null);
 		initVersion += 1;
 		cancelAnimationFrame(raf);
 		unsubscribe?.();
@@ -854,6 +973,12 @@
 			aria-label="Loom audio visualizer"
 			data-loom-section={hudSection}
 			data-loom-topology={hudTopology}
+			data-loom-grammar={hudGrammar}
+			data-loom-palette={hudPalette}
+			data-loom-camera={hudCamera}
+			data-loom-material={hudMaterial}
+			data-loom-environment={hudEnvironment}
+			data-loom-beat-form={hudBeatForm}
 			data-loom-render-passes="8"
 			data-loom-strands={LOOM_STRANDS}
 			data-loom-frame-stride={activeFrameStride}

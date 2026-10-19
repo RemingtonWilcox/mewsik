@@ -18,7 +18,30 @@ export const LOOM_UNIFORM_GROUPS = [
 	['cloth', ['beatConveyor', 'swayPhase', 'weftSparse', 'driftPhase']],
 	['style', ['warpRadius', 'weftRadius', 'glow', 'silence']],
 	['harmony', ['seedHi', 'seedLo', 'key', 'mode']],
-	['post', ['feedbackFade', 'feedbackZoom', 'bloomThreshold', 'aberration']]
+	['post', ['feedbackFade', 'feedbackZoom', 'bloomThreshold', 'aberration']],
+	// Long-listen look (src/lib/visualizer/loom/look.ts), resolved on the CPU.
+	['topo', ['topoFrom', 'topoTo', 'topoMix', 'strandCount']],
+	['form', ['formTwist', 'crossDensity', 'spread', 'symmetry']],
+	['formB', ['curvature', 'taper', 'bead', 'swell']],
+	['frame', ['frameScale', 'nearFade', 'widthScale', 'frameSpare']],
+	['lens', ['focal', 'lensShiftX', 'lensShiftY', 'orbitYaw']],
+	['heroTint', ['heroR', 'heroG', 'heroB', 'heroGain']],
+	['supportTint', ['supportR', 'supportG', 'supportB', 'supportGain']],
+	['weftTint', ['weftR', 'weftG', 'weftB', 'weftGain']],
+	['deepTint', ['deepR', 'deepG', 'deepB', 'envGain']],
+	['hazeTint', ['hazeR', 'hazeG', 'hazeB', 'hazeGain']],
+	['glowTint', ['glowR', 'glowG', 'glowB', 'glowGain']],
+	['materialA', ['diffuse', 'gloss', 'sharpness', 'aniso']],
+	['materialB', ['fresnel', 'emissive', 'mirror', 'whiteCore']],
+	['materialC', ['sheen', 'stripes', 'translucency', 'hotspot']],
+	['materialD', ['iridescence', 'glint', 'chorusLevel', 'pale']],
+	['envA', ['floorMirror', 'ripple', 'fog', 'stars']],
+	['envB', ['sky', 'walls', 'pool', 'horizon']],
+	['envC', ['floorLine', 'sunX', 'floorAmount', 'envSpare']],
+	['light', ['keyAzimuth', 'keyElevation', 'lightWarmth', 'fillLevel']],
+	['beat', ['packets', 'pluck', 'crossPulse', 'shuttle']],
+	['beatB', ['sparks', 'beatGain', 'beatSpareA', 'beatSpareB']],
+	['postB', ['driftX', 'driftY', 'spin', 'trailBoost']]
 ] as const;
 
 export const LOOM_UNIFORM_FLOATS = LOOM_UNIFORM_GROUPS.length * 4;
@@ -28,7 +51,7 @@ export type LoomUniformGroupName = (typeof LOOM_UNIFORM_GROUPS)[number][0];
 export type LoomUniformSlot = (typeof LOOM_UNIFORM_GROUPS)[number][1][number];
 export type LoomUniformValues = Record<LoomUniformSlot, number>;
 
-/** Pack named values into the 56-float uniform block in contract order. */
+/** Pack named values into the uniform block in contract order. */
 export function packLoomUniforms(
 	out: Float32Array,
 	values: Readonly<LoomUniformValues>
