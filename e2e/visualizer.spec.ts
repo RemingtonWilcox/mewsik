@@ -234,7 +234,7 @@ test.describe('visualizer engine roster', () => {
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'loom');
 		const loomCanvas = page.getByLabel('Loom audio visualizer');
-		await expect(loomCanvas).toHaveAttribute('data-loom-render-passes', '8');
+		await expect(loomCanvas).toHaveAttribute('data-loom-render-passes', '9');
 		await expect(loomCanvas).toHaveAttribute('data-loom-topology', /torus|helix|saddle|knot|cage/);
 		if (await hasUsableWebGpu(page)) {
 			await expect(loomCanvas).toHaveAttribute('data-loom-ready', 'true', { timeout: 15_000 });
