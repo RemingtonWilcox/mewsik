@@ -12,12 +12,19 @@
 		LOOM_CHORUS_STRANDS,
 		LOOM_CHORUS_VERTEX_COUNT,
 		LOOM_COMPOSITE_WGSL,
+		LOOM_DUST,
+		LOOM_ENV_WGSL,
 		LOOM_FIRST_CHORUS,
 		LOOM_FEEDBACK_WGSL,
 		LOOM_INSTANCES,
+		LOOM_LIGHT_BYTES,
 		LOOM_SCENE_WGSL,
 		LOOM_STRANDS,
-		LOOM_VERTEX_COUNT
+		LOOM_THREAD_VERTEX_COUNT,
+		LOOM_THREADS,
+		LOOM_VERTEX_COUNT,
+		LOOM_VOLUME_SCALE,
+		LOOM_VOLUME_WGSL
 	} from '$lib/visualizer/loom/shaders';
 	import {
 		LOOM_UNIFORM_BYTES,
@@ -33,6 +40,8 @@
 	const TARGET_FRAME_RATE = 60;
 	const INTERNAL_SCALE = 0.78;
 	const MAX_INTERNAL_PIXELS = 1600 * 900;
+	/** Gain of the ribbons as light sources on the stage (floor, medium, threads, dust). */
+	const ENV_LIGHT = 1.2;
 	/** One weft pick per beat; the draft re-patterns every phrase of 32 picks. */
 	const BEATS_PER_PHRASE = 32;
 
@@ -74,6 +83,8 @@
 	let beatGlow = 0;
 	let swayPhase = 0;
 	let driftPhase = 0;
+	/** Flow clock for the environment (dust, mist, threads, water); rate follows tempo. */
+	let flowPhase = 0;
 	let seedHi = 0;
 	let seedLo = 0;
 	/** Journey identity the strand hashes were seeded from (stable across songs). */
@@ -100,6 +111,9 @@
 		/** Half-resolution bloom chain: [0] prefilter/final, [1] horizontal pass. */
 		bloom: [GPUTexture, GPUTexture];
 		bloomViews: [GPUTextureView, GPUTextureView];
+		/** Low-resolution scattered light of the participating medium. */
+		volume: GPUTexture;
+		volumeView: GPUTextureView;
 		width: number;
 		height: number;
 	};
@@ -111,8 +125,22 @@
 		sampler: GPUSampler;
 		uniformBuffer: GPUBuffer;
 		detailBuffer: GPUBuffer;
+		/** The ribbons as light sources, written each frame by the lights compute pass. */
+		lightBuffer: GPUBuffer;
 		uniforms: Float32Array;
+		lightsPipeline: GPUComputePipeline;
+		lightsBindGroup: GPUBindGroup;
 		scenePipeline: GPURenderPipeline;
+		mirrorPipeline: GPURenderPipeline;
+		mirrorBindGroup: GPUBindGroup;
+		floorPipeline: GPURenderPipeline;
+		floorBindGroup: GPUBindGroup;
+		threadsPipeline: GPURenderPipeline;
+		threadsBindGroup: GPUBindGroup;
+		dustPipeline: GPURenderPipeline;
+		dustBindGroup: GPUBindGroup;
+		volumePipeline: GPURenderPipeline;
+		volumeBindGroup: GPUBindGroup;
 		feedbackPipeline: GPURenderPipeline;
 		bloomDownPipeline: GPURenderPipeline;
 		blurHPipeline: GPURenderPipeline;
@@ -131,6 +159,26 @@
 	};
 
 	let gpu: LoomGpu | null = null;
+	/** QA (?loomProbe=1): the ribbon lights read back to window.__LOOM_LIGHTS__. */
+	let lightProbe: GPUBuffer | null = null;
+	let lightProbeBusy = false;
+	let lightProbeFrames = 0;
+
+	function readLightProbe(buffer: GPUBuffer) {
+		lightProbeBusy = true;
+		buffer
+			.mapAsync(GPUMapMode.READ)
+			.then(() => {
+				(window as unknown as { __LOOM_LIGHTS__?: number[] }).__LOOM_LIGHTS__ = Array.from(
+					new Float32Array(buffer.getMappedRange().slice(0))
+				);
+				buffer.unmap();
+			})
+			.catch(() => {})
+			.finally(() => {
+				lightProbeBusy = false;
+			});
+	}
 
 	type LoomFrame = VisualizerJourneySnapshot['loom'];
 	const LOOM_POSE_KEYS = [
@@ -274,6 +322,7 @@
 		targets.depth.destroy();
 		for (const texture of targets.feedback) texture.destroy();
 		for (const texture of targets.bloom) texture.destroy();
+		targets.volume.destroy();
 	}
 
 	function ensureTargets(state: LoomGpu, width: number, height: number) {
@@ -303,6 +352,11 @@
 			hdr('Loom bloom A', bloomWidth, bloomHeight),
 			hdr('Loom bloom B', bloomWidth, bloomHeight)
 		];
+		const volume = hdr(
+			'Loom medium',
+			Math.max(1, Math.floor(width * LOOM_VOLUME_SCALE)),
+			Math.max(1, Math.floor(height * LOOM_VOLUME_SCALE))
+		);
 		const targets: LoomTargets = {
 			scene,
 			sceneView: scene.createView(),
@@ -312,6 +366,8 @@
 			feedbackViews: [feedback[0].createView(), feedback[1].createView()],
 			bloom,
 			bloomViews: [bloom[0].createView(), bloom[1].createView()],
+			volume,
+			volumeView: volume.createView(),
 			width,
 			height
 		};
@@ -340,8 +396,16 @@
 		state.blurHBindGroup = bind(state.blurHPipeline, 'Loom bloom blur H', [targets.bloomViews[0]]);
 		state.blurVBindGroup = bind(state.blurVPipeline, 'Loom bloom blur V', [targets.bloomViews[1]]);
 		state.compositeBindGroups = [
-			bind(state.compositePipeline, 'Loom composite A', [targets.feedbackViews[0], targets.bloomViews[0]]),
-			bind(state.compositePipeline, 'Loom composite B', [targets.feedbackViews[1], targets.bloomViews[0]])
+			bind(state.compositePipeline, 'Loom composite A', [
+				targets.feedbackViews[0],
+				targets.bloomViews[0],
+				targets.volumeView
+			]),
+			bind(state.compositePipeline, 'Loom composite B', [
+				targets.feedbackViews[1],
+				targets.bloomViews[0],
+				targets.volumeView
+			])
 		];
 		feedbackResetFrames = 2;
 	}
@@ -355,6 +419,7 @@
 		let context: GPUCanvasContext | null = null;
 		let uniformBuffer: GPUBuffer | null = null;
 		let detailBuffer: GPUBuffer | null = null;
+		let lightBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
 			if (!context) throw new Error('The WebGPU canvas context could not be created.');
@@ -367,6 +432,8 @@
 			const blurHModule = device.createShaderModule({ code: LOOM_BLOOM_BLUR_H_WGSL });
 			const blurVModule = device.createShaderModule({ code: LOOM_BLOOM_BLUR_V_WGSL });
 			const compositeModule = device.createShaderModule({ code: LOOM_COMPOSITE_WGSL });
+			const envModule = device.createShaderModule({ code: LOOM_ENV_WGSL });
+			const volumeModule = device.createShaderModule({ code: LOOM_VOLUME_WGSL });
 			const assertCompiled = async (module: GPUShaderModule, label: string) => {
 				const info = await module.getCompilationInfo();
 				const errors = info.messages.filter((message) => message.type === 'error');
@@ -383,7 +450,9 @@
 				assertCompiled(bloomDownModule, 'Loom bloom prefilter'),
 				assertCompiled(blurHModule, 'Loom bloom blur'),
 				assertCompiled(blurVModule, 'Loom bloom blur'),
-				assertCompiled(compositeModule, 'Loom presentation')
+				assertCompiled(compositeModule, 'Loom presentation'),
+				assertCompiled(envModule, 'Loom environment'),
+				assertCompiled(volumeModule, 'Loom medium')
 			]);
 			const fullscreenPipeline = (
 				label: string,
@@ -397,14 +466,14 @@
 					fragment: { module, entryPoint: 'fs_main', targets: [{ format: targetFormat }] },
 					primitive: { topology: 'triangle-list' }
 				});
-			const pipelines = (await Promise.all([
+			const strandPipeline = (label: string, vertex: string, fragment: string) =>
 				device.createRenderPipelineAsync({
-					label: 'Loom instrument pipeline',
+					label,
 					layout: 'auto',
-					vertex: { module: sceneModule, entryPoint: 'vs_main' },
+					vertex: { module: sceneModule, entryPoint: vertex },
 					fragment: {
 						module: sceneModule,
-						entryPoint: 'fs_main',
+						entryPoint: fragment,
 						targets: [{ format: 'rgba16float' }]
 					},
 					primitive: { topology: 'triangle-list', cullMode: 'none' },
@@ -413,7 +482,61 @@
 						depthWriteEnabled: true,
 						depthCompare: 'less'
 					}
-				}),
+				});
+			// Light added over the stage (threads, dust): depth-tested, never occluding.
+			const additive: GPUBlendState = {
+				color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+				alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' }
+			};
+			const envPipeline = (label: string, vertex: string, fragment: string) =>
+				device.createRenderPipelineAsync({
+					label,
+					layout: 'auto',
+					vertex: { module: envModule, entryPoint: vertex },
+					fragment: {
+						module: envModule,
+						entryPoint: fragment,
+						targets: [{ format: 'rgba16float', blend: additive }]
+					},
+					primitive: { topology: 'triangle-list', cullMode: 'none' },
+					depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' }
+				});
+			const [lightsPipeline, mirrorPipeline, floorPipeline, threadsPipeline, dustPipeline, volumePipeline] =
+				await Promise.all([
+					device.createComputePipelineAsync({
+						label: 'Loom ribbon lights',
+						layout: 'auto',
+						compute: { module: sceneModule, entryPoint: 'cs_lights' }
+					}),
+					strandPipeline('Loom reflection pipeline', 'vs_mirror', 'fs_mirror'),
+					// The floor lays its own light over the mirrored strands beneath it,
+					// keeping a Fresnel-weighted share of them: out = src + dst * srcAlpha.
+					device.createRenderPipelineAsync({
+						label: 'Loom floor pipeline',
+						layout: 'auto',
+						vertex: { module: envModule, entryPoint: 'vs_floor' },
+						fragment: {
+							module: envModule,
+							entryPoint: 'fs_floor',
+							targets: [
+								{
+									format: 'rgba16float',
+									blend: {
+										color: { srcFactor: 'one', dstFactor: 'src-alpha', operation: 'add' },
+										alpha: { srcFactor: 'zero', dstFactor: 'one', operation: 'add' }
+									}
+								}
+							]
+						},
+						primitive: { topology: 'triangle-list' },
+						depthStencil: { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' }
+					}),
+					envPipeline('Loom threads pipeline', 'vs_threads', 'fs_threads'),
+					envPipeline('Loom dust pipeline', 'vs_dust', 'fs_dust'),
+					fullscreenPipeline('Loom medium pipeline', volumeModule, 'rgba16float')
+				]);
+			const pipelines = (await Promise.all([
+				strandPipeline('Loom instrument pipeline', 'vs_main', 'fs_main'),
 				fullscreenPipeline('Loom feedback pipeline', feedbackModule, 'rgba16float'),
 				fullscreenPipeline('Loom bloom prefilter pipeline', bloomDownModule, 'rgba16float'),
 				fullscreenPipeline('Loom bloom blur H pipeline', blurHModule, 'rgba16float'),
@@ -436,13 +559,19 @@
 				size: DETAIL_BYTES,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 			});
-			const sceneBindGroup = device.createBindGroup({
-				layout: pipelines[0].getBindGroupLayout(0),
-				entries: [
-					{ binding: 0, resource: { buffer: uniformBuffer } },
-					{ binding: 1, resource: { buffer: detailBuffer } }
-				]
+			lightBuffer = device.createBuffer({
+				size: LOOM_LIGHT_BYTES,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
 			});
+			const uniformEntry = { binding: 0, resource: { buffer: uniformBuffer } };
+			const detailEntry = { binding: 1, resource: { buffer: detailBuffer } };
+			const lightEntry = { binding: 1, resource: { buffer: lightBuffer } };
+			const group = (
+				pipeline: GPURenderPipeline | GPUComputePipeline,
+				label: string,
+				entries: GPUBindGroupEntry[]
+			) => device.createBindGroup({ label, layout: pipeline.getBindGroupLayout(0), entries });
+			const sceneBindGroup = group(pipelines[0], 'Loom instrument', [uniformEntry, detailEntry]);
 			const state: LoomGpu = {
 				device,
 				context,
@@ -450,8 +579,25 @@
 				sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }),
 				uniformBuffer,
 				detailBuffer,
+				lightBuffer,
 				uniforms: new Float32Array(LOOM_UNIFORM_FLOATS),
+				lightsPipeline,
+				lightsBindGroup: group(lightsPipeline, 'Loom ribbon lights', [
+					uniformEntry,
+					detailEntry,
+					{ binding: 2, resource: { buffer: lightBuffer } }
+				]),
 				scenePipeline: pipelines[0],
+				mirrorPipeline,
+				mirrorBindGroup: group(mirrorPipeline, 'Loom reflection', [uniformEntry, detailEntry]),
+				floorPipeline,
+				floorBindGroup: group(floorPipeline, 'Loom floor', [uniformEntry, lightEntry]),
+				threadsPipeline,
+				threadsBindGroup: group(threadsPipeline, 'Loom threads', [uniformEntry, lightEntry]),
+				dustPipeline,
+				dustBindGroup: group(dustPipeline, 'Loom dust', [uniformEntry, lightEntry]),
+				volumePipeline,
+				volumeBindGroup: group(volumePipeline, 'Loom medium', [uniformEntry, lightEntry]),
 				feedbackPipeline: pipelines[1],
 				bloomDownPipeline: pipelines[2],
 				blurHPipeline: pipelines[3],
@@ -477,6 +623,7 @@
 		} catch (error) {
 			uniformBuffer?.destroy();
 			detailBuffer?.destroy();
+			lightBuffer?.destroy();
 			try {
 				context?.unconfigure();
 			} catch {
@@ -492,6 +639,7 @@
 		destroyTargets(state.targets);
 		state.uniformBuffer.destroy();
 		state.detailBuffer.destroy();
+		state.lightBuffer.destroy();
 		try {
 			state.context.unconfigure();
 		} catch {
@@ -503,6 +651,7 @@
 	function teardownGpu() {
 		const state = gpu;
 		gpu = null;
+		lightProbe = null;
 		ready = false;
 		destroyGpuState(state);
 	}
@@ -616,8 +765,11 @@
 		const response = VISUALIZER_TUNING.loom;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
+		// Flow follows the music's tempo character: ambient drifts, noise rock races.
+		const weave = loom.look.weave;
 		swayPhase +=
-			(0.35 + pose.motion * 0.9 + pose.tempo * 0.35) * responseMotion * dt;
+			(0.25 + pose.motion * 0.75 + pose.tempo * 0.3) * weave.flow * responseMotion * dt;
+		flowPhase += weave.flow * (1 - silence * 0.7) * dt;
 
 		const energy = clamp(
 			pose.macroEnergy * 0.72 + rms * 0.18 + renderSpectralMotion * 0.1,
@@ -705,12 +857,13 @@
 			swayPhase,
 			weftSparse: pose.weftSparse,
 			driftPhase,
+			// Bass gives the ribbons their weight: heavy music, broad bands.
 			warpRadius: clamp(
-				(0.016 + renderBands.body * 0.003 + impact * 0.001) * response.width,
-				0.01,
-				0.024
+				(0.016 + renderBands.body * 0.003 + impact * 0.001) * response.width * (0.72 + weave.weight * 0.62),
+				0.009,
+				0.03
 			),
-			weftRadius: clamp(0.011 * (0.85 + response.width * 0.15), 0.007, 0.016),
+			weftRadius: clamp(0.011 * (0.85 + response.width * 0.15) * (0.85 + weave.weight * 0.3), 0.007, 0.018),
 			glow: clamp((0.42 + energy * 0.34) * response.glow, 0.3, 1.05),
 			silence,
 			seedHi,
@@ -781,17 +934,17 @@
 			glint: look.material.glint,
 			chorusLevel: budget.chorusWidth,
 			pale: look.material.pale,
-			floorMirror: look.env.floorMirror,
+			reflect: look.env.reflect,
+			roughness: look.env.roughness,
 			ripple: look.env.ripple,
-			fog: look.env.fog,
-			stars: look.env.stars,
-			sky: look.env.sky,
-			walls: look.env.walls,
-			pool: look.env.pool,
-			horizon: look.env.horizon,
-			floorLine: look.floorLine,
-			sunX: look.env.sunX,
-			floorAmount: look.floorAmount,
+			floorAlbedo: look.env.albedo,
+			mist: look.env.mist,
+			mistHeight: look.env.mistHeight,
+			mistNoise: look.env.mistNoise,
+			fogExtinction: 0.035 + look.env.mist * 0.05,
+			floorY: look.floorY,
+			floorAmount: look.env.floor,
+			envLight: ENV_LIGHT,
 			bloomWeight: budget.bloomWeight,
 			keyAzimuth: look.keyAzimuth,
 			keyElevation: look.keyElevation,
@@ -808,9 +961,15 @@
 			driftX: look.drift * 0.0011,
 			driftY: Math.abs(look.drift) * 0.0005 - 0.00025,
 			spin: look.drift * 0.0016,
-			// Squared: the room lifts slowly out of the dark and settles slowly back
-			// into it, so a light to dark crossfade never reads as a sudden relight.
-			paper: look.tonePaper * look.tonePaper
+			flowPhase,
+			threads: look.env.threads,
+			warpRows: look.env.warpRows,
+			threadReach: look.env.threadReach,
+			dust: look.env.dust,
+			fray: weave.fray,
+			grain: weave.grain,
+			turbulence: weave.turbulence,
+			edge: weave.edge
 		};
 		packLoomUniforms(state.uniforms, values);
 
@@ -841,6 +1000,14 @@
 		hudComposition = look.names.composition;
 		const encoder = state.device.createCommandEncoder({ label: 'Loom frame' });
 		{
+			// The rails become light sources before anything is lit by them.
+			const pass = encoder.beginComputePass({ label: 'Loom ribbon lights' });
+			pass.setPipeline(state.lightsPipeline);
+			pass.setBindGroup(0, state.lightsBindGroup);
+			pass.dispatchWorkgroups(1);
+			pass.end();
+		}
+		{
 			const pass = encoder.beginRenderPass({
 				label: 'Loom instrument',
 				colorAttachments: [
@@ -865,6 +1032,21 @@
 			// Chorus strands: fewer segments and sides, same pipeline; the shader
 			// collapses the ones the current grammar does not show.
 			pass.draw(LOOM_CHORUS_VERTEX_COUNT, LOOM_CHORUS_STRANDS, 0, LOOM_FIRST_CHORUS);
+			// The stage: the strands' reflection, the floor over it, then the far
+			// threads and the dust, all lit by the ribbons.
+			pass.setPipeline(state.mirrorPipeline);
+			pass.setBindGroup(0, state.mirrorBindGroup);
+			pass.draw(LOOM_VERTEX_COUNT, LOOM_INSTANCES);
+			pass.draw(LOOM_CHORUS_VERTEX_COUNT, LOOM_CHORUS_STRANDS, 0, LOOM_FIRST_CHORUS);
+			pass.setPipeline(state.floorPipeline);
+			pass.setBindGroup(0, state.floorBindGroup);
+			pass.draw(3);
+			pass.setPipeline(state.threadsPipeline);
+			pass.setBindGroup(0, state.threadsBindGroup);
+			pass.draw(LOOM_THREAD_VERTEX_COUNT, LOOM_THREADS);
+			pass.setPipeline(state.dustPipeline);
+			pass.setBindGroup(0, state.dustBindGroup);
+			pass.draw(6, LOOM_DUST);
 			pass.end();
 		}
 		const previous = state.parity;
@@ -886,6 +1068,8 @@
 			pass.draw(3);
 			pass.end();
 		};
+		// The participating medium, at low resolution.
+		fullscreen('Loom medium', targets.volumeView, state.volumePipeline, state.volumeBindGroup);
 		// scene + feedback[previous] -> feedback[next]
 		fullscreen(
 			'Loom feedback',
@@ -912,7 +1096,10 @@
 			state.compositeBindGroups[next]
 		);
 		state.parity = next;
+		const probe = lightProbe && !lightProbeBusy && ++lightProbeFrames % 30 === 0;
+		if (probe && lightProbe) encoder.copyBufferToBuffer(state.lightBuffer, 0, lightProbe, 0, LOOM_LIGHT_BYTES);
 		state.device.queue.submit([encoder.finish()]);
+		if (probe && lightProbe) readLightProbe(lightProbe);
 	}
 
 	function loop(now: number) {
@@ -968,6 +1155,12 @@
 					return;
 				}
 				gpu = state;
+				if (import.meta.env.DEV && new URL(location.href).searchParams.get('loomProbe') === '1') {
+					lightProbe = state.device.createBuffer({
+						size: LOOM_LIGHT_BYTES,
+						usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+					});
+				}
 				startTime = performance.now();
 				schedulerTickAt = 0;
 				refreshIntervalMs = 1000 / 60;
@@ -1028,7 +1221,7 @@
 			data-loom-beat-form={hudBeatForm}
 			data-loom-tone={hudTone}
 			data-loom-composition={hudComposition}
-			data-loom-render-passes="8"
+			data-loom-render-passes="9"
 			data-loom-strands={LOOM_STRANDS}
 			data-loom-frame-stride={activeFrameStride}
 			data-loom-refresh-rate={measuredRefreshRate}

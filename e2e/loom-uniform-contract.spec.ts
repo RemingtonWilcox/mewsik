@@ -54,8 +54,8 @@ test.describe('Loom uniform contract', () => {
 			};
 		});
 
-		// 14 reactive groups + 22 long-listen look groups (look.ts), 4 floats each.
-		expect(result.floats).toBe(144);
+		// 14 reactive groups + 24 long-listen look and environment groups, 4 floats each.
+		expect(result.floats).toBe(152);
 		expect(result.sceneFields).not.toBeNull();
 		expect(result.compositeFields).not.toBeNull();
 		expect(result.sceneFields).toEqual(result.layoutGroups);

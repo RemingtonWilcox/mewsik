@@ -35,13 +35,17 @@ export const LOOM_UNIFORM_GROUPS = [
 	['materialB', ['fresnel', 'emissive', 'mirror', 'whiteCore']],
 	['materialC', ['sheen', 'stripes', 'translucency', 'hotspot']],
 	['materialD', ['iridescence', 'glint', 'chorusLevel', 'pale']],
-	['envA', ['floorMirror', 'ripple', 'fog', 'stars']],
-	['envB', ['sky', 'walls', 'pool', 'horizon']],
-	['envC', ['floorLine', 'sunX', 'floorAmount', 'bloomWeight']],
+	// Environment (look.ts LOOM_ENVIRONMENTS): physical stage, lit by the ribbons.
+	['envA', ['reflect', 'roughness', 'ripple', 'floorAlbedo']],
+	['envB', ['mist', 'mistHeight', 'mistNoise', 'fogExtinction']],
+	['envC', ['floorY', 'floorAmount', 'envLight', 'bloomWeight']],
 	['light', ['keyAzimuth', 'keyElevation', 'lightWarmth', 'fillLevel']],
 	['beat', ['packets', 'pluck', 'crossPulse', 'shuttle']],
 	['beatB', ['sparks', 'beatGain', 'litGain', 'chorusGlow']],
-	['postB', ['driftX', 'driftY', 'spin', 'paper']]
+	['postB', ['driftX', 'driftY', 'spin', 'flowPhase']],
+	['envD', ['threads', 'warpRows', 'threadReach', 'dust']],
+	// Character-driven weave (look.ts LoomWeaveCharacter).
+	['weave', ['fray', 'grain', 'turbulence', 'edge']]
 ] as const;
 
 export const LOOM_UNIFORM_FLOATS = LOOM_UNIFORM_GROUPS.length * 4;

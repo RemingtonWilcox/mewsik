@@ -13,6 +13,11 @@
 
 import { VariationGenome, variationSpaceSize, type VariationAxis } from '$lib/visualizer/variation';
 import {
+	characterWeights,
+	type CharacterFeature,
+	type MusicCharacter
+} from '$lib/visualizer/character';
+import {
 	createLoomExposure,
 	resolveLoomExposure,
 	type LoomExposure,
@@ -35,22 +40,28 @@ export type LoomGrammar = {
 	 * shorter trails and less bloom so the figure never dissolves into a blob.
 	 */
 	density: number;
+	/**
+	 * Height of the floor under this grammar in strand space: just below its
+	 * lowest threads, so towers stand on it, fans spring from it and curtains
+	 * hang just clear of it.
+	 */
+	floor: number;
 };
 
 export const LOOM_GRAMMARS: readonly LoomGrammar[] = [
-	{ name: 'ribbon', strands: [0, 0.3], scale: 1, density: 0.35 },
-	{ name: 'canopy', strands: [0.4, 0.85], scale: 0.82, density: 0.85 },
-	{ name: 'tunnel', strands: [0.4, 0.85], scale: 0.78, density: 0.95 },
-	{ name: 'helix-tower', strands: [0.25, 0.7], scale: 0.88, density: 0.55 },
-	{ name: 'mobius', strands: [0.4, 0.9], scale: 0.86, density: 0.6 },
-	{ name: 'peacock', strands: [0.45, 0.9], scale: 0.86, density: 0.7 },
-	{ name: 'braid', strands: [0, 0.5], scale: 0.88, density: 0.45 },
-	{ name: 'string-hyperboloid', strands: [0.5, 0.9], scale: 0.84, density: 0.75 },
-	{ name: 'saddle-lattice', strands: [0.45, 0.9], scale: 0.82, density: 0.8 },
-	{ name: 'thread-galaxy', strands: [0.35, 0.8], scale: 0.72, density: 0.9 },
-	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9, density: 0.45 },
-	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86, density: 0.55 },
-	{ name: 'aurora-curtain', strands: [0.45, 0.85], scale: 0.8, density: 0.85 }
+	{ name: 'ribbon', strands: [0, 0.3], scale: 1, density: 0.35, floor: -0.86 },
+	{ name: 'canopy', strands: [0.4, 0.85], scale: 0.82, density: 0.85, floor: -1.06 },
+	{ name: 'tunnel', strands: [0.4, 0.85], scale: 0.78, density: 0.95, floor: -0.96 },
+	{ name: 'helix-tower', strands: [0.25, 0.7], scale: 0.88, density: 0.55, floor: -1.02 },
+	{ name: 'mobius', strands: [0.4, 0.9], scale: 0.86, density: 0.6, floor: -1.0 },
+	{ name: 'peacock', strands: [0.45, 0.9], scale: 0.86, density: 0.7, floor: -0.68 },
+	{ name: 'braid', strands: [0, 0.5], scale: 0.88, density: 0.45, floor: -0.72 },
+	{ name: 'string-hyperboloid', strands: [0.5, 0.9], scale: 0.84, density: 0.75, floor: -0.74 },
+	{ name: 'saddle-lattice', strands: [0.45, 0.9], scale: 0.82, density: 0.8, floor: -0.86 },
+	{ name: 'thread-galaxy', strands: [0.35, 0.8], scale: 0.72, density: 0.9, floor: -0.5 },
+	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9, density: 0.45, floor: -0.88 },
+	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86, density: 0.55, floor: -0.86 },
+	{ name: 'aurora-curtain', strands: [0.45, 0.85], scale: 0.8, density: 0.85, floor: -0.64 }
 ];
 
 // ---------------------------------------------------------------------------
@@ -175,45 +186,61 @@ export type LoomCameraRegime = {
 	shiftY: number;
 	/** Radians per second of held orbit while this regime is active. */
 	orbit: number;
-	/** How much of the floor/horizon the environment shows from this angle. */
-	floor: number;
-	floorLine: number;
 };
 
 export const LOOM_CAMERAS: readonly LoomCameraRegime[] = [
-	{ name: 'three-quarter', yaw: 0, pitch: 0, distance: 1, roll: 0, focal: 3.08, shiftX: 0, shiftY: 0, orbit: 0, floor: 1, floorLine: -0.17 },
-	{ name: 'low-hero', yaw: -0.28, pitch: 0.34, distance: 0.86, roll: 0.05, focal: 2.75, shiftX: 0, shiftY: 0.1, orbit: 0, floor: 1, floorLine: -0.31 },
-	{ name: 'top-down', yaw: 0.3, pitch: -1.08, distance: 1.02, roll: 0.45, focal: 3, shiftX: 0, shiftY: 0.02, orbit: 0.025, floor: 0.12, floorLine: -0.44 },
-	{ name: 'axial', yaw: 0.95, pitch: -0.06, distance: 0.62, roll: 0, focal: 2.05, shiftX: 0, shiftY: 0.02, orbit: 0, floor: 0.45, floorLine: -0.27 },
-	{ name: 'macro', yaw: 0.3, pitch: -0.14, distance: 0.72, roll: -0.07, focal: 3.6, shiftX: -0.16, shiftY: 0.05, orbit: 0, floor: 0.55, floorLine: -0.25 },
-	{ name: 'slow-orbit', yaw: 0, pitch: -0.28, distance: 1.04, roll: 0, focal: 3, shiftX: 0, shiftY: 0, orbit: 0.085, floor: 1, floorLine: -0.15 },
-	{ name: 'wide', yaw: -0.12, pitch: -0.2, distance: 1.42, roll: 0, focal: 3.15, shiftX: 0, shiftY: -0.02, orbit: 0, floor: 1, floorLine: -0.1 }
+	{ name: 'three-quarter', yaw: 0, pitch: 0.06, distance: 1, roll: 0, focal: 3.08, shiftX: 0, shiftY: 0, orbit: 0 },
+	{ name: 'low-hero', yaw: -0.28, pitch: 0.34, distance: 0.86, roll: 0.05, focal: 2.75, shiftX: 0, shiftY: 0.1, orbit: 0 },
+	// Looks up from under the weave into the hanging threads: no floor shows.
+	{ name: 'top-down', yaw: 0.3, pitch: -1.08, distance: 1.02, roll: 0.45, focal: 3, shiftX: 0, shiftY: 0.02, orbit: 0.025 },
+	{ name: 'axial', yaw: 0.95, pitch: 0.02, distance: 0.62, roll: 0, focal: 2.05, shiftX: 0, shiftY: 0.02, orbit: 0 },
+	{ name: 'macro', yaw: 0.3, pitch: 0.02, distance: 0.72, roll: -0.07, focal: 3.6, shiftX: -0.16, shiftY: 0.05, orbit: 0 },
+	{ name: 'slow-orbit', yaw: 0, pitch: 0.12, distance: 1.04, roll: 0, focal: 3, shiftX: 0, shiftY: 0, orbit: 0.085 },
+	{ name: 'wide', yaw: -0.12, pitch: 0.2, distance: 1.42, roll: 0, focal: 3.15, shiftX: 0, shiftY: -0.02, orbit: 0 }
 ];
 
 // ---------------------------------------------------------------------------
-// Environments: coefficient sets for the composite pass.
+// Environments: the place the weave lives in. Nothing here paints a
+// backdrop: every family is physical stage furniture lit only by the ribbons
+// themselves (see the environment shaders): a floor that pools their light
+// and mirrors them, participating mist that scatters it, far threads that
+// catch it and recede into the dark, dust that glints only near a strand.
 
 export type LoomEnvironment = {
 	name: string;
-	floorMirror: number;
+	/** 0 no floor .. 1 a floor under the figure. */
+	floor: number;
+	/** Mirror strength of the floor, Fresnel-weighted. */
+	reflect: number;
+	/** 0 polished .. 1 rough: the reflection spreads and dims with depth. */
+	roughness: number;
+	/** Standing water: ripples, and kicks send swells across it. */
 	ripple: number;
-	fog: number;
-	stars: number;
-	sky: number;
-	walls: number;
-	pool: number;
-	horizon: number;
-	/** Off-centre glow source x (screen units), only read when sky > 0. */
-	sunX: number;
+	/** How much ribbon light pools on the floor. */
+	albedo: number;
+	/** Density of the participating medium the ribbons light. */
+	mist: number;
+	/** Height of the medium above the floor (low = ground mist). */
+	mistHeight: number;
+	/** How wispy and patchy the medium is. */
+	mistNoise: number;
+	/** Far threads hanging around the figure. */
+	threads: number;
+	/** 0 a scattered hall of threads .. 1 ordered warp rings, a loom's warp. */
+	warpRows: number;
+	/** 0 short hanging threads .. 1 taut floor-to-ceiling warp. */
+	threadReach: number;
+	/** Dust and loose fibres catching the ribbon light. */
+	dust: number;
 };
 
 export const LOOM_ENVIRONMENTS: readonly LoomEnvironment[] = [
-	{ name: 'chamber', floorMirror: 1, ripple: 0, fog: 0, stars: 0, sky: 0, walls: 0, pool: 1, horizon: 1, sunX: 0.62 },
-	{ name: 'open-sky', floorMirror: 0.55, ripple: 0.15, fog: 0.15, stars: 0, sky: 0.7, walls: 0, pool: 0.25, horizon: 1.2, sunX: -0.66 },
-	{ name: 'water', floorMirror: 1.15, ripple: 1, fog: 0.1, stars: 0.25, sky: 0.35, walls: 0, pool: 0.4, horizon: 0.8, sunX: 0.7 },
-	{ name: 'mirror-box', floorMirror: 1, ripple: 0, fog: 0, stars: 0, sky: 0, walls: 1, pool: 0.6, horizon: 0.6, sunX: 0.6 },
-	{ name: 'fog-bank', floorMirror: 0.4, ripple: 0, fog: 0.7, stars: 0, sky: 0.2, walls: 0, pool: 0.7, horizon: 0.5, sunX: -0.55 },
-	{ name: 'starfield', floorMirror: 0.6, ripple: 0.2, fog: 0, stars: 1, sky: 0.15, walls: 0, pool: 0.15, horizon: 0.45, sunX: 0.58 }
+	{ name: 'black-pool', floor: 1, reflect: 1, roughness: 0.04, ripple: 0.12, albedo: 0.03, mist: 0.16, mistHeight: 0.28, mistNoise: 0.5, threads: 0, warpRows: 0.2, threadReach: 0.6, dust: 0.25 },
+	{ name: 'thread-hall', floor: 1, reflect: 0.34, roughness: 0.5, ripple: 0, albedo: 0.16, mist: 0.3, mistHeight: 0.42, mistNoise: 0.6, threads: 1, warpRows: 0, threadReach: 0.3, dust: 0.45 },
+	{ name: 'warp-frame', floor: 1, reflect: 0.55, roughness: 0.24, ripple: 0, albedo: 0.1, mist: 0.24, mistHeight: 0.38, mistNoise: 0.4, threads: 1, warpRows: 1, threadReach: 1, dust: 0.3 },
+	{ name: 'ground-mist', floor: 1, reflect: 0.22, roughness: 0.7, ripple: 0, albedo: 0.08, mist: 0.7, mistHeight: 0.5, mistNoise: 0.9, threads: 0.3, warpRows: 0.3, threadReach: 0.7, dust: 0.35 },
+	{ name: 'flooded-loom', floor: 1, reflect: 0.9, roughness: 0.1, ripple: 1, albedo: 0.04, mist: 0.3, mistHeight: 0.32, mistNoise: 0.6, threads: 0.85, warpRows: 0.75, threadReach: 1, dust: 0.2 },
+	{ name: 'dust-void', floor: 0.4, reflect: 0.3, roughness: 0.6, ripple: 0, albedo: 0.06, mist: 0.22, mistHeight: 0.6, mistNoise: 1, threads: 0, warpRows: 0, threadReach: 0.4, dust: 1 }
 ];
 
 // ---------------------------------------------------------------------------
@@ -232,8 +259,9 @@ export const LOOM_THICKNESS = [
 // ---------------------------------------------------------------------------
 // Tones: the value structure of a scene, which is what the eye reads first.
 // Palettes alone all read as saturated neon on a dark room; tones change how
-// light sits in the frame (light on dark, matte sculpture, ink on paper,
-// monochrome, mid-key dusk) so scenes differ before any colour is read.
+// light sits in the frame (light on dark, matte sculpture, dark ink lines,
+// monochrome, a thick lit medium) so scenes differ before any colour is read.
+// Every tone keeps the room dark: none of them lifts or tints the backdrop.
 
 export type LoomTone = {
 	name: string;
@@ -241,9 +269,7 @@ export type LoomTone = {
 	emission: number;
 	/** Multiplies the key/fill diffuse light (matte tones are lit, not glowing). */
 	diffuse: number;
-	/** 0 light on dark .. 1 ink on a pale paper room (dark on light). */
-	paper: number;
-	/** Lifts the room toward a mid-key haze. */
+	/** Thickens the participating medium the ribbons light (more scattering). */
 	room: number;
 	/** Collapses the palette onto the hero hue in value steps. */
 	mono: number;
@@ -254,11 +280,13 @@ export type LoomTone = {
 };
 
 export const LOOM_TONES: readonly LoomTone[] = [
-	{ name: 'glow', emission: 1, diffuse: 1, paper: 0, room: 0, mono: 0, bloom: 1, trail: 0 },
-	{ name: 'graphic', emission: 0.4, diffuse: 1.8, paper: 0, room: 0, mono: 0, bloom: 0.3, trail: -0.07 },
-	{ name: 'ink', emission: 0.1, diffuse: 1.1, paper: 1, room: 0, mono: 0, bloom: 0.1, trail: -0.04 },
-	{ name: 'mono', emission: 0.78, diffuse: 1.15, paper: 0, room: 0, mono: 1, bloom: 0.75, trail: 0 },
-	{ name: 'dusk', emission: 0.5, diffuse: 1.25, paper: 0, room: 1, mono: 0, bloom: 0.5, trail: -0.03 }
+	{ name: 'glow', emission: 1, diffuse: 1, room: 0, mono: 0, bloom: 1, trail: 0 },
+	{ name: 'graphic', emission: 0.4, diffuse: 1.8, room: 0, mono: 0, bloom: 0.3, trail: -0.07 },
+	// Dark ink lines: barely emissive fibres drawn by the key light, in a
+	// thicker medium so the little light they do give carries the space.
+	{ name: 'ink', emission: 0.2, diffuse: 1.5, room: 0.55, mono: 0, bloom: 0.1, trail: -0.04 },
+	{ name: 'mono', emission: 0.78, diffuse: 1.15, room: 0, mono: 1, bloom: 0.75, trail: 0 },
+	{ name: 'dusk', emission: 0.5, diffuse: 1.25, room: 1, mono: 0, bloom: 0.5, trail: -0.03 }
 ];
 
 /** Tone pick weights by musical energy: loud passages glow, quiet ones draw. */
@@ -348,6 +376,8 @@ export type LoomChoiceView = { from: number; to: number; mix: number };
 export class LoomChoiceMorph {
 	from: number;
 	to: number;
+	/** Wall-clock seconds of the current update (dt may be sped up by a shift). */
+	realDt = Infinity;
 	private progress = 1;
 	readonly view: LoomChoiceView;
 
@@ -375,7 +405,12 @@ export class LoomChoiceMorph {
 		return this.write();
 	}
 
-	update(target: number, dtSeconds: number): LoomChoiceView {
+	/**
+	 * `maxRate` caps the morph's progress per second however fast it is pushed
+	 * (a shift's glide speed times a queued target's rush), so a big structural
+	 * change always takes at least 1 / maxRate seconds and never reads as a cut.
+	 */
+	update(target: number, dtSeconds: number, maxRate = Infinity): LoomChoiceView {
 		const dt = Math.max(0, Math.min(0.5, Number.isFinite(dtSeconds) ? dtSeconds : 0));
 		if (this.progress >= 1 && target !== this.to) {
 			this.from = this.to;
@@ -384,7 +419,8 @@ export class LoomChoiceMorph {
 		}
 		if (this.progress < 1) {
 			const rate = (1 / Math.max(0.05, this.tau)) * (target !== this.to ? this.rush : 1);
-			this.progress = Math.min(1, this.progress + dt * rate);
+			const cap = Number.isFinite(maxRate) && Number.isFinite(this.realDt) ? maxRate * this.realDt : Infinity;
+			this.progress = Math.min(1, this.progress + Math.min(dt * rate, cap));
 			if (this.progress >= 1) this.from = this.to;
 		}
 		return this.write();
@@ -436,8 +472,8 @@ export type LoomLookFrame = {
 	focal: number;
 	lensShiftX: number;
 	lensShiftY: number;
-	floorAmount: number;
-	floorLine: number;
+	/** Floor height under the current grammar (strand space), blended across a morph. */
+	floorY: number;
 	/** Accumulated orbit yaw; only advances while an orbiting regime is active. */
 	orbit: number;
 	keyAzimuth: number;
@@ -451,11 +487,15 @@ export type LoomLookFrame = {
 	/** Tone coefficients (LOOM_TONES), crossfaded. */
 	toneEmission: number;
 	toneDiffuse: number;
-	tonePaper: number;
 	toneRoom: number;
 	toneMono: number;
 	toneBloom: number;
 	toneTrail: number;
+	/**
+	 * What kind of music is playing, as continuous weave parameters that
+	 * always follow it (see LoomLook.followCharacter): never boundaries.
+	 */
+	weave: LoomWeaveCharacter;
 	/** Light budget resolved from everything above (exposure.ts). */
 	exposure: LoomExposure;
 	/** Stable per-journey identity in 0..1 (see LoomLook.identitySeed). */
@@ -473,6 +513,32 @@ export type LoomLookFrame = {
 	};
 	paletteIndex: number;
 	cameraIndex: number;
+	/** Shifts answered so far: from the shared tracker, and heard by Loom itself. */
+	shifts: { shared: number; local: number; contrast: number };
+};
+
+/**
+ * Character-driven weave parameters. They glide with the music's fast
+ * character envelopes (about a second), so ambient and noise rock differ in
+ * structure, not only in tint, even between boundaries.
+ */
+export type LoomWeaveCharacter = {
+	/** Flow-rate multiplier for sway, drift, dust and mist (tempo). */
+	flow: number;
+	/** 0..1 fibres fraying off the strands (noise). */
+	fray: number;
+	/** 0..1 fibre grain on the strand surface (noise, dark timbre). */
+	grain: number;
+	/** 0..1 turbulent wobble of the strands and the medium (noise, motion). */
+	turbulence: number;
+	/** 0..1 ribbon width and weight (bass). */
+	weight: number;
+	/** 0..1 hard, hot-cored edges versus soft glow (punch). */
+	edge: number;
+	/** -1 cool .. +1 warm light colour (valence, timbre brightness). */
+	warmth: number;
+	/** Light value multiplier (brightness, valence). */
+	value: number;
 };
 
 export type LoomLookContext = {
@@ -484,6 +550,31 @@ export type LoomLookContext = {
 	/** 0..1 circle-of-fifths position. */
 	key: number;
 	dt: number;
+	/** The music's character (journey); null in tests and before audio. */
+	character?: Readonly<MusicCharacter> | null;
+	/** Raw spectrum cues Loom calibrates its own hearing from (see LoomLook.hear). */
+	listen?: LoomListenCues | null;
+};
+
+/** Per-frame spectrum cues (SignalSpectrumProfile values). */
+export type LoomListenCues = {
+	/** Spectral centroid, 0..1. */
+	centroid: number;
+	/** Spectral motion (how fast the spectrum changes), 0..1. */
+	motion: number;
+	/** Air band level, 0..1. */
+	air: number;
+};
+
+/** Fastest a choice morph may run, per second (see LoomChoiceMorph.update). */
+const MORPH_MAX_RATE: Partial<Record<string, number>> = {
+	grammar: 1 / 2.2,
+	camera: 1 / 2.2,
+	composition: 1 / 2.2,
+	palette: 1 / 1.1,
+	environment: 1 / 1.1,
+	material: 1 / 1.1,
+	tone: 1 / 1.3
 };
 
 const CHOICE_AXES = [
@@ -564,6 +655,198 @@ function seedUnit(seed: number | string): number {
 	return h / 0x100000000;
 }
 
+// ---------------------------------------------------------------------------
+// Character fit: which options suit which music. Each option has a partial
+// character prototype; characterWeights() turns the playing music into pick
+// weights, so boundaries and shifts land on looks that fit (a harsh lattice in
+// a dust storm for noise rock, a curtain over still black water for ambient).
+
+type Prototype = Partial<Record<CharacterFeature, number>>;
+
+const GRAMMAR_FIT: readonly Prototype[] = [
+	{ tempo: 0.5, energy: 0.5 }, // ribbon
+	{ tempo: 0.2, energy: 0.3, noise: 0.15 }, // canopy
+	{ tempo: 0.85, energy: 0.85, bass: 0.7 }, // tunnel
+	{ tempo: 0.6, punch: 0.6, energy: 0.6 }, // helix tower
+	{ tempo: 0.3, valence: 0.6, noise: 0.2 }, // mobius
+	{ energy: 0.7, valence: 0.8, brightness: 0.65 }, // peacock
+	{ tempo: 0.35, energy: 0.4, noise: 0.15, punch: 0.35 }, // braid
+	{ tempo: 0.7, punch: 0.8, bass: 0.65 }, // hyperboloid
+	{ noise: 0.8, tempo: 0.9, energy: 0.85 }, // lattice
+	{ tempo: 0.1, energy: 0.2, punch: 0.15 }, // galaxy
+	{ tempo: 0.5, bass: 0.5, valence: 0.45 }, // trefoil
+	{ tempo: 0.15, valence: 0.35, energy: 0.35 }, // rings
+	{ tempo: 0.05, energy: 0.15, noise: 0.1 } // curtain
+];
+
+const ENVIRONMENT_FIT: readonly Prototype[] = [
+	{ tempo: 0.1, noise: 0.1, energy: 0.2 }, // black pool
+	{ tempo: 0.4, energy: 0.45, punch: 0.4 }, // thread hall
+	{ tempo: 0.7, punch: 0.75, bass: 0.65 }, // warp frame
+	{ tempo: 0.15, brightness: 0.25, energy: 0.3 }, // ground mist
+	{ bass: 0.8, tempo: 0.6, energy: 0.75 }, // flooded loom
+	{ noise: 0.85, tempo: 0.9, energy: 0.85 } // dust void
+];
+
+const CAMERA_FIT: readonly Prototype[] = [
+	{ tempo: 0.5, energy: 0.5 }, // three-quarter
+	{ energy: 0.8, bass: 0.75 }, // low hero
+	{ tempo: 0.35, noise: 0.55 }, // from below
+	{ tempo: 0.85, energy: 0.8 }, // axial
+	{ noise: 0.45, punch: 0.65 }, // macro
+	{ tempo: 0.1, energy: 0.25 }, // slow orbit
+	{ tempo: 0.2, energy: 0.3, bass: 0.3 } // wide
+];
+
+const MATERIAL_FIT: readonly Prototype[] = [
+	{ tempo: 0.5, energy: 0.5 }, // glass fibre
+	{ brightness: 0.8, punch: 0.7 }, // liquid chrome
+	{ tempo: 0.2, noise: 0.1, energy: 0.25 }, // silk
+	{ tempo: 0.85, energy: 0.85, punch: 0.6 }, // neon
+	{ bass: 0.75, valence: 0.6 }, // molten glass
+	{ valence: 0.7, energy: 0.3, tempo: 0.3 }, // pearl
+	{ noise: 0.8, brightness: 0.6 } // phosphor
+];
+
+const TONE_FIT: readonly Prototype[] = [
+	{ energy: 0.8, tempo: 0.7 }, // glow
+	{ punch: 0.75, noise: 0.5 }, // graphic
+	{ energy: 0.15, tempo: 0.2 }, // ink
+	{ noise: 0.75 }, // mono
+	{ tempo: 0.15, energy: 0.3, brightness: 0.25 } // dusk
+];
+
+/**
+ * Palette fit from the family's own colours: warm families suit happy music,
+ * luminous ones bright timbres, dark eras quiet or harsh music.
+ */
+const PALETTE_FIT: readonly Prototype[] = LOOM_PALETTES.map((family) => {
+	const colours = [family.hero, family.support, family.weft].map(srgbToLinear);
+	let warmth = 0;
+	let light = 0;
+	for (const [r, g, b] of colours) {
+		warmth += (r - b) / (r + g + b + 0.05) / 3;
+		light += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 3;
+	}
+	return {
+		valence: clamp01(0.5 + warmth * 0.55),
+		brightness: clamp01(0.2 + light * 1.1),
+		energy: family.dark ? 0.25 : 0.65,
+		noise: family.dark ? 0.6 : 0.2
+	};
+});
+
+/**
+ * Colour signature of each family: the mean chroma of its three roles on an
+ * opponent plane, so a shift can prefer a family that reads as a different
+ * colour world rather than a near neighbour.
+ */
+const PALETTE_SIGNATURE: readonly [number, number][] = LOOM_PALETTES.map((family) => {
+	// Weighted by how much of the frame each role holds: the hero leads.
+	const roles: [string, number][] = [[family.hero, 0.5], [family.support, 0.3], [family.weft, 0.2]];
+	let a = 0;
+	let b = 0;
+	for (const [hex, weight] of roles) {
+		const [r, g, bl] = srgbToLinear(hex);
+		const sum = r + g + bl + 0.05;
+		a += ((r - g) / sum) * weight;
+		b += (((r + g) * 0.5 - bl) / sum) * weight;
+	}
+	return [a, b];
+});
+
+function paletteDistance(from: number, to: number): number {
+	const x = PALETTE_SIGNATURE[from] ?? [0, 0];
+	const y = PALETTE_SIGNATURE[to] ?? [0, 0];
+	return Math.min(1, Math.hypot(x[0] - y[0], x[1] - y[1]) * 1.6);
+}
+
+/** Loom's own shift detector on its calibrated hearing (see LoomLook.detect). */
+const LOCAL_FEATURES = 6;
+const LOCAL_WEIGHTS = [1.3, 0.4, 1.2, 0.9, 1.1, 0.8];
+const LOCAL_WEIGHT_SUM = LOCAL_WEIGHTS.reduce((sum, w) => sum + w, 0);
+const LOCAL_THRESHOLD = 0.18;
+const LOCAL_REFRACTORY_S = 8;
+const LOCAL_SLOW_TAU_S = 20;
+/** After a shift, the new scene holds this long before phrase boundaries move it. */
+const SHIFT_HOLD_S = 10;
+const BOUNDARY_DELAY_S = 0.8;
+/** Continuous axes Loom glides itself (see LoomLook.followAxes). */
+const CONTINUOUS_AXES = LOOM_LOOK_AXES.map((axis, index) => ({ axis, index })).filter(
+	(entry): entry is { axis: Extract<VariationAxis, { kind: 'continuous' }>; index: number } =>
+		entry.axis.kind === 'continuous'
+);
+
+function neutralWeave(): LoomWeaveCharacter {
+	return { flow: 1, fray: 0, grain: 0.15, turbulence: 0.15, weight: 0.45, edge: 0.4, warmth: 0, value: 1 };
+}
+
+function smoothstep(edge0: number, edge1: number, x: number): number {
+	const t = clamp01((x - edge0) / (edge1 - edge0));
+	return t * t * (3 - 2 * t);
+}
+
+/** Weave targets for one character (see LoomWeaveCharacter). */
+function weaveTarget(out: LoomWeaveCharacter, c: Readonly<MusicCharacter>): LoomWeaveCharacter {
+	out.flow = 0.4 + c.tempo * 1.3 + c.motion * 0.3;
+	out.fray = smoothstep(0.3, 0.85, c.noise) * (0.7 + c.punch * 0.3);
+	out.grain = clamp01(smoothstep(0.25, 0.9, c.noise) * 0.8 + (1 - c.brightness) * 0.15);
+	out.turbulence = clamp01((c.noise - 0.2) * 1.1 + c.motion * 0.25);
+	out.weight = clamp01(c.bass * 0.9 + c.energy * 0.2);
+	out.edge = clamp01(c.punch);
+	out.warmth = Math.max(-1, Math.min(1, (c.valence - 0.5) * 1.1 - (c.brightness - 0.5) * 1.0));
+	out.value = 0.86 + c.brightness * 0.16 + c.energy * 0.1;
+	return out;
+}
+
+/**
+ * Loom's hearing: the shared character, with motion taken from the spectrum's
+ * own rate of change (the shared motion barely moves between genres), energy
+ * and valence stretched to the range real music spans, and a little spectral
+ * steadying of brightness and noise. Tempo, shift serial and strength pass
+ * through unchanged.
+ */
+type Heard = { -readonly [K in keyof MusicCharacter]: MusicCharacter[K] };
+
+function createHeard(): Heard {
+	return {
+		vector: new Float32Array(8),
+		tempo: 0.5,
+		energy: 0.5,
+		brightness: 0.45,
+		bass: 0.5,
+		noise: 0.2,
+		punch: 0.4,
+		motion: 0.4,
+		valence: 0.5,
+		contrast: 0,
+		shift: 0,
+		shiftSerial: 0,
+		shiftStrength: 0,
+		sinceShift: 1e6
+	};
+}
+
+/** Look numbers that scale the figure on screen, and their top speed (log units per second). */
+const SCALE_KEYS = new Set<string>(['frameScale', 'camDistance', 'focal']);
+const SCALE_RATE = 0.42;
+
+/** Weave numbers that move the geometry glide slower after a shift than colour does. */
+const WEAVE_GEOMETRY = new Set<string>(['flow', 'fray', 'turbulence', 'weight', 'edge', 'grain']);
+
+const WEAVE_KEYS = ['flow', 'fray', 'grain', 'turbulence', 'weight', 'edge', 'warmth', 'value'] as const;
+
+/**
+ * White balance of the ribbons' own light: warm music shifts it toward amber,
+ * cool toward blue. A property of the light sources, not an overlay.
+ */
+function whiteBalance(rgb: Rgb, warmth: number): void {
+	const k = warmth * 0.32;
+	rgb[0] = Math.max(0, rgb[0] * (1 + k * 0.7));
+	rgb[1] = Math.max(0, rgb[1] * (1 + k * 0.08));
+	rgb[2] = Math.max(0, rgb[2] * (1 - k * 0.75));
+}
+
 const NUMERIC_KEYS = [
 	'strandCount',
 	'density',
@@ -586,8 +869,7 @@ const NUMERIC_KEYS = [
 	'focal',
 	'lensShiftX',
 	'lensShiftY',
-	'floorAmount',
-	'floorLine',
+	'floorY',
 	'keyAzimuth',
 	'keyElevation',
 	'lightWarmth',
@@ -597,7 +879,6 @@ const NUMERIC_KEYS = [
 	'drift',
 	'toneEmission',
 	'toneDiffuse',
-	'tonePaper',
 	'toneRoom',
 	'toneMono',
 	'toneBloom',
@@ -648,8 +929,7 @@ function emptyFrame(): LoomLookFrame {
 		focal: 3.08,
 		lensShiftX: 0,
 		lensShiftY: 0,
-		floorAmount: 1,
-		floorLine: -0.17,
+		floorY: LOOM_GRAMMARS[0].floor,
 		orbit: 0,
 		keyAzimuth: 0,
 		keyElevation: 0.7,
@@ -661,8 +941,8 @@ function emptyFrame(): LoomLookFrame {
 		drift: 0,
 		toneEmission: 1,
 		toneDiffuse: 1,
-		tonePaper: 0,
 		toneRoom: 0,
+		weave: neutralWeave(),
 		toneMono: 0,
 		toneBloom: 1,
 		toneTrail: 0,
@@ -679,7 +959,8 @@ function emptyFrame(): LoomLookFrame {
 			composition: LOOM_COMPOSITIONS[0].name
 		},
 		paletteIndex: 0,
-		cameraIndex: 0
+		cameraIndex: 0,
+		shifts: { shared: 0, local: 0, contrast: 0 }
 	};
 }
 
@@ -712,6 +993,49 @@ export class LoomLook {
 	private paletteRaw = -1;
 	private paletteTarget = 0;
 	private readonly toneWeights: number[] = [];
+	private readonly toneFit: number[] = [];
+	private readonly fitWeights = {
+		grammar: [] as number[],
+		palette: [] as number[],
+		camera: [] as number[],
+		material: [] as number[],
+		environment: [] as number[]
+	};
+	/**
+	 * The character shift this look last answered. It lives with the
+	 * journey-owned look, so a new source's conductor (or a remounted renderer)
+	 * never answers the same shift twice.
+	 */
+	private answeredSerial = 0;
+	/** Wall-clock dt of the frame being resolved (morph rate caps use it). */
+	private realDt = 0;
+	private weaveReady = false;
+	private readonly weaveGoal = neutralWeave();
+	private readonly heard = createHeard();
+	/** Fast envelopes of the spectrum cues (centroid, motion, air). */
+	private readonly cueEnvelope = new Float64Array(3);
+	private cuesPrimed = false;
+	/** Slow memory of the calibrated hearing, and seconds since any shift. */
+	private readonly localSlow = new Float64Array(LOCAL_FEATURES);
+	private localPrimed = false;
+	private sinceAnyShift = 1e6;
+	/** Seconds since a new source began, and how long the local contrast has held. */
+	private sourceAge = 1e6;
+	private localHeld = 0;
+	/**
+	 * Loom's own glide of the genome's continuous targets: the genome's glide
+	 * in steady state, but after a shift every axis lands within about two
+	 * seconds instead of creeping on for its full time constant.
+	 */
+	private readonly axisValues = new Map<string, number>();
+	private axesReady = false;
+	/** Phrase and section the genome sees (frozen during a post-shift hold). */
+	private heldPhrase = 0;
+	private heldSection = '';
+	private realPhrase = Number.NaN;
+	/** Seconds until a natural boundary is passed to the genome (-1: none). */
+	private boundaryWait = -1;
+	private realSection = '';
 	private readonly target = emptyFrame();
 	readonly frame = emptyFrame();
 	private readonly scratch: Rgb = [0, 0, 0];
@@ -742,7 +1066,7 @@ export class LoomLook {
 			material: f.material,
 			density: 0,
 			strandCount: 0,
-			tone: { emission: 1, paper: 0, room: 0, bloom: 1, trail: 0 },
+			tone: { emission: 1, room: 0, bloom: 1, trail: 0 },
 			env: f.env
 		};
 		this.reset(seed);
@@ -757,6 +1081,15 @@ export class LoomLook {
 		return this.identity;
 	}
 
+	/**
+	 * A new source began (the journey rebuilt the conductor). Its shared
+	 * strength-1 shift answers it; Loom's own ear stays quiet meanwhile.
+	 */
+	beginSource(): void {
+		this.sourceAge = 0;
+		this.localHeld = 0;
+	}
+
 	/** Carry the current look into a new source: only future mutations change. */
 	continueWith(seed: number | string): void {
 		this.genome.reseed(seed);
@@ -769,7 +1102,14 @@ export class LoomLook {
 		this.paletteRaw = -1;
 		this.orbit = 0;
 		this.smoothedReady = false;
+		this.weaveReady = false;
+		this.axesReady = false;
 		this.carry.valid = false;
+	}
+
+	/** The last character shift this look answered (diagnostics, tests). */
+	get answeredShift(): number {
+		return this.answeredSerial;
 	}
 
 	/** Advance on one conductor tick and resolve the frame. */
@@ -797,20 +1137,311 @@ export class LoomLook {
 			});
 			this.genome.settle();
 		}
-		// Quiet passages lean toward drawn tones, loud ones toward glow. Weights
-		// only bias the next pick, so they never move the current scene.
-		this.genome.setWeights('tone', loomToneWeights(energy, this.toneWeights));
+		const character = this.hear(context.character ?? null, context.listen ?? null, context.dt);
+		// Quiet passages lean toward drawn tones, loud ones toward glow, and
+		// every big axis leans toward options that fit the music. Weights only
+		// bias the next pick, so they never move the current scene.
+		this.fit(character, energy, 3);
+		this.answerShift(character, energy, context.dt, context);
+		// A scene just re-picked for new music establishes itself before it
+		// evolves: phrase and section boundaries during the hold are skipped,
+		// and the walk resumes at the next real boundary after it (never with a
+		// catch-up boundary the moment the hold ends).
+		// The same while the music is audibly changing: a section label that
+		// flips with a station's new genre must not spend the morphs the shift
+		// is about to need for picks that fit the new music.
+		const holding = this.sinceAnyShift < SHIFT_HOLD_S || this.frame.shifts.contrast > 0.1;
+		const phraseMoved = context.phraseIndex !== this.realPhrase;
+		const sectionMoved = context.sectionKey !== this.realSection;
+		this.realPhrase = context.phraseIndex;
+		this.realSection = context.sectionKey;
+		// Natural boundaries land a beat late (BOUNDARY_DELAY_S), so a change
+		// of music that is only just being heard can still claim them.
+		if (first) {
+			this.heldPhrase = context.phraseIndex;
+			this.heldSection = context.sectionKey;
+			this.boundaryWait = -1;
+		} else if (phraseMoved || sectionMoved) {
+			this.boundaryWait = holding ? -1 : BOUNDARY_DELAY_S;
+		} else if (this.boundaryWait >= 0) {
+			this.boundaryWait = holding ? -1 : Math.max(0, this.boundaryWait - Math.max(0, context.dt || 0));
+		}
+		if (this.boundaryWait === 0 && !holding) {
+			this.heldPhrase = context.phraseIndex;
+			this.heldSection = context.sectionKey;
+			this.boundaryWait = -1;
+		}
 		this.genome.advance({
-			phraseIndex: context.phraseIndex,
-			sectionKey: context.sectionKey,
+			phraseIndex: this.heldPhrase,
+			sectionKey: this.heldSection,
 			energy,
 			dt: context.dt
 		});
-		this.resolve(this.target, context, override ?? globalOverride, first);
-		this.smooth(context.dt);
+		// Loom's own morphs and smoothers run in step with the genome's glides,
+		// which run several times faster for a few seconds after a shift.
+		const speed = this.genome.glideSpeed;
+		this.followAxes(context.dt, speed, first);
+		this.followCharacter(character, context.dt, speed);
+		this.resolve(this.target, context, override ?? globalOverride, first, speed);
+		this.smooth(context.dt, speed);
 		this.budget();
 		this.frame.identity = this.identity;
 		return this.frame;
+	}
+
+	/** The calibrated character Loom heard last frame (diagnostics, tests). */
+	get hearing(): Readonly<MusicCharacter> | null {
+		return this.cuesPrimed ? this.heard : null;
+	}
+
+	/** Calibrate the shared character into Loom's hearing (see Heard). */
+	private hear(
+		character: Readonly<MusicCharacter> | null,
+		listen: LoomListenCues | null,
+		dtSeconds: number
+	): Readonly<MusicCharacter> | null {
+		if (!character) return null;
+		const h = this.heard;
+		const env = this.cueEnvelope;
+		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
+		if (listen) {
+			const cues = [listen.centroid, listen.motion, listen.air];
+			// Quicker right after a shift, so the new music is heard at once.
+			const tau = character.sinceShift < 2.5 ? 0.25 : 0.45;
+			const k = this.cuesPrimed ? 1 - Math.exp(-dt / tau) : 1;
+			for (let i = 0; i < 3; i += 1) {
+				const value = Number.isFinite(cues[i]) ? cues[i] : env[i];
+				env[i] += (value - env[i]) * k;
+			}
+			this.cuesPrimed = true;
+		} else if (!this.cuesPrimed) {
+			env[0] = 0.1;
+			env[1] = 0.2;
+			env[2] = 0.6;
+			this.cuesPrimed = true;
+		}
+		const [centroid, motion, air] = env;
+		h.tempo = character.tempo;
+		h.energy = clamp01((character.energy - 0.18) / 0.35);
+		// Timbre straight from the shared character (it spans real material);
+		// the spectral centroid only steadies brightness a little.
+		h.brightness = clamp01(character.brightness * 0.85 + clamp01((centroid - 0.03) / 0.18) * 0.15);
+		h.bass = clamp01(character.bass);
+		h.noise = clamp01(character.noise * 0.85 + clamp01(motion * 1.3 + (air - 0.6) * 0.9) * 0.15);
+		h.punch = clamp01(character.punch / 0.9);
+		h.motion = clamp01(motion / 0.45);
+		h.valence = clamp01((character.valence - 0.5) / 0.22);
+		h.contrast = character.contrast;
+		h.shift = character.shift;
+		h.shiftSerial = character.shiftSerial;
+		h.shiftStrength = character.shiftStrength;
+		h.sinceShift = character.sinceShift;
+		const v = h.vector;
+		v[0] = h.tempo;
+		v[1] = h.energy;
+		v[2] = h.brightness;
+		v[3] = h.bass;
+		v[4] = h.noise;
+		v[5] = h.punch;
+		v[6] = h.motion;
+		v[7] = h.valence;
+		return h;
+	}
+
+	/** Character-conditioned pick weights for the axes that set the scene. */
+	private fit(character: Readonly<MusicCharacter> | null, energy: number, sharpness: number): void {
+		const g = this.genome;
+		const tone = loomToneWeights(energy, this.toneWeights);
+		if (!character) {
+			g.setWeights('tone', tone);
+			return;
+		}
+		const w = this.fitWeights;
+		g.setWeights('grammar', characterWeights(GRAMMAR_FIT, character, sharpness, 0.08, w.grammar));
+		g.setWeights('palette', characterWeights(PALETTE_FIT, character, sharpness, 0.08, w.palette));
+		g.setWeights('camera', characterWeights(CAMERA_FIT, character, sharpness, 0.1, w.camera));
+		g.setWeights('material', characterWeights(MATERIAL_FIT, character, sharpness, 0.1, w.material));
+		g.setWeights('environment', characterWeights(ENVIRONMENT_FIT, character, sharpness, 0.06, w.environment));
+		characterWeights(TONE_FIT, character, sharpness, 0.1, this.toneFit);
+		for (let i = 0; i < tone.length; i += 1) tone[i] *= this.toneFit[i] ?? 1;
+		g.setWeights('tone', tone);
+	}
+
+	/**
+	 * Answer a new character shift exactly once: re-pick the scene for the new
+	 * music (sharper weights), mutate the genome now and steer the continuous
+	 * axes toward the music. Everything still glides; the glides just run fast.
+	 */
+	private answerShift(
+		character: Readonly<MusicCharacter> | null,
+		energy: number,
+		dtSeconds: number,
+		context: LoomLookContext
+	): void {
+		if (!character) return;
+		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
+		this.sinceAnyShift += dt;
+		this.sourceAge += dt;
+		const serial = character.shiftSerial;
+		if (Number.isFinite(serial) && serial !== this.answeredSerial) {
+			const fresh = serial > this.answeredSerial;
+			this.answeredSerial = serial;
+			const strength = clamp01(character.shiftStrength);
+			// A shift Loom already heard for itself a moment ago is the same event.
+			if (fresh && strength > 0 && (this.sinceAnyShift > 3 || strength >= 0.99)) {
+				this.applyShift(character, energy, strength, context);
+				this.frame.shifts.shared += 1;
+			}
+			return;
+		}
+		const local = this.detect(character, dt);
+		if (local > 0) {
+			this.applyShift(character, energy, local, context);
+			this.frame.shifts.local += 1;
+		}
+	}
+
+	/**
+	 * Loom's own ear: the shared tracker's timbre features barely move for real
+	 * material, so a station drifting from swing to club can pass unnoticed.
+	 * The calibrated hearing's fast envelopes are compared with a slow memory;
+	 * a large enough difference is a shift (refractory, like the tracker's).
+	 */
+	private detect(c: Readonly<MusicCharacter>, dt: number): number {
+		const now = [c.tempo, c.energy, c.brightness, c.bass, c.noise, c.punch];
+		const slow = this.localSlow;
+		if (!this.localPrimed) {
+			for (let i = 0; i < LOCAL_FEATURES; i += 1) slow[i] = now[i];
+			this.localPrimed = true;
+			return 0;
+		}
+		// Right after a shift the envelopes are still settling on the new
+		// music: keep re-referencing, so the settling is not a second shift.
+		const settling = this.sinceAnyShift < 3 || this.sourceAge < 2.5;
+		const k = settling ? 1 : 1 - Math.exp(-dt / LOCAL_SLOW_TAU_S);
+		let distance = 0;
+		for (let i = 0; i < LOCAL_FEATURES; i += 1) {
+			slow[i] += (now[i] - slow[i]) * k;
+			distance += Math.abs(now[i] - slow[i]) * LOCAL_WEIGHTS[i];
+		}
+		const contrast = distance / LOCAL_WEIGHT_SUM;
+		this.frame.shifts.contrast = contrast;
+		// The change must hold briefly, so the hearing has caught up with the
+		// new music before the scene is re-picked for it.
+		this.localHeld = contrast >= LOCAL_THRESHOLD ? this.localHeld + dt : 0;
+		if (settling || this.sinceAnyShift < LOCAL_REFRACTORY_S || this.localHeld < 0.25) return 0;
+		return clamp01(0.5 + (contrast - LOCAL_THRESHOLD) * 3);
+	}
+
+	private applyShift(
+		character: Readonly<MusicCharacter>,
+		energy: number,
+		strength: number,
+		context: LoomLookContext
+	): void {
+		this.sinceAnyShift = 0;
+		// The new music becomes the reference, so one change fires once.
+		const c0 = character;
+		const now = [c0.tempo, c0.energy, c0.brightness, c0.bass, c0.noise, c0.punch];
+		for (let i = 0; i < LOCAL_FEATURES; i += 1) this.localSlow[i] = now[i];
+		this.localPrimed = true;
+		this.fit(character, energy, 7);
+		// Any shift that fires is a change of character: answer it with a whole
+		// new scene (palette, place, camera, era), not a partial one.
+		strength = Math.max(strength, 0.9);
+		// Prefer a family that reads as a different colour world, and a place
+		// built differently (threads or none, mist or mirror).
+		const palettes = this.fitWeights.palette;
+		const current = this.frame.paletteIndex;
+		for (let i = 0; i < palettes.length; i += 1) {
+			// Judge the family the option will actually land on (dark eras remap).
+			const family = this.mapPalette(i, context);
+			// Cubed: close to the best-fitting family in another colour world.
+			palettes[i] = (palettes[i] * (0.02 + smoothstep(0.35, 0.9, paletteDistance(current, family)))) ** 3 + 1e-6;
+		}
+		this.genome.setWeights('palette', palettes);
+		const places = this.fitWeights.environment;
+		const here = this.frame.env;
+		for (let i = 0; i < places.length; i += 1) {
+			const e = LOOM_ENVIRONMENTS[i];
+			const apart = Math.abs(e.threads - here.threads) + Math.abs(e.mist - here.mist) + Math.abs(e.reflect - here.reflect) * 0.5;
+			places[i] *= 0.05 + Math.min(1, apart);
+		}
+		this.genome.setWeights('environment', places);
+		const g = this.genome;
+		g.shift(strength, Math.max(energy, character.energy));
+		const amount = 0.35 + strength * 0.4;
+		const c = character;
+		g.pull('strands', c.energy * 0.6 + c.noise * 0.4, amount);
+		g.pull('twist', c.tempo, amount * 0.6);
+		g.pull('crossings', c.punch * 0.5 + c.noise * 0.5, amount);
+		g.pull('curvature', c.motion, amount * 0.6);
+		g.pull('symmetry', 1 - c.noise, amount);
+		g.pull('scale', 0.2 + c.bass * 0.6, amount * 0.6);
+		g.pull('trail', 1 - c.tempo, amount);
+		g.pull('bloom', c.energy, amount);
+		g.pull('vivid', c.valence * 0.6 + c.energy * 0.4, amount);
+		g.pull('lightWarmth', clamp01(0.5 + (c.valence - 0.5) * 1.2 - (c.brightness - 0.45) * 0.8), amount);
+	}
+
+	private axis(name: string): number {
+		return this.axisValues.get(name) ?? this.genome.value(name);
+	}
+
+	private followAxes(dtSeconds: number, speed: number, first: boolean): void {
+		const targets = this.genome.targetVector();
+		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
+		// Fast for two seconds after a shift, back to the authored glide by six.
+		const landing = 1 + 4 * Math.max(0, Math.min(1, (6 - this.sinceAnyShift) / 4));
+		const rate = Math.max(speed, landing);
+		const snap = first || !this.axesReady;
+		for (const { axis, index } of CONTINUOUS_AXES) {
+			const range = axis.max - axis.min;
+			const goal = axis.min + (targets[index] ?? 0.5) * range;
+			const current = this.axisValues.get(axis.name);
+			if (snap || current === undefined) {
+				this.axisValues.set(axis.name, goal);
+				continue;
+			}
+			const k = 1 - Math.exp((-dt * rate) / Math.max(0.05, axis.tau));
+			let delta = goal - current;
+			if (axis.wrap) {
+				delta = delta % range;
+				if (delta > range / 2) delta -= range;
+				if (delta < -range / 2) delta += range;
+				let next = current + delta * k;
+				next = axis.min + ((((next - axis.min) % range) + range) % range);
+				this.axisValues.set(axis.name, next);
+			} else {
+				this.axisValues.set(axis.name, current + delta * k);
+			}
+		}
+		this.axesReady = true;
+	}
+
+	/** Glide the character-driven weave parameters (seconds; under one after a shift). */
+	private followCharacter(character: Readonly<MusicCharacter> | null, dtSeconds: number, speed: number): void {
+		const goal = this.weaveGoal;
+		if (character) weaveTarget(goal, character);
+		else Object.assign(goal, neutralWeave());
+		const weave = this.frame.weave;
+		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
+		// Slow in steady state, so beat-rate wobble in the hearing never tints
+		// the scene; after a shift the genome's glide speed makes it fast.
+		// Like the axes: fast for two seconds after a shift, so the new scene
+		// settles and then holds instead of creeping on for several seconds.
+		const landing = 1 + 4 * Math.max(0, Math.min(1, (6 - this.sinceAnyShift) / 4));
+		const fast = Math.max(1, speed, landing);
+		const ready = this.weaveReady;
+		this.weaveReady = true;
+		for (const key of WEAVE_KEYS) {
+			// Colour lands in under a second after a shift; ribbon width,
+			// churn and fraying take about a second, so the strands never jolt.
+			const tau = WEAVE_GEOMETRY.has(key) ? Math.max(1.0, 2.2 / fast) : Math.max(0.6, 2.2 / fast ** 1.3);
+			const k = ready ? 1 - Math.exp(-dt / tau) : 1;
+			weave[key] = lerp(weave[key], goal[key], k);
+		}
+		Object.assign(this.target.weave, weave);
 	}
 
 	private choice(
@@ -824,11 +1455,13 @@ export class LoomLook {
 		const goal =
 			pinned !== undefined && Number.isFinite(pinned) ? pinned : (target ?? this.genome.choice(name).to);
 		const morph = this.morphs[name];
-		return first ? morph.snap(goal) : morph.update(goal, dt);
+		if (first) return morph.snap(goal);
+		morph.realDt = this.realDt;
+		return morph.update(goal, dt, MORPH_MAX_RATE[name] ?? Infinity);
 	}
 
 	private mapPalette(raw: number, context: LoomLookContext): number {
-		const vivid = this.genome.value('vivid');
+		const vivid = this.axis('vivid');
 		const family = LOOM_PALETTES[raw];
 		const gate = hashUnit(raw * 31 + 7, this.genome.boundaries.sections);
 		if (family?.dark) {
@@ -845,10 +1478,12 @@ export class LoomLook {
 		out: LoomLookFrame,
 		context: LoomLookContext,
 		override: LoomLookOverride | null,
-		first: boolean
+		first: boolean,
+		speed = 1
 	): void {
 		const g = this.genome;
-		const dt = context.dt;
+		const dt = context.dt * speed;
+		this.realDt = Math.max(0, Math.min(0.5, Number.isFinite(context.dt) ? context.dt : 0));
 		// Palette families are re-mapped once, at the moment a raw option becomes
 		// the genome's target, so a crossfade never flips mid-way.
 		const rawPalette = g.choice('palette').to;
@@ -872,18 +1507,19 @@ export class LoomLook {
 		out.grammarMix = grammar.mix;
 		const gFrom = LOOM_GRAMMARS[grammar.from] ?? LOOM_GRAMMARS[0];
 		const gTo = LOOM_GRAMMARS[grammar.to] ?? LOOM_GRAMMARS[0];
-		const strands = g.value('strands');
+		const strands = this.axis('strands');
 		out.strandCount = lerp(
 			lerp(gFrom.strands[0], gFrom.strands[1], strands),
 			lerp(gTo.strands[0], gTo.strands[1], strands),
 			grammar.mix
 		);
 		out.density = lerp(gFrom.density, gTo.density, grammar.mix);
-		out.twist = g.value('twist');
-		out.crossings = g.value('crossings');
-		out.spread = g.value('spread');
-		out.symmetry = g.value('symmetry');
-		out.curvature = g.value('curvature');
+		out.floorY = lerp(gFrom.floor, gTo.floor, grammar.mix);
+		out.twist = this.axis('twist');
+		out.crossings = this.axis('crossings');
+		out.spread = this.axis('spread');
+		out.symmetry = this.axis('symmetry');
+		out.curvature = this.axis('curvature');
 		const tFrom = LOOM_THICKNESS[thickness.from] ?? LOOM_THICKNESS[0];
 		const tTo = LOOM_THICKNESS[thickness.to] ?? LOOM_THICKNESS[0];
 		out.taper = lerp(tFrom.taper, tTo.taper, thickness.mix);
@@ -893,11 +1529,20 @@ export class LoomLook {
 		const kFrom = LOOM_COMPOSITIONS[composition.from] ?? LOOM_COMPOSITIONS[0];
 		const kTo = LOOM_COMPOSITIONS[composition.to] ?? LOOM_COMPOSITIONS[0];
 		const compScale = lerp(kFrom.scale, kTo.scale, composition.mix);
-		const scaleAxis = g.value('scale');
+		const scaleAxis = this.axis('scale');
 		// Dense grammars sit a little smaller so they keep negative space round them.
 		out.frameScale =
 			lerp(gFrom.scale, gTo.scale, grammar.mix) * (0.88 + scaleAxis * 0.24) * compScale * (1.04 - out.density * 0.08);
-		const framing = g.value('framing');
+		// Never lose the figure: a small composition seen from a far camera
+		// keeps a minimum apparent size (smoothed with everything else).
+		const camScale = lerp(
+			(LOOM_CAMERAS[camera.from] ?? LOOM_CAMERAS[0]).distance,
+			(LOOM_CAMERAS[camera.to] ?? LOOM_CAMERAS[0]).distance,
+			camera.mix
+		);
+		const apparent = out.frameScale / Math.max(0.4, camScale);
+		if (apparent < 0.74) out.frameScale *= 0.74 / apparent;
+		const framing = this.axis('framing');
 		out.frameShiftX = framing * 0.1 + lerp(kFrom.shiftX, kTo.shiftX, composition.mix);
 		out.frameShiftY = lerp(kFrom.shiftY, kTo.shiftY, composition.mix);
 		out.frameTilt = framing * 0.06;
@@ -907,7 +1552,7 @@ export class LoomLook {
 		const famTo = PALETTE_RGB[palette.to] ?? PALETTE_RGB[0];
 		const orderFrom = LOOM_ROLE_ORDERS[roles.from] ?? LOOM_ROLE_ORDERS[0];
 		const orderTo = LOOM_ROLE_ORDERS[roles.to] ?? LOOM_ROLE_ORDERS[0];
-		const hueLean = Math.sin(g.value('hueDrift') * Math.PI * 2) * 0.045 + (context.key - 0.5) * 0.05;
+		const hueLean = Math.sin(this.axis('hueDrift') * Math.PI * 2) * 0.045 + (context.key - 0.5) * 0.05;
 		const roleColor = (fam: ResolvedPalette, slot: number): Rgb =>
 			slot === 0 ? fam.hero : slot === 1 ? fam.support : fam.weft;
 		const blendRole = (dst: Rgb, role: number) => {
@@ -927,6 +1572,10 @@ export class LoomLook {
 		blendRole(out.hero, 0);
 		blendRole(out.support, 1);
 		blendRole(out.weft, 2);
+		const warmth = this.frame.weave.warmth;
+		whiteBalance(out.hero, warmth);
+		whiteBalance(out.support, warmth);
+		whiteBalance(out.weft, warmth);
 		const blendEnv = (dst: Rgb, key: 'deep' | 'haze' | 'glow') => {
 			for (let c = 0; c < 3; c += 1) this.scratch[c] = lerp(famFrom[key][c], famTo[key][c], palette.mix);
 			rotateHue(dst, this.scratch, hueLean * 0.6);
@@ -943,7 +1592,6 @@ export class LoomLook {
 		const tm = tone.mix;
 		out.toneEmission = lerp(oFrom.emission, oTo.emission, tm);
 		out.toneDiffuse = lerp(oFrom.diffuse, oTo.diffuse, tm);
-		out.tonePaper = lerp(oFrom.paper, oTo.paper, tm);
 		out.toneRoom = lerp(oFrom.room, oTo.room, tm);
 		out.toneMono = lerp(oFrom.mono, oTo.mono, tm);
 		out.toneBloom = lerp(oFrom.bloom, oTo.bloom, tm);
@@ -958,12 +1606,6 @@ export class LoomLook {
 				out.deep[c] = lerp(out.deep[c], h[c] * 0.01, m * 0.85);
 				out.haze[c] = lerp(out.haze[c], h[c] * 0.06, m * 0.85);
 				out.glow[c] = lerp(out.glow[c], h[c] * 0.55, m * 0.8);
-			}
-		}
-		if (out.toneRoom > 0.001) {
-			const r = out.toneRoom;
-			for (let c = 0; c < 3; c += 1) {
-				out.deep[c] = lerp(out.deep[c], out.haze[c] * 1.1 + out.glow[c] * 0.03, r * 0.75);
 			}
 		}
 
@@ -985,24 +1627,22 @@ export class LoomLook {
 		out.focal = lerp(cFrom.focal, cTo.focal, cm);
 		out.lensShiftX = lerp(cFrom.shiftX, cTo.shiftX, cm) + out.frameShiftX;
 		out.lensShiftY = lerp(cFrom.shiftY, cTo.shiftY, cm) + out.frameShiftY;
-		out.floorAmount = lerp(cFrom.floor, cTo.floor, cm);
-		out.floorLine = lerp(cFrom.floorLine, cTo.floorLine, cm);
 		const orbitRate = lerp(cFrom.orbit, cTo.orbit, cm);
-		const drift = g.value('drift');
+		const drift = this.axis('drift');
 		this.orbit += orbitRate * (drift >= 0 ? 1 : -1) * Math.max(0, Math.min(0.25, context.dt));
 		out.orbit = this.orbit;
 		out.cameraIndex = camera.to;
 
-		out.keyAzimuth = g.value('lightAzimuth');
+		out.keyAzimuth = this.axis('lightAzimuth');
 		out.keyElevation = 0.55 + out.symmetry * 0.3;
-		out.lightWarmth = g.value('lightWarmth');
+		out.lightWarmth = this.axis('lightWarmth');
 		out.fillLevel = 0.45 + (1 - out.lightWarmth) * 0.35;
 
 		for (let i = 0; i < out.beat.length; i += 1) {
 			out.beat[i] = (beatForm.from === i ? 1 - beatForm.mix : 0) + (beatForm.to === i ? beatForm.mix : 0);
 		}
-		out.trail = g.value('trail');
-		out.bloom = g.value('bloom');
+		out.trail = this.axis('trail');
+		out.bloom = this.axis('bloom');
 		out.drift = drift;
 
 		out.names.grammar = gTo.name;
@@ -1019,13 +1659,24 @@ export class LoomLook {
 	 * A last, short glide over every resolved number, so nothing the genome
 	 * does can produce a visible jump.
 	 */
-	private smooth(dtSeconds: number): void {
+	private smooth(dtSeconds: number, speed = 1): void {
 		const out = this.frame;
 		const src = this.target;
 		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
-		const k = this.smoothedReady ? 1 - Math.exp(-dt / 0.35) : 1;
+		const ready = this.smoothedReady;
+		const k = ready ? 1 - Math.exp((-dt * Math.min(2, Math.max(1, speed))) / 0.35) : 1;
 		this.smoothedReady = true;
-		for (const key of NUMERIC_KEYS) out[key] = lerp(out[key], src[key], k);
+		for (const key of NUMERIC_KEYS) {
+			const previous = out[key];
+			out[key] = lerp(previous, src[key], k);
+			// Scale travels at a bounded speed (log space), so a small figure
+			// never balloons to fill the frame in a second: a zoom, not a cut.
+			if (ready && SCALE_KEYS.has(key) && previous > 0 && out[key] > 0) {
+				const limit = SCALE_RATE * dt;
+				const step = Math.log(out[key] / previous);
+				if (Math.abs(step) > limit) out[key] = previous * Math.exp(Math.sign(step) * limit);
+			}
+		}
 		for (const key of MATERIAL_KEYS) out.material[key] = lerp(out.material[key], src.material[key], k);
 		for (const key of ENV_KEYS) out.env[key] = lerp(out.env[key], src.env[key], k);
 		for (const key of COLOUR_KEYS) {
@@ -1049,11 +1700,16 @@ export class LoomLook {
 		input.density = f.density;
 		input.strandCount = f.strandCount;
 		input.tone.emission = f.toneEmission;
-		input.tone.paper = f.tonePaper;
 		input.tone.room = f.toneRoom;
 		input.tone.bloom = f.toneBloom;
 		input.tone.trail = f.toneTrail;
 		resolveLoomExposure(input, f.exposure);
+		// Light value follows the music's brightness and mood after the budget
+		// has normalised the palette, so it is not normalised away.
+		const value = f.weave.value;
+		f.exposure.heroGain *= value;
+		f.exposure.supportGain *= value;
+		f.exposure.weftGain *= value;
 	}
 }
 
