@@ -11,8 +11,6 @@
 		PRESET_NAMES,
 		VISUALIZER_CATALOG,
 		VISUALIZER_ENGINES,
-		VISUALIZER_RESPONSE_LABELS,
-		VISUALIZER_RESPONSES,
 		useVisualizer,
 		type AudioFeatures,
 		type VisualizerEngine
@@ -398,16 +396,6 @@
 					>
 						{VISUALIZER_CATALOG.loom.name}
 					</button>
-				</div>
-				<div class="flex overflow-hidden rounded border border-white/20">
-					{#each VISUALIZER_RESPONSES as response}
-						<button
-							onclick={() => vis.setResponse(response)}
-							class={`border-l border-white/20 px-2 py-1 first:border-l-0 ${vis.response === response ? 'bg-white text-black' : 'bg-black/40 text-white/60 hover:bg-white/10'}`}
-						>
-							{VISUALIZER_RESPONSE_LABELS[response]}
-						</button>
-					{/each}
 				</div>
 				<label class="flex items-center gap-2 rounded border border-white/20 bg-black/40 px-2 py-1">
 					<input

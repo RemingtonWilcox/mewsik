@@ -177,6 +177,18 @@ export class VariationGenome {
 		});
 	}
 
+	/**
+	 * Continue into a new source (next song, new station) without a cut: keep
+	 * every current value, target and crossfade, and only change the seed that
+	 * drives future mutations. The first frame of the new source is not a
+	 * boundary.
+	 */
+	reseed(seed: number | string): void {
+		this.seed = seedWord(seed);
+		this.lastPhrase = null;
+		this.lastSection = null;
+	}
+
 	/** Feed one frame of musical context. Mutations happen only on boundaries. */
 	advance(input: VariationInput): void {
 		const energy = Math.min(1, Math.max(0, Number.isFinite(input.energy) ? input.energy : 0));

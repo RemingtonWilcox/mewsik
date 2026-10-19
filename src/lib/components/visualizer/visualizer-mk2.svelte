@@ -30,7 +30,7 @@
 
 	import { onMount, onDestroy } from 'svelte';
 	import {
-		VISUALIZER_RESPONSE_PROFILES,
+		VISUALIZER_TUNING,
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
@@ -1742,7 +1742,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		currentForm = dominantLifecycleForm(journey);
 		currentGesture = dominantGesture(journey);
 
-		const response = VISUALIZER_RESPONSE_PROFILES.mk2[vis.response];
+		const response = VISUALIZER_TUNING.mk2;
 		somaPaletteRoles(directed.palette, directed.context.keyMode, paletteRoles);
 
 		// Silence: an absent or near-silent analyzer slowly dims the organism.

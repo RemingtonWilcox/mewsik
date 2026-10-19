@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import {
-		VISUALIZER_RESPONSE_PROFILES,
+		VISUALIZER_TUNING,
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
@@ -579,7 +579,7 @@
 		}
 		const beatPhase = clamp(clock.beatPhase, 0, 1);
 		beatGlow = approach(beatGlow, feature ? Math.exp(-beatPhase * 5) : 0, 30, dt);
-		const response = VISUALIZER_RESPONSE_PROFILES.loom[vis.response];
+		const response = VISUALIZER_TUNING.loom;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
 		swayPhase +=

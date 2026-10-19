@@ -7,23 +7,15 @@ import {
 	VisualizerJourneyRuntime,
 	type VisualizerJourneySnapshot
 } from '$lib/visualizer/journey';
-import {
-	VISUALIZER_ENGINES,
-	VISUALIZER_RESPONSES,
-	type VisualizerEngine,
-	type VisualizerResponse
-} from '$lib/visualizer/catalog';
+import { VISUALIZER_ENGINES, type VisualizerEngine } from '$lib/visualizer/catalog';
 
 export type { VisualizerJourneySnapshot } from '$lib/visualizer/journey';
 export {
 	VISUALIZER_CATALOG,
 	VISUALIZER_ENGINES,
-	VISUALIZER_RESPONSE_LABELS,
-	VISUALIZER_RESPONSE_PROFILES,
-	VISUALIZER_RESPONSES,
+	VISUALIZER_TUNING,
 	adjacentVisualizer,
-	type VisualizerEngine,
-	type VisualizerResponse
+	type VisualizerEngine
 } from '$lib/visualizer/catalog';
 
 export type AudioFeatures = AudioFeatureFrame;
@@ -63,7 +55,6 @@ function migrateSavedEngine(saved: string): VisualizerEngine {
 class VisualizerState {
 	active = $state(false);
 	engine = $state<VisualizerEngine>('mk1');
-	response = $state<VisualizerResponse>('flow');
 	// Prism keeps one production scene; `preset` reports the actual rendered
 	// scene so the browser lab can truthfully inspect its alternate generators.
 	preset = $state(0);
@@ -97,13 +88,14 @@ class VisualizerState {
 		}
 	}
 
-	setResponse(response: VisualizerResponse) {
-		this.response = response;
-		try {
-			localStorage.setItem('mewsik.visualizer.response', response);
-		} catch {
-			// Storage can be unavailable in restricted webviews; keep runtime state.
-		}
+	/**
+	 * Engine look state that must outlive renderer remounts and song changes:
+	 * created once per app session and never reset by a new source. Engines
+	 * reseed it softly on a new source so the picture carries on instead of
+	 * restarting (see VariationGenome.reseed).
+	 */
+	persistentLook<T>(key: string, create: () => T): T {
+		return this.journeyRuntime.persistentLook(key, create);
 	}
 
 	/** Restore the saved engine synchronously before an engine component mounts. */
@@ -119,12 +111,8 @@ class VisualizerState {
 					localStorage.setItem('mewsik.visualizer.engine', migrated);
 				}
 			}
-			const savedResponse = localStorage.getItem('mewsik.visualizer.response');
-			if (VISUALIZER_RESPONSES.includes(savedResponse as VisualizerResponse)) {
-				this.response = savedResponse as VisualizerResponse;
-			} else if (savedResponse !== null) {
-				localStorage.setItem('mewsik.visualizer.response', this.response);
-			}
+			// The Calm/Flow/Surge switch was removed; drop its stale preference.
+			localStorage.removeItem('mewsik.visualizer.response');
 		} catch {
 			// Storage can be unavailable in restricted webviews; retain Mk1.
 		}

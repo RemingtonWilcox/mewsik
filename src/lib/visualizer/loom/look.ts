@@ -518,6 +518,11 @@ export class LoomLook {
 		this.reset(seed);
 	}
 
+	/** Carry the current look into a new source: only future mutations change. */
+	continueWith(seed: number | string): void {
+		this.genome.reseed(seed);
+	}
+
 	reset(seed: number | string): void {
 		this.genome.reset(seed);
 		this.warmed = false;

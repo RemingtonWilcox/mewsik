@@ -2,10 +2,6 @@ export const VISUALIZER_ENGINES = ['mk1', 'mk2', 'signal', 'loom'] as const;
 
 export type VisualizerEngine = (typeof VISUALIZER_ENGINES)[number];
 
-export const VISUALIZER_RESPONSES = ['still', 'flow', 'surge'] as const;
-
-export type VisualizerResponse = (typeof VISUALIZER_RESPONSES)[number];
-
 export type VisualizerIdentity = {
 	name: string;
 	subtitle: string;
@@ -50,51 +46,15 @@ export const VISUALIZER_CATALOG: Record<VisualizerEngine, VisualizerIdentity> = 
 	}
 };
 
-export const VISUALIZER_RESPONSE_LABELS: Record<VisualizerResponse, string> = {
-	still: 'Calm',
-	flow: 'Flow',
-	surge: 'Surge'
-};
-
-// Shared response profiles keep the UI modes honest across renderers. Flow is
-// deliberately the exact authored baseline (unit multipliers, zero offsets),
-// while Still and Surge only scale intensity around that identity.
-export const VISUALIZER_RESPONSE_PROFILES = {
-	mk1: {
-		still: { motion: 0.64, impact: 0.62, bloomThresholdOffset: 0.12, feedbackFadeOffset: -0.025 },
-		flow: { motion: 1, impact: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
-		surge: { motion: 1.22, impact: 1.18, bloomThresholdOffset: -0.1, feedbackFadeOffset: 0.02 }
-	},
-	mk2: {
-		still: { motion: 0.68, impact: 0.62, fog: 0.9, shafts: 0.84 },
-		flow: { motion: 1, impact: 1, fog: 1, shafts: 1 },
-		surge: { motion: 1.15, impact: 1.18, fog: 1.08, shafts: 1.1 }
-	},
-	signal: {
-		still: { motion: 0.76, impact: 0.62, persistenceOffset: -0.018, stroke: 0.82, saturation: 0.88 },
-		flow: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
-		surge: { motion: 1.12, impact: 1.18, persistenceOffset: 0.01, stroke: 1.1, saturation: 1.06 }
-	},
-	loom: {
-		still: {
-			motion: 0.68,
-			impact: 0.62,
-			width: 0.88,
-			glow: 0.76,
-			bloomThresholdOffset: 0.12,
-			feedbackFadeOffset: -0.03
-		},
-		flow: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
-		surge: {
-			motion: 1.16,
-			impact: 1.2,
-			width: 1.08,
-			glow: 1.14,
-			bloomThresholdOffset: -0.1,
-			feedbackFadeOffset: 0.02
-		}
-	}
-} as const satisfies Record<VisualizerEngine, Record<VisualizerResponse, Record<string, number>>>;
+// Per-engine tuning constants. These used to be the "Flow" column of a
+// Calm/Flow/Surge response switch that never meaningfully changed the
+// picture; the switch is gone and every engine runs its authored baseline.
+export const VISUALIZER_TUNING = {
+	mk1: { motion: 1, impact: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 },
+	mk2: { motion: 1, impact: 1, fog: 1, shafts: 1 },
+	signal: { motion: 1, impact: 1, persistenceOffset: 0, stroke: 1, saturation: 1 },
+	loom: { motion: 1, impact: 1, width: 1, glow: 1, bloomThresholdOffset: 0, feedbackFadeOffset: 0 }
+} as const satisfies Record<VisualizerEngine, Record<string, number>>;
 
 export function adjacentVisualizer(
 	engine: VisualizerEngine,

@@ -76,7 +76,7 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByText(/Loom · harmonic weave/).last()).toBeVisible();
 	});
 
-	test('named production rail uses arrows, retires V, persists response, and Escape closes', async ({ page }) => {
+	test('named production rail uses arrows, retires V, and Escape closes', async ({ page }) => {
 		await page.addInitScript(() => {
 			localStorage.setItem('mewsik.visualizer.engine', 'auto');
 		});
@@ -131,15 +131,6 @@ test.describe('visualizer engine roster', () => {
 		await expectProductionEngine(page, 'loom');
 		await page.keyboard.press('ArrowLeft');
 		await expectProductionEngine(page, 'signal');
-		await page.getByRole('button', { name: /Signal: Phosphor score\. Show details/ }).click();
-		await page.getByRole('button', { name: 'Calm', exact: true }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'still'
-		);
-		await expect
-			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
-			.toBe('still');
 		await page.keyboard.press('Escape');
 		await expect(page.locator('[data-visualizer-host]')).toHaveCount(0);
 		await expect(page.getByRole('button', { name: 'Close visualizer' })).toHaveCount(0);
@@ -230,100 +221,6 @@ test.describe('visualizer engine roster', () => {
 
 		await page.keyboard.press('Escape');
 		await expect(opener).toBeFocused();
-	});
-
-	test('response mode repairs invalid storage and hydrates across a reload', async ({ page }) => {
-		await page.addInitScript(() => {
-			if (sessionStorage.getItem('response-seeded')) return;
-			sessionStorage.setItem('response-seeded', 'true');
-			localStorage.setItem('mewsik.visualizer.response', 'maximum-chaos');
-		});
-		await page.goto('/');
-		await page.getByRole('button', { name: 'Visualizer' }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'flow'
-		);
-		await expect
-			.poll(() => page.evaluate(() => localStorage.getItem('mewsik.visualizer.response')))
-			.toBe('flow');
-
-		await page.keyboard.press('i');
-		await page.getByRole('button', { name: 'Surge', exact: true }).click();
-		await page.keyboard.press('Escape');
-		await page.reload();
-		await page.getByRole('button', { name: 'Visualizer' }).click();
-		await expect(page.locator('[data-visualizer-host]')).toHaveAttribute(
-			'data-visualizer-response',
-			'surge'
-		);
-	});
-
-	test('response profiles preserve Flow and scale Calm through Surge monotonically', async ({ page }) => {
-		await page.goto('/');
-		const profiles = await page.evaluate(async () => {
-			const modulePath = '/src/lib/visualizer/catalog.ts';
-			const { VISUALIZER_RESPONSE_PROFILES } = await import(modulePath);
-			return VISUALIZER_RESPONSE_PROFILES;
-		});
-
-		expect(profiles.mk1.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			bloomThresholdOffset: 0,
-			feedbackFadeOffset: 0
-		});
-		expect(profiles.mk2.flow).toEqual({ motion: 1, impact: 1, fog: 1, shafts: 1 });
-		expect(profiles.signal.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			persistenceOffset: 0,
-			stroke: 1,
-			saturation: 1
-		});
-		expect(profiles.loom.flow).toEqual({
-			motion: 1,
-			impact: 1,
-			width: 1,
-			glow: 1,
-			bloomThresholdOffset: 0,
-			feedbackFadeOffset: 0
-		});
-
-		for (const rail of ['motion', 'impact'] as const) {
-			expect(profiles.mk1.still[rail]).toBeLessThan(profiles.mk1.flow[rail]);
-			expect(profiles.mk1.flow[rail]).toBeLessThan(profiles.mk1.surge[rail]);
-			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
-			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
-			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
-			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
-			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
-			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
-		}
-		for (const rail of ['fog', 'shafts'] as const) {
-			expect(profiles.mk2.still[rail]).toBeLessThan(profiles.mk2.flow[rail]);
-			expect(profiles.mk2.flow[rail]).toBeLessThan(profiles.mk2.surge[rail]);
-		}
-		for (const rail of ['persistenceOffset', 'stroke', 'saturation'] as const) {
-			expect(profiles.signal.still[rail]).toBeLessThan(profiles.signal.flow[rail]);
-			expect(profiles.signal.flow[rail]).toBeLessThan(profiles.signal.surge[rail]);
-		}
-		for (const rail of ['width', 'glow'] as const) {
-			expect(profiles.loom.still[rail]).toBeLessThan(profiles.loom.flow[rail]);
-			expect(profiles.loom.flow[rail]).toBeLessThan(profiles.loom.surge[rail]);
-		}
-		expect(profiles.mk1.still.feedbackFadeOffset).toBeLessThan(
-			profiles.mk1.flow.feedbackFadeOffset
-		);
-		expect(profiles.mk1.flow.feedbackFadeOffset).toBeLessThan(
-			profiles.mk1.surge.feedbackFadeOffset
-		);
-		expect(profiles.mk1.still.bloomThresholdOffset).toBeGreaterThan(
-			profiles.mk1.flow.bloomThresholdOffset
-		);
-		expect(profiles.mk1.flow.bloomThresholdOffset).toBeGreaterThan(
-			profiles.mk1.surge.bloomThresholdOffset
-		);
 	});
 
 	test('legacy and unknown engines migrate to supported renderers', async ({ browser }) => {

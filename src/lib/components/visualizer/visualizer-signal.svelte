@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
 	import {
-		VISUALIZER_RESPONSE_PROFILES,
+		VISUALIZER_TUNING,
 		useVisualizer,
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
@@ -632,7 +632,7 @@
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
 		const journey = shared.signal;
-		const response = VISUALIZER_RESPONSE_PROFILES.signal[vis.response];
+		const response = VISUALIZER_TUNING.signal;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
 

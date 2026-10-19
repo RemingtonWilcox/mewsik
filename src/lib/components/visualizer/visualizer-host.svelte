@@ -8,12 +8,9 @@
 	import {
 		PRESET_NAMES,
 		VISUALIZER_CATALOG,
-		VISUALIZER_RESPONSE_LABELS,
-		VISUALIZER_RESPONSES,
 		adjacentVisualizer,
 		useVisualizer,
-		type VisualizerJourneySnapshot,
-		type VisualizerResponse
+		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
 	import { useVisualizerChrome } from '$lib/state/visualizer-chrome.svelte';
 
@@ -140,11 +137,6 @@
 		visualizerChrome.wake();
 	}
 
-	function setResponse(response: VisualizerResponse) {
-		vis.setResponse(response);
-		visualizerChrome.wake();
-	}
-
 	function isInteractiveEvent(event: KeyboardEvent): boolean {
 		return event.composedPath().some((node) => {
 			if (!(node instanceof HTMLElement)) return false;
@@ -234,7 +226,6 @@
 		data-visualizer-host
 		data-render-engine={vis.engine}
 		data-engine-name={identity.name}
-		data-visualizer-response={vis.response}
 		data-controls-visible={visualizerChrome.visible}
 		data-controls-mode={visualizerChrome.mode}
 	>
@@ -364,22 +355,6 @@
 						{:else}
 							<span>{hudTopology}</span>
 						{/if}
-					</div>
-
-					<div class="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-						<p class="font-mono text-[10px] uppercase tracking-[0.18em] text-white/40">Response</p>
-						<div class="grid grid-cols-3 overflow-hidden rounded-lg border border-white/15" role="group" aria-label="Visualizer response">
-							{#each VISUALIZER_RESPONSES as response}
-								<button
-									type="button"
-									class={`min-h-10 border-l border-white/10 px-4 font-mono text-[10px] uppercase tracking-[0.15em] transition first:border-l-0 hover:bg-white/10 focus-visible:outline-2 focus-visible:outline-offset-[-3px] focus-visible:outline-white ${vis.response === response ? 'bg-white text-black' : 'text-white/55'}`}
-									aria-pressed={vis.response === response}
-									onclick={() => setResponse(response)}
-								>
-									{VISUALIZER_RESPONSE_LABELS[response]}
-								</button>
-							{/each}
-						</div>
 					</div>
 
 					<p class="mt-4 hidden font-mono text-[10px] uppercase tracking-[0.13em] text-white/30 sm:block">

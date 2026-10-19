@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { VISUALIZER_RESPONSE_PROFILES, useVisualizer } from '$lib/state/visualizer.svelte';
+	import { VISUALIZER_TUNING, useVisualizer } from '$lib/state/visualizer.svelte';
 	import {
 		FixedFrameScheduler,
 		PRISM_FRAME_RATE,
@@ -102,7 +102,13 @@
 	type Comp = PrismStructure & { petalWidth: number; petalReach: number; outerLit: number };
 
 	// The variation genome: Prism's look walks through it at musical boundaries.
-	const genome = new VariationGenome(PRISM_AXES, 0.5);
+	// It is owned by the shared journey, so leaving and re-entering the
+	// visualizer resumes the look and a new song carries it on.
+	const lookState = vis.persistentLook('prism', () => ({
+		genome: new VariationGenome(PRISM_AXES, 0.5),
+		epoch: -1
+	}));
+	const genome = lookState.genome;
 
 	// The far view and the candle-lit apse and crypt shrink the window to a
 	// small light in a black frame. Keep them in the space but rarer, and lift
@@ -535,7 +541,7 @@
 		const sampleAt = Math.max(now, performance.now());
 		const feat = vis.getLatest(sampleAt);
 		const journey = vis.getJourney(sampleAt);
-		const response = VISUALIZER_RESPONSE_PROFILES.mk1[vis.response];
+		const response = VISUALIZER_TUNING.mk1;
 		const directed = journey.director;
 		const spectrum = journey.spectrum;
 		const clock = directed.clock;
@@ -549,7 +555,10 @@
 			rendererSourceEpoch = journey.sourceEpoch;
 			songSeed = journey.seed;
 			seedSalt = Math.floor(clamp(songSeed, 0, 1) * 65_535);
-			genome.reset(songSeed);
+			if (lookState.epoch === -1) genome.reset(songSeed);
+			else if (lookState.epoch !== journey.sourceEpoch) genome.reseed(songSeed);
+			// Same epoch: a renderer remount resumes the look exactly where it was.
+			lookState.epoch = journey.sourceEpoch;
 			applyLookWeights();
 			compA = makeComp(prismStructure(genome, family), family);
 			compB = { ...compA };

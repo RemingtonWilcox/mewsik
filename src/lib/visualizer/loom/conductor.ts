@@ -516,7 +516,9 @@ export class LoomConductor {
 	private cameraPitch = SECTION_PROFILES.intro.cameraPitch;
 	private cameraDistance = SECTION_PROFILES.intro.cameraDistance;
 	private cameraRoll = 0;
-	private readonly look = new LoomLook(0);
+	private look = new LoomLook(0);
+	/** True when the journey owns the look; reset() then leaves it alone. */
+	private sharedLook = false;
 
 	private readonly output: LoomConductorFrame = {
 		section: 'intro',
@@ -559,7 +561,13 @@ export class LoomConductor {
 		look: this.look.frame
 	};
 
-	constructor(seed: LoomSeed = 0) {
+	constructor(seed: LoomSeed = 0, look?: LoomLook) {
+		if (look) {
+			// A journey-owned look carries on across songs instead of restarting.
+			this.look = look;
+			this.sharedLook = true;
+			this.output.look = look.frame;
+		}
 		this.reset(seed);
 	}
 
@@ -567,7 +575,7 @@ export class LoomConductor {
 		this.seed = seed;
 		this.seedWord = signalSeedWord(seed);
 		this.rotationDirection = (this.seedWord & 1) === 0 ? 1 : -1;
-		this.look.reset(seed);
+		if (!this.sharedLook) this.look.reset(seed);
 		const seedUnit = this.seedWord / 0x1_0000_0000;
 		const intro = SECTION_PROFILES.intro;
 
