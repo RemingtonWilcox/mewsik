@@ -1,5 +1,6 @@
 pub mod analyzer;
 pub mod engine;
+pub mod ensemble;
 pub mod http_stream;
 #[cfg(target_os = "ios")]
 pub mod now_playing;

@@ -8,6 +8,7 @@
 	import VisualizerMk2 from '$lib/components/visualizer/visualizer-mk2.svelte';
 	import VisualizerSignal from '$lib/components/visualizer/visualizer-signal.svelte';
 	import VisualizerLoom from '$lib/components/visualizer/visualizer-loom.svelte';
+	import EnsembleOverlay from '$lib/components/visualizer/ensemble-overlay.svelte';
 	import {
 		PRESET_NAMES,
 		VISUALIZER_CATALOG,
@@ -64,6 +65,8 @@
 	let labReady = $state(false);
 	let labProfileReady = $state(false);
 	let chromeVisible = $state(true);
+	// ?ensemble=1 (or the n key): live meters for every ensemble channel.
+	let ensembleOverlay = $state(false);
 	let activeProfileId = $state<SomaLabProfileId>('club128');
 	let activeStageId = $state(SOMA_LAB_PROFILES.club128.defaultStage);
 	let labSeed = $state(DEFAULT_SEED);
@@ -113,6 +116,8 @@
 		url.searchParams.set('chrome', chromeVisible ? '1' : '0');
 		if (songMode) url.searchParams.set('song', '1');
 		else url.searchParams.delete('song');
+		if (ensembleOverlay) url.searchParams.set('ensemble', '1');
+		else url.searchParams.delete('ensemble');
 		replaceState(url, {});
 	}
 
@@ -326,6 +331,7 @@
 			? (requestedEngine as VisualizerEngine)
 			: vis.engine;
 		chromeVisible = params.get('chrome') !== '0';
+		ensembleOverlay = params.get('ensemble') === '1';
 		songMode = params.get('song') === '1';
 		songNewSource = params.get('newsource') === '1';
 		const requestedProfile = getSomaLabProfile(params.get('profile'));
@@ -382,6 +388,10 @@
 		else if (event.key.toLowerCase() === 'r') setEngine('loom');
 		else if (event.key.toLowerCase() === 't') setEngine('mandala');
 		else if (event.key.toLowerCase() === 'c') setChromeVisible(!chromeVisible);
+		else if (event.key.toLowerCase() === 'n') {
+			ensembleOverlay = !ensembleOverlay;
+			updateUrl();
+		}
 	}}
 />
 
@@ -542,7 +552,7 @@
 					<span class="text-emerald-200">{activeProfile.label} · {activeStage.label}</span>
 					<span class="max-w-80 truncate text-white/40">{activeProfile.description}</span>
 				{/if}
-				<span class="text-white/45">keys: q/w/e/r/t engines · c chrome · 0–4 prism scenes</span>
+				<span class="text-white/45">keys: q/w/e/r/t engines · c chrome · n ensemble · 0–4 prism scenes</span>
 				<span class="text-white/40">|</span>
 				{#if vis.latest}
 					<span>bpm {vis.latest.bpm.toFixed(0)}</span>
@@ -556,6 +566,10 @@
 				{/if}
 			</div>
 		</div>
+	{/if}
+
+	{#if labReady && ensembleOverlay}
+		<EnsembleOverlay />
 	{/if}
 
 	{#if labReady}

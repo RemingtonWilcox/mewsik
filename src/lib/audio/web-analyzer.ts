@@ -4,9 +4,13 @@
 //  • iterate on shader code via `pnpm dev` (Vite HMR) instead of Tauri rebuild
 //  • drop any audio file in the lab page to test how the visualizer reacts
 //
-// Outputs an AudioFeatures object compatible with the visualizer store.
+// Outputs an AudioFeatures object compatible with the visualizer store,
+// including the raw ensemble features (chroma vectors, per-layer onsets and
+// the stereo image; see ensemble-features.ts). Works on a live AudioContext
+// and on an OfflineAudioContext (pass the render clock to `tick`).
 
 import type { AudioFeatures } from '$lib/state/visualizer.svelte';
+import { ENSEMBLE_LONG_FFT, EnsembleFeatureExtractor, type StereoSums } from './ensemble-features';
 
 const BIN_COUNT = 64;
 const FFT_SIZE = 2048;
@@ -19,9 +23,15 @@ const SCOPE_WINDOW = 4096;
 const SCOPE_MAX_PAIRS = 2048;
 
 export class WebAnalyzer {
-	private ctx: AudioContext;
+	private ctx: BaseAudioContext;
 	private analyser: AnalyserNode;
 	private frequencyDb: Float32Array;
+	// A second, long analyser for pitch (chroma and bass chroma).
+	private longAnalyser: AnalyserNode;
+	private longDb: Float32Array;
+	private longMags: Float32Array;
+	private readonly ensemble = new EnsembleFeatureExtractor();
+	private readonly stereoSums: StereoSums = { ll: 0, rr: 0, lr: 0, count: 0 };
 	private timeDomain: Float32Array;
 	// Stereo scope: a splitter (which up-mixes a mono source to both outputs)
 	// feeding one time-domain analyser per channel. Each tick sends the pairs
@@ -36,10 +46,10 @@ export class WebAnalyzer {
 	private beatPhase = 0;
 	private bpmCheckCounter = 0;
 	private prevEnergy = 0;
-	private lastEmit = performance.now();
+	private lastEmit = -Infinity;
 	private emitIntervalMs: number;
 
-	constructor(ctx: AudioContext, sourceNode: AudioNode) {
+	constructor(ctx: BaseAudioContext, sourceNode: AudioNode) {
 		this.ctx = ctx;
 		this.analyser = ctx.createAnalyser();
 		this.analyser.fftSize = FFT_SIZE;
@@ -48,6 +58,12 @@ export class WebAnalyzer {
 		this.frequencyDb = new Float32Array(this.analyser.frequencyBinCount);
 		this.timeDomain = new Float32Array(this.analyser.fftSize);
 		this.emitIntervalMs = 1000 / EMIT_HZ;
+		this.longAnalyser = ctx.createAnalyser();
+		this.longAnalyser.fftSize = ENSEMBLE_LONG_FFT;
+		this.longAnalyser.smoothingTimeConstant = 0;
+		sourceNode.connect(this.longAnalyser);
+		this.longDb = new Float32Array(this.longAnalyser.frequencyBinCount);
+		this.longMags = new Float32Array(this.longAnalyser.frequencyBinCount);
 		const splitter = ctx.createChannelSplitter(2);
 		sourceNode.connect(splitter);
 		this.scopeLeft = ctx.createAnalyser();
@@ -72,22 +88,30 @@ export class WebAnalyzer {
 		this.scopeRight.getFloatTimeDomainData(this.scopeR as Float32Array<ArrayBuffer>);
 		const pairs = new Float32Array(count * 2);
 		const offset = SCOPE_WINDOW - count;
+		const sums = this.stereoSums;
 		let peak = 0;
 		for (let index = 0; index < count; index += 1) {
 			const left = this.scopeL[offset + index];
 			const right = this.scopeR[offset + index];
 			pairs[index * 2] = left;
 			pairs[index * 2 + 1] = right;
+			sums.ll += left * left;
+			sums.rr += right * right;
+			sums.lr += left * right;
+			sums.count += 1;
 			peak = Math.max(peak, Math.abs(left), Math.abs(right));
 		}
 		return peak < 1e-4 ? null : pairs;
 	}
 
-	/** Compute features for the current audio frame. Returns null if not yet
-	 *  ready (warming up the flux history). */
-	tick(): AudioFeatures | null {
-		const now = performance.now();
-		if (now - this.lastEmit < this.emitIntervalMs) return null;
+	/** Compute features for the current audio frame. Returns null between
+	 *  emits. `nowMs` defaults to the page clock; an offline render passes its
+	 *  own (`currentTime * 1000`). */
+	tick(nowMs?: number): AudioFeatures | null {
+		const now = nowMs ?? performance.now();
+		// Allow a little early jitter so a 60 Hz rAF never skips every other frame.
+		if (now - this.lastEmit < this.emitIntervalMs * 0.75) return null;
+		const dtSeconds = Number.isFinite(this.lastEmit) ? (now - this.lastEmit) / 1000 : 1 / EMIT_HZ;
 		this.lastEmit = now;
 
 		this.analyser.getFloatFrequencyData(this.frequencyDb as Float32Array<ArrayBuffer>);
@@ -184,7 +208,28 @@ export class WebAnalyzer {
 			}
 		}
 		const bpm = this.beatPeriodFrames > 0 ? (EMIT_HZ * 60) / this.beatPeriodFrames : 0;
+		this.stereoSums.ll = 0;
+		this.stereoSums.rr = 0;
+		this.stereoSums.lr = 0;
+		this.stereoSums.count = 0;
 		const scopePcm = this.scopePairs();
+
+		// Raw ensemble features from the same short spectrum plus the long one.
+		this.longAnalyser.getFloatFrequencyData(this.longDb as Float32Array<ArrayBuffer>);
+		const longNyquistBin = Math.min(this.longDb.length, Math.ceil((5_200 / nyquist) * this.longDb.length));
+		for (let i = 0; i < this.longDb.length; i++) {
+			const db = this.longDb[i];
+			this.longMags[i] = i < longNyquistBin && Number.isFinite(db) ? Math.pow(10, db / 20) : 0;
+		}
+		const ensemble = this.ensemble.process(
+			mags,
+			FFT_SIZE,
+			this.longMags,
+			ENSEMBLE_LONG_FFT,
+			sampleRate,
+			this.stereoSums.count > 0 ? this.stereoSums : null,
+			dtSeconds
+		);
 
 		// Chroma (12 pitch classes)
 		const chroma = new Array(12).fill(0) as number[];
@@ -225,6 +270,7 @@ export class WebAnalyzer {
 			beat_phase: this.beatPhase,
 			chroma_key: chromaKey,
 			chroma_strength: chromaStrength,
+			...ensemble,
 			scope_rate: sampleRate,
 			...(scopePcm ? { scope_pcm: scopePcm } : {})
 		};

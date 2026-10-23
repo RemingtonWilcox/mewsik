@@ -8,8 +8,11 @@
 //! and emits log-grouped magnitude bins + envelope features to the frontend at
 //! ~60Hz. Each event also carries the stereo pairs heard since the previous
 //! one (`scope`), which the Signal visualizer draws as a real XY beam; the
-//! features never read them.
+//! features never read them. The raw ensemble features (chroma vectors,
+//! per-layer onset strengths, stereo image; see `ensemble.rs`) ride along for
+//! the visualizer's ensemble listener.
 
+use super::ensemble::{round3, EnsembleAnalyzer, EnsembleRaw, StereoSums};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use realfft::RealFftPlanner;
@@ -57,6 +60,34 @@ pub struct AudioFeatures {
     // silent. Renderer-only; none of the features above read it.
     pub scope: String,
     pub scope_rate: u32, // pair rate after decimation, Hz
+    // Raw ensemble features (ensemble.rs), rounded to 3 decimals for the
+    // payload. Chroma vectors are 12 pitch classes from C, max-normalised.
+    pub chroma: [f32; 12],      // 100 Hz - 5 kHz, 0..1
+    pub bass_chroma: [f32; 12], // 40 - 250 Hz, 0..1
+    pub onset_kick: f32,        // onset strengths in this frame, 0..1
+    pub onset_snare: f32,
+    pub onset_hat: f32,
+    pub onset_perc: f32,
+    pub onset_tonal: f32,
+    pub stereo_width: f32, // side / (mid + side) RMS, 0..1, 0 = mono
+    pub stereo_corr: f32,  // left/right correlation, -1..1
+}
+
+impl AudioFeatures {
+    /// Copy one frame of raw ensemble features in, rounded for the payload.
+    fn set_ensemble(&mut self, raw: &EnsembleRaw) {
+        for i in 0..12 {
+            self.chroma[i] = round3(raw.chroma[i]);
+            self.bass_chroma[i] = round3(raw.bass_chroma[i]);
+        }
+        self.onset_kick = round3(raw.onsets[0]);
+        self.onset_snare = round3(raw.onsets[1]);
+        self.onset_hat = round3(raw.onsets[2]);
+        self.onset_perc = round3(raw.onsets[3]);
+        self.onset_tonal = round3(raw.onsets[4]);
+        self.stereo_width = round3(raw.stereo_width);
+        self.stereo_corr = round3(raw.stereo_corr);
+    }
 }
 
 pub struct TapFrame {
@@ -301,71 +332,92 @@ pub fn spawn_analyzer(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHa
         .expect("failed to spawn analyzer");
 }
 
-fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>>>) {
-    let mut planner = RealFftPlanner::<f32>::new();
-    let r2c = planner.plan_fft_forward(FFT_SIZE);
-    let mut input = vec![0.0f32; FFT_SIZE];
-    let mut output = r2c.make_output_vec();
-    let mut ring = vec![0.0f32; FFT_SIZE];
-    let mut ring_head: usize = 0;
-    let mut sr: u32;
-    let mut last_emit = Instant::now();
-    let emit_interval = Duration::from_millis(1000 / EMIT_HZ);
-    let mut prev_energy: f32 = 0.0;
-    let mut scope = ScopeCollector::new();
+// BPM tracker: onset flux ring buffer, ~4s long at 60Hz emit. Long enough
+// to autocorrelate down to 60 BPM (1-beat-per-second period).
+const FLUX_HIST_LEN: usize = 256;
 
-    // BPM tracker — onset flux ring buffer, ~4s long at 60Hz emit. Long enough
-    // to autocorrelate down to 60 BPM (1-beat-per-second period).
-    const FLUX_HIST_LEN: usize = 256;
-    let mut flux_hist: VecDeque<f32> = VecDeque::with_capacity(FLUX_HIST_LEN);
-    let mut beat_period_frames: f32 = 0.0; // 0 = no estimate yet
-    let mut beat_phase: f32 = 0.0;
-    let mut bpm_check_counter: u32 = 0;
+/// Everything one analyzer frame is computed from: the mono FFT ring, the
+/// envelope and beat trackers, the scope collector and the ensemble
+/// analyzer. The analyzer thread pushes tapped frames and takes one
+/// `AudioFeatures` per emit; tests drive it the same way from PCM.
+pub(crate) struct FrameAnalyzer {
+    r2c: Arc<dyn realfft::RealToComplex<f32>>,
+    input: Vec<f32>,
+    output: Vec<realfft::num_complex::Complex<f32>>,
+    ring: Vec<f32>,
+    ring_head: usize,
+    sr: u32,
+    prev_energy: f32,
+    scope: ScopeCollector,
+    ensemble: EnsembleAnalyzer,
+    stereo: StereoSums,
+    flux_hist: VecDeque<f32>,
+    beat_period_frames: f32, // 0 = no estimate yet
+    beat_phase: f32,
+    bpm_check_counter: u32,
+    window: Vec<f32>,
+}
 
-    let window: Vec<f32> = (0..FFT_SIZE)
-        .map(|i| {
-            let t = i as f32 / (FFT_SIZE - 1) as f32;
-            0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos()
-        })
-        .collect();
-
-    loop {
-        let first = match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(f) => f,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        };
-        ring[ring_head] = first.sample;
-        ring_head = (ring_head + 1) % FFT_SIZE;
-        sr = first.sample_rate;
-        scope.push(first.left, first.right, first.sample_rate);
-
-        while let Ok(frame) = rx.try_recv() {
-            ring[ring_head] = frame.sample;
-            ring_head = (ring_head + 1) % FFT_SIZE;
-            sr = frame.sample_rate;
-            scope.push(frame.left, frame.right, frame.sample_rate);
+impl FrameAnalyzer {
+    pub(crate) fn new() -> Self {
+        let mut planner = RealFftPlanner::<f32>::new();
+        let r2c = planner.plan_fft_forward(FFT_SIZE);
+        let output = r2c.make_output_vec();
+        Self {
+            r2c,
+            input: vec![0.0f32; FFT_SIZE],
+            output,
+            ring: vec![0.0f32; FFT_SIZE],
+            ring_head: 0,
+            sr: 0,
+            prev_energy: 0.0,
+            scope: ScopeCollector::new(),
+            ensemble: EnsembleAnalyzer::new(),
+            stereo: StereoSums::default(),
+            flux_hist: VecDeque::with_capacity(FLUX_HIST_LEN),
+            beat_period_frames: 0.0,
+            beat_phase: 0.0,
+            bpm_check_counter: 0,
+            window: (0..FFT_SIZE)
+                .map(|i| {
+                    let t = i as f32 / (FFT_SIZE - 1) as f32;
+                    0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos()
+                })
+                .collect(),
         }
+    }
 
-        if last_emit.elapsed() < emit_interval {
-            continue;
-        }
-        last_emit = Instant::now();
+    pub(crate) fn push(&mut self, frame: &TapFrame) {
+        self.ring[self.ring_head] = frame.sample;
+        self.ring_head = (self.ring_head + 1) % FFT_SIZE;
+        self.sr = frame.sample_rate;
+        self.scope.push(frame.left, frame.right, frame.sample_rate);
+        self.ensemble.push(frame.sample);
+        self.stereo.push(frame.left, frame.right);
+    }
+
+    /// One event's features from everything pushed so far. `dt` is the time
+    /// since the previous emit, in seconds.
+    pub(crate) fn emit(&mut self, dt: f64) -> Option<AudioFeatures> {
+        let sr = self.sr;
+        let ensemble_raw = self.ensemble.frame(sr, Some(&self.stereo), dt);
+        self.stereo = StereoSums::default();
 
         // Loudness is a time-domain property. Measure the unwindowed PCM ring;
         // FFT magnitudes stay dedicated to spectral features below.
-        let (rms, peak) = pcm_levels(&ring);
+        let (rms, peak) = pcm_levels(&self.ring);
 
         for i in 0..FFT_SIZE {
-            let src_idx = (ring_head + i) % FFT_SIZE;
-            input[i] = ring[src_idx] * window[i];
+            let src_idx = (self.ring_head + i) % FFT_SIZE;
+            self.input[i] = self.ring[src_idx] * self.window[i];
         }
 
-        if r2c.process(&mut input, &mut output).is_err() {
-            continue;
+        if self.r2c.process(&mut self.input, &mut self.output).is_err() {
+            return None;
         }
 
-        let mags: Vec<f32> = output
+        let mags: Vec<f32> = self
+            .output
             .iter()
             .map(|c| (c.re * c.re + c.im * c.im).sqrt() / FFT_SIZE as f32)
             .collect();
@@ -410,41 +462,41 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         let treble = bins[bass_n + mid_n..].iter().sum::<f32>() / treble_n.max(1) as f32;
 
         let total_energy: f32 = mags.iter().sum();
-        let flux = (total_energy - prev_energy).max(0.0);
-        let onset = flux > prev_energy * 0.3 && prev_energy > 0.01;
-        prev_energy = total_energy * 0.7 + prev_energy * 0.3;
+        let flux = (total_energy - self.prev_energy).max(0.0);
+        let onset = flux > self.prev_energy * 0.3 && self.prev_energy > 0.01;
+        self.prev_energy = total_energy * 0.7 + self.prev_energy * 0.3;
 
         // ── BPM / beat phase: track the onset-flux envelope, autocorrelate
         // every ~0.5s. Beat phase advances per emit and snaps to onsets that
         // land near the expected beat.
-        flux_hist.push_back(flux);
-        if flux_hist.len() > FLUX_HIST_LEN {
-            flux_hist.pop_front();
+        self.flux_hist.push_back(flux);
+        if self.flux_hist.len() > FLUX_HIST_LEN {
+            self.flux_hist.pop_front();
         }
-        if beat_period_frames > 0.0 {
-            beat_phase += 1.0 / beat_period_frames;
-            if beat_phase >= 1.0 {
-                beat_phase -= beat_phase.floor();
+        if self.beat_period_frames > 0.0 {
+            self.beat_phase += 1.0 / self.beat_period_frames;
+            if self.beat_phase >= 1.0 {
+                self.beat_phase -= self.beat_phase.floor();
             }
             // Re-align to strong onsets that arrive near the expected beat.
-            if onset && (beat_phase < 0.18 || beat_phase > 0.82) {
-                beat_phase = 0.0;
+            if onset && (self.beat_phase < 0.18 || self.beat_phase > 0.82) {
+                self.beat_phase = 0.0;
             }
         }
-        bpm_check_counter += 1;
-        if flux_hist.len() >= 128 && bpm_check_counter >= 30 {
-            bpm_check_counter = 0;
-            let new_period = estimate_beat_period(&flux_hist, EMIT_HZ as f32);
+        self.bpm_check_counter += 1;
+        if self.flux_hist.len() >= 128 && self.bpm_check_counter >= 30 {
+            self.bpm_check_counter = 0;
+            let new_period = estimate_beat_period(&self.flux_hist, EMIT_HZ as f32);
             if new_period > 0.0 {
-                beat_period_frames = if beat_period_frames > 0.0 {
-                    beat_period_frames * 0.7 + new_period * 0.3
+                self.beat_period_frames = if self.beat_period_frames > 0.0 {
+                    self.beat_period_frames * 0.7 + new_period * 0.3
                 } else {
                     new_period
                 };
             }
         }
-        let bpm = if beat_period_frames > 0.0 {
-            (EMIT_HZ as f32) * 60.0 / beat_period_frames
+        let bpm = if self.beat_period_frames > 0.0 {
+            (EMIT_HZ as f32) * 60.0 / self.beat_period_frames
         } else {
             0.0
         };
@@ -483,7 +535,7 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             (0.0, 0.0)
         };
 
-        let features = AudioFeatures {
+        let mut features = AudioFeatures {
             bins,
             rms,
             peak,
@@ -494,11 +546,49 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             treble: treble.clamp(0.0, 1.0),
             sample_rate: sr,
             bpm,
-            beat_phase,
+            beat_phase: self.beat_phase,
             chroma_key,
             chroma_strength,
-            scope: scope.drain(),
-            scope_rate: scope.pair_rate(),
+            scope: self.scope.drain(),
+            scope_rate: self.scope.pair_rate(),
+            chroma: [0.0; 12],
+            bass_chroma: [0.0; 12],
+            onset_kick: 0.0,
+            onset_snare: 0.0,
+            onset_hat: 0.0,
+            onset_perc: 0.0,
+            onset_tonal: 0.0,
+            stereo_width: 0.0,
+            stereo_corr: 1.0,
+        };
+        features.set_ensemble(&ensemble_raw);
+        Some(features)
+    }
+}
+
+fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>>>) {
+    let mut analyzer = FrameAnalyzer::new();
+    let mut last_emit = Instant::now();
+    let emit_interval = Duration::from_millis(1000 / EMIT_HZ);
+
+    loop {
+        let first = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(f) => f,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        analyzer.push(&first);
+        while let Ok(frame) = rx.try_recv() {
+            analyzer.push(&frame);
+        }
+
+        let since_emit = last_emit.elapsed();
+        if since_emit < emit_interval {
+            continue;
+        }
+        last_emit = Instant::now();
+        let Some(features) = analyzer.emit(since_emit.as_secs_f64()) else {
+            continue;
         };
 
         let handle = app_handle.lock().clone();
@@ -511,8 +601,8 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
 #[cfg(test)]
 mod tests {
     use super::{
-        base64_encode, pcm_levels, scope_decimation, AudioFeatures, ScopeCollector, BASE64_TABLE,
-        SCOPE_MAX_PAIRS,
+        base64_encode, pcm_levels, scope_decimation, AudioFeatures, EnsembleRaw, ScopeCollector,
+        BASE64_TABLE, SCOPE_MAX_PAIRS,
     };
 
     /// Decode the scope payload back into (left, right) pairs.
@@ -553,6 +643,84 @@ mod tests {
             + 0.22 * (tau * 329.6 * t).sin()
             + 0.07 * (tau * 1975.0 * t + 2.0).sin();
         (left, right)
+    }
+
+    /// Not a check. With ENSEMBLE_WAV_DIR set, runs every 16-bit stereo WAV
+    /// in that folder through the production frame analyzer at 60 Hz and
+    /// writes `<name>.native.json` beside it: the frames the frontend would
+    /// receive (minus the scope), for scoring the ensemble listener on the
+    /// native path. `cargo test dump_native_features -- --ignored`.
+    #[test]
+    #[ignore]
+    fn dump_native_features_for_wavs() {
+        use super::{FrameAnalyzer, TapFrame};
+        let Ok(dir) = std::env::var("ENSEMBLE_WAV_DIR") else {
+            return;
+        };
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("wav") {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let (rate, samples) = parse_wav16(&bytes);
+            let hop = (rate / 60) as usize;
+            let mut analyzer = FrameAnalyzer::new();
+            let mut frames = Vec::new();
+            for (i, pair) in samples.chunks(2).enumerate() {
+                let (left, right) = (pair[0], pair[1]);
+                analyzer.push(&TapFrame {
+                    sample: (left + right) / 2.0,
+                    left,
+                    right,
+                    sample_rate: rate,
+                });
+                if (i + 1) % hop == 0 {
+                    if let Some(features) = analyzer.emit(hop as f64 / rate as f64) {
+                        let mut value = serde_json::to_value(&features).unwrap();
+                        value.as_object_mut().unwrap().remove("scope");
+                        frames.push(serde_json::json!({
+                            "atMs": (i + 1) as f64 * 1000.0 / rate as f64,
+                            "features": value
+                        }));
+                    }
+                }
+            }
+            let out = path.with_extension("native.json");
+            std::fs::write(&out, serde_json::to_string(&frames).unwrap()).unwrap();
+            eprintln!("{} -> {} frames", out.display(), frames.len());
+        }
+    }
+
+    /// Minimal RIFF reader: 16-bit PCM, stereo (mono is duplicated).
+    fn parse_wav16(bytes: &[u8]) -> (u32, Vec<f32>) {
+        let mut at = 12;
+        let mut rate = 44_100;
+        let mut channels = 2;
+        while at + 8 <= bytes.len() {
+            let id = &bytes[at..at + 4];
+            let size = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            let body = &bytes[at + 8..(at + 8 + size).min(bytes.len())];
+            if id == b"fmt " {
+                channels = u16::from_le_bytes([body[2], body[3]]) as usize;
+                rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            } else if id == b"data" {
+                let mut out = Vec::with_capacity(body.len() / 2);
+                for frame in body.chunks_exact(2 * channels) {
+                    let l = i16::from_le_bytes([frame[0], frame[1]]) as f32 / 32768.0;
+                    let r = if channels > 1 {
+                        i16::from_le_bytes([frame[2], frame[3]]) as f32 / 32768.0
+                    } else {
+                        l
+                    };
+                    out.push(l);
+                    out.push(r);
+                }
+                return (rate, out);
+            }
+            at += 8 + size + (size & 1);
+        }
+        (rate, Vec::new())
     }
 
     #[test]
@@ -604,8 +772,9 @@ mod tests {
         )
         .unwrap();
         assert!(as_json.len() > text.len() * 2, "json {}", as_json.len());
-        // Measure the whole event as the frontend receives it.
-        let features = AudioFeatures {
+        // Measure the whole event as the frontend receives it, with a busy
+        // frame of ensemble features (every value a full three decimals).
+        let mut features = AudioFeatures {
             bins: vec![0.523_456_7; 64],
             rms: 0.31,
             peak: 0.82,
@@ -621,15 +790,49 @@ mod tests {
             chroma_strength: 0.3,
             scope: text,
             scope_rate: 48_000,
+            chroma: [0.0; 12],
+            bass_chroma: [0.0; 12],
+            onset_kick: 0.0,
+            onset_snare: 0.0,
+            onset_hat: 0.0,
+            onset_perc: 0.0,
+            onset_tonal: 0.0,
+            stereo_width: 0.0,
+            stereo_corr: 1.0,
         };
+        let busy = EnsembleRaw {
+            chroma: [0.123_456; 12],
+            bass_chroma: [0.654_321; 12],
+            onsets: [0.876_54; 5],
+            stereo_width: 0.234_56,
+            stereo_corr: -0.345_67,
+        };
+        features.set_ensemble(&busy);
         let event = serde_json::to_string(&features).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&event).unwrap();
+        let ensemble_bytes: usize = [
+            "chroma",
+            "bass_chroma",
+            "onset_kick",
+            "onset_snare",
+            "onset_hat",
+            "onset_perc",
+            "onset_tonal",
+            "stereo_width",
+            "stereo_corr",
+        ]
+        .iter()
+        .map(|key| key.len() + 4 + value[*key].to_string().len())
+        .sum();
         eprintln!(
-            "audio:features event: {} bytes ({} of them scope); json i16 scope would be {}",
+            "audio:features event: {} bytes ({} of them scope, {} ensemble); json i16 scope would be {}",
             event.len(),
             features.scope.len(),
+            ensemble_bytes,
             as_json.len()
         );
-        assert!(event.len() < 6_500, "event {} bytes", event.len());
+        assert!(ensemble_bytes < 400, "ensemble {ensemble_bytes} bytes");
+        assert!(event.len() < 6_000, "event {} bytes", event.len());
     }
 
     #[test]

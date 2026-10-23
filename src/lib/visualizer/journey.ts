@@ -16,6 +16,7 @@ import { Mk2Conductor, type Mk2ConductorFrame } from '$lib/visualizer/mk2/conduc
 import { LoomConductor, type LoomConductorFrame } from '$lib/visualizer/loom/conductor';
 import { LoomLook } from '$lib/visualizer/loom/look';
 import { CharacterTracker, type MusicCharacter } from '$lib/visualizer/character';
+import { EnsembleTracker, type EnsembleFrame } from '$lib/visualizer/ensemble';
 
 /**
  * Atomic live view of one journey tick. Nested controller outputs and typed
@@ -33,6 +34,12 @@ export type VisualizerJourneySnapshot = {
 	 * a new song is measured against the previous one.
 	 */
 	readonly character: MusicCharacter;
+	/**
+	 * What each part of the band is doing: per-layer drums, groove, harmony,
+	 * bass, articulation and texture channels (see ensemble.ts for the list).
+	 * Song-specific state resets per source; serials never do.
+	 */
+	readonly ensemble: EnsembleFrame;
 	/** Deterministic per-source visual identity in the 0..1 range. */
 	readonly seed: number;
 	/** Monotonic source generation, so A -> B -> A is three distinct journeys. */
@@ -75,6 +82,7 @@ export class VisualizerJourneyRuntime {
 	private loomLookSeeded = false;
 	private spectrumTracker = new SignalSpectrumTracker();
 	private readonly characterTracker = new CharacterTracker();
+	private readonly ensembleTracker = new EnsembleTracker();
 	private signalConductor: SignalConductor;
 	private mk2Conductor: Mk2Conductor;
 	private loomConductor: LoomConductor;
@@ -136,6 +144,7 @@ export class VisualizerJourneyRuntime {
 		this.mk2Conductor = new Mk2Conductor(this.seed);
 		this.loomConductor = new LoomConductor(this.seed, this.continueLoomLook());
 		this.characterTracker.beginSource();
+		this.ensembleTracker.beginSource();
 		this.snapshot = null;
 		return true;
 	}
@@ -163,6 +172,8 @@ export class VisualizerJourneyRuntime {
 		// Character before the conductors, so any of them can answer a shift
 		// in the same tick it fires.
 		const character = this.characterTracker.update(director, spectrum, dt);
+		// The ensemble is additive: no conductor reads it yet.
+		const ensemble = this.ensembleTracker.update(features, director, spectrum, dt);
 		const signal = this.signalConductor.update(director, spectrum, dt, character);
 		const mk2 = this.mk2Conductor.update(director, spectrum, dt, signal, character);
 		const loom = this.loomConductor.update(director, spectrum, dt, character);
@@ -174,6 +185,7 @@ export class VisualizerJourneyRuntime {
 			mk2,
 			loom,
 			character,
+			ensemble,
 			seed: this.seed,
 			sourceEpoch: this.epoch,
 			timelineSeconds
