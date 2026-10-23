@@ -30,6 +30,7 @@
 
 import { chromium } from 'playwright';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { formatResult, repetitionMetrics } from './lib/repetition-metrics.mjs';
 
 const label = process.argv[2] ?? 'run';
 const engines = (process.env.VIS_ENGINES ?? 'mk1,mandala,mk2,signal,loom').split(',').filter(Boolean);
@@ -57,8 +58,18 @@ async function record(engine) {
 	const page = await context.newPage();
 	let loads = 0;
 	page.on('load', () => (loads += 1));
-	await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=club128&seed=${seed}&song=1&chrome=0`);
-	await page.getByLabel(ENGINE_CANVAS[engine]).waitFor({ state: 'attached', timeout: 180_000 });
+	// A cold server optimises dependencies and asks the page to reload; with
+	// HMR off nothing reloads it, so retry the load a few times ourselves.
+	for (let attempt = 0; ; attempt += 1) {
+		await page.goto(`${baseURL}/visualizer-test?engine=${engine}&profile=club128&seed=${seed}&song=1&chrome=0`);
+		try {
+			await page.getByLabel(ENGINE_CANVAS[engine]).waitFor({ state: 'attached', timeout: 60_000 });
+			break;
+		} catch (error) {
+			if (attempt >= 3) throw error;
+		}
+	}
+	loads = 1;
 	await page.addStyleTag({ content: 'vite-error-overlay{display:none!important}' });
 	await page.waitForTimeout(8000);
 	const frames = [];
@@ -154,15 +165,12 @@ function distance(a, b) {
 	return 0.5 * thumb + 0.3 * (hue / 2) * hueWeight + 0.2 * edge;
 }
 
-function median(values) {
-	const s = [...values].sort((x, y) => x - y);
-	return s.length ? s[Math.floor(s.length / 2)] : 0;
-}
 
 async function matrixImage(D, n, path) {
 	const page = await browser.newPage({ viewport: { width: n, height: n } });
 	await page.setContent('<body style="margin:0"><canvas id="c"></canvas></body>');
-	const max = Math.max(...D.flat());
+	let max = 0;
+	for (const row of D) for (const v of row) if (v > max) max = v;
 	await page.evaluate(
 		([rows, size, top]) => {
 			const c = document.getElementById('c');
@@ -200,6 +208,7 @@ async function sheet(frames, path) {
 	await page.close();
 }
 
+
 const results = [];
 try {
 	const recordings = await Promise.all(engines.map((engine) => record(engine)));
@@ -208,62 +217,20 @@ try {
 		const n = d.length;
 		const D = Array.from({ length: n }, () => new Array(n).fill(0));
 		for (let i = 0; i < n; i += 1) for (let j = i + 1; j < n; j += 1) D[i][j] = D[j][i] = distance(d[i], d[j]);
-		const all = [];
-		for (let i = 0; i < n; i += 1) for (let j = i + 1; j < n; j += 1) all.push(D[i][j]);
-		const typical = median(all);
-		const gapFrames = Math.ceil(45_000 / SAMPLE_MS);
-		// Recurrence: frames whose nearest frame >= 45 s earlier is a near-duplicate.
-		let recurrent = 0;
-		let considered = 0;
-		for (let i = gapFrames; i < n; i += 1) {
-			let nearest = Infinity;
-			for (let j = 0; j <= i - gapFrames; j += 1) nearest = Math.min(nearest, D[i][j]);
-			considered += 1;
-			if (nearest < typical * 0.35) recurrent += 1;
-		}
-		// Cadence: autocorrelation of the change signal at 10..120 s lags.
-		const change = [];
-		for (let i = 1; i < n; i += 1) change.push(D[i][i - 1]);
-		const mean = change.reduce((a, b) => a + b, 0) / Math.max(1, change.length);
-		const c = change.map((x) => x - mean);
-		const var0 = c.reduce((a, b) => a + b * b, 0) || 1;
-		let cadence = 0;
-		let cadenceLag = 0;
-		for (let lag = 5; lag <= 60 && lag < c.length / 2; lag += 1) {
-			let sum = 0;
-			for (let i = 0; i + lag < c.length; i += 1) sum += c[i] * c[i + lag];
-			const r = (sum / var0) * (c.length / (c.length - lag));
-			if (r > cadence) {
-				cadence = r;
-				cadenceLag = lag * (SAMPLE_MS / 1000);
-			}
-		}
-		// Parked: 10 s windows whose start and end frames barely differ.
-		const win = Math.round(10_000 / SAMPLE_MS);
-		let parked = 0;
-		let windows = 0;
-		for (let i = 0; i + win < n; i += win) {
-			windows += 1;
-			if (D[i][i + win] < typical * 0.2) parked += 1;
-		}
-		const result = {
-			engine,
-			frames: n,
-			reloads,
-			typicalDistance: Number(typical.toFixed(4)),
-			recurrence: Number((recurrent / Math.max(1, considered)).toFixed(3)),
-			cadence: Number(cadence.toFixed(3)),
-			cadenceLagSeconds: cadenceLag,
-			parked: Number((parked / Math.max(1, windows)).toFixed(3))
-		};
+		const metrics = repetitionMetrics(D, SAMPLE_MS);
+		const result = { engine, frames: n, reloads, ...metrics };
+		await writeFile(`${outDir}/${engine}-distances.json`, JSON.stringify(D.map((row) => row.map((v) => Number(v.toFixed(5))))));
 		results.push(result);
-		await matrixImage(D, n, `${outDir}/${engine}-recurrence.png`);
-		await sheet(frames, `${outDir}/${engine}-sheet.jpg`);
-		console.log(
-			`${engine.padEnd(8)} recurrence ${(result.recurrence * 100).toFixed(1).padStart(5)}%  cadence ${result.cadence.toFixed(2)} @${String(cadenceLag).padStart(3)}s  parked ${(result.parked * 100).toFixed(1).padStart(5)}%${reloads ? `  (${reloads} reloads!)` : ''}`
-		);
+		await writeFile(`${outDir}/report.json`, JSON.stringify(results, null, 2));
+		console.log(formatResult(result));
+		// Pictures last: a failure here must not lose the numbers above.
+		try {
+			await matrixImage(D, n, `${outDir}/${engine}-recurrence.png`);
+			await sheet(frames, `${outDir}/${engine}-sheet.jpg`);
+		} catch (error) {
+			console.warn(`${engine}: could not draw the matrix or sheet: ${error.message}`);
+		}
 	}
-	await writeFile(`${outDir}/report.json`, JSON.stringify(results, null, 2));
 	console.log(`-> ${outDir}`);
 } finally {
 	await browser.close();
