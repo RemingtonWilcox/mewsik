@@ -22,6 +22,7 @@
 
 import { SignalFigureEngine } from './figures';
 import { SignalVoice } from './voice';
+import type { SignalRoam } from './roam';
 import { SIGNAL_TERRAIN_BINS, SIGNAL_TERRAIN_FLOATS } from './shaders';
 
 /** Quintic ease: zero velocity and acceleration at both ends. */
@@ -127,7 +128,9 @@ export const SIGNAL_MORPH_TIMING = {
 	layout: { seconds: 7.5, delay: 0.6 },
 	family: { seconds: 6.5, delay: 2.8 },
 	display: { seconds: 8, delay: 0 },
-	traceMap: { seconds: 4.5, delay: 0.4 }
+	traceMap: { seconds: 4.5, delay: 0.4 },
+	// The bench turning round is the biggest rearrangement: it takes longest.
+	mirror: { seconds: 10, delay: 2 }
 } as const;
 
 export type SignalMorphAxis = keyof typeof SIGNAL_MORPH_TIMING;
@@ -202,7 +205,6 @@ export type SignalRendererScalars = {
 	figurePhase: number;
 	lastTracePhase: number;
 	spinAngle: number;
-	dollyTime: number;
 	sweepPhase: number;
 	tickPhase: number;
 	terrainHead: number;
@@ -222,6 +224,11 @@ export type SignalRendererMemory = {
 	epoch: number;
 	scalars: SignalRendererScalars | null;
 	readonly morphs: Record<SignalMorphAxis, SignalChoiceMorph>;
+	/**
+	 * Bench, camera and hero roam (see roam.ts). Created on the first frame,
+	 * seeded by that journey, and then carried through every source after.
+	 */
+	roam: SignalRoam | null;
 	readonly carry: SignalCarry;
 	readonly figure: SignalFigureEngine;
 	/** The music's character as an instrument, glided (see voice.ts). */
@@ -239,6 +246,7 @@ export function signalRendererMemory(): SignalRendererMemory {
 		epoch: -1,
 		scalars: null,
 		morphs: createSignalMorphs(),
+		roam: null,
 		// Three seconds: long enough that a new song's rails glide in, short
 		// enough that the new music's own rails show by the time it is heard.
 		carry: new SignalCarry(3),

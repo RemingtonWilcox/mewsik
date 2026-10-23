@@ -35,8 +35,15 @@ import {
 	signalCharacterView,
 	type SignalCharacterView
 } from './voice';
+import {
+	SIGNAL_BENCH_COUNT,
+	signalArrangement,
+	signalBenchWeight
+} from './layouts';
 
-export const SIGNAL_LAYOUT_COUNT = 8;
+/** Benches: eight arrangements, each standing on up to four horizons (layouts.ts). */
+export const SIGNAL_LAYOUT_COUNT = SIGNAL_BENCH_COUNT;
+
 export const SIGNAL_FAMILY_COUNT = 9;
 /** The family whose hero is the real stereo signal (figures.ts). */
 const SCOPE_FAMILY = 8;
@@ -44,20 +51,26 @@ export const SIGNAL_PALETTE_COUNT = 22;
 export const SIGNAL_CAMERA_COUNT = 5;
 export const SIGNAL_DISPLAY_COUNT = 6;
 export const SIGNAL_TRACE_MAP_COUNT = 3;
+export const SIGNAL_MIRROR_COUNT = 2;
 
 export const SIGNAL_VARIATION_AXES: readonly VariationAxis[] = [
 	// Section scale: a new scene.
-	{ kind: 'choice', name: 'layout', options: SIGNAL_LAYOUT_COUNT, scale: 'section', chance: 0.96, memory: 2, tau: 3.2 },
-	{ kind: 'choice', name: 'family', options: SIGNAL_FAMILY_COUNT, scale: 'section', chance: 0.92, memory: 2, tau: 2.6 },
-	{ kind: 'choice', name: 'palette', options: SIGNAL_PALETTE_COUNT, scale: 'section', chance: 1, memory: 3, tau: 3.6 },
-	{ kind: 'choice', name: 'camera', options: SIGNAL_CAMERA_COUNT, scale: 'section', chance: 0.55, memory: 2, tau: 4.5 },
+	// Long memories: a bench, family or phosphor seen in the last few scenes
+	// does not come straight back, so the walk keeps finding new ground.
+	{ kind: 'choice', name: 'layout', options: SIGNAL_LAYOUT_COUNT, scale: 'section', chance: 0.8, memory: 10, maxHold: 3, tau: 3.2 },
+	{ kind: 'choice', name: 'family', options: SIGNAL_FAMILY_COUNT, scale: 'section', chance: 0.85, memory: 4, tau: 2.6 },
+	{ kind: 'choice', name: 'palette', options: SIGNAL_PALETTE_COUNT, scale: 'section', chance: 1, memory: 9, tau: 3.6 },
+	{ kind: 'choice', name: 'camera', options: SIGNAL_CAMERA_COUNT, scale: 'section', chance: 0.55, memory: 3, tau: 4.5 },
+	// Which way round the bench stands. Doubles every bench's room of
+	// arrangements; the pieces slide across, nothing flips.
+	{ kind: 'choice', name: 'mirror', options: SIGNAL_MIRROR_COUNT, scale: 'section', chance: 0.55, memory: 1, tau: 4 },
 	{ kind: 'continuous', name: 'figureScale', min: 0, max: 1, scale: 'section', step: 0.34, tau: 3 },
 	{ kind: 'continuous', name: 'persistence', min: 0, max: 1, scale: 'section', step: 0.36, tau: 4 },
 	{ kind: 'continuous', name: 'relief', min: 0, max: 1, scale: 'section', step: 0.36, tau: 3 },
 	{ kind: 'continuous', name: 'grid', min: 0, max: 1, scale: 'section', step: 0.4, tau: 3 },
 	{ kind: 'continuous', name: 'coupling', min: 0, max: 1, scale: 'section', step: 0.4, tau: 3 },
 	// Era scale: a new reel.
-	{ kind: 'choice', name: 'display', options: SIGNAL_DISPLAY_COUNT, scale: 'era', chance: 1, memory: 3, tau: 4 },
+	{ kind: 'choice', name: 'display', options: SIGNAL_DISPLAY_COUNT, scale: 'era', chance: 1, memory: 4, tau: 4 },
 	{ kind: 'continuous', name: 'scan', min: 0, max: 1, scale: 'era', step: 0.4, tau: 3.5 },
 	{ kind: 'continuous', name: 'curvature', min: 0, max: 1, scale: 'era', step: 0.4, tau: 3.5 },
 	{ kind: 'continuous', name: 'grain', min: 0, max: 1, scale: 'era', step: 0.4, tau: 3.5 },
@@ -77,7 +90,7 @@ export function signalVariationSpaceSize(): number {
 	return variationSpaceSize(SIGNAL_VARIATION_AXES);
 }
 
-export type SignalChoiceName = 'layout' | 'family' | 'palette' | 'camera' | 'display' | 'traceMap';
+export type SignalChoiceName = 'layout' | 'family' | 'palette' | 'camera' | 'display' | 'traceMap' | 'mirror';
 export type SignalContinuousName =
 	| 'figureScale'
 	| 'persistence'
@@ -104,8 +117,22 @@ export type SignalVariationInput = {
 	dt: number;
 };
 
-/** Scene moves at least this often (in phrases) when the section never changes. */
-const SCENE_FALLBACK_PHRASES = 3;
+/**
+ * Scene moves at least this often (in phrases) when the section never
+ * changes. Each scene draws its own count, so a radio stream never settles
+ * into a fixed scene rhythm.
+ */
+const SCENE_FALLBACK_PHRASES = [2, 3, 2, 4, 3, 4, 3, 2] as const;
+
+function seedHash(seed: number | string): number {
+	const text = String(seed);
+	let h = 0x811c9dc5;
+	for (let i = 0; i < text.length; i += 1) {
+		h ^= text.charCodeAt(i);
+		h = Math.imul(h, 0x01000193);
+	}
+	return h >>> 0;
+}
 /** A new section label must hold this long before it counts as a scene. */
 const SECTION_DEBOUNCE_SECONDS = 3;
 /** Never cut two scenes closer together than this. */
@@ -164,14 +191,19 @@ export class SignalVariation {
 	private stereoInterest = 0;
 	private readonly weightScratch = {
 		layout: [] as number[],
+		arrangement: [] as number[],
 		family: [] as number[],
 		palette: [] as number[],
 		camera: [] as number[],
 		display: [] as number[]
 	};
 
+	/** Seed word for the scene-length draws (kept across continueWith). */
+	private seedWord = 0;
+
 	constructor(seed: number | string) {
 		this.genome = new VariationGenome(SIGNAL_VARIATION_AXES, `signal:${seed}`);
+		this.seedWord = seedHash(seed);
 	}
 
 	/** Carry the current look into a new source: keep the scene, change future draws. */
@@ -184,6 +216,7 @@ export class SignalVariation {
 
 	reset(seed: number | string): void {
 		this.genome.reset(`signal:${seed}`);
+		this.seedWord = seedHash(seed);
 		this.sceneIndex = 0;
 		this.emittedSection = null;
 		this.candidateSection = null;
@@ -264,7 +297,13 @@ export class SignalVariation {
 		const w = this.weightScratch;
 		const genome = this.genome;
 		const c = view as unknown as MusicCharacter;
-		genome.setWeights('layout', characterWeights(SIGNAL_LAYOUT_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.layout));
+		// Arrangements fit the music; each stands on its own horizon most often.
+		const arrangements = characterWeights(SIGNAL_LAYOUT_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.arrangement);
+		w.layout.length = SIGNAL_LAYOUT_COUNT;
+		for (let index = 0; index < SIGNAL_LAYOUT_COUNT; index += 1) {
+			w.layout[index] = arrangements[signalArrangement(index)] * signalBenchWeight(index);
+		}
+		genome.setWeights('layout', w.layout);
 		// The real signal is a frequent, prominent hero whatever the genre,
 		// weighted by how much picture the stereo image holds: up to well
 		// above the best-fitting synthesized family, down to a rare pick for
@@ -319,6 +358,14 @@ export class SignalVariation {
 		return this.sceneIndex;
 	}
 
+	/** This scene's fallback length in phrases, drawn from the seed and scene. */
+	private fallbackPhrases(): number {
+		let h = Math.imul(this.sceneIndex + 1, 0x9e3779b1) ^ this.seedWord;
+		h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+		h ^= h >>> 13;
+		return SCENE_FALLBACK_PHRASES[(h >>> 0) % SCENE_FALLBACK_PHRASES.length];
+	}
+
 	advance(input: SignalVariationInput): void {
 		const dt = Math.min(0.5, Math.max(0, Number.isFinite(input.dt) ? input.dt : 0));
 		const phrase = Number.isFinite(input.phraseIndex) ? Math.floor(input.phraseIndex) : 0;
@@ -336,7 +383,7 @@ export class SignalVariation {
 		}
 		const labelMove =
 			this.candidateSection !== this.emittedSection && this.candidateAge >= SECTION_DEBOUNCE_SECONDS;
-		const fallbackMove = phraseChanged && this.phrasesInScene >= SCENE_FALLBACK_PHRASES;
+		const fallbackMove = phraseChanged && this.phrasesInScene >= this.fallbackPhrases();
 		if (
 			(labelMove || fallbackMove) &&
 			this.sceneAge >= MIN_SCENE_SECONDS &&
@@ -389,7 +436,8 @@ export function parseSignalLookOverride(text: string | null | undefined): Signal
 		palette: SIGNAL_PALETTE_COUNT,
 		camera: SIGNAL_CAMERA_COUNT,
 		display: SIGNAL_DISPLAY_COUNT,
-		traceMap: SIGNAL_TRACE_MAP_COUNT
+		traceMap: SIGNAL_TRACE_MAP_COUNT,
+		mirror: SIGNAL_MIRROR_COUNT
 	};
 	for (const part of text.split(',')) {
 		const [rawName, rawValue] = part.split(/[:=]/);

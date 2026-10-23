@@ -129,7 +129,9 @@ export function resolveSignalPalette(
 	const b = SIGNAL_PALETTES[((to % SIGNAL_PALETTES.length) + SIGNAL_PALETTES.length) % SIGNAL_PALETTES.length];
 	const t = Math.min(1, Math.max(0, mix));
 	// Major keys lean warm, minor cool; the genome adds its own small lean.
-	const angle = context.hueLean * 0.16 + context.mode * 0.05 + context.warmth * 0.06;
+	// The lean wanders continuously with the genome (about +-14 degrees), so a
+	// family seen again a few minutes later is not the same colour again.
+	const angle = context.hueLean * 0.24 + context.mode * 0.05 + context.warmth * 0.06;
 	const chroma = 1 + context.energy * 0.12;
 	for (const role of ROLES) {
 		const la = toLab(a[role]);
