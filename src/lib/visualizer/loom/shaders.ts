@@ -114,6 +114,20 @@ struct Params {
 	envD: vec4<f32>,
 	// fray, grain, turbulence, edge
 	weave: vec4<f32>,
+	// twistY, twistX, bend, flare
+	deform: vec4<f32>,
+	// tiltX, tiltZ, laneGamma, deformAmount
+	figure: vec4<f32>,
+	// warpAx, warpAy, warpAz, warpAAmp
+	warpA: vec4<f32>,
+	// warpBx, warpBy, warpBz, warpBAmp
+	warpB: vec4<f32>,
+	// warpCx, warpCy, warpCz, warpCAmp
+	warpC: vec4<f32>,
+	// warpAPhase, warpBPhase, warpCPhase, centerY
+	warpPhase: vec4<f32>,
+	// hybridGrammar, hybridMix, reserveA, reserveB
+	hybrid: vec4<f32>,
 };
 `;
 
@@ -179,17 +193,10 @@ fn phraseClock() -> vec2<f32> {
 	return vec2<f32>(floor(beats), smoothstep(0.875, 1.0, fract(beats)));
 }
 
-// A small per-phrase change of viewing angle, so long passages do not hold one
-// framing; it eases across the phrase boundary instead of cutting.
-fn phraseYaw() -> f32 {
-	let clock = phraseClock();
-	let now = hashUnit(u32(max(clock.x, 0.0)) + 5u, 53u, 3u) - 0.5;
-	let next = hashUnit(u32(max(clock.x + 1.0, 0.0)) + 5u, 53u, 3u) - 0.5;
-	return mix(now, next, clock.y) * 0.42 * params.view.w;
-}
-
+// The viewing angle comes from the look's roaming camera (look.ts): no
+// per-phrase step here, which turned the stage on every phrase like clockwork.
 fn stageYaw() -> f32 {
-	return params.camera.x + 0.62 + phraseYaw() + params.lens.w;
+	return params.camera.x + 0.62 + params.lens.w;
 }
 
 fn stagePitch() -> f32 {
@@ -698,22 +705,68 @@ fn grammarPoint(g: u32, s: f32, strand: Strand, lane: f32) -> GPoint {
 }
 
 // The current grammar, crossfading from the previous one while a section
-// change morphs the threads; mid-morph the weave lifts apart a little.
+// change morphs the threads; mid-morph the weave lifts apart a little. The
+// look can also lean the figure toward a second grammar (hybrid), so the
+// grammars are corners of a continuous space rather than a set of shapes.
 fn surfacePoint(s: f32, strand: Strand, lane: f32) -> GPoint {
 	let t = clamp(params.topo.z, 0.0, 1.0);
 	let gTo = u32(params.topo.y + 0.5);
 	let gFrom = u32(params.topo.x + 0.5);
-	let b = grammarPoint(gTo, s, strand, lane);
-	if (t >= 0.999 || gFrom == gTo) { return b; }
-	let a = grammarPoint(gFrom, s, strand, lane);
-	let lift = sin(t * PI) * (0.06 + strand.sid * 0.08);
-	return GPoint(
-		mix(a.p, b.p, t) + normalize(mix(a.n, b.n, t) + vec3<f32>(0.0001, 0.0002, 0.0003)) * lift,
-		normalize(mix(a.n, b.n, t) + vec3<f32>(0.0001, 0.0002, 0.0003)),
-		normalize(mix(a.b, b.b, t) + vec3<f32>(0.0002, 0.0001, 0.0003)),
-		mix(a.closed, b.closed, t),
-		mix(a.react, b.react, t)
-	);
+	var out = grammarPoint(gTo, s, strand, lane);
+	if (t < 0.999 && gFrom != gTo) {
+		let a = grammarPoint(gFrom, s, strand, lane);
+		let lift = sin(t * PI) * (0.06 + strand.sid * 0.08);
+		let n = normalize(mix(a.n, out.n, t) + vec3<f32>(0.0001, 0.0002, 0.0003));
+		out = GPoint(
+			mix(a.p, out.p, t) + n * lift,
+			n,
+			normalize(mix(a.b, out.b, t) + vec3<f32>(0.0002, 0.0001, 0.0003)),
+			mix(a.closed, out.closed, t),
+			mix(a.react, out.react, t)
+		);
+	}
+	let h = clamp(params.hybrid.y, 0.0, 0.6);
+	if (h > 0.002) {
+		let c = grammarPoint(u32(params.hybrid.x + 0.5), s, strand, lane);
+		out = GPoint(
+			mix(out.p, c.p, h),
+			normalize(mix(out.n, c.n, h) + vec3<f32>(0.0001, 0.0002, 0.0003)),
+			normalize(mix(out.b, c.b, h) + vec3<f32>(0.0002, 0.0001, 0.0003)),
+			mix(out.closed, c.closed, h),
+			mix(out.react, c.react, h)
+		);
+	}
+	return out;
+}
+
+// Strand spacing across the surface: < 1 crowds the strands to the edges,
+// > 1 gathers them to the middle. Wanders with the look.
+fn laneSpacing(lane: f32) -> f32 {
+	return sign(lane) * pow(abs(lane), params.figure.z);
+}
+
+// The figure's continuous form (look.ts LoomFigure), in strand space: centred
+// on its bounds, wrung about its vertical and long axes, bent, flared, rippled
+// by three slow travelling waves whose directions drift, then leant. Every
+// parameter wanders on non-repeating noise, so the ribbons keep finding forms.
+fn deformFigure(p0: vec3<f32>) -> vec3<f32> {
+	var p = p0;
+	p.y = p.y - params.warpPhase.w;
+	let k = params.figure.w;
+	p = rotateY(p, params.deform.x * p.y * k);
+	p = rotateX(p, params.deform.y * p.x * k);
+	p.y = p.y + params.deform.z * k * (p.x * p.x - 0.4);
+	let flare = max(0.35, 1.0 + params.deform.w * k * p.y);
+	p.x = p.x * flare;
+	p.z = p.z * flare;
+	let dirA = normalize(params.warpB.xyz + vec3<f32>(0.0001, 0.0002, 0.0003));
+	let dirB = normalize(params.warpC.xyz + vec3<f32>(0.0002, 0.0001, 0.0003));
+	let dirC = normalize(params.warpA.xyz + vec3<f32>(0.0003, 0.0002, 0.0001));
+	let waveA = sin(dot(params.warpA.xyz, p) + params.warpPhase.x) * params.warpA.w;
+	let waveB = sin(dot(params.warpB.xyz, p) + params.warpPhase.y) * params.warpB.w;
+	let waveC = sin(dot(params.warpC.xyz, p) + params.warpPhase.z) * params.warpC.w;
+	p = p + (dirA * waveA + dirB * waveB + dirC * waveC) * k;
+	return rotateZ(rotateX(p, params.figure.x), params.figure.y);
 }
 
 // Which primary rail leads this phrase. The centre rail leads most phrases;
@@ -806,11 +859,11 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 // World-space point on strand: grammar surface, weft threading, the shared
 // reactive layer and the genome's beat form. w = how closed the loop is.
 fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
-	var lane = st.lane;
+	var lane = laneSpacing(st.lane);
 	var weftLift = 0.0;
 	if (st.kind == 1.0) {
 		let angle = weftAngle(s, st.weft);
-		lane = mix(st.lane, st.laneB, 0.5 + 0.5 * sin(angle));
+		lane = mix(laneSpacing(st.lane), laneSpacing(st.laneB), 0.5 + 0.5 * sin(angle));
 		weftLift = cos(angle);
 	}
 	let g = surfacePoint(s, st, lane);
@@ -863,7 +916,7 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 		* sin(params.view.z * TAU * 6.5 + st.sid * 9.0) * mix(env, 1.0, 0.4);
 	let shuttle = params.beat.w * exp(-pow((sw - shuttleS()) * 14.0, 2.0)) * (0.03 + params.pulse.w * 0.05);
 	p = p + g.n * (pluck + shuttle) * params.beatB.y;
-	return vec4<f32>(p, g.closed);
+	return vec4<f32>(deformFigure(p), g.closed);
 }
 
 fn colorPeak(c: vec3<f32>) -> vec3<f32> {

@@ -45,7 +45,15 @@ export const LOOM_UNIFORM_GROUPS = [
 	['postB', ['driftX', 'driftY', 'spin', 'flowPhase']],
 	['envD', ['threads', 'warpRows', 'threadReach', 'dust']],
 	// Character-driven weave (look.ts LoomWeaveCharacter).
-	['weave', ['fray', 'grain', 'turbulence', 'edge']]
+	['weave', ['fray', 'grain', 'turbulence', 'edge']],
+	// The figure's continuous form (look.ts LoomFigure, deformFigure in shaders.ts).
+	['deform', ['twistY', 'twistX', 'bend', 'flare']],
+	['figure', ['tiltX', 'tiltZ', 'laneGamma', 'deformAmount']],
+	['warpA', ['warpAx', 'warpAy', 'warpAz', 'warpAAmp']],
+	['warpB', ['warpBx', 'warpBy', 'warpBz', 'warpBAmp']],
+	['warpC', ['warpCx', 'warpCy', 'warpCz', 'warpCAmp']],
+	['warpPhase', ['warpAPhase', 'warpBPhase', 'warpCPhase', 'centerY']],
+	['hybrid', ['hybridGrammar', 'hybridMix', 'reserveA', 'reserveB']]
 ] as const;
 
 export const LOOM_UNIFORM_FLOATS = LOOM_UNIFORM_GROUPS.length * 4;
