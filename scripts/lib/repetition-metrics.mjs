@@ -13,10 +13,12 @@ export function median(values) {
  *                  at least 45 s earlier is within 0.5 x median: returns to a
  *                  look already shown
  *   nearDuplicate  the same at 0.3 x median: near-identical returns
- *   vocabulary     distinct states visited: greedy clusters at 0.6 x median,
- *                  counting clusters that hold at least 2% of frames
- *   revisits       mean number of separate visits per cluster (a cluster
- *                  left and re-entered after 45 s counts again): high = the
+ *   vocabulary     how many distinct states it takes to cover 80% of the
+ *                  run (greedy clusters at 0.6 x median, largest first): an
+ *                  engine cycling a few states needs few, an engine that
+ *                  keeps finding new looks needs many
+ *   revisits       mean number of separate visits per state among those
+ *                  states (re-entered after 45 s counts again): high = the
  *                  engine cycles through a small set of states
  *   cadence        strongest autocorrelation of the change signal beyond its
  *                  first zero crossing (10-120 s): change on a fixed rhythm
@@ -59,7 +61,15 @@ export function repetitionMetrics(D, sampleMs) {
 	}
 	const sizes = new Array(leaders.length).fill(0);
 	for (const l of label) sizes[l] += 1;
-	const vocabulary = sizes.filter((size) => size >= Math.max(2, n * 0.02)).length;
+	const order = sizes.map((size, c) => [size, c]).sort((a, b) => b[0] - a[0]);
+	const covering = [];
+	let covered = 0;
+	for (const [size, c] of order) {
+		if (covered >= n * 0.8) break;
+		covering.push(c);
+		covered += size;
+	}
+	const vocabulary = covering.length;
 	const visits = new Array(leaders.length).fill(0);
 	const lastSeen = new Array(leaders.length).fill(-Infinity);
 	for (let i = 0; i < n; i += 1) {
@@ -67,8 +77,7 @@ export function repetitionMetrics(D, sampleMs) {
 		if (i - lastSeen[c] > gap) visits[c] += 1;
 		lastSeen[c] = i;
 	}
-	const big = visits.filter((_, c) => sizes[c] >= Math.max(2, n * 0.02));
-	const revisits = big.length ? big.reduce((a, b) => a + b, 0) / big.length : 0;
+	const revisits = covering.length ? covering.reduce((sum, c) => sum + visits[c], 0) / covering.length : 0;
 	// Cadence beyond the first zero crossing.
 	const change = [];
 	for (let i = 1; i < n; i += 1) change.push(D[i][i - 1]);
