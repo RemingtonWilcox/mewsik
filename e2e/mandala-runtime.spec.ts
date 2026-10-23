@@ -118,6 +118,7 @@ test.describe('Mandala render foundations', () => {
 				surge: 0,
 				restless: 0.6,
 				drift: 0.5,
+				tempo: 0.55,
 				silence: 0
 			};
 			const voyage = new flight.MandalaVoyage(0.42);
@@ -129,7 +130,7 @@ test.describe('Mandala render foundations', () => {
 			for (let frame = 0; frame < 1200; frame += 1) {
 				if (frame === 600) {
 					beforeSource = Array.from(voyage.phase);
-					voyage.continueSource(0.91);
+					voyage.continueSource();
 					afterSource = Array.from(voyage.phase);
 				}
 				voyage.update({ ...input, surge: frame % 28 === 0 ? 0.6 : 0 });
@@ -154,6 +155,78 @@ test.describe('Mandala render foundations', () => {
 		expect(result.wrappedPhase).toBeGreaterThanOrEqual(0);
 		expect(result.wrappedPhase).toBeLessThan(1);
 		expect(result.velocity).toBeGreaterThan(0.2);
+	});
+
+	test('the camera roams: it never parks and never closes a loop', async ({ page }) => {
+		await page.goto('/');
+		const result = await page.evaluate(async () => {
+			const flight = await import('/src/lib/visualizer/mandala/flight.ts');
+			const input = {
+				dt: 1 / 30,
+				speed: 0.3,
+				rates: [1, 1, 1, 1, 1, 1, 1, 1],
+				spin: 0.1,
+				surge: 0,
+				restless: 0.5,
+				drift: 0.6,
+				tempo: 0.55,
+				silence: 0
+			};
+			const state = (v: InstanceType<typeof flight.MandalaVoyage>) => [
+				v.yaw,
+				v.pitch,
+				v.roll,
+				v.panX * 3,
+				v.panY * 6,
+				v.zoom * 2.5,
+				v.lampX,
+				v.lampY,
+				Math.log(v.extent)
+			];
+			const run = (seed: number) => {
+				const voyage = new flight.MandalaVoyage(seed);
+				const samples: number[][] = [];
+				// Twenty minutes, sampled every two seconds.
+				for (let frame = 0; frame < 30 * 60 * 20; frame += 1) {
+					voyage.update(input);
+					if (frame % 60 === 0) samples.push(state(voyage));
+				}
+				return samples;
+			};
+			const a = run(0.42);
+			const again = run(0.42);
+			const dist = (x: number[], y: number[]) => Math.hypot(...x.map((v, i) => v - y[i]));
+			// No 10 s window in which the view barely moves.
+			let parked = 0;
+			for (let i = 0; i + 5 < a.length; i += 5) if (dist(a[i], a[i + 5]) < 0.05) parked += 1;
+			// No lag (20 s .. 5 min) at which the path comes back to itself.
+			let pairs = 0;
+			let total = 0;
+			for (let i = 0; i < a.length; i += 3) for (let j = i + 3; j < a.length; j += 3) {
+				total += dist(a[i], a[j]);
+				pairs += 1;
+			}
+			const typical = total / pairs;
+			let tightest = Infinity;
+			for (let lag = 10; lag <= 150; lag += 1) {
+				let sum = 0;
+				let n = 0;
+				for (let i = 0; i + lag < a.length; i += 1) {
+					sum += dist(a[i], a[i + lag]);
+					n += 1;
+				}
+				tightest = Math.min(tightest, sum / n / typical);
+			}
+			return {
+				deterministic: JSON.stringify(a) === JSON.stringify(again),
+				parked: parked / Math.floor(a.length / 5),
+				tightest
+			};
+		});
+		expect(result.deterministic).toBe(true);
+		expect(result.parked).toBeLessThan(0.05);
+		// An authored Lissajous returns at its period (ratio near 0); a roam never does.
+		expect(result.tightest).toBeGreaterThan(0.7);
 	});
 
 	test('a Julia dive repeats exactly: z* is fixed, its multiplier is the one asked for', async ({ page }) => {

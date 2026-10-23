@@ -7,8 +7,18 @@
 // one self-similar step of the Julia dive (a factor lambda), one x3 step into
 // the sponge, one cell of the cavern... so only the fractional part reaches
 // the shader and nothing ever runs out of float precision.
+//
+// The camera is not an authored path. A Roamer travels a box of good
+// viewpoints (look yaw and pitch, roll, where the mandala's eye sits in the
+// frame, how close, the lens, the orbit distance), picking new destinations
+// at irregular times and gliding there on critically damped springs, with a
+// wander on top: tempo sets its pace, energy its restlessness, kicks nudge
+// it and a change of music sends it somewhere new. Slow drift lanes move the
+// fractal constants, the orbit and the palette mapping along non-repeating
+// noise, so a world's seamless loop never shows the same frame twice.
 
 import { MANDALA_WORLDS } from './look';
+import { Roamer, Wander } from '../motion';
 
 const WORLD_COUNT = MANDALA_WORLDS.length;
 /** Phases wrap here: a multiple of every period a shader takes them modulo. */
@@ -32,8 +42,15 @@ export type VoyageInput = {
 	restless: number;
 	/** 0..1 how far the look wanders. */
 	drift: number;
+	/** 0..1 the music's tempo: the pace the camera roams at. */
+	tempo: number;
 	silence: number;
 };
+
+/** Roamer axes, each -1..1. */
+const ROAM = { yaw: 0, pitch: 1, roll: 2, panX: 3, panY: 4, zoom: 5, focal: 6, dolly: 7, lampX: 8, lampY: 9, reach: 10, extent: 11, swing: 12 } as const;
+/** Drift lanes: four structure morphs, the orbit's pace, the palette's pace, the spiral's eye, the tint. */
+const LANE = { morph: 0, orbit: 4, paint: 5, eye: 6, tint: 7 } as const;
 
 export class MandalaVoyage {
 	/** Per world: phase in its own period units, wrapped at PHASE_WRAP. */
@@ -45,23 +62,71 @@ export class MandalaVoyage {
 	/** Log travel this frame (the feedback zoom follows it). */
 	stepLog = 0;
 	stepTurn = 0;
+	/** Look offsets (3D worlds), about -1..1 scaled by the drift. */
 	yaw = 0;
 	pitch = 0;
-	private wanderPhase: [number, number, number, number];
+	/** Extra roll of the whole view, radians. */
+	roll = 0;
+	/** Where the planes' centre sits in the frame (screen heights from the middle). */
+	panX = 0;
+	panY = 0;
+	/** Log zoom of the planes about their centre (+ is closer). */
+	zoom = 0;
+	/** Lens multiplier for the raymarched worlds. */
+	focal = 1;
+	/** Orbit distance / channel offset, -1..1. */
+	dolly = 0;
+	/** The 3D lamp's offset from the camera, in its reach (-1..1). */
+	lampX = 0;
+	lampY = 0;
+	/** The lamp's reach multiplier. */
+	lampReach = 1;
+	/** How far the planes' pattern carries from its centre, screen heights. */
+	extent = 1.2;
+	/** The orbiting worlds' angle, radians: integrated, plus the roamer's swing. */
+	orbit = 0;
+	private orbitBase = 0;
+	/** Palette mapping offset, integrated and wrapped at 2 (the shader folds it). */
+	paint = 0;
+	/** The spiral's eye offset from its mirror centre, -1..1. */
+	eye = 0;
+	/** Hue turn of the palette's authored stops, radians: each palette is a continuum. */
+	tint = 0;
+	/** Four slow structure morphs, -1..1, each world reads them in its own terms. */
+	readonly morph = new Float32Array(4);
+	private readonly roamer: Roamer;
+	private readonly lanes: Wander;
 
 	constructor(seed: number) {
 		const s = Number.isFinite(seed) ? seed : 0.5;
-		this.wanderPhase = [s * 17.3, s * 29.1 + 1.3, s * 41.7 + 2.1, s * 53.9 + 0.7];
 		for (let i = 0; i < WORLD_COUNT; i += 1) {
 			this.phase[i] = (s * 7.31 * (i + 1)) % 1;
 			this.turn[i] = (s * 6.283 * (i + 3)) % 6.283;
 		}
+		this.roamer = new Roamer(13, s + 0.137, { meanHold: 13, minHold: 4, response: 5, wander: 0.25, wanderPeriod: 23 });
+		// Incommensurate periods, long enough that a lane reads as drift, not motion.
+		this.lanes = new Wander(8, s + 0.613, [31, 43, 57, 71, 37, 53, 47, 64]);
+		this.orbitBase = s * 6.283;
+		this.paint = (s * 3.7) % 2;
+		this.compose(0.5, 1);
 	}
 
 	/** A new source: keep the whole voyage, only the course of the future moves. */
-	continueSource(seed: number): void {
-		const s = Number.isFinite(seed) ? seed : 0.5;
-		this.wanderPhase[2] += 0.4 + s * 0.6;
+	continueSource(): void {
+		this.redirect();
+	}
+
+	/** A change of music: the camera heads somewhere new now. */
+	redirect(): void {
+		this.roamer.redirect();
+	}
+
+	/** A heard kick: the view leans in a little and the look flinches. */
+	kick(strength: number): void {
+		if (!(strength > 0)) return;
+		const k = Math.min(1, strength);
+		this.roamer.impulse(ROAM.zoom, k * 0.35);
+		this.roamer.impulse(ROAM.dolly, -k * 0.25);
 	}
 
 	update(input: VoyageInput): void {
@@ -78,19 +143,48 @@ export class MandalaVoyage {
 			this.phase[i] = wrap(this.phase[i] + log * (input.rates[i] ?? 1), PHASE_WRAP);
 			this.turn[i] = wrap(this.turn[i] + turnStep, Math.PI * 2);
 		}
-		// The look wanders on incommensurate phases, faster when the music is restless.
-		const pace = (0.04 + input.restless * 0.2) * (1 - input.silence * 0.6);
-		this.wanderPhase[0] += dt * pace * 1.0;
-		this.wanderPhase[1] += dt * pace * 0.618;
-		this.wanderPhase[2] += dt * pace * 0.83;
-		this.wanderPhase[3] += dt * pace * 0.47;
-		for (let i = 0; i < 4; i += 1) this.wanderPhase[i] = wrap(this.wanderPhase[i], Math.PI * 2 * 1000);
-		const [a, b, c, d] = this.wanderPhase;
-		const yawTarget = input.drift * (Math.sin(a) * 0.65 + Math.sin(b * 2.1 + 0.7) * 0.35);
-		const pitchTarget = input.drift * 0.7 * (Math.sin(c * 1.3 + 1.1) * 0.6 + Math.sin(d * 2.7) * 0.4);
-		const ease = 1 - Math.exp(-dt * 1.6);
-		this.yaw += (yawTarget - this.yaw) * ease;
-		this.pitch += (pitchTarget - this.pitch) * ease;
+		// Tempo sets the camera's pace, energy and motion its restlessness;
+		// silence slows it to a drift without stopping it.
+		const hush = 1 - input.silence * 0.65;
+		const tempo = Number.isFinite(input.tempo) ? Math.min(1, Math.max(0, input.tempo)) : 0.5;
+		const pace = (0.75 + tempo * 0.75) * hush;
+		this.roamer.update(dt, pace, input.restless);
+		this.lanes.update(dt, (0.7 + tempo * 0.6) * hush);
+		const lane = this.lanes.value;
+		// The orbit always moves on, at a pace that wanders (never a loop),
+		// and never stands still even when the music barely travels.
+		const orbitPace = 0.022 * hush + this.velocity * 0.34 * (0.3 + 0.7 * (lane[LANE.orbit] * 0.5 + 0.5));
+		this.orbitBase = wrap(this.orbitBase + orbitPace * dt, Math.PI * 2);
+		// The palette mapping drifts: what burns hot and what stays deep moves on.
+		this.paint = wrap(this.paint + dt * (0.004 + 0.01 * (lane[LANE.paint] * 0.5 + 0.5)) * hush, 2);
+		this.compose(input.drift, dt > 0 ? 1 - Math.exp(-dt * 2.5) : 1);
+	}
+
+	private compose(drift: number, ease: number): void {
+		const r = this.roamer.value;
+		const amp = 0.35 + Math.min(1, Math.max(0, drift)) * 0.65;
+		const to = (current: number, goal: number) => current + (goal - current) * ease;
+		this.yaw = to(this.yaw, r[ROAM.yaw] * amp);
+		this.pitch = to(this.pitch, r[ROAM.pitch] * amp * 0.75);
+		this.roll = to(this.roll, r[ROAM.roll] * 0.45 * amp);
+		this.panX = to(this.panX, r[ROAM.panX] * 0.34 * amp);
+		this.panY = to(this.panY, r[ROAM.panY] * 0.17 * amp);
+		this.zoom = to(this.zoom, r[ROAM.zoom] * 0.38);
+		this.focal = to(this.focal, Math.exp(r[ROAM.focal] * 0.2));
+		this.dolly = to(this.dolly, Math.max(-1, Math.min(1, r[ROAM.dolly])));
+		this.orbit = this.orbitBase + r[ROAM.swing] * 0.9;
+		this.lampX = to(this.lampX, r[ROAM.lampX]);
+		this.lampY = to(this.lampY, r[ROAM.lampY]);
+		// The lamp's reach only ever grows a little or eases back a little:
+		// never a dim world.
+		this.lampReach = to(this.lampReach, Math.exp(0.08 + r[ROAM.reach] * 0.2));
+		// From a medallion with black round it to a field past every edge.
+		this.extent = to(this.extent, 0.65 * Math.exp((Math.max(-1, Math.min(1, r[ROAM.extent])) + 1) * 0.75));
+		const lane = this.lanes.value;
+		for (let i = 0; i < 4; i += 1) this.morph[i] = lane[LANE.morph + i];
+		this.eye = lane[LANE.eye];
+		// Small enough that neighbouring families (emerald, honey) never meet.
+		this.tint = lane[LANE.tint] * 0.3;
 	}
 }
 
