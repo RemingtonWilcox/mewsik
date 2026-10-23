@@ -56,11 +56,21 @@ test.describe('visual variation genome', () => {
 			const live = run('radio', 400, true);
 
 			// No mutation without a boundary: hold one phrase for 10 seconds.
+			// Targets stay put; values only wander, slowly and smoothly.
 			const still = new VariationGenome(axes as never, 'still');
 			still.advance({ phraseIndex: 0, sectionKey: 'verse', energy: 0.5, dt: 1 / 60 });
-			const before = still.snapshot();
-			for (let i = 0; i < 600; i += 1) still.advance({ phraseIndex: 0, sectionKey: 'verse', energy: 0.9, dt: 1 / 60 });
-			const after = still.snapshot();
+			const before = JSON.stringify(still.targetVector());
+			const densityBefore = still.value('density');
+			let wanderStep = 0;
+			let lastDensity = densityBefore;
+			for (let i = 0; i < 600; i += 1) {
+				still.advance({ phraseIndex: 0, sectionKey: 'verse', energy: 0.9, dt: 1 / 60 });
+				const d = still.value('density');
+				wanderStep = Math.max(wanderStep, Math.abs(d - lastDensity));
+				lastDensity = d;
+			}
+			const after = JSON.stringify(still.targetVector());
+			const wandered = Math.abs(lastDensity - densityBefore);
 
 			// Choice memory: the palette never returns to one of its last 6 picks.
 			const memoryGenome = new VariationGenome(axes as never, 'memory');
@@ -152,7 +162,9 @@ test.describe('visual variation genome', () => {
 				maxFrameJump: a.maxFrameJump,
 				liveBoundaries: live.genome.boundaries,
 				liveDistinct: new Set(live.signatures).size,
-				stillUnchanged: JSON.stringify(before) === JSON.stringify(after),
+				stillUnchanged: before === after,
+				wandered,
+				wanderStep,
 				memoryViolations,
 				paletteChanges: palettePicks.length,
 				hueInRange: a.hueTrace.every((h) => h >= 0 && h < 1),
@@ -175,6 +187,10 @@ test.describe('visual variation genome', () => {
 		expect(result.liveBoundaries.eras).toBeGreaterThan(10);
 		expect(result.liveDistinct).toBeGreaterThan(300);
 		expect(result.stillUnchanged).toBe(true);
+		// Between boundaries values keep drifting (no parked plateaus), but
+		// slowly: a tiny step per frame, never a jump.
+		expect(result.wandered).toBeGreaterThan(0);
+		expect(result.wanderStep).toBeLessThan(0.002);
 		expect(result.memoryViolations).toBe(0);
 		expect(result.paletteChanges).toBeGreaterThan(60);
 		expect(result.hueInRange).toBe(true);
@@ -186,7 +202,9 @@ test.describe('visual variation genome', () => {
 		// out near half the picks; it must still clearly beat each light option.
 		expect(result.weightCounts[2]).toBeGreaterThan(result.weightCounts[1] * 1.5);
 		expect(result.weightCounts[2]).toBeGreaterThan(result.weightCounts[3] * 1.5);
-		expect(result.settledGap).toBeLessThan(1e-9);
+		// Settled onto the target; only the continuous wander (at most
+		// min(0.12, step * 0.6) of the range) separates value and target.
+		expect(result.settledGap).toBeLessThanOrEqual(0.12 + 1e-9);
 		expect(result.settledMix).toBe(1);
 		// A smoothstepped 40-frame fade moves at most ~4% per frame; a retarget snap would be 50%+.
 		expect(result.maxBlendJump).toBeLessThan(0.06);

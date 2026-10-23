@@ -20,6 +20,8 @@
 // reading absolute phrase indices, so a looping score or an hours-long radio
 // stream keeps moving forward instead of replaying.
 
+import { noise1 } from '$lib/visualizer/motion';
+
 export type VariationScale = 'phrase' | 'section' | 'era';
 
 export type ContinuousAxis = {
@@ -36,6 +38,14 @@ export type ContinuousAxis = {
 	wrap?: boolean;
 	/** Seconds to glide to a new target. */
 	tau: number;
+	/**
+	 * Continuous drift around the target, as a fraction of the range, so the
+	 * value never parks between boundaries. Follows smooth non-repeating
+	 * noise. Default: min(0.12, step * 0.6); 0 disables.
+	 */
+	wander?: number;
+	/** Seconds per wander undulation. Default by scale: 24 / 50 / 110 s. */
+	wanderPeriod?: number;
 };
 
 export type ChoiceAxis = {
@@ -75,6 +85,7 @@ export type VariationInput = {
 export type ChoiceState = { from: number; to: number; mix: number };
 
 const SECTION_FALLBACK_PHRASES = 6;
+const WANDER_PERIOD: Record<VariationScale, number> = { phrase: 24, section: 50, era: 110 };
 /** After a shift, glides run this many times faster, easing back over SHIFT_RECOVER_S. */
 const SHIFT_SPEEDUP = 3.5;
 const SHIFT_RECOVER_S = 4;
@@ -108,7 +119,17 @@ function seedWord(seed: number | string): number {
 	return h;
 }
 
-type ContinuousState = { axis: ContinuousAxis; target: number; current: number };
+type ContinuousState = {
+	axis: ContinuousAxis;
+	index: number;
+	target: number;
+	current: number;
+	/** Wander clock in undulations; advances with time, never reset by reseed. */
+	wanderT: number;
+	/** Glide-time multiplier of the current move (varies per mutation). */
+	tauScale: number;
+};
+
 type ChoiceRuntime = {
 	axis: ChoiceAxis;
 	from: number;
@@ -141,6 +162,8 @@ export class VariationGenome {
 	private sectionsSinceEra = 0;
 	private mutationCount = 0;
 	private shiftEvents = 0;
+	/** Fixed for a journey: reseed must not jump the wander path. */
+	private wanderSeed = 0;
 	/** 1 = authored glide speed; > 1 right after a shift. */
 	private speed = 1;
 
@@ -170,11 +193,19 @@ export class VariationGenome {
 		this.mutationCount = 0;
 		this.shiftEvents = 0;
 		this.speed = 1;
+		this.wanderSeed = hash32(this.seed, 0x3a9d, 0, 0);
 		this.axes.forEach((axis, index) => {
 			const r = unit(this.seed, index, 0, 0x5eed);
 			if (axis.kind === 'continuous') {
 				const value = axis.min + r * (axis.max - axis.min);
-				this.continuous.set(axis.name, { axis, target: value, current: value });
+				this.continuous.set(axis.name, {
+					axis,
+					index,
+					target: value,
+					current: value,
+					wanderT: unit(this.seed, index, 1, 0x5eed) * 100,
+					tauScale: 1
+				});
 			} else {
 				const option = Math.floor(r * axis.options) % axis.options;
 				this.choices.set(axis.name, {
@@ -238,9 +269,15 @@ export class VariationGenome {
 		}
 
 		const speed = this.speed;
+		// Wander runs a little faster in loud music, never stops in quiet.
+		const wanderRate = 0.75 + energy * 0.5;
+		for (const state of this.continuous.values()) {
+			const period = state.axis.wanderPeriod ?? WANDER_PERIOD[state.axis.scale];
+			state.wanderT += (dt * wanderRate) / Math.max(1, period);
+		}
 		if (this.speed > 1) this.speed = Math.max(1, this.speed - (dt * (SHIFT_SPEEDUP - 1)) / SHIFT_RECOVER_S);
 		for (const state of this.continuous.values()) {
-			const k = 1 - Math.exp((-dt * speed) / Math.max(0.05, state.axis.tau));
+			const k = 1 - Math.exp((-dt * speed) / Math.max(0.05, state.axis.tau * state.tauScale));
 			if (state.axis.wrap) {
 				const range = state.axis.max - state.axis.min;
 				let delta = (state.target - state.current) % range;
@@ -332,11 +369,11 @@ export class VariationGenome {
 		state.weights = weights;
 	}
 
-	/** Eased value of a continuous axis. */
+	/** Eased value of a continuous axis, including its continuous wander. */
 	value(name: string): number {
 		const state = this.continuous.get(name);
 		if (!state) throw new Error(`Unknown continuous variation axis "${name}"`);
-		return state.current;
+		return this.wandered(state);
 	}
 
 	/** Crossfade state of a choice axis; `mix` is smoothstepped. */
@@ -350,7 +387,7 @@ export class VariationGenome {
 	/** All eased values (choices report their current target option). */
 	snapshot(): Record<string, number> {
 		const out: Record<string, number> = {};
-		for (const [name, state] of this.continuous) out[name] = state.current;
+		for (const [name, state] of this.continuous) out[name] = this.wandered(state);
 		for (const [name, state] of this.choices) out[name] = state.to;
 		return out;
 	}
@@ -407,6 +444,32 @@ export class VariationGenome {
 		return { phrases: this.phraseEvents, sections: this.sectionEvents, eras: this.eraEvents };
 	}
 
+	private wandered(state: ContinuousState): number {
+		const axis = state.axis;
+		const amount = axis.wander ?? Math.min(0.12, axis.step * 0.6);
+		if (amount <= 0) return state.current;
+		const range = axis.max - axis.min;
+		const v = state.current + noise1(this.wanderSeed, state.index, state.wanderT) * amount * range;
+		if (axis.wrap) return this.wrapValue(axis, v);
+		// Reflect at the bounds so the drift never sticks to an edge.
+		let out = v;
+		if (out > axis.max) out = axis.max - (out - axis.max);
+		if (out < axis.min) out = axis.min + (axis.min - out);
+		return Math.min(axis.max, Math.max(axis.min, out));
+	}
+
+	/**
+	 * How strongly a natural boundary moves the look, 0.35..1.6: sets the size
+	 * and the glide time of each change. Smooth across boundary events (busy
+	 * and quiet stretches cluster) plus a per-boundary roll, leaning on energy,
+	 * so change does not arrive with one fixed weight and tempo.
+	 */
+	private activity(scaleId: number, event: number, energy: number): number {
+		const mood = 0.5 + 0.5 * noise1(this.wanderSeed, 900 + scaleId, event * 0.53);
+		const roll = unit(this.seed, scaleId, event, 0xac71);
+		return Math.min(1.6, Math.max(0.35, 0.35 + mood * 0.8 + roll * 0.4 + (energy - 0.5) * 0.4));
+	}
+
 	private startCrossfade(state: ChoiceRuntime, pick: number): void {
 		state.from = state.to;
 		state.to = pick;
@@ -428,6 +491,8 @@ export class VariationGenome {
 		salt = 0
 	): void {
 		const scaleId = (scale === 'phrase' ? 1 : scale === 'section' ? 2 : 3) + salt * 3;
+		// Shifts answer the music at full strength; natural boundaries vary.
+		const activity = boost ? 1 : this.activity(scaleId, event, energy);
 		this.axes.forEach((axis, index) => {
 			if (axis.scale !== scale) return;
 			const gate = unit(this.seed, index, event, scaleId * 7 + 1);
@@ -438,8 +503,10 @@ export class VariationGenome {
 				// Signed jump, bolder with energy, never tiny (a mutation that is
 				// invisible is wasted variety).
 				const r = unit(this.seed, index, event, scaleId * 7 + 2) * 2 - 1;
-				const magnitude =
-					Math.min(0.5, (0.35 + 0.65 * Math.abs(r)) * axis.step * (0.7 + energy * 0.6) * (boost?.step ?? 1));
+				const magnitude = Math.min(
+					0.5,
+					(0.35 + 0.65 * Math.abs(r)) * axis.step * (0.7 + energy * 0.6) * (boost?.step ?? 0.55 + 0.45 * activity)
+				);
 				let next = state.target + Math.sign(r || 1) * magnitude * range;
 				if (axis.wrap) {
 					next = this.wrapValue(axis, next);
@@ -450,6 +517,9 @@ export class VariationGenome {
 					next = Math.min(axis.max, Math.max(axis.min, next));
 				}
 				state.target = next;
+				// Each move lands at its own pace: quiet boundaries glide slowly,
+				// busy ones arrive quicker, so changes never share one rhythm.
+				state.tauScale = boost ? 1 : 1.9 - activity * 0.75 + unit(this.seed, index, event, scaleId * 7 + 6) * 0.3;
 				this.mutationCount += 1;
 			} else {
 				const state = this.choices.get(axis.name)!;
