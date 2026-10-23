@@ -15,6 +15,10 @@
 //   5 Attractor     a Lorenz trail integrated in real time
 //   6 Polar loop    the spectrum wrapped into one closed outline (no bars)
 //   7 Torus knot    (p, q) knot projection
+//   8 Scope         the real stereo signal as XY (drawn by the beam module
+//                   in shaders.ts). Here it is a stand-in: the polyline
+//                   keeps the family it is morphing from or to, which the
+//                   beam traces while it hands over to the signal.
 
 export const SIGNAL_FIGURE_SEGMENTS = 480;
 export const SIGNAL_FIGURE_POINTS = SIGNAL_FIGURE_SEGMENTS + 1;
@@ -28,13 +32,28 @@ export const SIGNAL_FAMILY_NAMES = [
 	'phase-plot',
 	'attractor',
 	'polar-loop',
-	'torus-knot'
+	'torus-knot',
+	'scope'
 ] as const;
+
+/** The family whose hero is the real stereo signal (SIGNAL_FAMILY_NAMES). */
+export const SIGNAL_SCOPE_FAMILY = 8;
+
+/**
+ * How much of the hero the XY beam owns for a family morph: 1 while the
+ * scope family is on, easing in and out with the morph.
+ */
+export function signalScopeShare(familyFrom: number, familyTo: number, familyMix: number): number {
+	const mix = clamp(familyMix, 0, 1);
+	const to = familyTo === SIGNAL_SCOPE_FAMILY ? 1 : 0;
+	const from = familyFrom === SIGNAL_SCOPE_FAMILY ? 1 : 0;
+	return from + (to - from) * mix;
+}
 
 const TAU = Math.PI * 2;
 
 /** How far each family may tip in 3D (flat curves read best nearly face-on). */
-const FAMILY_TILT = [1, 0.5, 0.32, 0.32, 0.6, 1, 0.28, 1];
+const FAMILY_TILT = [1, 0.5, 0.32, 0.32, 0.6, 1, 0.28, 1, 1];
 
 export type SignalFigureInput = {
 	familyFrom: number;
@@ -154,6 +173,8 @@ export class SignalFigureEngine {
 	private trailHead = 0;
 	private lorenz: Vec3 = [0.1, 0, 20];
 	private stepCarry = 0;
+	/** Mean segment length of figures A and B (local units), for the beam light. */
+	readonly meanLength: [number, number] = [0.01, 0.01];
 
 	constructor() {
 		this.resetAttractor();
@@ -520,16 +541,23 @@ export class SignalFigureEngine {
 			const o = base + i * 4;
 			total += Math.hypot(this.points[o + 4] - this.points[o], this.points[o + 5] - this.points[o + 1]);
 		}
-		const mean = total / SIGNAL_FIGURE_SEGMENTS;
-		for (let i = 0; i < SIGNAL_FIGURE_POINTS; i += 1) {
-			const o = base + i * 4;
-			const j = Math.min(i, SIGNAL_FIGURE_SEGMENTS - 1) * 4 + base;
-			const length = Math.hypot(this.points[j + 4] - this.points[j], this.points[j + 5] - this.points[j + 1]);
-			this.points[o + 3] = clamp(Math.pow(mean / Math.max(length, mean * 0.02), 0.55), 0.55, 1.9);
-		}
+		// Beam dwell is physical now (the shader integrates the spot along each
+		// segment), so the fourth float is unused; the mean segment is the
+		// figure's reference speed.
+		this.meanLength[figure] = Math.max(total / SIGNAL_FIGURE_SEGMENTS, 1e-4);
+		for (let i = 0; i < SIGNAL_FIGURE_POINTS; i += 1) this.points[base + i * 4 + 3] = 1;
 	}
 
-	evaluate(input: SignalFigureInput): Float32Array {
+	evaluate(source: SignalFigureInput): Float32Array {
+		// The scope family draws no polyline of its own: hold the family it is
+		// leaving or arriving from (a Lissajous when there is none).
+		let input = source;
+		const scope = SIGNAL_SCOPE_FAMILY;
+		if (source.familyFrom === scope || source.familyTo === scope) {
+			const other =
+				source.familyFrom !== scope ? source.familyFrom : source.familyTo !== scope ? source.familyTo : 0;
+			input = { ...source, familyFrom: other, familyTo: other, familyMix: 1 };
+		}
 		this.advanceAttractor(input);
 		this.evaluateRaw(input, input.phase, this.rawA);
 		this.project(this.rawA, input, input.yaw, 1, 0, 1, null, input.yaw);

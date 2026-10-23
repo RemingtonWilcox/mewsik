@@ -5,7 +5,8 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['view', ['width', 'height', 'elapsed', 'dt']],
 	['bandsA', ['sub', 'kick', 'body', 'mids']],
 	['bandsB', ['presence', 'air', 'rms', 'centroid']],
-	['pulse', ['impact', 'beatGlow', 'sectionPulse', 'ringOut']],
+	// transient: heard kick/onset envelope (never the predicted beat clock).
+	['pulse', ['impact', 'transient', 'sectionPulse', 'ringOut']],
 	['tone', ['energy', 'silence', 'stroke', 'beatPhase']],
 	// Phosphor roles, resolved on the CPU from the genome's palette family.
 	['heroColor', ['heroR', 'heroG', 'heroB', 'paletteGain']],
@@ -50,14 +51,35 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	// Display character.
 	['display', ['scanDensity', 'scanStrength', 'curvature', 'grain']],
 	['display2', ['bloomGain', 'aberration', 'vignette', 'glass']],
-	['post', ['feedbackFade', 'floorFade', 'bloomThreshold', 'gridLevel']],
+	// Phosphor decay: fade per frame (long, short class) and the afterglow knee.
+	['post', ['fadeLong', 'fadeShort', 'afterglow', 'gridLevel']],
 	['floor', ['reflectY', 'reflect', 'seamY', 'seam']],
 	['context', ['gridDensity', 'sectionProgress', 'figurePhase', 'tempo']],
 	// The music's character as an instrument: broken beam, stroke core, crawl.
 	['voice', ['fracture', 'sharpness', 'fracturePhase', 'halation']],
 	// Tube geometry: face corner radius, glass reflectance, light spilled into
 	// the room, ghost from the glass thickness.
-	['tube', ['tubeRadius', 'glassReflect', 'roomSpill', 'glassGhost']]
+	['tube', ['tubeRadius', 'glassReflect', 'roomSpill', 'glassGhost']],
+	// Beam physics. Strokes are Gaussian spots dragged along each segment;
+	// the mean segment length (figure-local units) and the size compensation
+	// set how much light a figure's segment carries (see shaders.ts).
+	['figureLen', ['figALen', 'figBLen', 'figAEnergy', 'figBEnergy']],
+	// Light each stroke deposits per frame, per phosphor class, and the spot.
+	['deposit', ['depositLong', 'depositShort', 'spotSigma', 'focus']],
+	// The real XY beam: window index of its first pair, segment count,
+	// upsampling factor, and its share of the hero (0 synthesized .. 1 XY).
+	['beam', ['beamFirst', 'beamSegments', 'beamUp', 'beamMix']],
+	// Speed gain (light at reference speed x reference length), auto gain,
+	// rotation (0 XY .. pi/4 goniometer), and the frame's mean segment in
+	// pixels (what the dwell cap measures a near-resting beam against).
+	['beamDrive', ['beamGain', 'beamAgc', 'beamTurn', 'beamStep']],
+	// Channel traces 0 and 1 as the real left/right waveforms (triggered).
+	['scopeTrace', ['traceStart', 'traceSpan', 'traceGain', 'traceMix']],
+	// Glow and output: tight and wide glow, glass reflections, exposure.
+	['glow', ['glowTight', 'glowWide', 'reflection', 'exposure']],
+	// Overexposure to white, reflection spread, saturation, and the
+	// extinction floor that puts the phosphor's last glimmer out.
+	['output', ['overexposure', 'reflectSpread', 'saturation', 'extinction']]
 ] as const;
 
 type Group = (typeof SIGNAL_UNIFORM_GROUPS)[number];

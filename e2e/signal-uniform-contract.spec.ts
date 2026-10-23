@@ -35,10 +35,14 @@ test.describe('Signal uniform contract', () => {
 
 			const modules = {
 				scene: shaders.SIGNAL_SCENE_WGSL,
+				beam: shaders.SIGNAL_BEAM_WGSL,
 				feedback: shaders.SIGNAL_FEEDBACK_WGSL,
-				bloomDown: shaders.SIGNAL_BLOOM_DOWN_WGSL,
-				blurH: shaders.SIGNAL_BLOOM_BLUR_H_WGSL,
-				blurV: shaders.SIGNAL_BLOOM_BLUR_V_WGSL,
+				glowDown: shaders.SIGNAL_GLOW_DOWN_WGSL,
+				tightH: shaders.SIGNAL_TIGHT_BLUR_H_WGSL,
+				tightV: shaders.SIGNAL_TIGHT_BLUR_V_WGSL,
+				wideDown: shaders.SIGNAL_WIDE_DOWN_WGSL,
+				wideH: shaders.SIGNAL_WIDE_BLUR_H_WGSL,
+				wideV: shaders.SIGNAL_WIDE_BLUR_V_WGSL,
 				composite: shaders.SIGNAL_COMPOSITE_WGSL
 			};
 			const layoutGroups = layout.SIGNAL_UNIFORM_GROUPS.map(([group, slots]) => ({
@@ -89,8 +93,15 @@ test.describe('Signal uniform contract', () => {
 			const shaders = await import('/src/lib/visualizer/signal/shaders.ts');
 			const figures = await import('/src/lib/visualizer/signal/figures.ts');
 			const source = shaders.SIGNAL_SCENE_WGSL;
+			const scopeArray = `array<vec2<f32>, ${shaders.SIGNAL_SCOPE_WINDOW}>`;
 			return {
 				figureArray: source.includes(`array<vec4<f32>, ${figures.SIGNAL_FIGURE_POINTS * 2}>`),
+				// The stroke and XY beam modules read the same stereo window.
+				scopeArrays:
+					source.includes(scopeArray) &&
+					shaders.SIGNAL_BEAM_WGSL.includes(scopeArray) &&
+					shaders.SIGNAL_BEAM_WGSL.includes(`array<vec4<f32>, ${figures.SIGNAL_FIGURE_POINTS * 2}>`),
+				passes: shaders.SIGNAL_RENDER_PASSES,
 				terrainArray: source.includes(
 					`array<vec2<f32>, ${shaders.SIGNAL_TERRAIN_ROWS * shaders.SIGNAL_TERRAIN_BINS}>`
 				),
@@ -102,12 +113,20 @@ test.describe('Signal uniform contract', () => {
 				// Any backtick inside the generated WGSL would mean a broken template.
 				backticks: [
 					shaders.SIGNAL_SCENE_WGSL,
+					shaders.SIGNAL_BEAM_WGSL,
 					shaders.SIGNAL_FEEDBACK_WGSL,
+					shaders.SIGNAL_GLOW_DOWN_WGSL,
+					shaders.SIGNAL_TIGHT_BLUR_H_WGSL,
+					shaders.SIGNAL_WIDE_DOWN_WGSL,
+					shaders.SIGNAL_WIDE_BLUR_V_WGSL,
 					shaders.SIGNAL_COMPOSITE_WGSL
 				].some((code) => code.includes('`'))
 			};
 		});
 		expect(result.figureArray).toBe(true);
+		expect(result.scopeArrays).toBe(true);
+		// Beams, phosphor, glow prefilter, tight H/V, wide prefilter, wide H/V, present.
+		expect(result.passes).toBe(9);
 		expect(result.terrainArray).toBe(true);
 		expect(result.terrainFloats).toBe(result.expectedTerrain);
 		expect(result.instances).toBe(2 + 4 + 3 + 7 + 22);
@@ -262,7 +281,10 @@ test.describe('Signal instrument coupling', () => {
 			const silhouettes: number[][] = [];
 			let finite = true;
 			let extentOk = true;
+			// The scope family draws the real stereo signal on the GPU; its
+			// polyline is a stand-in for the family it morphs from or to.
 			for (let family = 0; family < figures.SIGNAL_FAMILY_NAMES.length; family += 1) {
+				if (family === figures.SIGNAL_SCOPE_FAMILY) continue;
 				const engine = new figures.SignalFigureEngine();
 				const points = engine.evaluate(input(family));
 				let maxR = 0;
@@ -286,6 +308,21 @@ test.describe('Signal instrument coupling', () => {
 			const engine = new figures.SignalFigureEngine();
 			const half = Array.from(engine.evaluate({ ...input(0), familyFrom: 2, familyTo: 7, familyMix: 0.5 }));
 			const halfFinite = half.every(Number.isFinite);
+			// Morphing into the scope family keeps the leaving family's polyline
+			// (the XY beam traces it while it hands over), and the share eases.
+			const rose = Array.from(new figures.SignalFigureEngine().evaluate({ ...input(2) }));
+			const toScope = Array.from(
+				new figures.SignalFigureEngine().evaluate({
+					...input(2),
+					familyFrom: 2,
+					familyTo: figures.SIGNAL_SCOPE_FAMILY,
+					familyMix: 0.4
+				})
+			);
+			const standIn = rose.every((value, i) => Math.abs(value - toScope[i]) < 1e-6);
+			const shares = [0, 0.25, 0.5, 1].map((mix) =>
+				figures.signalScopeShare(2, figures.SIGNAL_SCOPE_FAMILY, mix)
+			);
 			// Sampling at u returns the polyline the X and Y traces draw.
 			const sampleEngine = new figures.SignalFigureEngine();
 			const pts = sampleEngine.evaluate(input(3));
@@ -296,6 +333,8 @@ test.describe('Signal instrument coupling', () => {
 				extentOk,
 				minDifference,
 				halfFinite,
+				standIn,
+				shares,
 				sampleError: Math.hypot(sample[0] - pts[index * 4], sample[1] - pts[index * 4 + 1])
 			};
 		});
@@ -303,6 +342,8 @@ test.describe('Signal instrument coupling', () => {
 		expect(result.extentOk).toBe(true);
 		expect(result.minDifference).toBeGreaterThan(0.01);
 		expect(result.halfFinite).toBe(true);
+		expect(result.standIn).toBe(true);
+		expect(result.shares).toEqual([0, 0.25, 0.5, 1]);
 		expect(result.sampleError).toBeLessThan(1e-4);
 	});
 

@@ -58,7 +58,14 @@ export type SomaLabProfile = {
 	score: TrackScore;
 	stages: readonly SomaLabStage[];
 	defaultStage: string;
-	frameAt(positionMs: number, seed?: string): AudioFeatureFrame;
+	/**
+	 * Features at a song position. The frame's stereo scope covers the time
+	 * since `fromMs` (one 60 Hz frame when omitted or not just before), so a
+	 * caller that passes its previous position gets one continuous signal.
+	 */
+	frameAt(positionMs: number, seed?: string, fromMs?: number): AudioFeatureFrame;
+	/** The deterministic synthetic stereo signal between two positions. */
+	scopeBetween(fromMs: number, toMs: number, seed?: string): Float32Array;
 };
 
 const SAMPLE_RATE = 44_100;
@@ -359,7 +366,156 @@ function scoreEnergyAt(score: TrackScore, positionMs: number): number {
 	return score.energy_curve[low] + (score.energy_curve[high] - score.energy_curve[low]) * amount;
 }
 
-function makeFrame(spec: ProfileSpec, score: TrackScore, positionMs: number, seed: string): AudioFeatureFrame {
+// ---- Synthetic stereo ---------------------------------------------------
+// A deterministic stereo signal per profile, so the lab, specs and captures
+// can exercise Signal's XY beam without real audio. Each profile plays chord
+// tones in just intonation (closed Lissajous figures) split across the two
+// channels with its own phase, detune and width; bass, energy and the
+// profile's transients drive the amplitudes. Everything is a function of the
+// absolute sample time, so any two windows join seamlessly.
+
+const SCOPE_MAX_WINDOW_MS = 100;
+const TAU = Math.PI * 2;
+
+/** Seeded pseudo-random 0..1 from an integer. */
+function seeded(n: number): number {
+	let x = Math.imul(n | 0, 0x9e3779b1) ^ 0x85ebca6b;
+	x ^= x >>> 15;
+	x = Math.imul(x, 0xc2b2ae35);
+	x ^= x >>> 13;
+	return (x >>> 0) / 0x1_0000_0000;
+}
+
+/** Time since the last event at `eventPhase` of a repeating beat, seconds. */
+function sinceBeat(beats: number, eventPhase: number, beatSeconds: number): number {
+	return wrap01(beats - eventPhase) * beatSeconds;
+}
+
+/** A kick: a sine sweeping 150 Hz down to 48 Hz, decaying in about 0.15 s. */
+function kick(age: number): number {
+	const phase = TAU * (48 * age + (102 * (1 - Math.exp(-age * 24))) / 24);
+	return Math.sin(phase) * Math.exp(-age * 9);
+}
+
+type StereoVoice = {
+	/** Chord tone ratios over the root (just intonation). */
+	tones: readonly number[];
+	/** Octave multiplier on the root. */
+	octave: number;
+	/** Which chord tone index plays on each channel, with weights. */
+	left: readonly (readonly [tone: number, weight: number])[];
+	right: readonly (readonly [tone: number, weight: number])[];
+	/** Right channel detune in Hz: the figure turns once per 1/detune s. */
+	detune: number;
+	/** Right channel phase offset, turns. */
+	phase: number;
+	/** Inharmonic scribble (decorrelated per channel), 0..1. */
+	scribble: number;
+	/** Kick drum level (mono, so it draws the diagonal). */
+	kick: number;
+	/** Plucked decay rate per beat-group (0 = sustained). */
+	pluck: number;
+	/** Slow phase wander of the right channel, turns per second. */
+	wander: number;
+};
+
+const MAJOR_TONES = [1, 5 / 4, 3 / 2, 2] as const;
+const MINOR_TONES = [1, 6 / 5, 3 / 2, 2] as const;
+
+function stereoVoice(spec: ProfileSpec): StereoVoice {
+	const tones = spec.keyMode === 'minor' ? MINOR_TONES : MAJOR_TONES;
+	switch (spec.id) {
+		case 'club128':
+			// Root against fifth: a 2:3 knot turning slowly, kicked on the beat.
+			return { tones, octave: 2, left: [[0, 1]], right: [[2, 1]], detune: 0.12, phase: 0.1, scribble: 0.03, kick: 0.55, pluck: 0, wander: 0 };
+		case 'swing86':
+			// Near-mono sub (a thin ellipse) with a wide offbeat stab on top.
+			return { tones, octave: 1, left: [[0, 1], [2, 0.25]], right: [[0, 1], [1, 0.3]], detune: 0.04, phase: 0.06, scribble: 0.02, kick: 0.35, pluck: 1.4, wander: 0.01 };
+		case 'indie118':
+			return { tones, octave: 2, left: [[0, 0.8], [2, 0.45]], right: [[1, 0.8], [3, 0.35]], detune: 0.3, phase: 0.27, scribble: 0.12, kick: 0.25, pluck: 0.6, wander: 0.03 };
+		case 'ambient64':
+			// Slow pad: rose-like figures that wander with the phase.
+			return { tones, octave: 2, left: [[0, 1], [3, 0.35]], right: [[2, 0.9], [1, 0.4]], detune: 0.05, phase: 0.31, scribble: 0, kick: 0, pluck: 0, wander: 0.045 };
+		case 'acoustic94':
+			// Plucks: crisp figures that ring down after each strum.
+			return { tones, octave: 3, left: [[0, 1], [2, 0.3]], right: [[2, 0.9], [3, 0.4]], detune: 0.02, phase: 0.18, scribble: 0.04, kick: 0, pluck: 3.2, wander: 0.004 };
+		case 'noise172':
+			// Atonal pressure: mostly decorrelated scribble.
+			return { tones, octave: 3, left: [[0, 0.4]], right: [[1, 0.4]], detune: 1.7, phase: 0.43, scribble: 0.85, kick: 0.2, pluck: 0, wander: 0.2 };
+		case 'cinematic72':
+			// Wide strings: big figures that swell with the bow.
+			return { tones, octave: 2, left: [[0, 1], [1, 0.5], [3, 0.3]], right: [[2, 1], [3, 0.4], [1, 0.25]], detune: 0.08, phase: 0.22, scribble: 0.05, kick: 0.3, pluck: 0, wander: 0.02 };
+	}
+}
+
+function makeScope(spec: ProfileSpec, score: TrackScore, fromMs: number, toMs: number, seed: string): Float32Array {
+	const start = Math.round((Math.max(0, fromMs) / 1000) * SAMPLE_RATE);
+	const end = Math.round((Math.max(0, toMs) / 1000) * SAMPLE_RATE);
+	const count = Math.max(0, Math.min(end - start, Math.round((SCOPE_MAX_WINDOW_MS / 1000) * SAMPLE_RATE)));
+	const out = new Float32Array(count * 2);
+	if (count === 0) return out;
+	const voice = stereoVoice(spec);
+	const seedHash = stringHash(`${spec.id}:${seed}:scope`);
+	const root = 65.41 * Math.pow(2, spec.keyPitchClass / 12) * voice.octave;
+	const beatSeconds = 60 / spec.bpm;
+	const first = start + (end - start - count);
+	const energyFrom = scoreEnergyAt(score, (first / SAMPLE_RATE) * 1000);
+	const energyTo = scoreEnergyAt(score, (end / SAMPLE_RATE) * 1000);
+	const bass = spec.bands[0] * 0.6 + spec.bands[1] * 0.4;
+	// Scribble partials: inharmonic, a different set on each channel.
+	const scribbleHz = Array.from({ length: 8 }, (_, i) => 180 + seeded(seedHash + i * 31) * 2600);
+	const scribblePhase = Array.from({ length: 8 }, (_, i) => seeded(seedHash + i * 57 + 7) * TAU);
+	for (let index = 0; index < count; index += 1) {
+		const n = first + index;
+		const t = n / SAMPLE_RATE;
+		const energy = energyFrom + ((energyTo - energyFrom) * index) / count;
+		const beats = t / beatSeconds;
+		// Sustain and pluck envelopes: a pluck rings down over two beats.
+		const strum = voice.pluck > 0 ? Math.exp(-sinceBeat(beats / 2, 0, beatSeconds * 2) * voice.pluck) : 1;
+		const level = (0.16 + energy * 0.5) * (0.45 + 0.55 * strum) * (0.7 + bass * 0.3);
+		const wander = voice.wander > 0 ? Math.sin(TAU * voice.wander * t + seedHash * 1e-9) * 0.5 : 0;
+		let left = 0;
+		let right = 0;
+		for (const [tone, weight] of voice.left) {
+			left += Math.sin(TAU * root * voice.tones[tone] * t) * weight;
+		}
+		for (const [tone, weight] of voice.right) {
+			const f = root * voice.tones[tone] + voice.detune;
+			right += Math.sin(TAU * (f * t + voice.phase + wander)) * weight;
+		}
+		const normL = voice.left.reduce((sum, [, w]) => sum + w, 0);
+		const normR = voice.right.reduce((sum, [, w]) => sum + w, 0);
+		left = (left / normL) * level;
+		right = (right / normR) * level;
+		if (voice.scribble > 0) {
+			let sl = 0;
+			let sr = 0;
+			for (let k = 0; k < 4; k += 1) {
+				sl += Math.sin(TAU * scribbleHz[k] * t + scribblePhase[k]);
+				sr += Math.sin(TAU * scribbleHz[k + 4] * t + scribblePhase[k + 4]);
+			}
+			const s = voice.scribble * (0.1 + energy * 0.25) * 0.5;
+			left = left * (1 - voice.scribble * 0.5) + sl * s;
+			right = right * (1 - voice.scribble * 0.5) + sr * s;
+		}
+		if (voice.kick > 0) {
+			const k = kick(sinceBeat(beats, 0, beatSeconds)) * voice.kick * (0.3 + energy * 0.7);
+			left += k;
+			right += k;
+		}
+		out[index * 2] = Math.max(-1, Math.min(1, left));
+		out[index * 2 + 1] = Math.max(-1, Math.min(1, right));
+	}
+	return out;
+}
+
+function makeFrame(
+	spec: ProfileSpec,
+	score: TrackScore,
+	positionMs: number,
+	seed: string,
+	fromMs?: number
+): AudioFeatureFrame {
 	const boundedMs = Math.min(score.duration_ms, Math.max(0, positionMs));
 	const positionSeconds = boundedMs / 1_000;
 	const energy = scoreEnergyAt(score, boundedMs);
@@ -419,7 +575,17 @@ function makeFrame(spec: ProfileSpec, score: TrackScore, positionMs: number, see
 		bpm: spec.bpm,
 		beat_phase: beatPhase,
 		chroma_key: spec.keyPitchClass / 12,
-		chroma_strength: spec.keyConfidence
+		chroma_strength: spec.keyConfidence,
+		scope_rate: SAMPLE_RATE,
+		scope_pcm: makeScope(
+			spec,
+			score,
+			fromMs !== undefined && fromMs < boundedMs && boundedMs - fromMs <= SCOPE_MAX_WINDOW_MS
+				? fromMs
+				: boundedMs - 1000 / 60,
+			boundedMs,
+			seed
+		)
 	};
 }
 
@@ -487,8 +653,11 @@ function buildProfile(spec: ProfileSpec): SomaLabProfile {
 		score,
 		stages,
 		defaultStage: stages.find((stage) => stage.id === 'verse')?.id ?? stages[0].id,
-		frameAt(positionMs: number, seed = 'soma-qa') {
-			return makeFrame(spec, score, positionMs, seed);
+		frameAt(positionMs: number, seed = 'soma-qa', fromMs?: number) {
+			return makeFrame(spec, score, positionMs, seed, fromMs);
+		},
+		scopeBetween(fromMs: number, toMs: number, seed = 'soma-qa') {
+			return makeScope(spec, score, fromMs, toMs, seed);
 		}
 	};
 }

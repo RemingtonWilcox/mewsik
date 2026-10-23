@@ -80,6 +80,7 @@
 	let songNewSource = $state(false);
 	let songTracks = 0;
 	let activePositionMs = 0;
+	let lastScopeMs: number | undefined;
 	let profileFrameSerial = 0;
 	let installedLabApi: MewsikLabApi | null = null;
 	let settleWaiters: Array<{
@@ -224,7 +225,10 @@
 			activePositionMs = Math.min(activeStage.endMs - 1, activeStage.atMs + elapsedMs);
 		}
 		setScorePlayback(activePositionMs, false);
-		vis.setLatest(activeProfile.frameAt(activePositionMs, labSeed), now);
+		// The synthetic stereo scope covers exactly the time since the last
+		// frame, so the XY beam sees one continuous signal.
+		vis.setLatest(activeProfile.frameAt(activePositionMs, labSeed, lastScopeMs), now);
+		lastScopeMs = activePositionMs;
 		profileFrameSerial += 1;
 		if (!labProfileReady) labProfileReady = true;
 		flushSettleWaiters();

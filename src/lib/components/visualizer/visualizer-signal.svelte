@@ -6,18 +6,25 @@
 		type VisualizerJourneySnapshot
 	} from '$lib/state/visualizer.svelte';
 	import {
-		SIGNAL_BLOOM_BLUR_H_WGSL,
-		SIGNAL_BLOOM_BLUR_V_WGSL,
-		SIGNAL_BLOOM_DOWN_WGSL,
+		SIGNAL_BEAM_WGSL,
 		SIGNAL_COMPOSITE_WGSL,
 		SIGNAL_FEEDBACK_WGSL,
+		SIGNAL_GLOW_DOWN_WGSL,
 		SIGNAL_RENDER_PASSES,
 		SIGNAL_SCENE_WGSL,
+		SIGNAL_SCOPE_WINDOW,
 		SIGNAL_TERRAIN_BINS,
 		SIGNAL_TERRAIN_FLOATS,
 		SIGNAL_TERRAIN_ROWS,
+		SIGNAL_TIGHT_BLUR_H_WGSL,
+		SIGNAL_TIGHT_BLUR_V_WGSL,
+		SIGNAL_TIGHT_DIVISOR,
 		SIGNAL_TRACE_INSTANCES,
-		SIGNAL_VERTEX_COUNT
+		SIGNAL_VERTEX_COUNT,
+		SIGNAL_WIDE_BLUR_H_WGSL,
+		SIGNAL_WIDE_BLUR_V_WGSL,
+		SIGNAL_WIDE_DIVISOR,
+		SIGNAL_WIDE_DOWN_WGSL
 	} from '$lib/visualizer/signal/shaders';
 	import {
 		SIGNAL_UNIFORM_BYTES,
@@ -28,8 +35,11 @@
 	import {
 		SIGNAL_FAMILY_NAMES,
 		SIGNAL_FIGURE_FLOATS,
+		SIGNAL_FIGURE_SEGMENTS,
+		signalScopeShare,
 		type SignalFigureInput
 	} from '$lib/visualizer/signal/figures';
+	import { SignalScopeBeam } from '$lib/visualizer/signal/scope-beam';
 	import {
 		SIGNAL_CAMERAS,
 		SIGNAL_DISPLAYS,
@@ -61,6 +71,11 @@
 	const TERRAIN_FLOATS = SIGNAL_TERRAIN_FLOATS;
 	const TARGET_FRAME_RATE = 60;
 	const INTERNAL_SCALE = 0.75;
+	// The cheaper path for phones (lab: ?signalLite=1): half the beam
+	// upsampling and a smaller internal target; the glow targets scale with it.
+	const LITE_INTERNAL_SCALE = 0.6;
+	const LITE_UPSAMPLE = 3;
+	let internalScale = INTERNAL_SCALE;
 	const MAX_INTERNAL_PIXELS = 1920 * 1080;
 	const BEATS_PER_PHRASE = 32;
 	// How far a bench change ripples down the horizon history: rows nearest the
@@ -82,7 +97,17 @@
 	let hudPalette = $state('P31 bench');
 	let hudScene = $state(0);
 	let hudFrameMs = $state(0);
+	let hudBeam = $state(0);
+	let hudStereo = $state(0);
 	let frameCpuMs = 0;
+	// Lab-only GPU timing (?signalGpuTiming=1): timestamp queries around the
+	// whole frame when the adapter has them, else submit to queue-done.
+	let gpuTiming = $state(false);
+	let gpuPending = false;
+	let gpuMs = 0;
+	let hudGpuMs = $state(0);
+	type SignalTimer = { querySet: GPUQuerySet; resolve: GPUBuffer; readback: GPUBuffer };
+	let timer: SignalTimer | null = null;
 	let activeFrameStride = $state(1);
 	let measuredRefreshRate = $state(60);
 	let internalPixels = $state(0);
@@ -109,7 +134,9 @@
 	let quietFor = 0.5;
 	let renderBeats = 0;
 	let renderBpm = 120;
-	let beatGlow = 0;
+	// Heard transients (kick-band rise, onsets): the only beat light.
+	let transient = 0;
+	let lastKickLevel = 0;
 	let sweepPhase = 0;
 	let figurePhase = 0;
 	let lastTracePhase = 0;
@@ -136,11 +163,14 @@
 	// Interleaved height, heat per bin.
 	const pendingRow = memory.pendingRow;
 	const silhouette = new Float32Array(SIGNAL_TERRAIN_BINS);
+	const scopeSilhouette = new Float32Array(SIGNAL_TERRAIN_BINS);
 	let pendingRowFresh = true;
 
 	// The instrument model shared by every element on the bench.
 	const figureEngine = memory.figure;
 	const voiceTracker = memory.voice;
+	// The real stereo signal as the XY beam (see scope-beam.ts).
+	let scopeBeam = new SignalScopeBeam();
 	const paletteOut = createSignalPaletteOut();
 	const layoutMix = createSignalLayout();
 	/** This frame's conductor rails as drawn (see SignalCarry). */
@@ -202,8 +232,12 @@
 		sceneView: GPUTextureView;
 		feedback: [GPUTexture, GPUTexture];
 		feedbackViews: [GPUTextureView, GPUTextureView];
-		bloom: [GPUTexture, GPUTexture];
-		bloomViews: [GPUTextureView, GPUTextureView];
+		/** Tight glow, half resolution: [result, scratch]. */
+		tight: [GPUTexture, GPUTexture];
+		tightViews: [GPUTextureView, GPUTextureView];
+		/** Wide glow, an eighth of full resolution: [result, scratch]. */
+		wide: [GPUTexture, GPUTexture];
+		wideViews: [GPUTextureView, GPUTextureView];
 		width: number;
 		height: number;
 	};
@@ -217,21 +251,34 @@
 		detailBuffer: GPUBuffer;
 		terrainBuffer: GPUBuffer;
 		figureBuffer: GPUBuffer;
+		scopeBuffer: GPUBuffer;
 		uniforms: Float32Array;
 		scenePipeline: GPURenderPipeline;
+		beamPipeline: GPURenderPipeline;
 		feedbackPipeline: GPURenderPipeline;
-		bloomDownPipeline: GPURenderPipeline;
-		blurHPipeline: GPURenderPipeline;
-		blurVPipeline: GPURenderPipeline;
+		glowDownPipeline: GPURenderPipeline;
+		tightHPipeline: GPURenderPipeline;
+		tightVPipeline: GPURenderPipeline;
+		wideDownPipeline: GPURenderPipeline;
+		wideHPipeline: GPURenderPipeline;
+		wideVPipeline: GPURenderPipeline;
 		compositePipeline: GPURenderPipeline;
 		sceneBindGroup: GPUBindGroup;
+		beamBindGroup: GPUBindGroup;
 		targets: SignalTargets | null;
-		feedbackBindGroups: [GPUBindGroup, GPUBindGroup] | null;
-		bloomDownBindGroups: [GPUBindGroup, GPUBindGroup] | null;
-		blurHBindGroup: GPUBindGroup | null;
-		blurVBindGroup: GPUBindGroup | null;
-		compositeBindGroups: [GPUBindGroup, GPUBindGroup] | null;
+		post: SignalPostBindings | null;
 		parity: 0 | 1;
+	};
+
+	type SignalPostBindings = {
+		feedback: [GPUBindGroup, GPUBindGroup];
+		glowDown: [GPUBindGroup, GPUBindGroup];
+		tightH: GPUBindGroup;
+		tightV: GPUBindGroup;
+		wideDown: GPUBindGroup;
+		wideH: GPUBindGroup;
+		wideV: GPUBindGroup;
+		composite: [GPUBindGroup, GPUBindGroup];
 	};
 
 	let gpu: SignalGpu | null = null;
@@ -242,6 +289,11 @@
 
 	function approach(current: number, target: number, rate: number, dt: number) {
 		return current + (target - current) * (1 - Math.exp(-rate * dt));
+	}
+
+	function smoothstep(edge0: number, edge1: number, value: number) {
+		const t = clamp((value - edge0) / (edge1 - edge0), 0, 1);
+		return t * t * (3 - 2 * t);
 	}
 
 	function wrapSigned(value: number) {
@@ -317,8 +369,21 @@
 	 * with the bass under the figure. Beat stamps from the beam head ride in a
 	 * second channel. Peak-held between ticks so no transient is lost.
 	 */
-	function accumulateTerrainRow(coupling: number, headTurn: number, stamp: number) {
+	function accumulateTerrainRow(
+		coupling: number,
+		headTurn: number,
+		stamp: number,
+		beamMix: number,
+		beamTurn: number
+	) {
 		figureEngine.silhouette(silhouette);
+		// With the XY beam up, the horizon remembers the real picture.
+		if (beamMix > 0.001) {
+			scopeBeam.silhouette(scopeSilhouette, beamTurn);
+			for (let bin = 0; bin < SIGNAL_TERRAIN_BINS; bin += 1) {
+				silhouette[bin] += (scopeSilhouette[bin] - silhouette[bin]) * beamMix;
+			}
+		}
 		let mean = 0;
 		for (let bin = 0; bin < SIGNAL_TERRAIN_BINS; bin += 1) mean += silhouette[bin];
 		mean = Math.max(0.15, mean / SIGNAL_TERRAIN_BINS);
@@ -447,8 +512,8 @@
 		const cssWidth = Math.max(1, targetCanvas.clientWidth);
 		const cssHeight = Math.max(1, targetCanvas.clientHeight);
 		const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5);
-		let width = Math.max(1, Math.floor(cssWidth * pixelRatio * INTERNAL_SCALE));
-		let height = Math.max(1, Math.floor(cssHeight * pixelRatio * INTERNAL_SCALE));
+		let width = Math.max(1, Math.floor(cssWidth * pixelRatio * internalScale));
+		let height = Math.max(1, Math.floor(cssHeight * pixelRatio * internalScale));
 		const pixels = width * height;
 		if (pixels > MAX_INTERNAL_PIXELS) {
 			const reduction = Math.sqrt(MAX_INTERNAL_PIXELS / pixels);
@@ -461,8 +526,7 @@
 	function destroyTargets(targets: SignalTargets | null) {
 		if (!targets) return;
 		targets.scene.destroy();
-		for (const texture of targets.feedback) texture.destroy();
-		for (const texture of targets.bloom) texture.destroy();
+		for (const texture of [...targets.feedback, ...targets.tight, ...targets.wide]) texture.destroy();
 	}
 
 	function ensureTargets(state: SignalGpu, width: number, height: number) {
@@ -471,28 +535,36 @@
 		const hdr = (label: string, w: number, h: number) =>
 			state.device.createTexture({
 				label,
-				size: { width: w, height: h },
+				size: { width: Math.max(1, w), height: Math.max(1, h) },
 				format: 'rgba16float',
 				usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
 			});
-		const scene = hdr('Signal scene', width, height);
+		const scene = hdr('Signal beams', width, height);
 		const feedback: [GPUTexture, GPUTexture] = [
 			hdr('Signal phosphor A', width, height),
 			hdr('Signal phosphor B', width, height)
 		];
-		const bloomWidth = Math.max(1, Math.floor(width / 2));
-		const bloomHeight = Math.max(1, Math.floor(height / 2));
-		const bloom: [GPUTexture, GPUTexture] = [
-			hdr('Signal bloom A', bloomWidth, bloomHeight),
-			hdr('Signal bloom B', bloomWidth, bloomHeight)
+		const tightWidth = Math.ceil(width / SIGNAL_TIGHT_DIVISOR);
+		const tightHeight = Math.ceil(height / SIGNAL_TIGHT_DIVISOR);
+		const tight: [GPUTexture, GPUTexture] = [
+			hdr('Signal tight glow', tightWidth, tightHeight),
+			hdr('Signal tight glow scratch', tightWidth, tightHeight)
+		];
+		const wideWidth = Math.ceil(width / SIGNAL_WIDE_DIVISOR);
+		const wideHeight = Math.ceil(height / SIGNAL_WIDE_DIVISOR);
+		const wide: [GPUTexture, GPUTexture] = [
+			hdr('Signal wide glow', wideWidth, wideHeight),
+			hdr('Signal wide glow scratch', wideWidth, wideHeight)
 		];
 		const targets: SignalTargets = {
 			scene,
 			sceneView: scene.createView(),
 			feedback,
 			feedbackViews: [feedback[0].createView(), feedback[1].createView()],
-			bloom,
-			bloomViews: [bloom[0].createView(), bloom[1].createView()],
+			tight,
+			tightViews: [tight[0].createView(), tight[1].createView()],
+			wide,
+			wideViews: [wide[0].createView(), wide[1].createView()],
 			width,
 			height
 		};
@@ -510,32 +582,28 @@
 					...views.map((view, index) => ({ binding: 2 + index, resource: view }))
 				]
 			});
-		state.feedbackBindGroups = [
-			bind(state.feedbackPipeline, 'Signal phosphor reads A', [
-				targets.sceneView,
-				targets.feedbackViews[0]
-			]),
-			bind(state.feedbackPipeline, 'Signal phosphor reads B', [
-				targets.sceneView,
-				targets.feedbackViews[1]
-			])
-		];
-		state.bloomDownBindGroups = [
-			bind(state.bloomDownPipeline, 'Signal bloom prefilter A', [targets.feedbackViews[0]]),
-			bind(state.bloomDownPipeline, 'Signal bloom prefilter B', [targets.feedbackViews[1]])
-		];
-		state.blurHBindGroup = bind(state.blurHPipeline, 'Signal bloom blur H', [targets.bloomViews[0]]);
-		state.blurVBindGroup = bind(state.blurVPipeline, 'Signal bloom blur V', [targets.bloomViews[1]]);
-		state.compositeBindGroups = [
-			bind(state.compositePipeline, 'Signal composite A', [
-				targets.feedbackViews[0],
-				targets.bloomViews[0]
-			]),
-			bind(state.compositePipeline, 'Signal composite B', [
-				targets.feedbackViews[1],
-				targets.bloomViews[0]
-			])
-		];
+		const [phosphorA, phosphorB] = targets.feedbackViews;
+		const [tightGlow, tightScratch] = targets.tightViews;
+		const [wideGlow, wideScratch] = targets.wideViews;
+		state.post = {
+			feedback: [
+				bind(state.feedbackPipeline, 'Signal phosphor reads A', [targets.sceneView, phosphorA]),
+				bind(state.feedbackPipeline, 'Signal phosphor reads B', [targets.sceneView, phosphorB])
+			],
+			glowDown: [
+				bind(state.glowDownPipeline, 'Signal glow prefilter A', [phosphorA]),
+				bind(state.glowDownPipeline, 'Signal glow prefilter B', [phosphorB])
+			],
+			tightH: bind(state.tightHPipeline, 'Signal tight glow H', [tightGlow]),
+			tightV: bind(state.tightVPipeline, 'Signal tight glow V', [tightScratch]),
+			wideDown: bind(state.wideDownPipeline, 'Signal wide prefilter', [tightGlow]),
+			wideH: bind(state.wideHPipeline, 'Signal wide glow H', [wideGlow]),
+			wideV: bind(state.wideVPipeline, 'Signal wide glow V', [wideScratch]),
+			composite: [
+				bind(state.compositePipeline, 'Signal present A', [phosphorA, tightGlow, wideGlow]),
+				bind(state.compositePipeline, 'Signal present B', [phosphorB, tightGlow, wideGlow])
+			]
+		};
 		feedbackResetFrames = 2;
 	}
 
@@ -544,12 +612,31 @@
 		if (!gpuApi) throw new Error('Signal needs WebGPU, but this WebView does not expose it.');
 		const adapter = await gpuApi.requestAdapter();
 		if (!adapter) throw new Error('No compatible WebGPU adapter was found.');
-		const device = (await adapter.requestDevice()) as GPUDevice;
+		const wantTiming =
+			new URLSearchParams(location.search).get('signalGpuTiming') === '1' &&
+			adapter.features.has('timestamp-query');
+		const device = (await adapter.requestDevice(
+			wantTiming ? { requiredFeatures: ['timestamp-query'] } : undefined
+		)) as GPUDevice;
+		timer = wantTiming
+			? {
+					querySet: device.createQuerySet({ type: 'timestamp', count: 2 }),
+					resolve: device.createBuffer({
+						size: 16,
+						usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC
+					}),
+					readback: device.createBuffer({
+						size: 16,
+						usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST
+					})
+				}
+			: null;
 		let context: GPUCanvasContext | null = null;
 		let uniformBuffer: GPUBuffer | null = null;
 		let detailBuffer: GPUBuffer | null = null;
 		let terrainBuffer: GPUBuffer | null = null;
 		let figureBuffer: GPUBuffer | null = null;
+		let scopeBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
 			if (!context) throw new Error('The WebGPU canvas context could not be created.');
@@ -558,10 +645,14 @@
 
 			const modules = {
 				scene: device.createShaderModule({ label: 'Signal scene', code: SIGNAL_SCENE_WGSL }),
+				beam: device.createShaderModule({ label: 'Signal XY beam', code: SIGNAL_BEAM_WGSL }),
 				feedback: device.createShaderModule({ label: 'Signal phosphor', code: SIGNAL_FEEDBACK_WGSL }),
-				bloomDown: device.createShaderModule({ label: 'Signal bloom', code: SIGNAL_BLOOM_DOWN_WGSL }),
-				blurH: device.createShaderModule({ label: 'Signal blur H', code: SIGNAL_BLOOM_BLUR_H_WGSL }),
-				blurV: device.createShaderModule({ label: 'Signal blur V', code: SIGNAL_BLOOM_BLUR_V_WGSL }),
+				glowDown: device.createShaderModule({ label: 'Signal glow', code: SIGNAL_GLOW_DOWN_WGSL }),
+				tightH: device.createShaderModule({ label: 'Signal tight H', code: SIGNAL_TIGHT_BLUR_H_WGSL }),
+				tightV: device.createShaderModule({ label: 'Signal tight V', code: SIGNAL_TIGHT_BLUR_V_WGSL }),
+				wideDown: device.createShaderModule({ label: 'Signal wide', code: SIGNAL_WIDE_DOWN_WGSL }),
+				wideH: device.createShaderModule({ label: 'Signal wide H', code: SIGNAL_WIDE_BLUR_H_WGSL }),
+				wideV: device.createShaderModule({ label: 'Signal wide V', code: SIGNAL_WIDE_BLUR_V_WGSL }),
 				composite: device.createShaderModule({ label: 'Signal composite', code: SIGNAL_COMPOSITE_WGSL })
 			};
 			await Promise.all(
@@ -577,12 +668,24 @@
 				})
 			);
 
-			// Max blending: crossing beams never sum to white, the brighter wins,
-			// which is how overlapping phosphor actually reads.
-			const maxBlend: GPUBlendState = {
-				color: { srcFactor: 'one', dstFactor: 'one', operation: 'max' },
-				alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'max' }
+			// Additive light: retraces and crossings stack, the way a beam's
+			// energy really lands on the phosphor (the tone map rolls it off).
+			const addBlend: GPUBlendState = {
+				color: { srcFactor: 'one', dstFactor: 'one', operation: 'add' },
+				alpha: { srcFactor: 'one', dstFactor: 'one', operation: 'add' }
 			};
+			const beams = (label: string, module: GPUShaderModule) =>
+				device.createRenderPipelineAsync({
+					label,
+					layout: 'auto',
+					vertex: { module, entryPoint: 'vs_main' },
+					fragment: {
+						module,
+						entryPoint: 'fs_main',
+						targets: [{ format: 'rgba16float', blend: addBlend }]
+					},
+					primitive: { topology: 'triangle-list', cullMode: 'none' }
+				});
 			const fullscreen = (label: string, module: GPUShaderModule, targetFormat: GPUTextureFormat) =>
 				device.createRenderPipelineAsync({
 					label,
@@ -591,22 +694,27 @@
 					fragment: { module, entryPoint: 'fs_main', targets: [{ format: targetFormat }] },
 					primitive: { topology: 'triangle-list' }
 				});
-			const pipelines = await Promise.all([
-				device.createRenderPipelineAsync({
-					label: 'Signal beams',
-					layout: 'auto',
-					vertex: { module: modules.scene, entryPoint: 'vs_main' },
-					fragment: {
-						module: modules.scene,
-						entryPoint: 'fs_main',
-						targets: [{ format: 'rgba16float', blend: maxBlend }]
-					},
-					primitive: { topology: 'triangle-list', cullMode: 'none' }
-				}),
+			const [
+				scenePipeline,
+				beamPipeline,
+				feedbackPipeline,
+				glowDownPipeline,
+				tightHPipeline,
+				tightVPipeline,
+				wideDownPipeline,
+				wideHPipeline,
+				wideVPipeline,
+				compositePipeline
+			] = await Promise.all([
+				beams('Signal strokes', modules.scene),
+				beams('Signal XY beam', modules.beam),
 				fullscreen('Signal phosphor', modules.feedback, 'rgba16float'),
-				fullscreen('Signal bloom prefilter', modules.bloomDown, 'rgba16float'),
-				fullscreen('Signal bloom blur H', modules.blurH, 'rgba16float'),
-				fullscreen('Signal bloom blur V', modules.blurV, 'rgba16float'),
+				fullscreen('Signal glow prefilter', modules.glowDown, 'rgba16float'),
+				fullscreen('Signal tight glow H', modules.tightH, 'rgba16float'),
+				fullscreen('Signal tight glow V', modules.tightV, 'rgba16float'),
+				fullscreen('Signal wide prefilter', modules.wideDown, 'rgba16float'),
+				fullscreen('Signal wide glow H', modules.wideH, 'rgba16float'),
+				fullscreen('Signal wide glow V', modules.wideV, 'rgba16float'),
 				fullscreen('Signal present', modules.composite, format)
 			]);
 
@@ -630,14 +738,29 @@
 				size: SIGNAL_FIGURE_FLOATS * 4,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 			});
+			scopeBuffer = device.createBuffer({
+				label: 'Signal stereo window',
+				size: SIGNAL_SCOPE_WINDOW * 2 * 4,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
 			const sceneBindGroup = device.createBindGroup({
-				label: 'Signal beams',
-				layout: pipelines[0].getBindGroupLayout(0),
+				label: 'Signal strokes',
+				layout: scenePipeline.getBindGroupLayout(0),
 				entries: [
 					{ binding: 0, resource: { buffer: uniformBuffer } },
 					{ binding: 1, resource: { buffer: detailBuffer } },
 					{ binding: 2, resource: { buffer: terrainBuffer } },
-					{ binding: 3, resource: { buffer: figureBuffer } }
+					{ binding: 3, resource: { buffer: figureBuffer } },
+					{ binding: 4, resource: { buffer: scopeBuffer } }
+				]
+			});
+			const beamBindGroup = device.createBindGroup({
+				label: 'Signal XY beam',
+				layout: beamPipeline.getBindGroupLayout(0),
+				entries: [
+					{ binding: 0, resource: { buffer: uniformBuffer } },
+					{ binding: 1, resource: { buffer: figureBuffer } },
+					{ binding: 2, resource: { buffer: scopeBuffer } }
 				]
 			});
 			const state: SignalGpu = {
@@ -654,20 +777,22 @@
 				detailBuffer,
 				terrainBuffer,
 				figureBuffer,
+				scopeBuffer,
 				uniforms: new Float32Array(SIGNAL_UNIFORM_FLOATS),
-				scenePipeline: pipelines[0],
-				feedbackPipeline: pipelines[1],
-				bloomDownPipeline: pipelines[2],
-				blurHPipeline: pipelines[3],
-				blurVPipeline: pipelines[4],
-				compositePipeline: pipelines[5],
+				scenePipeline,
+				beamPipeline,
+				feedbackPipeline,
+				glowDownPipeline,
+				tightHPipeline,
+				tightVPipeline,
+				wideDownPipeline,
+				wideHPipeline,
+				wideVPipeline,
+				compositePipeline,
 				sceneBindGroup,
+				beamBindGroup,
 				targets: null,
-				feedbackBindGroups: null,
-				bloomDownBindGroups: null,
-				blurHBindGroup: null,
-				blurVBindGroup: null,
-				compositeBindGroups: null,
+				post: null,
 				parity: 0
 			};
 
@@ -683,6 +808,7 @@
 			detailBuffer?.destroy();
 			terrainBuffer?.destroy();
 			figureBuffer?.destroy();
+			scopeBuffer?.destroy();
 			try {
 				context?.unconfigure();
 			} catch {
@@ -700,6 +826,14 @@
 		state.detailBuffer.destroy();
 		state.terrainBuffer.destroy();
 		state.figureBuffer.destroy();
+		state.scopeBuffer.destroy();
+		if (timer) {
+			timer.querySet.destroy();
+			timer.resolve.destroy();
+			timer.readback.destroy();
+			timer = null;
+			gpuPending = false;
+		}
 		try {
 			state.context.unconfigure();
 		} catch {
@@ -736,15 +870,10 @@
 
 		ensureTargets(state, size.width, size.height);
 		const targets = state.targets;
-		if (
-			!targets ||
-			!state.feedbackBindGroups ||
-			!state.bloomDownBindGroups ||
-			!state.blurHBindGroup ||
-			!state.blurVBindGroup ||
-			!state.compositeBindGroups
-		)
-			return;
+		const post = state.post;
+		if (!targets || !post) return;
+		// The stereo pairs whose time has come (renderer-only; see scope-beam.ts).
+		const beam = scopeBeam.update(vis.scope, dt, sampleAt);
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
@@ -785,7 +914,7 @@
 		// The music's character: weights fitted to it, character-led axes
 		// pulled toward it, and every new shift answered once (genome.shift).
 		const character = shared.character;
-		const shiftEvent = genome.respond(character, directed.energy, dt);
+		const shiftEvent = genome.respond(character, directed.energy, dt, beam.interest);
 		if (shiftEvent) reactBoost = Math.max(reactBoost, 1 + 4.5 * Math.max(0.65, shiftEvent.strength));
 		reactBoost = 1 + (reactBoost - 1) * Math.exp(-dt / 4);
 		const voice = voiceTracker.update(character, dt, Math.max(reactBoost * 0.75, genome.genome.glideSpeed));
@@ -821,12 +950,13 @@
 			if (Math.abs(diff) > BEATS_PER_PHRASE * 0.75) renderBeats = anchor;
 			else renderBeats += diff * (1 - Math.exp(-dt / 0.45));
 		}
-		beatGlow = approach(
-			beatGlow,
-			feature ? Math.exp(-clamp(clock.beatPhase, 0, 1) * 5) : 0,
-			30,
-			dt
-		);
+		// Beat light comes only from what is heard: the kick band's rise and the
+		// analyzer's onsets, decaying in a breath. Never the predicted clock.
+		const kickLevel = feature ? spectrum.levels.kick : 0;
+		const kickRise = Math.max(0, kickLevel - lastKickLevel);
+		lastKickLevel = kickLevel;
+		transient *= Math.exp(-dt / 0.14);
+		transient = Math.max(transient, clamp(kickRise * 7, 0, 1), feature?.onset ? 0.55 : 0);
 
 		// Channel sweep: one pass per sweepBeats, locked to the bar when the
 		// section's sweep length settles on a whole number of beats.
@@ -953,7 +1083,7 @@
 			(0.86 + gene('figureScale') * 0.26) *
 			voice.scale *
 			(1 + voice.breathe * 0.07 * Math.sin(breathPhase)) *
-			(1 + voice.lock * (beatGlow * 0.06 + bands.kick * 0.03));
+			(1 + voice.lock * (transient * 0.05 + bands.kick * 0.03));
 		const figAScale = layout.figAScale * scaleFactor;
 		const figAX = layout.figAX + driftX;
 		const figAY =
@@ -1015,14 +1145,32 @@
 		const figurePoints = figureEngine.evaluate(figureInput);
 		const headU = sweepPhase;
 		figureEngine.sample(0, headU, headLocal);
+		// The XY beam owns the hero by the scope family's share of the morph,
+		// and only while the signal is there; otherwise the synthesized figure
+		// carries on. When the picture turns to a cloud (noise, a dense mix)
+		// the beam mostly hands back: the synthesized figure, shaken by the
+		// signal. Goniometer view (mid up) as the tilt gene runs high.
+		const beamMix =
+			signalScopeShare(familyChoice.from, familyChoice.to, familyChoice.mix) *
+			beam.live *
+			(0.2 + 0.8 * beam.structure);
+		const beamTurn = smoothstep(0.58, 0.78, gene('tilt')) * (Math.PI / 4);
+		if (beamMix > 0) {
+			const c = Math.cos(beamTurn);
+			const s = Math.sin(beamTurn);
+			const hx = beam.head[0] * c - beam.head[1] * s;
+			const hy = beam.head[0] * s + beam.head[1] * c;
+			headLocal[0] += (hx - headLocal[0]) * beamMix;
+			headLocal[1] += (hy - headLocal[1]) * beamMix;
+		}
 		const headX = figAX + headLocal[0] * figAScale;
 		const headY = figAY + headLocal[1] * figAScale;
 		const headTurn = (Math.atan2(headLocal[1], headLocal[0]) / (Math.PI * 2) + 1) % 1;
 
 		// ---- Horizon: the figure's history, written on beat ticks. ------------
 		const coupling = clamp(0.5 + gene('coupling') * 0.42, 0, 1);
-		const stamp = clamp(beatGlow * 1.3 + impact * 0.4 - 0.25, 0, 1.6);
-		accumulateTerrainRow(coupling, headTurn, stamp);
+		const stamp = clamp(transient * 1.3 + impact * 0.4 - 0.25, 0, 1.6);
+		accumulateTerrainRow(coupling, headTurn, stamp, beamMix, beamTurn);
 		const tickRate = clamp(journey.tickRate, 0.125, 3);
 		tickPhase += dt * beatsPerSecond * tickRate * (feature ? 1 : 0.25);
 		if (tickPhase >= 1) {
@@ -1095,6 +1243,32 @@
 		// analytically, so the feedback only needs to soften them).
 		const floorFade = feedbackResetFrames > 0 ? 0 : Math.pow(0.6, dt * 60);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
+		// Light each frame deposits. A stroke redrawn every frame builds toward
+		// deposit / fade, a one-off fast stroke shows only its deposit: so
+		// standing figures glow and passing ones are faint, as on a real tube.
+		// A deposit a little over the fade settles a standing stroke near its
+		// intensity, so the tone map has headroom for dwell and retraces.
+		const frames60 = dt * 60;
+		const depositLong = ((1 - persistence) * 1.15 + 0.025) * frames60;
+		const depositShort = 0.42 * frames60;
+		// Beam light: the same reference intensity the hero uses, carried by
+		// every segment equally. The reference length is the geometric mean
+		// of the beam's mean step and a fixed 2 px, so a larger or busier
+		// picture dims by the square root of its speed, not all the way.
+		const halfHeight = size.height * 0.5;
+		const beamSegments = Math.max(1, beam.segments);
+		const synthStep = (figureEngine.meanLength[0] * SIGNAL_FIGURE_SEGMENTS) / beamSegments;
+		const meanStepPx = (synthStep + (beam.step - synthStep) * beamMix) * figAScale * halfHeight;
+		const beamReference = Math.sqrt(Math.max(meanStepPx, 0.02) * 2);
+		const heroLight =
+			(0.62 + energy * 0.4 + clamp(journey.sectionPulse * responseImpact, 0, 1) * 0.3) *
+			(1 - silence * 0.55) *
+			paletteOut.gain *
+			voice.gain;
+		// A figure's light shrinks with its size: double the figure, about
+		// two thirds the light per pixel.
+		const sizeEnergy = (meanLength: number, scale: number) =>
+			Math.pow(Math.max((meanLength * scale * halfHeight) / 7, 0.05), -0.4);
 
 		// Band traces follow the genome's trace map on the shared time base.
 		const mapA = TRACE_MAPS[traceMapChoice.from];
@@ -1121,7 +1295,7 @@
 			rms,
 			centroid: spectrum.centroid,
 			impact,
-			beatGlow,
+			transient,
 			sectionPulse: clamp(journey.sectionPulse * responseImpact, 0, 1),
 			ringOut,
 			energy: clamp(energy * responseMotion, 0, 1),
@@ -1164,7 +1338,7 @@
 			headU,
 			headX,
 			headY,
-			lightLevel: (0.55 + energy * 0.35 + beatGlow * 0.35) * (1 - silence * 0.6),
+			lightLevel: (0.55 + energy * 0.35 + transient * 0.25) * (1 - silence * 0.6),
 			sweepPhase,
 			channels: clamp(journey.channels * (0.85 + responseMotion * 0.15), 0, 4),
 			feed: layout.feed,
@@ -1279,9 +1453,9 @@
 			aberration: display.aberration,
 			vignette: display.vignette,
 			glass: display.glass,
-			feedbackFade,
-			floorFade,
-			bloomThreshold: 1.0 - energy * 0.25,
+			fadeLong: 1 - feedbackFade,
+			fadeShort: 1 - floorFade,
+			afterglow: 0.2,
 			gridLevel: 0.75 + gene('grid') * 0.5,
 			reflectY: layout.reflectY,
 			reflect: layout.reflect,
@@ -1300,7 +1474,36 @@
 			tubeRadius: 0.05 + display.curvature * 0.7,
 			glassReflect: 0.35 + display.glass * 0.9,
 			roomSpill: 1,
-			glassGhost: 0.03 + display.glass * 0.09
+			glassGhost: 0.03 + display.glass * 0.09,
+			figALen: figureEngine.meanLength[0],
+			figBLen: figureEngine.meanLength[1],
+			figAEnergy: sizeEnergy(figureEngine.meanLength[0], figAScale),
+			figBEnergy: sizeEnergy(figureEngine.meanLength[1], figBScale),
+			depositLong,
+			depositShort,
+			spotSigma: 0.8,
+			// Punchy music focuses the spot hard; soft music blooms it.
+			focus: 1.2 - voice.sharpness * 0.4,
+			beamFirst: beam.first,
+			beamSegments: beam.segments,
+			beamUp: beam.up,
+			beamMix,
+			beamGain: heroLight * beamMix * beamReference,
+			beamAgc: beam.agc,
+			beamTurn,
+			beamStep: Math.max(meanStepPx, 0.01),
+			traceStart: beam.traceStart,
+			traceSpan: beam.traceSpan,
+			traceGain: beam.agc,
+			traceMix: beamMix,
+			glowTight: 0.26,
+			glowWide: 0.17,
+			reflection: 0.1,
+			exposure: 1.15 + energy * 0.1,
+			overexposure: 0.8,
+			reflectSpread: 0.05,
+			saturation: 1.06,
+			extinction: 0.0012 * dt * 60
 		};
 		packSignalUniforms(state.uniforms, values);
 
@@ -1333,6 +1536,13 @@
 			figurePoints.byteOffset,
 			figurePoints.byteLength
 		);
+		queue.writeBuffer(
+			state.scopeBuffer,
+			0,
+			scopeBeam.window.buffer,
+			scopeBeam.window.byteOffset,
+			scopeBeam.window.byteLength
+		);
 
 		const now = performance.now();
 		if (now - lastHudUpdateAt >= 250) {
@@ -1346,12 +1556,15 @@
 			hudPalette = SIGNAL_PALETTES[paletteChoice.to].name;
 			hudScene = genome.scene;
 			hudFrameMs = Math.round(frameCpuMs * 100) / 100;
+			hudBeam = Math.round(beamMix * 100) / 100;
+			hudStereo = Math.round(beam.interest * 100) / 100;
 		}
 
 		const encoder = state.device.createCommandEncoder({ label: 'Signal frame' });
 		{
 			const pass = encoder.beginRenderPass({
 				label: 'Signal beams',
+				...(timer ? { timestampWrites: { querySet: timer.querySet, beginningOfPassWriteIndex: 0 } } : {}),
 				colorAttachments: [
 					{
 						view: targets.sceneView,
@@ -1365,6 +1578,12 @@
 			pass.setPipeline(state.scenePipeline);
 			pass.setBindGroup(0, state.sceneBindGroup);
 			pass.draw(SIGNAL_VERTEX_COUNT, SIGNAL_TRACE_INSTANCES);
+			// The real XY beam, in the same light (figure B's screen when dual).
+			if (beamMix > 0.001 && beam.segments > 0) {
+				pass.setPipeline(state.beamPipeline);
+				pass.setBindGroup(0, state.beamBindGroup);
+				pass.draw(beam.segments * 6, screen > 0.01 ? 2 : 1);
+			}
 			pass.end();
 		}
 		const previous = state.parity;
@@ -1373,10 +1592,12 @@
 			label: string,
 			view: GPUTextureView,
 			pipeline: GPURenderPipeline,
-			bindGroup: GPUBindGroup
+			bindGroup: GPUBindGroup,
+			last = false
 		) => {
 			const pass = encoder.beginRenderPass({
 				label,
+				...(timer && last ? { timestampWrites: { querySet: timer.querySet, endOfPassWriteIndex: 1 } } : {}),
 				colorAttachments: [
 					{ view, clearValue: { r: 0, g: 0, b: 0, a: 1 }, loadOp: 'clear', storeOp: 'store' }
 				]
@@ -1386,30 +1607,49 @@
 			pass.draw(3);
 			pass.end();
 		};
-		fullscreen(
-			'Signal phosphor',
-			targets.feedbackViews[next],
-			state.feedbackPipeline,
-			state.feedbackBindGroups[previous]
-		);
-		fullscreen(
-			'Signal bloom prefilter',
-			targets.bloomViews[0],
-			state.bloomDownPipeline,
-			state.bloomDownBindGroups[next]
-		);
-		for (let iteration = 0; iteration < 2; iteration += 1) {
-			fullscreen('Signal bloom blur H', targets.bloomViews[1], state.blurHPipeline, state.blurHBindGroup);
-			fullscreen('Signal bloom blur V', targets.bloomViews[0], state.blurVPipeline, state.blurVBindGroup);
-		}
+		fullscreen('Signal phosphor', targets.feedbackViews[next], state.feedbackPipeline, post.feedback[previous]);
+		fullscreen('Signal glow prefilter', targets.tightViews[0], state.glowDownPipeline, post.glowDown[next]);
+		fullscreen('Signal tight glow H', targets.tightViews[1], state.tightHPipeline, post.tightH);
+		fullscreen('Signal tight glow V', targets.tightViews[0], state.tightVPipeline, post.tightV);
+		fullscreen('Signal wide prefilter', targets.wideViews[0], state.wideDownPipeline, post.wideDown);
+		fullscreen('Signal wide glow H', targets.wideViews[1], state.wideHPipeline, post.wideH);
+		fullscreen('Signal wide glow V', targets.wideViews[0], state.wideVPipeline, post.wideV);
 		fullscreen(
 			'Signal present',
 			state.context.getCurrentTexture().createView(),
 			state.compositePipeline,
-			state.compositeBindGroups[next]
+			post.composite[next],
+			true
 		);
 		state.parity = next;
+		const frameTimer = timer && !gpuPending ? timer : null;
+		if (frameTimer) {
+			encoder.resolveQuerySet(frameTimer.querySet, 0, 2, frameTimer.resolve, 0);
+			encoder.copyBufferToBuffer(frameTimer.resolve, 0, frameTimer.readback, 0, 16);
+		}
 		queue.submit([encoder.finish()]);
+		const recordGpu = (ms: number) => {
+			gpuPending = false;
+			if (Number.isFinite(ms) && ms >= 0 && ms < 1000) {
+				gpuMs += (ms - gpuMs) * 0.1;
+				hudGpuMs = Math.round(gpuMs * 100) / 100;
+			}
+		};
+		if (frameTimer) {
+			gpuPending = true;
+			void frameTimer.readback
+				.mapAsync(GPUMapMode.READ)
+				.then(() => {
+					const stamps = new BigInt64Array(frameTimer.readback.getMappedRange().slice(0));
+					frameTimer.readback.unmap();
+					recordGpu(Number(stamps[1] - stamps[0]) / 1e6);
+				})
+				.catch(() => (gpuPending = false));
+		} else if (gpuTiming && !gpuPending) {
+			gpuPending = true;
+			const submittedAt = performance.now();
+			void queue.onSubmittedWorkDone().then(() => recordGpu(performance.now() - submittedAt));
+		}
 	}
 
 	function loop(now: number) {
@@ -1489,7 +1729,13 @@
 	onMount(async () => {
 		running = true;
 		startTime = performance.now();
-		lookOverride = parseSignalLookOverride(new URLSearchParams(location.search).get('signalLook'));
+		const search = new URLSearchParams(location.search);
+		lookOverride = parseSignalLookOverride(search.get('signalLook'));
+		gpuTiming = search.get('signalGpuTiming') === '1';
+		if (search.get('signalLite') === '1') {
+			internalScale = LITE_INTERNAL_SCALE;
+			scopeBeam = new SignalScopeBeam(LITE_UPSAMPLE);
+		}
 		variation?.setOverride(lookOverride);
 		unsubscribe = await vis.subscribe();
 		if (!running) {
@@ -1526,7 +1772,11 @@
 			data-signal-palette={hudPalette}
 			data-signal-scene={hudScene}
 			data-signal-frame-ms={hudFrameMs}
+			data-signal-gpu-ms={gpuTiming ? hudGpuMs : undefined}
+			data-signal-beam={hudBeam}
+			data-signal-stereo={hudStereo}
 			data-signal-render-passes={SIGNAL_RENDER_PASSES}
+			data-signal-uniform-bytes={SIGNAL_UNIFORM_BYTES}
 			data-signal-frame-stride={activeFrameStride}
 			data-signal-refresh-rate={measuredRefreshRate}
 			data-signal-internal-pixels={internalPixels}

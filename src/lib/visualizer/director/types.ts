@@ -25,6 +25,16 @@ export type AudioFeatureFrame = {
 	beat_phase: number;
 	chroma_key: number;
 	chroma_strength: number;
+	/**
+	 * Stereo scope (renderer-only, never read by the journey): the left/right
+	 * pairs heard since the previous frame, base64 of interleaved
+	 * little-endian i16 scaled by 32767. Empty while silent. Native frames.
+	 */
+	scope?: string;
+	/** Pair rate of `scope` / `scope_pcm` after any decimation, Hz. */
+	scope_rate?: number;
+	/** Browser analyzers and lab profiles: the same pairs as -1..1 floats. */
+	scope_pcm?: Float32Array;
 };
 
 export type VisualizerSection =
