@@ -32,7 +32,7 @@
 		packLoomUniforms,
 		type LoomUniformValues
 	} from '$lib/visualizer/loom/uniform-layout';
-	import { parseLoomLookOverride, setLoomLookOverride } from '$lib/visualizer/loom/look';
+	import { parseLoomLookOverride, setLoomLookOverride, setLoomMotionQa } from '$lib/visualizer/loom/look';
 
 	const vis = useVisualizer();
 
@@ -767,9 +767,12 @@
 		const responseImpact = response.impact;
 		// Flow follows the music's tempo character: ambient drifts, noise rock races.
 		const weave = loom.look.weave;
+		// The clocks' rates wander a little (look.pace), so sway and flow never
+		// settle into one fixed tempo of their own.
+		const pace = 1 + loom.look.pace * 0.3;
 		swayPhase +=
-			(0.25 + pose.motion * 0.75 + pose.tempo * 0.3) * weave.flow * responseMotion * dt;
-		flowPhase += weave.flow * (1 - silence * 0.7) * dt;
+			(0.25 + pose.motion * 0.75 + pose.tempo * 0.3) * weave.flow * pace * responseMotion * dt;
+		flowPhase += weave.flow * (1 - silence * 0.7) * (1 + loom.look.pace * 0.2) * dt;
 
 		const energy = clamp(
 			pose.macroEnergy * 0.72 + rms * 0.18 + renderSpectralMotion * 0.1,
@@ -781,7 +784,10 @@
 		// material and environment; the conductor's patient rails ride on top.
 		const look = loom.look;
 		const budget = look.exposure;
-		const cameraYaw = pose.cameraYaw + Math.sin(driftPhase * 0.5) * 0.045 + look.camYaw;
+		// The look's roaming camera leads; the conductor's section rails only
+		// lean it a little, so no section or phrase owns a fixed shot.
+		const cameraYaw = pose.cameraYaw * 0.35 + look.camYaw;
+		const figure = look.figure;
 
 		// Post stack: trails shorten on impact and in silence; the bloom knee
 		// drops with energy so drops glow and verses stay graphic.
@@ -850,9 +856,9 @@
 			rimHue: renderPalette.rimHue,
 			saturation: renderPalette.saturation,
 			yaw: cameraYaw,
-			pitch: pose.cameraPitch + look.camPitch,
+			pitch: pose.cameraPitch * 0.6 + look.camPitch,
 			distance: pose.cameraDistance * look.camDistance,
-			roll: pose.cameraRoll + look.camRoll,
+			roll: pose.cameraRoll * 0.5 + look.camRoll,
 			beatConveyor: renderBeats,
 			swayPhase,
 			weftSparse: pose.weftSparse,
@@ -969,7 +975,35 @@
 			fray: weave.fray,
 			grain: weave.grain,
 			turbulence: weave.turbulence,
-			edge: weave.edge
+			edge: weave.edge,
+			twistY: figure.twistY,
+			twistX: figure.twistX,
+			bend: figure.bend,
+			flare: figure.flare,
+			tiltX: figure.tiltX,
+			tiltZ: figure.tiltZ,
+			laneGamma: figure.laneGamma,
+			deformAmount: figure.amount,
+			warpAx: figure.warp[0],
+			warpAy: figure.warp[1],
+			warpAz: figure.warp[2],
+			warpAAmp: figure.warp[3],
+			warpBx: figure.warp[4],
+			warpBy: figure.warp[5],
+			warpBz: figure.warp[6],
+			warpBAmp: figure.warp[7],
+			warpCx: figure.warp[8],
+			warpCy: figure.warp[9],
+			warpCz: figure.warp[10],
+			warpCAmp: figure.warp[11],
+			warpAPhase: figure.phase[0],
+			warpBPhase: figure.phase[1],
+			warpCPhase: figure.phase[2],
+			centerY: figure.centerY,
+			hybridGrammar: figure.hybridGrammar,
+			hybridMix: figure.hybridMix,
+			reserveA: 0,
+			reserveB: 0
 		};
 		packLoomUniforms(state.uniforms, values);
 
@@ -1184,6 +1218,8 @@
 		running = true;
 		// QA: ?loomLook=grammar=3,palette=5,camera=2 pins genome choices.
 		setLoomLookOverride(parseLoomLookOverride(new URL(location.href).searchParams.get('loomLook')));
+		// QA: ?loomMotion=camera:0,figure:0 scales the organic motion.
+		setLoomMotionQa(new URL(location.href).searchParams.get('loomMotion'));
 		startTime = performance.now();
 		unsubscribe = await vis.subscribe();
 		if (!running) {
@@ -1197,6 +1233,7 @@
 	onDestroy(() => {
 		running = false;
 		setLoomLookOverride(null);
+		setLoomMotionQa(null);
 		initVersion += 1;
 		cancelAnimationFrame(raf);
 		unsubscribe?.();

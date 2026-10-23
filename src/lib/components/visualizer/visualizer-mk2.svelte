@@ -520,6 +520,10 @@
 			put(u, name as SomaUniformField, at(0), at(1), at(2), at(3));
 			lane += lanes;
 		}
+		// The app slot's two spare lanes carry integrated phases (water current,
+		// comb-row light) so the shader never animates on time * constant.
+		u[O.app + 2] = finite(f.flow.current);
+		u[O.app + 3] = finite(f.flow.comb);
 		put(u, 'counts', f.lobes, smooth01(f.lobeFade, 0, 1), f.arms, smooth01(f.armFade, 0, 1));
 		put(u, 'modes', f.beatForm.from, f.beatForm.to, f.beatForm.mix, m.shed);
 		put(u, 'env', f.environment.from, f.environment.to, f.environment.mix, env.floorY);
@@ -541,16 +545,16 @@
 		put3(u, 'organ', f.colors.organ);
 		put(u, 'post', feedbackFade, bloomThreshold, aberration, bloomGain);
 		const orgUv = projectUv(f, aspect, o.boundCenter);
-		put(u, 'orgScreen', orgUv[0], orgUv[1], 0.2, orgUv[2] > 0 ? 1 : 0);
+		put(u, 'orgScreen', orgUv[0], orgUv[1], env.layerY, env.layer);
 		const md = f.mood;
 		put(u, 'mood', md.agitation, md.punch, md.calm, md.pulse);
 		// The water as a medium: per-channel extinction, and how much daylight reaches this depth.
 		const fog = env.fog * tuning.fog;
 		put(u, 'medium', fog * env.absorb[0], fog * env.absorb[1], fog * env.absorb[2], env.down);
-		put(u, 'flow', f.flow.snow, f.flow.light, md.warmth, f.flow.shiver);
+		put(u, 'flow', f.flow.snow, f.flow.light, f.flow.life, f.flow.shiver);
 		put(u, 'march', profile.raymarchSteps, profile.shadowSteps, profile.interiorSteps, profile.particleCells);
 		put3(u, 'comp', f.companion.pos, f.companion.scale);
-		put3(u, 'drag', f.drag);
+		put3(u, 'drag', f.drag, f.flow.film);
 		put(u, 'seeds', look.layoutSeed, look.layoutSeed, mirrorSurface ? env.surfaceY : env.floorY, mirrorSurface ? 1 : 0);
 		put(u, 'debug', import.meta.env.DEV ? ((globalThis as { __SOMA_DEBUG__?: number }).__SOMA_DEBUG__ ?? 0) : 0);
 		frameIndex += 1;

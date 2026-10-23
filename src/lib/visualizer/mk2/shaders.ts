@@ -38,7 +38,7 @@ export const SOMA_UNIFORM_FIELDS = [
 	'body1', // lobeAmp, squash, fin, stalk
 	'tent0', // tentLen, tentThick, tentDir, tentRoot
 	'tent1', // tentRootY, tentCurl, tentWave, tipBulb
-	'app', // oral, cerata, (reserved), (reserved)
+	'app', // oral, cerata, water current phase, comb-row phase
 	'chain0', // chainCount, chainSpacing, chainTaper, chainCurve
 	'chain1', // chain dir xyz, size
 	'skin0', // lattice, combs, chromato, opacity
@@ -59,15 +59,15 @@ export const SOMA_UNIFORM_FIELDS = [
 	'accent',
 	'organ',
 	'post', // feedback fade, bloom threshold, aberration, bloom gain
-	'orgScreen', // animal uv x, y, radius, visible
+	'orgScreen', // animal uv x, y, plankton layer height (world y), plankton layer density
 	'mood', // agitation, punch, calm, pulse (what kind of music the animal hears)
 	'medium', // per-channel extinction rgb (fog x absorption), downwelling light
-	'flow', // snow drift phase, animal light power, warmth, shiver phase
+	'flow', // snow drift phase, animal light power, far-life density, shiver phase
 	'march', // steps, shadow steps, interior steps, particle cells
 	'comp', // companion xyz, relative scale
-	'drag', // swim velocity in body space (appendages trail it), unused
+	'drag', // swim velocity in body space (appendages trail it), iridescent film phase
 	'seeds', // seed, layout seed, reflection plane y, reflection mode (0 floor, 1 surface)
-	'debug' // dev-only profiling mask (1 no animal, 2 no world, 4 no particles, 8 no shadow/interior)
+	'debug' // dev-only profiling mask (1 no animal, 2 no world, 4 no particles, 8 no shadow/interior, 16 part ids)
 ] as const;
 
 export type SomaUniformField = (typeof SOMA_UNIFORM_FIELDS)[number];
@@ -196,9 +196,13 @@ fn sdRoundCylY(p: vec3<f32>, r: f32, h: f32, rb: f32) -> f32 {
 	return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0))) - rb;
 }
 
+// Written as a weighted sum, not mix(): HLSL's lerp is b + h * (a - b), and
+// with an absent part (b = 1e5) that cancels catastrophically, quantizing the
+// whole body's distance to the f32 spacing near 1e5 (about 0.008) and
+// banding its shading into bright moire.
 fn smin(a: f32, b: f32, k: f32) -> f32 {
 	let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
-	return mix(b, a, h) - k * h * (1.0 - h);
+	return a * h + b * (1.0 - h) - k * h * (1.0 - h);
 }
 
 fn rotY(p: vec3<f32>, a: f32) -> vec3<f32> {
@@ -713,16 +717,46 @@ fn packetBand(form: f32, arc: f32, phi: f32, seg: f32) -> f32 {
 // shallow) scatters mostly forward (Henyey-Greenstein), returns faintly from
 // below, and has crossed more water the further from the light it is seen, so
 // it filters toward the water's colour. Without it the deep is nearly black.
+// A deep scattering layer: a drifting slab of luminous plankton at some depth,
+// patchy, carried by the current. It is real structure in the far field, lit
+// by itself, and gives the black water a horizon of living light whose height
+// in the frame follows the camera and the layer.
+fn plankton(rd: vec3<f32>) -> vec3<f32> {
+	let density = u.orgScreen.w;
+	if (density < 0.002) {
+		return vec3<f32>(0.0);
+	}
+	let ro = u.camPos.xyz;
+	let yL = u.orgScreen.z;
+	var acc = 0.0;
+	var prev = 0.0;
+	for (var i = 0; i < 6; i = i + 1) {
+		let t = 1.5 * pow(1.8, f32(i));
+		let p = ro + rd * t;
+		let slab = exp(-pow((p.y - yL) / 1.3, 2.0));
+		let q = p.xz * 0.11 + vec2<f32>(u.app.z * 0.35, -u.app.z * 0.2);
+		let clump = smoothstep(0.35, 0.85, vnoise(vec3<f32>(q, p.y * 0.25 + u.app.z * 0.05)));
+		let fade = exp(-dot(u.medium.xyz, vec3<f32>(0.33)) * t * 0.8);
+		acc = acc + slab * (0.25 + 0.75 * clump) * fade * (t - prev);
+		prev = t;
+	}
+	let tint = mix(u.accent.rgb, u.glow.rgb, 0.35);
+	return tint * acc * density * 0.012 * (1.0 + 0.35 * u.beat2.y);
+}
+
 fn waterBg(rd: vec3<f32>) -> vec3<f32> {
 	let l = u.keyDir.xyz;
 	let mu = dot(rd, l);
 	let g = 0.72;
 	let hg = (1.0 - g * g) / pow(max(1.0 + g * g - 2.0 * g * mu, 1e-4), 1.5) / (4.0 * PI);
-	let lit = smoothstep(-0.9, 0.85, rd.y * sign(l.y + 1e-4));
+	// Daylight in water falls off steeply away from the light: looking up is
+	// bright, a level view is dim, looking down is near black.
+	let lit = pow(smoothstep(-0.75, 0.95, rd.y * sign(l.y + 1e-4)), 2.2);
 	let path = 2.0 + 6.0 * (1.0 - lit);
 	let down = u.medium.w * u.keyDir.w;
-	let scatter = u.haze.rgb * u.keyCol.rgb * absorb(path) * down * (0.5 + 1.4 * lit + hg * 1.3);
-	return u.water.rgb * 0.45 + scatter;
+	// Almost no flat floor: lit water glows where it faces the light, not everywhere.
+	let scatter = u.haze.rgb * u.keyCol.rgb * absorb(path) * down * (0.12 + 1.6 * lit + hg * 1.3);
+	return u.water.rgb * 0.45 + scatter + plankton(rd);
 }
 
 // The beat light as the water sees it: the body fires on the beat, the water
@@ -876,7 +910,7 @@ fn kelpEnv(ro: vec3<f32>, rd: vec3<f32>, w: f32, floorY: f32) -> EnvHit {
 			}
 			hitT = (-b - sqrt(disc)) / a;
 			let y = ro.y + rd.y * hitT;
-			let sway = sin(y * 0.45 + u.frame.z * 0.35 + h.y * 6.0) * 0.45 * (y - floorY) / 10.0;
+			let sway = sin(y * 0.45 + u.app.z + h.y * 6.0) * 0.45 * (y - floorY) / 10.0;
 			c = base + vec2<f32>(sway, sway * 0.6);
 			width = (0.16 + h.x * 0.12) * (0.7 + 0.6 * abs(sin(y * 2.3 + h.z * 9.0)));
 		}
@@ -1112,13 +1146,17 @@ fn farLights(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> vec3<f32> {
 	let tdel = abs(inv);
 	for (var i = 0; i < 9; i = i + 1) {
 		let h = hash33(cell * 1.31 + vec3<f32>(5.0, u.seeds.y * 13.0, 2.0));
-		if (h.x < 0.16) {
+		// How many distant animals share the water wanders (flow.z): some
+		// stretches are empty black, others a scatter of far lights.
+		if (h.x < 0.06 + 0.3 * u.flow.z) {
 			let pc = (cell + 0.25 + 0.5 * h.zxy - vec3<f32>(t * 0.004, 0.0, -t * 0.003)) * cs;
 			let tp = dot(pc - ro, rd);
 			if (tp > 3.0 && tp < tMax) {
 				let dp = length(ro + rd * tp - pc);
-				let blink = smoothstep(0.55, 1.0, sin(t * (0.4 + h.y) + h.z * 40.0)) * select(1.0, u.beat.z * (1.0 - u.beat.x) * 2.0, h.y > 0.7);
-				let core = exp(-dp * dp / (0.0004 * tp)) + exp(-dp * dp / (0.012 * tp)) * 0.12;
+				// Each far light flickers on its own noise, never on a fixed cycle.
+				let blink = smoothstep(0.6, 0.85, vnoise(vec3<f32>(h.z * 40.0, h.x * 17.0, t * (0.3 + 0.5 * h.y)))) * select(1.0, u.beat.z * (1.0 - u.beat.x) * 2.0, h.y > 0.7);
+				// A small hot core and a wide soft body: a far animal out of focus.
+				let core = exp(-dp * dp / (0.0004 * tp)) + exp(-dp * dp / (0.012 * tp)) * 0.12 + exp(-dp * dp / (0.05 * tp)) * 0.05 * u.flow.z;
 				let tint = select(u.glow.rgb, u.accent.rgb, h.z > 0.5);
 				acc = acc + tint * core * blink * absorb(tp * 0.7) * 0.5;
 			}
@@ -1224,8 +1262,8 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	if (u.skin0.y > 0.01 && part < 0.5) {
 		let row = smoothstep(0.88, 0.99, cos(8.0 * phi));
 		let yN = qi.y / max(u.body0.y, 0.05);
-		let beat = 0.5 + 0.5 * sin(yN * 14.0 - u.frame.z * 9.0 * (0.4 + u.audio.z) + phi);
-		col = col + film(yN * 0.8 + u.frame.z * 0.35 + phi * 0.2) * row * (1.0 - abs(yN)) * u.skin0.y * (0.12 + beat * (0.25 + 1.4 * u.beat2.y + u.audio.z * 0.6));
+		let beat = 0.5 + 0.5 * sin(yN * 14.0 - u.app.w + phi);
+		col = col + film(yN * 0.8 + u.drag.w + phi * 0.2) * row * (1.0 - abs(yN)) * u.skin0.y * (0.12 + beat * (0.25 + 1.4 * u.beat2.y + u.audio.z * 0.6));
 	}
 
 	// Photophores: rim ring, body spots, along the appendages, bulbs; notes light them.
@@ -1372,7 +1410,11 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 			}
 		}
 		if (hit) {
-			let shaded = shadeAnimal(ro + rd * t, rd, t, wv.rgb, hitS);
+			var shaded = shadeAnimal(ro + rd * t, rd, t, wv.rgb, hitS);
+			// Dev: debug bit 16 paints the hit part id (0 bell .. 10 spines).
+			if ((dbg & 16u) != 0u) {
+				shaded = vec3<f32>(fract(hitS.part * 0.37), fract(hitS.part * 0.61 + 0.2), fract(hitS.part * 0.13 + 0.5));
+			}
 			let tr = absorb(t);
 			col = bg * (vec3<f32>(1.0) - tr) + shaded * tr;
 			depth = t;
@@ -1566,7 +1608,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 			if (pr.z > 0.1) {
 				let ruv = pr.xy;
 				let inside = smoothstep(0.0, 0.05, min(min(ruv.x, ruv.y), min(1.0 - ruv.x, 1.0 - ruv.y)));
-				let wob = vec2<f32>(sin(hitP.x * 3.0 + u.frame.z * 0.8), cos(hitP.z * 2.6 + u.frame.z * 0.6)) * 0.004;
+				let wob = vec2<f32>(sin(hitP.x * 3.0 + u.app.z * 2.3), cos(hitP.z * 2.6 + u.app.z * 1.7)) * 0.004;
 				let sharp = textureSampleLevel(feedbackTex, samp, ruv + wob, 0.0).rgb;
 				let soft = textureSampleLevel(bloomTex, samp, ruv + wob, 0.0).rgb;
 				let fresnel = 0.25 + 0.75 * pow(1.0 - abs(rd.y), 4.0);

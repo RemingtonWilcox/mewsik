@@ -5,13 +5,17 @@
 // topology, the palette family and how its colours are cast, the fibre
 // material, the camera regime, the environment and the form beats take. It is
 // driven by the shared variation genome (src/lib/visualizer/variation.ts), so
-// it mutates only on phrase, section and era boundaries, glides across them,
-// never returns to a recent look and keeps moving on hours-long radio.
+// it mutates on phrase, section and era boundaries, glides across them, never
+// returns to a recent look and keeps moving on hours-long radio. Between
+// boundaries nothing parks: the camera roams a space of viewpoints around the
+// genome's regime (motion.ts Roamer), the figure's form wanders continuously
+// on top of its grammar (LoomFigure), and the place's details drift.
 //
 // Everything here is CPU-only and allocation-free per frame: the resolved
 // `LoomLookFrame` is one reused object the renderer packs into uniforms.
 
 import { VariationGenome, variationSpaceSize, type VariationAxis } from '$lib/visualizer/variation';
+import { Roamer, Wander } from '$lib/visualizer/motion';
 import {
 	characterWeights,
 	type CharacterFeature,
@@ -46,22 +50,30 @@ export type LoomGrammar = {
 	 * hang just clear of it.
 	 */
 	floor: number;
+	/**
+	 * Bounds of the figure in strand space, before any deformation, measured on
+	 * screen (bright-pixel extent per grammar, output/loom3/calib.mjs):
+	 * [half-width x, lowest y, highest y, half-depth z]. The look frames the
+	 * figure from these, so every grammar owns the frame at the same size
+	 * whatever its proportions (a tower, a platter, a tunnel).
+	 */
+	reach: readonly [number, number, number, number];
 };
 
 export const LOOM_GRAMMARS: readonly LoomGrammar[] = [
-	{ name: 'ribbon', strands: [0, 0.3], scale: 1, density: 0.35, floor: -0.86 },
-	{ name: 'canopy', strands: [0.4, 0.85], scale: 0.82, density: 0.85, floor: -1.06 },
-	{ name: 'tunnel', strands: [0.4, 0.85], scale: 0.78, density: 0.95, floor: -0.96 },
-	{ name: 'helix-tower', strands: [0.25, 0.7], scale: 0.88, density: 0.55, floor: -1.02 },
-	{ name: 'mobius', strands: [0.4, 0.9], scale: 0.86, density: 0.6, floor: -1.0 },
-	{ name: 'peacock', strands: [0.45, 0.9], scale: 0.86, density: 0.7, floor: -0.68 },
-	{ name: 'braid', strands: [0, 0.5], scale: 0.88, density: 0.45, floor: -0.72 },
-	{ name: 'string-hyperboloid', strands: [0.5, 0.9], scale: 0.84, density: 0.75, floor: -0.74 },
-	{ name: 'saddle-lattice', strands: [0.45, 0.9], scale: 0.82, density: 0.8, floor: -0.86 },
-	{ name: 'thread-galaxy', strands: [0.35, 0.8], scale: 0.72, density: 0.9, floor: -0.5 },
-	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9, density: 0.45, floor: -0.88 },
-	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86, density: 0.55, floor: -0.86 },
-	{ name: 'aurora-curtain', strands: [0.45, 0.85], scale: 0.8, density: 0.85, floor: -0.64 }
+	{ name: 'ribbon', strands: [0, 0.3], scale: 1, density: 0.35, floor: -0.86, reach: [0.76, -0.29, 0.37, 0.38] },
+	{ name: 'canopy', strands: [0.4, 0.85], scale: 0.82, density: 0.85, floor: -1.06, reach: [0.89, -0.52, 0.42, 0.51] },
+	{ name: 'tunnel', strands: [0.4, 0.85], scale: 0.78, density: 0.95, floor: -0.96, reach: [1.27, -0.56, 0.54, 0.55] },
+	{ name: 'helix-tower', strands: [0.25, 0.7], scale: 0.88, density: 0.55, floor: -1.02, reach: [0.44, -0.87, 0.73, 0.44] },
+	{ name: 'mobius', strands: [0.4, 0.9], scale: 0.86, density: 0.6, floor: -1.0, reach: [0.92, -0.75, 0.48, 0.73] },
+	{ name: 'peacock', strands: [0.45, 0.9], scale: 0.86, density: 0.7, floor: -0.68, reach: [0.64, -0.52, 0.24, 0.29] },
+	{ name: 'braid', strands: [0, 0.5], scale: 0.88, density: 0.45, floor: -0.72, reach: [0.85, -0.3, 0.47, 0.35] },
+	{ name: 'string-hyperboloid', strands: [0.5, 0.9], scale: 0.84, density: 0.75, floor: -0.74, reach: [0.59, -0.55, 0.55, 0.48] },
+	{ name: 'saddle-lattice', strands: [0.45, 0.9], scale: 0.82, density: 0.8, floor: -0.86, reach: [0.75, -0.45, 0.39, 0.75] },
+	{ name: 'thread-galaxy', strands: [0.35, 0.8], scale: 0.72, density: 0.9, floor: -0.5, reach: [0.92, -0.16, 0.27, 0.92] },
+	{ name: 'trefoil', strands: [0.2, 0.65], scale: 0.9, density: 0.45, floor: -0.88, reach: [0.76, -0.71, 0.51, 0.65] },
+	{ name: 'orrery-rings', strands: [0.35, 0.8], scale: 0.86, density: 0.55, floor: -0.86, reach: [1.37, -0.57, 0.51, 0.54] },
+	{ name: 'aurora-curtain', strands: [0.45, 0.85], scale: 0.8, density: 0.85, floor: -0.64, reach: [0.92, -0.38, 0.65, 0.32] }
 ];
 
 // ---------------------------------------------------------------------------
@@ -172,7 +184,9 @@ export const LOOM_MATERIALS: readonly LoomMaterial[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Camera regimes. Offsets on top of the conductor's patient camera rails.
+// Camera regimes. Regions of the roaming camera's space, not paths: the
+// genome blends between them and a Roamer (LoomLook.roam) travels freely
+// around the blend, so no viewpoint is ever a fixed, returning shot.
 
 export type LoomCameraRegime = {
 	name: string;
@@ -192,10 +206,10 @@ export const LOOM_CAMERAS: readonly LoomCameraRegime[] = [
 	{ name: 'three-quarter', yaw: 0, pitch: 0.06, distance: 1, roll: 0, focal: 3.08, shiftX: 0, shiftY: 0, orbit: 0 },
 	{ name: 'low-hero', yaw: -0.28, pitch: 0.34, distance: 0.86, roll: 0.05, focal: 2.75, shiftX: 0, shiftY: 0.1, orbit: 0 },
 	// Looks up from under the weave into the hanging threads: no floor shows.
-	{ name: 'top-down', yaw: 0.3, pitch: -1.08, distance: 1.02, roll: 0.45, focal: 3, shiftX: 0, shiftY: 0.02, orbit: 0.025 },
+	{ name: 'top-down', yaw: 0.3, pitch: -1.08, distance: 1.02, roll: 0.45, focal: 3, shiftX: 0, shiftY: 0.02, orbit: 0.02 },
 	{ name: 'axial', yaw: 0.95, pitch: 0.02, distance: 0.62, roll: 0, focal: 2.05, shiftX: 0, shiftY: 0.02, orbit: 0 },
 	{ name: 'macro', yaw: 0.3, pitch: 0.02, distance: 0.72, roll: -0.07, focal: 3.6, shiftX: -0.16, shiftY: 0.05, orbit: 0 },
-	{ name: 'slow-orbit', yaw: 0, pitch: 0.12, distance: 1.04, roll: 0, focal: 3, shiftX: 0, shiftY: 0, orbit: 0.085 },
+	{ name: 'slow-orbit', yaw: 0, pitch: 0.12, distance: 1.04, roll: 0, focal: 3, shiftX: 0, shiftY: 0, orbit: 0.055 },
 	{ name: 'wide', yaw: -0.12, pitch: 0.2, distance: 1.42, roll: 0, focal: 3.15, shiftX: 0, shiftY: -0.02, orbit: 0 }
 ];
 
@@ -284,7 +298,7 @@ export const LOOM_TONES: readonly LoomTone[] = [
 	{ name: 'graphic', emission: 0.4, diffuse: 1.8, room: 0, mono: 0, bloom: 0.3, trail: -0.07 },
 	// Dark ink lines: barely emissive fibres drawn by the key light, in a
 	// thicker medium so the little light they do give carries the space.
-	{ name: 'ink', emission: 0.2, diffuse: 1.5, room: 0.55, mono: 0, bloom: 0.1, trail: -0.04 },
+	{ name: 'ink', emission: 0.3, diffuse: 1.6, room: 0.55, mono: 0, bloom: 0.14, trail: -0.04 },
 	{ name: 'mono', emission: 0.78, diffuse: 1.15, room: 0, mono: 1, bloom: 0.75, trail: 0 },
 	{ name: 'dusk', emission: 0.5, diffuse: 1.25, room: 1, mono: 0, bloom: 0.5, trail: -0.03 }
 ];
@@ -300,16 +314,20 @@ export function loomToneWeights(energy: number, out: number[] = []): number[] {
 	return out;
 }
 
-// Compositions: where the figure sits and how much negative space it gets.
+// Compositions: where the figure sits and how much of the frame it owns.
+// They are biases of the roaming framing (see LoomLook.roam), not fixed
+// shots: `scale` multiplies the frame fill the camera roams around. Even the
+// most open one keeps the weave owning the frame; a small clump floating in a
+// black void is never a composition.
 export type LoomComposition = { name: string; scale: number; shiftX: number; shiftY: number };
 
 export const LOOM_COMPOSITIONS: readonly LoomComposition[] = [
 	{ name: 'centre', scale: 1, shiftX: 0, shiftY: 0 },
-	{ name: 'left-third', scale: 0.8, shiftX: -0.2, shiftY: 0.02 },
-	{ name: 'right-third', scale: 0.8, shiftX: 0.2, shiftY: -0.02 },
-	{ name: 'monument', scale: 1.12, shiftX: 0, shiftY: -0.05 },
-	{ name: 'small-in-space', scale: 0.72, shiftX: 0.1, shiftY: 0.08 },
-	{ name: 'high-horizon', scale: 0.86, shiftX: -0.06, shiftY: -0.12 }
+	{ name: 'left-third', scale: 0.92, shiftX: -0.16, shiftY: 0.02 },
+	{ name: 'right-third', scale: 0.92, shiftX: 0.16, shiftY: -0.02 },
+	{ name: 'monument', scale: 1.16, shiftX: 0, shiftY: -0.05 },
+	{ name: 'open-space', scale: 0.84, shiftX: 0.08, shiftY: 0.06 },
+	{ name: 'high-horizon', scale: 0.96, shiftX: -0.05, shiftY: -0.1 }
 ];
 
 // ---------------------------------------------------------------------------
@@ -454,6 +472,8 @@ export type LoomLookFrame = {
 	bead: number;
 	swell: number;
 	frameScale: number;
+	/** Fraction of the frame's half-height the figure is framed to fill (diagnostics). */
+	fill: number;
 	frameShiftX: number;
 	frameShiftY: number;
 	frameTilt: number;
@@ -496,6 +516,10 @@ export type LoomLookFrame = {
 	 * always follow it (see LoomLook.followCharacter): never boundaries.
 	 */
 	weave: LoomWeaveCharacter;
+	/** Continuous shape of the figure on top of its grammar (see LoomFigure). */
+	figure: LoomFigure;
+	/** -1..1 drift of the sway and flow clocks' rate, so no motion keeps one tempo. */
+	pace: number;
 	/** Light budget resolved from everything above (exposure.ts). */
 	exposure: LoomExposure;
 	/** Stable per-journey identity in 0..1 (see LoomLook.identitySeed). */
@@ -515,6 +539,40 @@ export type LoomLookFrame = {
 	cameraIndex: number;
 	/** Shifts answered so far: from the shared tracker, and heard by Loom itself. */
 	shifts: { shared: number; local: number; contrast: number };
+};
+
+/**
+ * The figure's continuous form on top of its grammar: the grammars are a few
+ * parametric surfaces, and this turns them into a continuum. Every number
+ * wanders on smooth non-repeating noise (motion.ts), so the ribbons keep
+ * finding forms they have not taken before instead of cycling a set. Applied
+ * in strand space by deformFigure (shaders.ts).
+ */
+export type LoomFigure = {
+	/** Wring about the vertical axis, radians per unit of height. */
+	twistY: number;
+	/** Wring about the long (x) axis, radians per unit of length. */
+	twistX: number;
+	/** Arc of the whole figure along x. */
+	bend: number;
+	/** Opens the top and gathers the base (negative: the reverse). */
+	flare: number;
+	/** Lean of the whole figure, radians. */
+	tiltX: number;
+	tiltZ: number;
+	/** Strand spacing: < 1 crowds strands to the edges, > 1 gathers them to the middle. */
+	laneGamma: number;
+	/** Overall strength of the deformation (character: churning music bends more). */
+	amount: number;
+	/** Vertical centre of the grammar's bounds (the figure is centred on it). */
+	centerY: number;
+	/** Three slow travelling waves through the figure: [kx, ky, kz, amplitude] each. */
+	warp: number[];
+	/** Their phases, radians, integrated at wandering rates. */
+	phase: number[];
+	/** A second grammar the figure leans toward, and how far (0 most of the time .. 0.42). */
+	hybridGrammar: number;
+	hybridMix: number;
 };
 
 /**
@@ -554,6 +612,8 @@ export type LoomLookContext = {
 	character?: Readonly<MusicCharacter> | null;
 	/** Raw spectrum cues Loom calibrates its own hearing from (see LoomLook.hear). */
 	listen?: LoomListenCues | null;
+	/** Heard kick/novelty impulse 0..1 (conductor); strong transients nudge the camera. */
+	impact?: number;
 };
 
 /** Per-frame spectrum cues (SignalSpectrumProfile values). */
@@ -628,6 +688,10 @@ function rotateHue(out: Rgb, rgb: Readonly<Rgb>, shift: number): Rgb {
 
 function lerp(a: number, b: number, t: number): number {
 	return a + (b - a) * t;
+}
+
+function clampSigned(value: number, limit: number): number {
+	return Math.max(-limit, Math.min(limit, Number.isFinite(value) ? value : 0));
 }
 
 function clamp01(value: number): number {
@@ -776,6 +840,78 @@ const CONTINUOUS_AXES = LOOM_LOOK_AXES.map((axis, index) => ({ axis, index })).f
 	(entry): entry is { axis: Extract<VariationAxis, { kind: 'continuous' }>; index: number } =>
 		entry.axis.kind === 'continuous'
 );
+/** Seconds per wander undulation of a continuous axis, by its scale (as the genome's). */
+const AXIS_WANDER_PERIOD = { phrase: 24, section: 50, era: 110 } as const;
+
+// Organic motion (motion.ts). The camera roams a space of good viewpoints
+// around the genome's regime and composition; the figure's continuous form
+// and the place's details wander on noise that never repeats.
+const CAM_YAW = 0;
+const CAM_PITCH = 1;
+const CAM_DOLLY = 2;
+const CAM_ROLL = 3;
+const CAM_FOCAL = 4;
+const CAM_SHIFT_X = 5;
+const CAM_SHIFT_Y = 6;
+const CAM_FILL = 7;
+const CAM_ORBIT = 8;
+const CAM_DIMS = 9;
+
+const FIG_TWIST_Y = 0;
+const FIG_TWIST_X = 1;
+const FIG_BEND = 2;
+const FIG_FLARE = 3;
+const FIG_TILT_X = 4;
+const FIG_TILT_Z = 5;
+const FIG_GAMMA = 6;
+const FIG_HYBRID = 7;
+const FIG_AMOUNT = 8;
+const FIG_WARP_AMP = 9; // 3 lanes
+const FIG_WARP_K = 12; // 9 lanes
+const FIG_WARP_RATE = 21; // 3 lanes
+const FIG_PACE = 24;
+const FIG_PERIODS = [
+	61, 67, 73, 64, 83, 91, 87, 97, 95, 53, 59, 49, 101, 107, 97, 113, 92, 109, 98, 121, 104, 47, 43, 53, 37
+];
+
+/** How far each environment detail wanders around its family (fraction of 0..1). */
+const ENV_WANDER: Partial<Record<keyof Omit<LoomEnvironment, 'name'>, number>> = {
+	reflect: 0.2,
+	roughness: 0.2,
+	albedo: 0.04,
+	mist: 0.14,
+	mistHeight: 0.16,
+	mistNoise: 0.25,
+	threads: 0.32,
+	warpRows: 0.35,
+	threadReach: 0.3,
+	dust: 0.3
+};
+const ENV_WANDER_KEYS = Object.keys(ENV_WANDER) as Array<keyof Omit<LoomEnvironment, 'name'>>;
+/** Nominal camera distance (the conductor's rail), for framing the figure. */
+const FRAME_DISTANCE = 3.45;
+/** Assumed screen aspect when framing (the visualizer runs fullscreen landscape). */
+const FRAME_ASPECT = 16 / 9;
+/** The stage's fixed yaw (stageYaw in shaders.ts). */
+const STAGE_YAW = 0.62;
+
+function neutralFigure(): LoomFigure {
+	return {
+		twistY: 0,
+		twistX: 0,
+		bend: 0,
+		flare: 0,
+		tiltX: 0,
+		tiltZ: 0,
+		laneGamma: 1,
+		amount: 1,
+		centerY: 0,
+		warp: [1.6, 0.4, 0, 0, 0, 1.6, 0.5, 0, 0.4, 0, 1.6, 0],
+		phase: [0, 0, 0],
+		hybridGrammar: 0,
+		hybridMix: 0
+	};
+}
 
 function neutralWeave(): LoomWeaveCharacter {
 	return { flow: 1, fray: 0, grain: 0.15, turbulence: 0.15, weight: 0.45, edge: 0.4, warmth: 0, value: 1 };
@@ -859,6 +995,7 @@ const NUMERIC_KEYS = [
 	'bead',
 	'swell',
 	'frameScale',
+	'fill',
 	'frameShiftX',
 	'frameShiftY',
 	'frameTilt',
@@ -911,6 +1048,7 @@ function emptyFrame(): LoomLookFrame {
 		bead: 0,
 		swell: 0,
 		frameScale: 1,
+		fill: 0.9,
 		frameShiftX: 0,
 		frameShiftY: 0,
 		frameTilt: 0,
@@ -943,6 +1081,8 @@ function emptyFrame(): LoomLookFrame {
 		toneDiffuse: 1,
 		toneRoom: 0,
 		weave: neutralWeave(),
+		figure: neutralFigure(),
+		pace: 0,
 		toneMono: 0,
 		toneBloom: 1,
 		toneTrail: 0,
@@ -965,6 +1105,19 @@ function emptyFrame(): LoomLookFrame {
 }
 
 let globalOverride: LoomLookOverride | null = null;
+/** QA (?loomMotion=camera:0,figure:0.5): scales the organic motion, for diagnosis. */
+const motionQa = { camera: 1, figure: 1, genome: 1 };
+
+export function setLoomMotionQa(text: string | null | undefined): void {
+	motionQa.camera = 1;
+	motionQa.figure = 1;
+	motionQa.genome = 1;
+	for (const part of (text ?? '').split(',')) {
+		const [key, raw] = part.split(':');
+		const value = Number(raw);
+		if ((key === 'camera' || key === 'figure' || key === 'genome') && Number.isFinite(value)) motionQa[key] = Math.max(0, value);
+	}
+}
 
 /**
  * QA hook: pin choice axes for every LoomLook (the Loom component sets it from
@@ -1046,6 +1199,27 @@ export class LoomLook {
 	 * intro defaults (that restart was the track-change jump cut).
 	 */
 	readonly carry: LoomRailCarry = { valid: false, data: new Float64Array(40) };
+	/**
+	 * Organic motion state. It lives here, in the journey-owned look, so a
+	 * remount or a new song resumes the same journey instead of restarting it.
+	 */
+	private camRoam!: Roamer;
+	private figureWander!: Wander;
+	private envWander!: Wander;
+	private axisWander!: Wander;
+	/** Travelling-wave phases of the figure warp (radians, wrapped). */
+	private readonly warpPhase = [0, 0, 0];
+	/** Hybrid partner grammar; re-picked only while the hybrid is invisible. */
+	private hybridGrammar = 0;
+	private hybridPicks = 0;
+	private hybridWasOn = false;
+	/** Strong-transient detector for camera nudges (rising edge, refractory). */
+	private impactArmed = true;
+	private impactRest = 0;
+	/** Floor margin under the deformed figure, smoothed. */
+	private floorMargin = 0.1;
+	private readonly roamView = new Float32Array(CAM_DIMS);
+	private readonly figureView = new Float32Array(FIG_PERIODS.length);
 
 	constructor(seed: number | string = 0) {
 		this.genome = new VariationGenome(LOOM_LOOK_AXES, seed);
@@ -1105,6 +1279,28 @@ export class LoomLook {
 		this.weaveReady = false;
 		this.axesReady = false;
 		this.carry.valid = false;
+		const key = `loom-motion:${typeof seed === 'number' ? seed.toFixed(9) : seed}`;
+		this.camRoam = new Roamer(CAM_DIMS, `${key}:camera`, {
+			meanHold: 22,
+			minHold: 8,
+			response: 3.6,
+			wander: 0.16,
+			wanderPeriod: 47
+		});
+		this.figureWander = new Wander(FIG_PERIODS.length, `${key}:figure`, FIG_PERIODS);
+		this.envWander = new Wander(ENV_WANDER_KEYS.length, `${key}:place`, 57);
+		this.axisWander = new Wander(
+			CONTINUOUS_AXES.length,
+			`${key}:axes`,
+			CONTINUOUS_AXES.map(({ axis }) => axis.wanderPeriod ?? AXIS_WANDER_PERIOD[axis.scale])
+		);
+		this.warpPhase.fill(0);
+		this.hybridGrammar = Math.floor(this.identity * LOOM_GRAMMARS.length) % LOOM_GRAMMARS.length;
+		this.hybridPicks = 0;
+		this.hybridWasOn = false;
+		this.impactArmed = true;
+		this.impactRest = 0;
+		this.floorMargin = 0.1;
 	}
 
 	/** The last character shift this look answered (diagnostics, tests). */
@@ -1150,7 +1346,8 @@ export class LoomLook {
 		// The same while the music is audibly changing: a section label that
 		// flips with a station's new genre must not spend the morphs the shift
 		// is about to need for picks that fit the new music.
-		const holding = this.sinceAnyShift < SHIFT_HOLD_S || this.frame.shifts.contrast > 0.1;
+		const holding =
+			this.sinceAnyShift < SHIFT_HOLD_S || this.frame.shifts.contrast > 0.1 || motionQa.genome <= 0;
 		const phraseMoved = context.phraseIndex !== this.realPhrase;
 		const sectionMoved = context.sectionKey !== this.realSection;
 		this.realPhrase = context.phraseIndex;
@@ -1180,10 +1377,12 @@ export class LoomLook {
 		// Loom's own morphs and smoothers run in step with the genome's glides,
 		// which run several times faster for a few seconds after a shift.
 		const speed = this.genome.glideSpeed;
-		this.followAxes(context.dt, speed, first);
+		this.followAxes(context.dt, speed, first, energy);
 		this.followCharacter(character, context.dt, speed);
+		this.roam(context, character, energy);
 		this.resolve(this.target, context, override ?? globalOverride, first, speed);
 		this.smooth(context.dt, speed);
+		this.shapeFigure();
 		this.budget();
 		this.frame.identity = this.identity;
 		return this.frame;
@@ -1370,6 +1569,12 @@ export class LoomLook {
 		this.genome.setWeights('environment', places);
 		const g = this.genome;
 		g.shift(strength, Math.max(energy, character.energy));
+		// The camera heads somewhere new at once, swinging round the figure as
+		// it goes, so new music is seen from a new place within a second.
+		this.camRoam.redirect();
+		const swing = hashUnit(this.frame.shifts.shared + this.frame.shifts.local * 7 + 3, 0x5f1) < 0.5 ? -1 : 1;
+		this.camRoam.impulse(CAM_YAW, swing * (0.5 + strength * 0.5));
+		this.camRoam.impulse(CAM_ORBIT, swing * 0.8);
 		const amount = 0.35 + strength * 0.4;
 		const c = character;
 		g.pull('strands', c.energy * 0.6 + c.noise * 0.4, amount);
@@ -1388,35 +1593,152 @@ export class LoomLook {
 		return this.axisValues.get(name) ?? this.genome.value(name);
 	}
 
-	private followAxes(dtSeconds: number, speed: number, first: boolean): void {
+	private followAxes(dtSeconds: number, speed: number, first: boolean, energy: number): void {
 		const targets = this.genome.targetVector();
 		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
 		// Fast for two seconds after a shift, back to the authored glide by six.
 		const landing = 1 + 4 * Math.max(0, Math.min(1, (6 - this.sinceAnyShift) / 4));
 		const rate = Math.max(speed, landing);
 		const snap = first || !this.axesReady;
-		for (const { axis, index } of CONTINUOUS_AXES) {
+		// Loom glides the genome's targets itself, so it adds the continuous
+		// wander the genome gives its own eased values: no axis ever parks
+		// between boundaries. A little faster in loud music, never still.
+		const drift = this.axisWander.update(dt, 0.75 + energy * 0.5);
+		CONTINUOUS_AXES.forEach(({ axis, index }, lane) => {
 			const range = axis.max - axis.min;
-			const goal = axis.min + (targets[index] ?? 0.5) * range;
-			const current = this.axisValues.get(axis.name);
-			if (snap || current === undefined) {
-				this.axisValues.set(axis.name, goal);
-				continue;
+			const amount = axis.wander ?? Math.min(0.12, axis.step * 0.6);
+			let goal = axis.min + (targets[index] ?? 0.5) * range + drift[lane] * amount * range;
+			if (axis.wrap) goal = axis.min + ((((goal - axis.min) % range) + range) % range);
+			else {
+				// Reflect at the bounds so the drift never sticks to an edge.
+				if (goal > axis.max) goal = axis.max - (goal - axis.max);
+				if (goal < axis.min) goal = axis.min + (axis.min - goal);
+				goal = Math.min(axis.max, Math.max(axis.min, goal));
 			}
-			const k = 1 - Math.exp((-dt * rate) / Math.max(0.05, axis.tau));
-			let delta = goal - current;
-			if (axis.wrap) {
-				delta = delta % range;
-				if (delta > range / 2) delta -= range;
-				if (delta < -range / 2) delta += range;
-				let next = current + delta * k;
-				next = axis.min + ((((next - axis.min) % range) + range) % range);
-				this.axisValues.set(axis.name, next);
-			} else {
-				this.axisValues.set(axis.name, current + delta * k);
-			}
-		}
+			this.followAxis(axis, goal, dt, rate, snap);
+		});
 		this.axesReady = true;
+	}
+
+	private followAxis(
+		axis: Extract<VariationAxis, { kind: 'continuous' }>,
+		goal: number,
+		dt: number,
+		rate: number,
+		snap: boolean
+	): void {
+		const range = axis.max - axis.min;
+		const current = this.axisValues.get(axis.name);
+		if (snap || current === undefined) {
+			this.axisValues.set(axis.name, goal);
+			return;
+		}
+		const k = 1 - Math.exp((-dt * rate) / Math.max(0.05, axis.tau));
+		let delta = goal - current;
+		if (axis.wrap) {
+			delta = delta % range;
+			if (delta > range / 2) delta -= range;
+			if (delta < -range / 2) delta += range;
+			let next = current + delta * k;
+			next = axis.min + ((((next - axis.min) % range) + range) % range);
+			this.axisValues.set(axis.name, next);
+		} else {
+			this.axisValues.set(axis.name, current + delta * k);
+		}
+	}
+
+	/**
+	 * Advance the organic motion: the camera's roam (tempo sets its pace,
+	 * energy its restlessness, strong heard transients nudge it), the figure's
+	 * wandering form, the place's wandering details and the warp phases.
+	 */
+	private roam(context: LoomLookContext, character: Readonly<MusicCharacter> | null, energy: number): void {
+		const dt = Math.max(0, Math.min(0.25, Number.isFinite(context.dt) ? context.dt : 0));
+		const tempo = character ? character.tempo : 0.5;
+		const restless = clamp01(energy * 0.7 + (character ? character.motion * 0.3 : 0.15));
+		// Strong transients only (rising edge, refractory), and small: a nudge
+		// of the dolly, never a pulse on every kick.
+		const impact = clamp01(context.impact ?? 0);
+		this.impactRest = Math.max(0, this.impactRest - dt);
+		if (impact < 0.5) this.impactArmed = true;
+		if (this.impactArmed && impact > 0.85 && this.impactRest <= 0) {
+			this.impactArmed = false;
+			this.impactRest = 3.5;
+			this.camRoam.impulse(CAM_FILL, 0.12 * impact);
+			this.camRoam.impulse(CAM_DOLLY, -0.1 * impact);
+		}
+		this.camRoam.update(dt, 0.7 + tempo * 0.6, restless);
+		const flow = this.frame.weave.flow;
+		const fig = this.figureWander.update(dt, 0.6 + flow * 0.35 + energy * 0.2);
+		this.envWander.update(dt, 0.8 + energy * 0.4);
+		for (let i = 0; i < 3; i += 1) {
+			const rate = (0.07 + 0.13 * (fig[FIG_WARP_RATE + i] * 0.5 + 0.5)) * (0.5 + flow * 0.6);
+			// Alternate directions, so the waves cross rather than all run one way.
+			const sign = i === 1 ? -1 : 1;
+			this.warpPhase[i] = (this.warpPhase[i] + sign * rate * motionQa.figure * dt) % (Math.PI * 2);
+		}
+	}
+
+	/**
+	 * Resolve the figure's continuous form (LoomFigure) on the smoothed frame.
+	 * Everything here is a wander, already smooth; only the hybrid partner is
+	 * discrete, and it is re-picked only while the hybrid is fully off.
+	 */
+	private shapeFigure(): void {
+		const f = this.frame;
+		const out = f.figure;
+		const w = this.figureView;
+		for (let i = 0; i < w.length; i += 1) w[i] = this.figureWander.value[i] * motionQa.figure;
+		const turb = f.weave.turbulence;
+		out.twistY = w[FIG_TWIST_Y] * 0.62;
+		out.twistX = w[FIG_TWIST_X] * 0.5;
+		out.bend = w[FIG_BEND] * 0.3;
+		out.flare = w[FIG_FLARE] * 0.32;
+		out.tiltX = w[FIG_TILT_X] * 0.26;
+		out.tiltZ = w[FIG_TILT_Z] * 0.3;
+		out.laneGamma = Math.pow(2, w[FIG_GAMMA] * 0.55);
+		// Churning music bends the figure further; still music holds its form.
+		out.amount = clamp01(0.55 + w[FIG_AMOUNT] * 0.3 + turb * 0.35);
+		const bases = [
+			[1, 0.35, 0],
+			[0, 1, 0.45],
+			[0.4, 0, 1]
+		];
+		for (let i = 0; i < 3; i += 1) {
+			let x = bases[i][0] + w[FIG_WARP_K + i * 3] * 0.9;
+			let y = bases[i][1] + w[FIG_WARP_K + i * 3 + 1] * 0.9;
+			let z = bases[i][2] + w[FIG_WARP_K + i * 3 + 2] * 0.9;
+			const length = Math.hypot(x, y, z) || 1;
+			const k = (1.5 + 0.9 * (w[FIG_WARP_K + i * 3] * 0.5 + 0.5)) / length;
+			x *= k;
+			y *= k;
+			z *= k;
+			out.warp[i * 4] = x;
+			out.warp[i * 4 + 1] = y;
+			out.warp[i * 4 + 2] = z;
+			out.warp[i * 4 + 3] = 0.03 + 0.09 * (w[FIG_WARP_AMP + i] * 0.5 + 0.5);
+			out.phase[i] = this.warpPhase[i];
+		}
+		const from = LOOM_GRAMMARS[f.grammarFrom] ?? LOOM_GRAMMARS[0];
+		const to = LOOM_GRAMMARS[f.grammarTo] ?? LOOM_GRAMMARS[0];
+		const centre = (g: LoomGrammar) => (g.reach[1] + g.reach[2]) * 0.5;
+		out.centerY = lerp(centre(from), centre(to), f.grammarMix);
+		// The hybrid is off about half the time; a new partner is chosen only
+		// then, so the figure never swaps what it leans toward in view.
+		const hybrid = smoothstep(0.05, 0.8, w[FIG_HYBRID]) * 0.42;
+		if (hybrid <= 0) {
+			if (this.hybridWasOn || out.hybridGrammar === f.grammarTo) {
+				this.hybridPicks += 1;
+				const pick = Math.floor(hashUnit(this.hybridPicks * 131 + 17, Math.floor(this.identity * 1e6)) * LOOM_GRAMMARS.length);
+				let next = pick % LOOM_GRAMMARS.length;
+				if (next === f.grammarTo || next === f.grammarFrom) next = (next + 5) % LOOM_GRAMMARS.length;
+				this.hybridGrammar = next;
+			}
+			this.hybridWasOn = false;
+		} else this.hybridWasOn = true;
+		out.hybridGrammar = this.hybridGrammar;
+		out.hybridMix = hybrid;
+		f.pace = w[FIG_PACE];
 	}
 
 	/** Glide the character-driven weave parameters (seconds; under one after a shift). */
@@ -1514,7 +1836,22 @@ export class LoomLook {
 			grammar.mix
 		);
 		out.density = lerp(gFrom.density, gTo.density, grammar.mix);
-		out.floorY = lerp(gFrom.floor, gTo.floor, grammar.mix);
+		// The figure is centred on its bounds (LoomFigure.centerY) and bends,
+		// leans and ripples; the floor sits under all of that, eased so it
+		// settles slowly rather than bobbing with the figure.
+		{
+			const w = this.figureWander.value;
+			const reachX = lerp(gFrom.reach[0], gTo.reach[0], grammar.mix);
+			const margin =
+				(Math.abs(w[FIG_TILT_X] * 0.26) + Math.abs(w[FIG_TILT_Z] * 0.3)) * reachX * 0.45 +
+				Math.abs(w[FIG_BEND] * 0.3) * 0.5 +
+				0.1;
+			const k = first ? 1 : 1 - Math.exp(-Math.max(0, Math.min(0.25, context.dt)) / 6);
+			this.floorMargin += (margin - this.floorMargin) * k;
+			const centre = (g: LoomGrammar) => (g.reach[1] + g.reach[2]) * 0.5;
+			out.floorY =
+				lerp(gFrom.floor - centre(gFrom), gTo.floor - centre(gTo), grammar.mix) - this.floorMargin;
+		}
 		out.twist = this.axis('twist');
 		out.crossings = this.axis('crossings');
 		out.spread = this.axis('spread');
@@ -1529,19 +1866,6 @@ export class LoomLook {
 		const kFrom = LOOM_COMPOSITIONS[composition.from] ?? LOOM_COMPOSITIONS[0];
 		const kTo = LOOM_COMPOSITIONS[composition.to] ?? LOOM_COMPOSITIONS[0];
 		const compScale = lerp(kFrom.scale, kTo.scale, composition.mix);
-		const scaleAxis = this.axis('scale');
-		// Dense grammars sit a little smaller so they keep negative space round them.
-		out.frameScale =
-			lerp(gFrom.scale, gTo.scale, grammar.mix) * (0.88 + scaleAxis * 0.24) * compScale * (1.04 - out.density * 0.08);
-		// Never lose the figure: a small composition seen from a far camera
-		// keeps a minimum apparent size (smoothed with everything else).
-		const camScale = lerp(
-			(LOOM_CAMERAS[camera.from] ?? LOOM_CAMERAS[0]).distance,
-			(LOOM_CAMERAS[camera.to] ?? LOOM_CAMERAS[0]).distance,
-			camera.mix
-		);
-		const apparent = out.frameScale / Math.max(0.4, camScale);
-		if (apparent < 0.74) out.frameScale *= 0.74 / apparent;
 		const framing = this.axis('framing');
 		out.frameShiftX = framing * 0.1 + lerp(kFrom.shiftX, kTo.shiftX, composition.mix);
 		out.frameShiftY = lerp(kFrom.shiftY, kTo.shiftY, composition.mix);
@@ -1616,21 +1940,81 @@ export class LoomLook {
 		const eFrom = LOOM_ENVIRONMENTS[environment.from] ?? LOOM_ENVIRONMENTS[0];
 		const eTo = LOOM_ENVIRONMENTS[environment.to] ?? LOOM_ENVIRONMENTS[0];
 		for (const key of ENV_KEYS) out.env[key] = lerp(eFrom[key], eTo[key], environment.mix);
+		// Six families of place become a continuum: each detail (how much the
+		// floor mirrors, how thick and how high the mist, how many far threads
+		// and how ordered, how much dust) wanders round its family.
+		const place = this.envWander.value;
+		ENV_WANDER_KEYS.forEach((key, lane) => {
+			out.env[key] = clamp01(out.env[key] + place[lane] * (ENV_WANDER[key] ?? 0));
+		});
 
 		const cFrom = LOOM_CAMERAS[camera.from] ?? LOOM_CAMERAS[0];
 		const cTo = LOOM_CAMERAS[camera.to] ?? LOOM_CAMERAS[0];
 		const cm = camera.mix;
-		out.camYaw = lerp(cFrom.yaw, cTo.yaw, cm);
-		out.camPitch = lerp(cFrom.pitch, cTo.pitch, cm);
-		out.camDistance = lerp(cFrom.distance, cTo.distance, cm);
-		out.camRoll = lerp(cFrom.roll, cTo.roll, cm) + out.frameTilt;
-		out.focal = lerp(cFrom.focal, cTo.focal, cm);
-		out.lensShiftX = lerp(cFrom.shiftX, cTo.shiftX, cm) + out.frameShiftX;
-		out.lensShiftY = lerp(cFrom.shiftY, cTo.shiftY, cm) + out.frameShiftY;
-		const orbitRate = lerp(cFrom.orbit, cTo.orbit, cm);
-		const drift = this.axis('drift');
-		this.orbit += orbitRate * (drift >= 0 ? 1 : -1) * Math.max(0, Math.min(0.25, context.dt));
+		// The camera roams around the blended regime: regimes are regions of
+		// the space, the Roamer travels it on springs between destinations
+		// picked at irregular times, so no viewpoint is a path that returns.
+		const roam = this.roamView;
+		for (let i = 0; i < CAM_DIMS; i += 1) roam[i] = this.camRoam.value[i] * motionQa.camera;
+		out.camYaw = lerp(cFrom.yaw, cTo.yaw, cm) + roam[CAM_YAW] * 0.6;
+		out.camPitch = Math.max(-1.25, Math.min(0.55, lerp(cFrom.pitch, cTo.pitch, cm) + roam[CAM_PITCH] * 0.28));
+		// Distance sets the perspective (near: steep and immersive, far: flat
+		// and graphic); the figure is framed to the same fill either way.
+		out.camDistance = Math.max(
+			0.75,
+			Math.min(1.5, Math.sqrt(lerp(cFrom.distance, cTo.distance, cm)) * Math.exp(roam[CAM_DOLLY] * 0.26))
+		);
+		out.camRoll = lerp(cFrom.roll, cTo.roll, cm) + out.frameTilt + roam[CAM_ROLL] * 0.1;
+		out.focal = lerp(cFrom.focal, cTo.focal, cm) * Math.exp(roam[CAM_FOCAL] * 0.2);
+		// Off-centre framings, but never so far that the figure leaves the frame.
+		out.lensShiftX = clampSigned(
+			lerp(cFrom.shiftX, cTo.shiftX, cm) + out.frameShiftX + roam[CAM_SHIFT_X] * 0.2,
+			0.34
+		);
+		out.lensShiftY = clampSigned(
+			lerp(cFrom.shiftY, cTo.shiftY, cm) + out.frameShiftY + roam[CAM_SHIFT_Y] * 0.1,
+			0.18
+		);
+		// Orbit: the regime's held orbit, its direction a smooth function of
+		// the drift axis (a hard sign flipped it in place), plus a roaming drift.
+		const orbitRate =
+			lerp(cFrom.orbit, cTo.orbit, cm) * Math.tanh(this.axis('drift') * 3) + roam[CAM_ORBIT] * 0.025;
+		this.orbit += orbitRate * Math.max(0, Math.min(0.25, context.dt));
 		out.orbit = this.orbit;
+
+		// Framing: scale the figure so it owns the frame. Its bounds, turned to
+		// the current view, are projected through the current lens; the fill
+		// the camera roams around (about 0.65..1.2 of the frame's half-height,
+		// sometimes overflowing it) sets how much of the frame it takes.
+		const reachOf = (i: number) => lerp(gFrom.reach[i], gTo.reach[i], grammar.mix);
+		const halfX = reachOf(0) * 1.32;
+		const halfZ = reachOf(3) * 1.16;
+		const halfY = (reachOf(2) - reachOf(1)) * 0.5 * 1.12;
+		const yaw = STAGE_YAW + out.camYaw + this.orbit;
+		const across = Math.max(
+			Math.hypot(halfX * Math.cos(yaw), halfZ * Math.sin(yaw)),
+			Math.max(halfX, halfZ) * 0.6
+		);
+		const deep = Math.hypot(halfX * Math.sin(yaw), halfZ * Math.cos(yaw));
+		const pitch = out.camPitch - 0.18;
+		const tall = Math.hypot(halfY * Math.cos(pitch), deep * Math.sin(pitch));
+		const extent = Math.max(across / FRAME_ASPECT, tall, 0.2);
+		// Owning the frame is not covering it: a figure that bleeds off every
+		// edge reads as texture, so the fill stays under about 1.1 and the
+		// framing leaves negative space on a side that moves.
+		const fill = Math.max(
+			0.6,
+			Math.min(
+				1.1,
+				(0.86 + roam[CAM_FILL] * 0.2) *
+					compScale *
+					(0.94 + this.axis('scale') * 0.12) *
+					(1.03 - out.density * 0.06) *
+					(0.88 + out.camDistance * 0.12)
+			)
+		);
+		out.fill = fill;
+		out.frameScale = (fill * FRAME_DISTANCE * out.camDistance) / (Math.max(1, out.focal) * extent);
 		out.cameraIndex = camera.to;
 
 		out.keyAzimuth = this.axis('lightAzimuth');
@@ -1643,7 +2027,7 @@ export class LoomLook {
 		}
 		out.trail = this.axis('trail');
 		out.bloom = this.axis('bloom');
-		out.drift = drift;
+		out.drift = this.axis('drift');
 
 		out.names.grammar = gTo.name;
 		out.names.palette = LOOM_PALETTES[palette.to]?.name ?? 'unknown';

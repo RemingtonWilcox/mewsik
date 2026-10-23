@@ -136,9 +136,17 @@ fn cycle(t: f32) -> vec3<f32> {
 	return mix(palStop(i), palStop((i + 1) % 4), smoothstep(0.0, 1.0, fract(x)));
 }
 
+// Folds any t back into 0..1 (identity on 0..1, continuous everywhere).
+fn tri(x: f32) -> f32 {
+	return 1.0 - abs(1.0 - fract(x * 0.5) * 2.0);
+}
+
 // The colour of structure at ramp position t; iri moves it round the cycle.
+// The drifting paint offset moves which structure burns hot and which stays
+// deep, so a world never wears the same colouring twice.
 fn jewel(t: f32, iri: f32) -> vec3<f32> {
-	return mix(ramp(t), cycle(t * 0.75 + iri + params.tone.z), params.tone.y);
+	let paint = params.cameraB.z;
+	return mix(ramp(tri(t + paint)), cycle(t * 0.75 + iri + params.tone.z + paint * 0.5), params.tone.y);
 }
 
 // Mirror fold into n sectors about the origin (the mandala).
@@ -219,10 +227,33 @@ fn pixelSize() -> f32 {
 	return 1.0 / max(params.view.y, 1.0);
 }
 
+// The roaming camera over a plane: its centre sits off the middle of the
+// frame where the camera has drifted, and the view rolls and zooms about it.
+fn planeUv(uv: vec2<f32>) -> vec2<f32> {
+	return rot2(uv - params.camera.xy, params.camera.w) * exp(-params.camera.z);
+}
+
+fn planePix() -> f32 {
+	return pixelSize() * exp(-params.camera.z);
+}
+
+// The pattern carries so far from its centre and then ends in black: at
+// times a medallion with darkness round it, at times a field past every
+// edge of the frame. Measured on screen, about wherever the centre drifted.
+fn planeExtent(uv: vec2<f32>) -> f32 {
+	let d = length(uv - params.camera.xy) / max(params.light.w, 0.3);
+	let d2 = d * d;
+	return 1.0 / (1.0 + d2 * d2);
+}
+
 // =====================================================================
 // bloom: Kaliset kaleidoscope, three scale layers
 // =====================================================================
-fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, iters: i32, pix: f32, s: Slot, layerId: f32) -> vec3<f32> {
+fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, itF: f32, pix: f32, s: Slot, layerId: f32) -> vec3<f32> {
+	// The iteration count is continuous: the last iteration fades in, so a
+	// drifting detail never pops a whole new layer of filigree.
+	let iters = i32(floor(itF)) + 1;
+	let lastFade = (1.0 - fract(itF)) * 40.0;
 	var z = p0;
 	var der = 1.0;
 	let twist = (params.form.z - 0.5) * 0.9 + params.motion.x * 0.05;
@@ -259,7 +290,10 @@ fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, iters: i32, pix: f32, s: Slot, layerId
 			}
 		}
 		// Iterations finer than a pixel are noise: they do not count.
-		let dPix = trap / max(der, 1e-20) / pix + max(0.0, log2(max(der * refPix / 0.015, 1e-9))) * 5.0;
+		var dPix = trap / max(der, 1e-20) / pix + max(0.0, log2(max(der * refPix / 0.015, 1e-9))) * 5.0;
+		if (i == iters - 1) {
+			dPix = dPix + lastFade;
+		}
 		if (dPix < best) {
 			second = best;
 			secondI = bestI;
@@ -272,8 +306,8 @@ fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, iters: i32, pix: f32, s: Slot, layerId
 			secondI = f32(i);
 		}
 	}
-	let fi = bestI / f32(iters);
-	let fj = secondI / f32(iters);
+	let fi = bestI / itF;
+	let fj = secondI / itF;
 	let id = layerId * 37.0 + bestI * 3.0 + floor(bestAng * 4.0) * 101.0 + bestCell;
 	let sp = sparkle(id);
 	let gainA = 0.35 + band(0.03 + fi * 0.9) * 1.6;
@@ -284,12 +318,14 @@ fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, iters: i32, pix: f32, s: Slot, layerId
 }
 
 fn bloomWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
-	var p = rot2(uv, s.turn);
+	var p = rot2(planeUv(uv), s.turn);
 	p = foldN(p, s.fold);
 	let f = fract(s.phase);
 	let base = floor(s.phase);
-	let iters = i32(clamp(13.0 * params.quality.y + params.form.w * 5.0, 6.0, 22.0));
-	let c0 = vec2<f32>(0.42 + params.form.x * 0.5, 0.3 + params.form.y * 0.55) + vec2<f32>(params.motion.x * 0.04, -params.motion.x * 0.03);
+	let itF = clamp(13.0 * params.quality.y + params.form.w * 5.0, 6.0, 22.0);
+	let c0 = vec2<f32>(0.42 + params.form.x * 0.5, 0.3 + params.form.y * 0.55)
+		+ vec2<f32>(params.drift.x, params.drift.y) * 0.035
+		+ vec2<f32>(params.motion.x * 0.04, -params.motion.x * 0.03);
 	var col = vec3<f32>(0.0);
 	for (var L = 0; L < 3; L = L + 1) {
 		let x = (f32(L) + 1.0 - f) / 3.0;
@@ -301,7 +337,7 @@ fn bloomWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 		let id = f32(L) + base;
 		let scale = 1.6 * exp(3.3 * (x - 0.5));
 		let jitter = vec2<f32>(hash11(id * 3.0) - 0.5, hash11(id * 5.0 + 1.0) - 0.5) * 0.05;
-		col = col + kaliLayer(p * scale, c0 + jitter, iters, pixelSize() * scale, s, id) * weight;
+		col = col + kaliLayer(p * scale, c0 + jitter, itF, planePix() * scale, s, id) * weight;
 	}
 	return col;
 }
@@ -350,20 +386,20 @@ fn juliaLayer(w0: vec2<f32>, s: Slot, iters: i32, pixW: f32) -> vec3<f32> {
 }
 
 fn spiralWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
-	var p = rot2(uv, s.turn * 0.25);
+	var p = rot2(planeUv(uv), s.turn * 0.25);
 	if (s.variant >= 2) {
 		p = foldN(p, s.fold);
 		// Variant 2 sets the spiral's eye off the mirror centre: a ring of
 		// spirals turning round the fold instead of a star.
 		if (s.variant == 2) {
-			p = p - vec2<f32>(0.32, 0.0);
+			p = p - vec2<f32>(0.32 + params.cameraB.w * 0.1, 0.0);
 		}
 	}
 	// Each pixel starts lead iterations before the window, near z*, so the
 	// iteration itself carries it out along the Poincare function: the dive
 	// repeats exactly every period with one layer.
 	let iters = i32(clamp(200.0 * params.quality.y, 60.0, 220.0)) + i32(s.jw);
-	let pixW = pixelSize() * length(s.js);
+	let pixW = planePix() * length(s.js);
 	return juliaLayer(s.jz + cmul(s.js, p), s, iters, pixW);
 }
 
@@ -395,9 +431,11 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 	switch (s.variant) {
 		case 1: {
 			// Sri Yantra: interlocking up and down triangles, a lotus ring.
+			// The rings' spacing and their twist against each other drift.
+			let twist = (params.form.y - 0.5) * 0.5 + params.drift.x * 0.12;
 			for (var j = 0; j < 5; j = j + 1) {
-				let rj = exp(lnK * (f32(j) + 0.7) / 5.0);
-				let up = select(0.0, PI, j % 2 == 1);
+				let rj = exp(lnK * (f32(j) + 0.45 + params.form.x * 0.5) / 5.0);
+				let up = select(0.0, PI, j % 2 == 1) + twist * f32(j);
 				let dj = abs(sdPolygon(rot2(q, up + params.motion.x * 0.12 * f32(j % 2 * 2 - 1)), rj, 3.0));
 				if (dj < d) {
 					d = dj;
@@ -405,8 +443,8 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 				}
 			}
 			let petals = foldN(q, n);
-			let lr = exp(lnK * 0.5);
-			let dp = abs(length(petals - vec2<f32>(lr, 0.0)) - lr * sin(PI / n) * 0.9);
+			let lr = exp(lnK * (0.4 + params.form.z * 0.2));
+			let dp = abs(length(petals - vec2<f32>(lr, 0.0)) - lr * sin(PI / n) * (0.9 + params.drift.y * 0.1));
 			if (dp < d) {
 				d = dp;
 				id = 7.0;
@@ -414,11 +452,11 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 		}
 		case 2: {
 			// Metatron's cube: two rings of n points, every point joined.
-			let r1 = exp(lnK * 0.3);
-			let r2 = exp(lnK * 0.72);
+			let r1 = exp(lnK * (0.22 + params.form.x * 0.16));
+			let r2 = exp(lnK * (0.62 + params.form.z * 0.2));
 			let fq = foldN(q, n);
 			let a0 = vec2<f32>(r1, 0.0);
-			let b0 = rot2(vec2<f32>(r2, 0.0), PI / n);
+			let b0 = rot2(vec2<f32>(r2, 0.0), (PI / n) * (1.0 + params.drift.x * 0.35));
 			let m = i32(n + 0.5);
 			for (var k = 0; k < m; k = k + 1) {
 				let ang = TAU * f32(k) / n;
@@ -444,7 +482,7 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 				let u = kk * seedStep;
 				var dth = w.y - kk * TAU * 0.381966011;
 				dth = dth - TAU * round(dth / TAU);
-				let dd = abs(length(vec2<f32>(w.x - u, dth)) - seedStep * 0.85) * r;
+				let dd = abs(length(vec2<f32>(w.x - u, dth)) - seedStep * (0.62 + params.form.x * 0.33)) * r;
 				if (dd < d) {
 					d = dd;
 					id = kk;
@@ -454,10 +492,10 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 		default: {
 			// Flower of life: rings of overlapping circles through each other's centres.
 			for (var j = 0; j < 3; j = j + 1) {
-				let rj = exp(lnK * (f32(j) + 0.5) / 3.0);
-				let fq = foldN(rot2(q, f32(j) * PI / n), n);
+				let rj = exp(lnK * (f32(j) + 0.3 + params.form.x * 0.4) / 3.0);
+				let fq = foldN(rot2(q, f32(j) * (PI / n) * (0.6 + params.form.y * 0.8 + params.drift.x * 0.15)), n);
 				let rc = rj * sin(PI / n);
-				let dj = min(abs(length(fq - vec2<f32>(rj, 0.0)) - rc), abs(length(fq - vec2<f32>(rj, 0.0)) - rc * 2.0));
+				let dj = min(abs(length(fq - vec2<f32>(rj, 0.0)) - rc), abs(length(fq - vec2<f32>(rj, 0.0)) - rc * (1.6 + params.form.z * 0.8)));
 				if (dj < d) {
 					d = dj;
 					id = f32(j);
@@ -472,14 +510,14 @@ fn yantraPattern(q: vec2<f32>, s: Slot, lnK: f32) -> vec2<f32> {
 
 fn yantraWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	let lnK = log(PHI) * 3.0;
-	let p = rot2(uv, s.turn);
+	let p = rot2(planeUv(uv), s.turn);
 	let r = max(length(p), 1e-6);
 	let beta = vec2<f32>(1.0, -lnK / TAU);
 	var w = cmul(vec2<f32>(log(r), atan2(p.y, p.x)), beta);
 	w.x = w.x - fract(s.phase) * lnK;
 	let layer = floor(w.x / lnK);
 	let u = w.x - layer * lnK;
-	let pix = pixelSize() * length(beta) / r;
+	let pix = planePix() * length(beta) / r;
 	var col = vec3<f32>(0.0);
 	// The pattern is evaluated in this layer and both neighbours, so nothing
 	// that crosses a seam is ever cut.
@@ -506,6 +544,8 @@ fn yantraWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 // level's tunnels (the middle third of a cell in two coordinates).
 fn spongeHole(x: vec3<f32>, variant: i32, width: f32) -> f32 {
 	let h = abs(fract(x) - 0.5);
+	// The square hole drifts toward round and back, never the same carving.
+	let round = clamp(0.22 + params.drift.x * 0.3, 0.0, 0.55);
 	switch (variant) {
 		case 1: {
 			let w = width * 1.12;
@@ -516,7 +556,10 @@ fn spongeHole(x: vec3<f32>, variant: i32, width: f32) -> f32 {
 			return max(max(w - (h.x + h.y) * 0.7071, w - (h.y + h.z) * 0.7071), w - (h.z + h.x) * 0.7071);
 		}
 		default: {
-			return max(max(width - max(h.x, h.y), width - max(h.y, h.z)), width - max(h.z, h.x));
+			let square = vec3<f32>(max(h.x, h.y), max(h.y, h.z), max(h.z, h.x));
+			let circle = vec3<f32>(length(h.xy), length(h.yz), length(h.zx)) / 1.12;
+			let k = mix(square, circle, round);
+			return max(max(width - k.x, width - k.y), width - k.z);
 		}
 	}
 }
@@ -524,10 +567,13 @@ fn spongeHole(x: vec3<f32>, variant: i32, width: f32) -> f32 {
 fn spongeWidth(m: i32, s: Slot) -> f32 {
 	let breathe = 1.0 + (params.form.x - 0.5) * 0.18 + params.motion.x * 0.04;
 	var w = breathe / 6.0;
-	if (s.variant == 3 && ((m + i32(s.level)) % 2 + 2) % 2 == 1) {
+	let odd = ((m + i32(s.level)) % 2 + 2) % 2 == 1;
+	if (s.variant == 3 && odd) {
 		w = w * 0.75;
 	}
-	return w;
+	// Alternate levels drift apart and back (wider holes, narrower holes),
+	// so the x3 descent never carves the same proportions twice.
+	return w * (1.0 + params.drift.y * 0.12 * select(-1.0, 1.0, odd));
 }
 
 // The sponge carved at every level, anchored at its corner: x3 about the
@@ -612,20 +658,20 @@ fn spongeRouteIn(g: f32, f: f32) -> vec3<f32> {
 
 // The cavern's flight line: a channel along z that the limit set never
 // crosses for any box size the form axes reach (found by scanning the
-// distance field), with a gentle sway inside its clearance.
-fn cavernPath(z: f32, period: f32) -> vec2<f32> {
-	let a = z * TAU / period;
-	return vec2<f32>(-0.78 + sin(a) * 0.03, 0.78 + cos(a * 2.0) * 0.03);
+// distance field). The roaming camera drifts inside its clearance.
+fn cavernPath() -> vec2<f32> {
+	return vec2<f32>(-0.78 + params.camera.x * 0.1, 0.78 + params.camera.y * 0.15);
 }
 
 fn deCavern(p0: vec3<f32>, s: Slot) -> vec4<f32> {
-	let C = vec3<f32>(0.83 + (params.form.x - 0.5) * 0.08, 0.83 + (params.form.y - 0.5) * 0.08, 1.167);
+	let box = clamp(vec2<f32>(params.form.x - 0.5, params.form.y - 0.5) * 0.08 + params.drift.xy * 0.02, vec2<f32>(-0.04), vec2<f32>(0.04));
+	let C = vec3<f32>(0.83 + box.x, 0.83 + box.y, 1.167);
 	let period = 4.0 * C.z;
 	var p = p0;
 	p.z = p.z - period * floor(p.z / period + 0.5);
 	var k = 1.0;
 	var orb = vec4<f32>(1e5);
-	let size = 1.0 + (params.form.z - 0.5) * 0.16 + params.motion.x * 0.03;
+	let size = 1.0 + clamp((params.form.z - 0.5) * 0.16 + params.drift.z * 0.03, -0.08, 0.08) + params.motion.x * 0.03;
 	let iters = i32(clamp(9.0 * params.quality.y, 5.0, 11.0));
 	for (var i = 0; i < iters; i = i + 1) {
 		p = 2.0 * clamp(p, -C, C) - p;
@@ -648,15 +694,15 @@ fn deCavern(p0: vec3<f32>, s: Slot) -> vec4<f32> {
 
 // The foam's flight line runs along the cell edges, the one channel every
 // variant leaves open.
-fn foamPath(z: f32) -> vec2<f32> {
-	return vec2<f32>(1.0 + sin(z * PI) * 0.04, 1.0 + cos(z * PI * 0.5) * 0.04);
+fn foamPath() -> vec2<f32> {
+	return vec2<f32>(1.0 + params.camera.x * 0.12, 1.0 + params.camera.y * 0.2);
 }
 
 fn deFoam(p0: vec3<f32>, s: Slot) -> vec4<f32> {
 	var p = p0;
 	var scale = 1.0;
 	var orb = vec4<f32>(1e5);
-	let sv = 1.08 + params.form.x * 0.32 + params.motion.x * 0.025;
+	let sv = clamp(1.08 + params.form.x * 0.32 + params.drift.x * 0.05, 1.06, 1.42) + params.motion.x * 0.025;
 	let iters = i32(clamp(8.0 * params.quality.y, 5.0, 9.0));
 	for (var i = 0; i < iters; i = i + 1) {
 		p = -1.0 + 2.0 * fract(0.5 * p + 0.5);
@@ -710,17 +756,17 @@ fn deCrystal(p0: vec3<f32>, s: Slot) -> vec4<f32> {
 	if (s.variant == 3) {
 		S = 3.0;
 	}
-	let evolve = s.phase * TAU / 84.0;
-	let a1 = params.form.y * 0.55 + sin(evolve) * 0.12 + params.motion.x * 0.12;
-	let a2 = params.form.z * 0.45 + cos(evolve * 0.618) * 0.1 - params.motion.x * 0.08;
+	// The fold angles drift on slow noise, never round a loop.
+	let a1 = params.form.y * 0.55 + params.drift.x * 0.14 + params.motion.x * 0.12;
+	let a2 = params.form.z * 0.45 + params.drift.y * 0.12 - params.motion.x * 0.08;
 	// Each fold family has its own canonical offset (a vertex of its solid);
 	// formD leans it, which is where the cathedral's proportions come from.
 	var offset: vec3<f32>;
 	switch (s.variant) {
-		case 1: { offset = vec3<f32>(0.851, 0.526 + params.form.w * 0.15, params.form.w * 0.1); }
-		case 2: { offset = vec3<f32>(1.0, 0.35 + params.form.w * 0.3, 0.9); }
+		case 1: { offset = vec3<f32>(0.851, 0.526 + params.form.w * 0.15 + params.drift.z * 0.05, params.form.w * 0.1); }
+		case 2: { offset = vec3<f32>(1.0, 0.35 + params.form.w * 0.3 + params.drift.z * 0.08, 0.9); }
 		case 3: { offset = vec3<f32>(1.0, 1.0, 1.0); }
-		default: { offset = vec3<f32>(1.0, 0.85 + params.form.w * 0.3, 0.55 + params.form.w * 0.5); }
+		default: { offset = vec3<f32>(1.0, 0.85 + params.form.w * 0.3 + params.drift.z * 0.08, 0.55 + params.form.w * 0.5); }
 	}
 	let iters = i32(clamp(10.0 * params.quality.y, 6.0, 12.0));
 	var orb = vec4<f32>(1e5);
@@ -750,7 +796,7 @@ fn deBulb(p0: vec3<f32>, s: Slot) -> vec4<f32> {
 		case 3: { power = 9.0; }
 		default: { power = 8.0; }
 	}
-	power = power + (params.form.x - 0.5) * 1.6 + params.motion.x * 0.15;
+	power = power + (params.form.x - 0.5) * 1.6 + params.drift.x * 0.6 + params.motion.x * 0.15;
 	var orb = vec4<f32>(1e5);
 	let iters = i32(clamp(7.0 * params.quality.y, 4.0, 9.0));
 	for (var i = 0; i < iters; i = i + 1) {
@@ -784,6 +830,8 @@ struct Camera {
 	rd: vec3<f32>,
 	// World units per "metre": the sponge shrinks as it dives.
 	unit: f32,
+	// Where the camera looks (the lamp hangs beside this line).
+	fwd: vec3<f32>,
 	maxT: f32,
 	// How far the camera's lamp carries before the structure sinks to black.
 	reach: f32,
@@ -804,6 +852,7 @@ fn lookAt(ro: vec3<f32>, aim: vec3<f32>, roll: f32, uv: vec2<f32>, focal: f32) -
 fn camera3d(uv: vec2<f32>, s: Slot) -> Camera {
 	var cam: Camera;
 	let focal = params.quality.z;
+	cam.fwd = vec3<f32>(0.0, 0.0, 1.0);
 	switch (s.world) {
 		case 3: {
 			// Threading the sponge's tunnels: one period goes x3 deeper and
@@ -818,7 +867,8 @@ fn camera3d(uv: vec2<f32>, s: Slot) -> Camera {
 			let up = cross(side, along);
 			let look = ro + along + side * (0.55 + s.yaw * 0.5) + up * (0.25 + s.pitch * 0.5);
 			cam.ro = ro;
-			cam.rd = lookAt(ro, look, s.turn, uv, focal);
+			cam.rd = lookAt(ro, look, s.turn + params.camera.w, uv, focal);
+			cam.fwd = look - ro;
 			cam.unit = 1.0;
 			cam.maxT = 3.0;
 			cam.reach = 0.22;
@@ -826,30 +876,33 @@ fn camera3d(uv: vec2<f32>, s: Slot) -> Camera {
 		case 4: {
 			let period = 4.0 * 1.167;
 			let z = fract(s.phase / 4.0) * period;
-			let ro = vec3<f32>(cavernPath(z, period), z);
-			let ahead = vec3<f32>(cavernPath(z + 0.35, period), z + 0.35);
+			let ro = vec3<f32>(cavernPath(), z);
+			let ahead = vec3<f32>(cavernPath(), z + 0.35);
 			// The look swings off the channel's axis, so the lattice is seen
 			// raking past instead of face-on.
 			let look = ahead + vec3<f32>(0.18 + s.yaw * 0.6, -0.1 + s.pitch * 0.45, 0.0);
 			cam.ro = ro;
-			cam.rd = lookAt(ro, look, s.turn * 0.5, uv, focal);
+			cam.rd = lookAt(ro, look, s.turn * 0.5 + params.camera.w, uv, focal);
+			cam.fwd = look - ro;
 			cam.unit = 1.0;
 			cam.maxT = 6.0;
 			cam.reach = 2.0;
 		}
 		case 5: {
 			let z = fract(s.phase / 8.0) * 16.0;
-			let ro = vec3<f32>(foamPath(z), z);
-			let ahead = vec3<f32>(foamPath(z + 0.3), z + 0.3);
+			let ro = vec3<f32>(foamPath(), z);
+			let ahead = vec3<f32>(foamPath(), z + 0.3);
 			let look = ahead + vec3<f32>(s.yaw * 0.3, s.pitch * 0.25, 0.0);
 			cam.ro = ro;
-			cam.rd = lookAt(ro, look, s.turn * 0.4, uv, focal);
+			cam.rd = lookAt(ro, look, s.turn * 0.4 + params.camera.w, uv, focal);
+			cam.fwd = look - ro;
 			cam.unit = 1.0;
 			cam.maxT = 5.0;
 			cam.reach = 2.6;
 		}
 		case 6: {
-			let orbit = s.turn + s.phase * TAU / 84.0;
+			// The orbit is integrated at a wandering pace: never a closed loop.
+			let orbit = s.turn + params.cameraB.y;
 			let elev = 0.35 + s.pitch * 0.8;
 			var dist = 4.4;
 			switch (s.variant) {
@@ -858,26 +911,28 @@ fn camera3d(uv: vec2<f32>, s: Slot) -> Camera {
 				case 3: { dist = 3.0; }
 				default: { dist = 3.2; }
 			}
-			dist = dist * (1.0 - params.form.w * 0.15);
+			dist = dist * (1.0 - params.form.w * 0.15) * exp(params.cameraB.x * select(0.22, 0.12, s.variant == 1));
 			let ro = dist * vec3<f32>(cos(orbit) * cos(elev), sin(elev), sin(orbit) * cos(elev));
 			// Aimed off the centre: the crystal is a place beside you, not an orb.
 			let sideways = normalize(cross(ro, vec3<f32>(0.0, 1.0, 0.0)));
-			let aim = sideways * (0.9 * sin(s.turn * 0.31 + 1.1) + s.yaw * 0.6) + vec3<f32>(0.0, 0.25, 0.0);
+			let aim = sideways * (params.drift.w * 0.8 + s.yaw * 0.6) + vec3<f32>(0.0, 0.25 + params.camera.y * 0.6, 0.0);
 			cam.ro = ro;
-			cam.rd = lookAt(ro, aim, s.yaw * 0.2, uv, focal);
+			cam.rd = lookAt(ro, aim, s.yaw * 0.2 + params.camera.w * 0.5, uv, focal);
+			cam.fwd = aim - ro;
 			cam.unit = 1.0;
 			cam.maxT = 12.0;
 			cam.reach = 5.5;
 		}
 		default: {
-			let orbit = s.turn + s.phase * TAU / 84.0;
+			let orbit = s.turn + params.cameraB.y;
 			let elev = 0.25 + s.pitch * 0.7;
-			let dist = 2.15 - params.form.w * 0.3;
+			let dist = (2.15 - params.form.w * 0.3) * exp(params.cameraB.x * 0.12);
 			let ro = dist * vec3<f32>(cos(orbit) * cos(elev), sin(elev), sin(orbit) * cos(elev));
 			let sideways = normalize(cross(ro, vec3<f32>(0.0, 1.0, 0.0)));
-			let aim = sideways * (0.75 * sin(s.turn * 0.29 + 2.0) + s.yaw * 0.3) + vec3<f32>(0.0, 0.15, 0.0);
+			let aim = sideways * (params.drift.w * 0.7 + s.yaw * 0.3) + vec3<f32>(0.0, 0.15 + params.camera.y * 0.5, 0.0);
 			cam.ro = ro;
-			cam.rd = lookAt(ro, aim, s.yaw * 0.25, uv, focal);
+			cam.rd = lookAt(ro, aim, s.yaw * 0.25 + params.camera.w * 0.5, uv, focal);
+			cam.fwd = aim - ro;
 			cam.unit = 1.0;
 			cam.maxT = 5.0;
 			cam.reach = 1.4;
@@ -1035,14 +1090,25 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 		emit = emit * sparkle(id * 131.0 + dot(cell, vec3<f32>(7.0, 13.0, 29.0)));
 	}
 
-	// Light: the camera's own lamp, a little above. It falls off over the
-	// world's own scale, so the far structure sinks to black.
-	let reach = cam.reach;
-	let lampPos = cam.ro + vec3<f32>(0.0, reach * 0.06, 0.0);
+	// Light: the camera's own lamp. It falls off over the world's own scale,
+	// so the far structure sinks to black. The lamp is carried off to one
+	// side or the other and its reach breathes, so light falls on a
+	// different part of the frame as the camera roams.
+	let reach = cam.reach * params.light.z;
+	let ahead = lookAt(cam.ro, cam.ro + cam.fwd, 0.0, vec2<f32>(0.0), 1.0);
+	var side = cross(ahead, vec3<f32>(0.0, 1.0, 0.0));
+	side = side / max(length(side), 1e-4);
+	let above = cross(side, ahead);
+	let lampPos = cam.ro + (vec3<f32>(0.0, 0.06, 0.0) + side * params.light.x * 0.28 + above * params.light.y * 0.2) * reach;
 	let toLamp = lampPos - p;
 	let lampDist = length(toLamp) / reach;
 	let l = toLamp / max(length(toLamp), 1e-6);
-	let atten = 1.0 / (1.0 + lampDist * lampDist * 3.0);
+	// The lamp throws a beam, not a flood: its axis swings with the roaming
+	// camera, so the lit pool falls on a different part of the frame while
+	// the structure's own emission still glows outside it.
+	let beamAxis = normalize(ahead + side * params.light.x * 0.55 + above * params.light.y * 0.4);
+	let beam = mix(0.3, 1.0, smoothstep(0.62, 0.94, dot(-l, beamAxis)));
+	let atten = beam / (1.0 + lampDist * lampDist * 3.0);
 	let diff = max(dot(n, l), 0.0);
 	let hv = normalize(l + view);
 	let spec = pow(max(dot(n, hv), 0.0), 56.0);
@@ -1050,7 +1116,7 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	let ao = occlusion(s, p, n, cam.unit);
 	// Orbit traps walk the whole palette, so one structure holds several jewels.
 	let albedo = mix(jewel(0.2 + t * 0.6, t), cycle(t * 1.7 + params.tone.z) * 0.8, 0.55);
-	let sheenCol = cycle(t + ndv * 1.3 + params.tone.z);
+	let sheenCol = cycle(t + ndv * 1.3 + params.tone.z + params.cameraB.z * 0.5);
 	let lampCol = mix(params.pal3.xyz, vec3<f32>(1.0), 0.6);
 	col = col + albedo * diff * atten * ao * 0.26 * matte;
 	col = col + lampCol * spec * atten * ao * (1.6 + params.character.z);
@@ -1074,9 +1140,9 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 
 fn renderSlot(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	switch (s.world) {
-		case 0: { return bloomWorld(uv, s); }
-		case 1: { return spiralWorld(uv, s); }
-		case 2: { return yantraWorld(uv, s); }
+		case 0: { return bloomWorld(uv, s) * planeExtent(uv); }
+		case 1: { return spiralWorld(uv, s) * planeExtent(uv); }
+		case 2: { return yantraWorld(uv, s) * planeExtent(uv); }
 		default: { return render3d(uv, s); }
 	}
 }

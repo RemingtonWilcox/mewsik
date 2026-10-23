@@ -43,7 +43,6 @@
 	import {
 		SIGNAL_CAMERAS,
 		SIGNAL_DISPLAYS,
-		SIGNAL_LAYOUT_NAMES,
 		SURFACE_FLOOR,
 		SURFACE_RING,
 		SURFACE_TUNNEL,
@@ -51,8 +50,13 @@
 		createSignalLayout,
 		lerpPreset,
 		lerpSignalLayout,
+		mirrorSignalLayout,
+		signalBenchName,
+		signalCompose,
+		type SignalCompose,
 		type SignalLayout
 	} from '$lib/visualizer/signal/layouts';
+	import { SIGNAL_NOISE_LANE, SignalRoam } from '$lib/visualizer/signal/roam';
 	import { SIGNAL_PALETTES, createSignalPaletteOut, resolveSignalPalette } from '$lib/visualizer/signal/palettes';
 	import {
 		parseSignalLookOverride,
@@ -147,7 +151,6 @@
 	let asymmetry = 0;
 	let spectralMotion = 0;
 	let spinAngle = 0;
-	let dollyTime = 0;
 	let lockStep = 0;
 	let breathPhase = 0;
 	let grainClock = 0;
@@ -195,20 +198,26 @@
 		sectionPulse: 0,
 		tracePhase: 0
 	};
-	const layoutCache = new Map<string, SignalLayout>();
 	const headLocal: [number, number] = [0, 0];
+	const heroDrift: [number, number] = [0, 0];
+	const compose: SignalCompose = { pan: 0, lift: 0, size: 0, spread: 0, depth: 0, reach: 0, horizon: 0, glow: 0 };
 	let lookOverride: SignalLookOverride = {};
+	let roamPin: Record<string, number> = {};
 	let variation: SignalVariation | null = null;
 
-	function layoutFor(index: number, aspectRatio: number) {
-		const key = `${index}:${aspectRatio.toFixed(3)}`;
-		let layout = layoutCache.get(key);
-		if (!layout) {
-			if (layoutCache.size > 64) layoutCache.clear();
-			layout = buildSignalLayout(index, aspectRatio);
-			layoutCache.set(key, layout);
-		}
-		return layout;
+	/**
+	 * One bench at the roam's current point in its room of arrangements,
+	 * turned round by the mirror morph. Built fresh every frame: the roam
+	 * never stops, so there is nothing to cache.
+	 */
+	function layoutFor(index: number, aspectRatio: number, mirror: number): SignalLayout {
+		return mirrorSignalLayout(buildSignalLayout(index, aspectRatio, compose), mirror);
+	}
+
+	/** The roam, created on the first frame of a session from its journey's seed. */
+	function roamFor(seed: number): SignalRoam {
+		memory.roam ??= new SignalRoam(`signal-roam:${seed}`);
+		return memory.roam;
 	}
 
 	// Band traces 2 and 3 by genome trace map: [level band, bin lo, bin hi, cycles].
@@ -415,7 +424,6 @@
 			figurePhase,
 			lastTracePhase,
 			spinAngle,
-			dollyTime,
 			sweepPhase,
 			tickPhase,
 			terrainHead,
@@ -450,6 +458,7 @@
 		rendererSourceEpoch = shared.sourceEpoch;
 		variation = signalVariationFor(shared.seed, shared.sourceEpoch);
 		variation.setOverride(lookOverride);
+		roamFor(shared.seed);
 		if (mounting) {
 			// Audio envelopes always start from what is playing now.
 			const levels = shared.spectrum.levels;
@@ -473,7 +482,6 @@
 				({
 					figurePhase,
 					spinAngle,
-					dollyTime,
 					sweepPhase,
 					tickPhase,
 					terrainHead,
@@ -493,7 +501,6 @@
 				tickPhase = 0;
 				terrainHead = 0;
 				spinAngle = 0;
-				dollyTime = 0;
 				terrainRows.fill(0);
 				pendingRow.fill(0);
 			}
@@ -915,7 +922,13 @@
 		// pulled toward it, and every new shift answered once (genome.shift).
 		const character = shared.character;
 		const shiftEvent = genome.respond(character, directed.energy, dt, beam.interest);
-		if (shiftEvent) reactBoost = Math.max(reactBoost, 1 + 4.5 * Math.max(0.65, shiftEvent.strength));
+		const roam = roamFor(shared.seed);
+		if (shiftEvent) {
+			reactBoost = Math.max(reactBoost, 1 + 4.5 * Math.max(0.65, shiftEvent.strength));
+			// New music, new ground: the bench and the camera set off somewhere
+			// else at once (on their springs, so it glides).
+			roam.redirect();
+		}
 		reactBoost = 1 + (reactBoost - 1) * Math.exp(-dt / 4);
 		const voice = voiceTracker.update(character, dt, Math.max(reactBoost * 0.75, genome.genome.glideSpeed));
 
@@ -1026,8 +1039,19 @@
 		const cameraChoice = morphs.camera.update(genome.choice('camera').to, morphDt, structural);
 		const displayChoice = morphs.display.update(genome.choice('display').to, morphDt, reactBoost);
 		const traceMapChoice = morphs.traceMap.update(genome.choice('traceMap').to, morphDt, reactBoost);
-		const layoutFrom = layoutFor(layoutChoice.from, aspect);
-		const layoutTo = layoutFor(layoutChoice.to, aspect);
+		const mirrorChoice = morphs.mirror.update(genome.choice('mirror').to, morphDt, structural);
+		const mirror = mirrorChoice.from + (mirrorChoice.to - mirrorChoice.from) * mirrorChoice.mix;
+		// The roam travels through each bench's room of arrangements while the
+		// genome picks which bench: tempo sets its pace, energy its restlessness,
+		// and it holds still in silence with the morphs.
+		roam.update(morphDt, { tempo: journey.tempo, energy: journey.energy, ringOut: journey.ringOut });
+		signalCompose(roam.compose.value, compose);
+		for (const key of Object.keys(compose) as (keyof SignalCompose)[]) {
+			if (roamPin[key] !== undefined) compose[key] = roamPin[key];
+		}
+		const layoutFrom = layoutFor(layoutChoice.from, aspect, mirror);
+		const layoutTo =
+			layoutChoice.to === layoutChoice.from ? layoutFrom : layoutFor(layoutChoice.to, aspect, mirror);
 		// Panels, traces and faces travel to their new places.
 		const layout = lerpSignalLayout(layoutFrom, layoutTo, layoutChoice.mix, layoutMix);
 		const camera = lerpPreset(
@@ -1043,20 +1067,24 @@
 		const gene = (name: Parameters<SignalVariation['value']>[0]) => genome.value(name);
 
 		// ---- Camera ------------------------------------------------------------
-		dollyTime += dt * (0.4 + journey.motion * 0.6);
+		// The regime the genome picked is the centre of a region the camera
+		// roams: pitch, height, focal length and yaw each travel on their own
+		// springs. Dolly and sway regimes roam wider in height and yaw.
 		const drift = gene('drift');
-		const sway = camera.sway * Math.sin(dollyTime * 0.11) + (drift - 0.5) * 0.12;
+		const roamCam = roam.camera.value;
+		const camRoam = (axis: number) => clamp(roamPin[`cam${axis}`] ?? roamCam[axis], -1.3, 1.3);
+		const yawRoam = camRoam(3) * (0.07 + camera.sway * 0.55) + (drift - 0.5) * 0.12;
 		/** One bench's camera under the current camera regime. */
 		const benchCamera = (bench: SignalLayout) => {
 			const freedom = bench.freedom;
 			return {
-				pitch: bench.pitch + (camera.pitch + (drift - 0.5) * 0.06) * freedom,
+				pitch: bench.pitch + (camera.pitch + camRoam(0) * 0.12 + (drift - 0.5) * 0.06) * freedom,
 				height:
 					bench.camHeight *
 					(1 + (camera.height - 1) * freedom) *
-					(1 + camera.dolly * 0.12 * Math.sin(dollyTime * 0.07) * freedom),
-				focal: bench.focal * (1 + (camera.focal - 1) * freedom),
-				yaw: sway * freedom
+					(1 + camRoam(1) * (0.24 + camera.dolly * 0.12) * freedom),
+				focal: bench.focal * (1 + (camera.focal - 1) * freedom) * (1 + camRoam(2) * 0.08 * freedom),
+				yaw: yawRoam * freedom
 			};
 		};
 		// The blended bench drives the figure's tilt; each horizon surface keeps
@@ -1082,12 +1110,18 @@
 			clamp(conductorScale / 0.4, 0.72, 1.3) *
 			(0.86 + gene('figureScale') * 0.26) *
 			voice.scale *
-			(1 + voice.breathe * 0.07 * Math.sin(breathPhase)) *
+			// The breath swells on a path that never repeats its rhythm.
+			(1 + voice.breathe * 0.07 * roam.noise(SIGNAL_NOISE_LANE.breath, breathPhase * 0.16)) *
 			(1 + voice.lock * (transient * 0.05 + bands.kick * 0.03));
 		const figAScale = layout.figAScale * scaleFactor;
-		const figAX = layout.figAX + driftX;
+		// The hero drifts slowly about its place on the face, the way a real
+		// trace wanders with the tube's warm-up; its own size sets how far.
+		roam.drift(heroDrift);
+		const figAX = layout.figAX + driftX + heroDrift[0] * figAScale * 0.1;
 		const figAY =
-			layout.figAY + (journey.openness * 0.04 - journey.tension * 0.03) * layout.drift;
+			layout.figAY +
+			(journey.openness * 0.04 - journey.tension * 0.03) * layout.drift +
+			heroDrift[1] * figAScale * 0.07;
 		const screen = clamp(layout.figBScreen, 0, 1);
 		const figBX = figAX + (layout.figBX - figAX) * screen;
 		const figBY = figAY + (layout.figBY - figAY) * screen;
@@ -1125,9 +1159,10 @@
 			detail: renderDetailBins,
 			yaw:
 				asymmetry * 0.55 +
-				Math.sin(figurePhase * 0.23) * 0.32 +
+				// Wobble on the figure's own music-driven phase, never periodic.
+				roam.noise(SIGNAL_NOISE_LANE.yaw, figurePhase * 0.037) * 0.36 +
 				spinAngle +
-				voice.organic * 0.22 * Math.sin(grainClock * 0.29),
+				voice.organic * 0.22 * roam.noise(SIGNAL_NOISE_LANE.organic, grainClock * 0.046),
 			tilt:
 				0.34 +
 				journey.tension * 0.2 -
@@ -1551,7 +1586,7 @@
 			hudTempo = directed.clock.tempoBpm;
 			hudContext = directed.context.source;
 			hudChannels = Math.round(journey.channels);
-			hudLayout = SIGNAL_LAYOUT_NAMES[layoutChoice.to];
+			hudLayout = signalBenchName(layoutChoice.to);
 			hudFamily = SIGNAL_FAMILY_NAMES[familyChoice.to];
 			hudPalette = SIGNAL_PALETTES[paletteChoice.to].name;
 			hudScene = genome.scene;
@@ -1731,6 +1766,13 @@
 		startTime = performance.now();
 		const search = new URLSearchParams(location.search);
 		lookOverride = parseSignalLookOverride(search.get('signalLook'));
+		// Lab: pin roam axes for inspection (?signalRoam=pan:1,lift:-1,cam1:0.5).
+		roamPin = {};
+		for (const part of (search.get('signalRoam') ?? '').split(',')) {
+			const [name, raw] = part.split(/[:=]/);
+			const value = Number(raw);
+			if (name && Number.isFinite(value)) roamPin[name.trim()] = Math.max(-1.3, Math.min(1.3, value));
+		}
 		gpuTiming = search.get('signalGpuTiming') === '1';
 		if (search.get('signalLite') === '1') {
 			internalScale = LITE_INTERNAL_SCALE;

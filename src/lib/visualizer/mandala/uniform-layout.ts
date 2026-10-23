@@ -42,7 +42,19 @@ export const MANDALA_UNIFORM_GROUPS = [
 	['postC', ['bloomWeight', 'contrast', 'vignette', 'grain']],
 	// exposureCeil / meanCeil: the brightest highlights and the brightest frame
 	// mean the meter allows before exposure comes down (it never goes up).
-	['mood', ['exposureCeil', 'meterRate', 'debug', 'meanCeil']]
+	['mood', ['exposureCeil', 'meterRate', 'debug', 'meanCeil']],
+	// The roaming camera: where the planes' centre sits in the frame, their
+	// log zoom, and an extra roll of the whole view.
+	['camera', ['panX', 'panY', 'zoomLog', 'roll']],
+	// dolly: orbit distance / channel offset; orbit: the orbiting worlds'
+	// integrated angle; paint: the drifting palette mapping; eye: the spiral's eye.
+	['cameraB', ['dolly', 'orbit', 'paint', 'eye']],
+	// Four slow, never-repeating structure morphs (-1..1), read per world.
+	['drift', ['morphA', 'morphB', 'morphC', 'morphD']],
+	// Where the light sits: the 3D lamp's offset from the camera (in its own
+	// reach) and its reach multiplier; extent: how far the planes' pattern
+	// carries from its centre before it ends in black (screen heights).
+	['light', ['lampX', 'lampY', 'lampReach', 'extent']]
 ] as const;
 
 export const MANDALA_UNIFORM_FLOATS = MANDALA_UNIFORM_GROUPS.length * 4;

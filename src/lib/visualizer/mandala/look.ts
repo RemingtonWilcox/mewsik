@@ -228,6 +228,32 @@ export const MANDALA_PALETTES: readonly MandalaPalette[] = [
 type Prototype = Partial<Record<CharacterFeature, number>>;
 
 /**
+ * Families of palettes that read alike (warm reds and golds, greens,
+ * violets, blues, the oil slick) and of worlds that read alike (two flat
+ * mandalas, the dive, tunnels, open foam, objects seen from outside). A
+ * change of music prefers a family it has not shown lately, not only a
+ * different member of the same one.
+ */
+const PALETTE_FAMILY: readonly number[] = [3, 1, 0, 2, 1, 4, 0, 3, 1, 2, 0, 0, 2];
+const WORLD_FAMILY: Record<MandalaWorld, number> = {
+	bloom: 0,
+	yantra: 0,
+	spiral: 1,
+	sponge: 2,
+	cavern: 2,
+	foam: 3,
+	crystal: 4,
+	bulb: 4
+};
+
+/** How far a recently shown option (or one of its family) steps back: 1 = not at all. */
+function freshness(axis: 'world' | 'palette', option: number, recent: readonly number[]): number {
+	if (recent.includes(option)) return 0.12;
+	const family = (o: number) => (axis === 'world' ? WORLD_FAMILY[MANDALA_WORLDS[o]] : PALETTE_FAMILY[o]);
+	return recent.some((shown) => family(shown) === family(option)) ? 0.4 : 1;
+}
+
+/**
  * Which music each world fits, fitted to what Mandala actually hears from
  * each genre (tempo, hiss, spectral tilt, punch, bass): ambient is vast and
  * slow (foam), noise fractured and violent (crystal, cavern), club hypnotic
@@ -285,10 +311,12 @@ export const MANDALA_AXES: readonly VariationAxis[] = [
 	{ kind: 'choice', name: 'palette', options: MANDALA_PALETTES.length, scale: 'era', chance: 0.9, memory: 5, maxHold: 2, tau: 6 },
 	// Continuous fractal parameters: each world reads them in its own terms
 	// (Kaliset constant, Julia angle, sponge hole shape, Kleinian box...).
-	{ kind: 'continuous', name: 'formA', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 10 },
-	{ kind: 'continuous', name: 'formB', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 12 },
-	{ kind: 'continuous', name: 'formC', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9 },
-	{ kind: 'continuous', name: 'formD', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9 },
+	// They wander wide between boundaries: the structure is a continuum the
+	// look keeps travelling through, not a set of parked shapes.
+	{ kind: 'continuous', name: 'formA', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 10, wander: 0.18, wanderPeriod: 33 },
+	{ kind: 'continuous', name: 'formB', min: 0, max: 1, scale: 'phrase', step: 0.3, chance: 0.8, tau: 12, wander: 0.18, wanderPeriod: 41 },
+	{ kind: 'continuous', name: 'formC', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9, wander: 0.16 },
+	{ kind: 'continuous', name: 'formD', min: 0, max: 1, scale: 'section', step: 0.4, tau: 9, wander: 0.14 },
 	{ kind: 'continuous', name: 'spin', min: -1, max: 1, scale: 'section', step: 0.45, tau: 9 },
 	{ kind: 'continuous', name: 'drift', min: 0, max: 1, scale: 'phrase', step: 0.35, tau: 8 },
 	{ kind: 'continuous', name: 'trail', min: 0, max: 1, scale: 'section', step: 0.45, tau: 6 },
@@ -305,10 +333,23 @@ const scratch: number[] = [];
  * shift (and every later boundary) picks a world, palette, fold and variant
  * that belong to the new genre.
  */
-export function mandalaApplyCharacter(genome: VariationGenome, character: MusicCharacter, sharpness = 4): void {
+export function mandalaApplyCharacter(
+	genome: VariationGenome,
+	character: MusicCharacter,
+	sharpness = 4,
+	recent: { world?: readonly number[]; palette?: readonly number[] } = {}
+): void {
 	const worlds = MANDALA_WORLDS.map((world) => WORLD_PROTOTYPES[world]);
-	genome.setWeights('world', characterWeights(worlds, character, sharpness, 0.02, scratch.slice()));
-	genome.setWeights('palette', characterWeights(PALETTE_PROTOTYPES, character, sharpness * 1.1, 0.02, []));
+	// Worlds and palettes shown lately (and their look-alikes) step back, so
+	// the walk does not keep landing on the one family several genres like.
+	// The option on screen keeps its own weight: only the alternatives step
+	// back, so a boundary is no likelier to leave than before.
+	const fresh = (axis: 'world' | 'palette', weights: number[], shown: readonly number[] = []) => {
+		const current = genome.choice(axis).to;
+		return weights.map((weight, option) => (option === current ? weight : weight * freshness(axis, option, shown)));
+	};
+	genome.setWeights('world', fresh('world', characterWeights(worlds, character, sharpness, 0.02, scratch.slice()), recent.world));
+	genome.setWeights('palette', fresh('palette', characterWeights(PALETTE_PROTOTYPES, character, sharpness * 1.1, 0.02, []), recent.palette));
 	genome.setWeights('fold', characterWeights(FOLD_PROTOTYPES, character, sharpness * 0.8, 0.12, []));
 	genome.setWeights('variant', characterWeights(VARIANT_PROTOTYPES, character, sharpness * 0.6, 0.2, []));
 }
@@ -348,7 +389,9 @@ export function mandalaPullCharacter(genome: VariationGenome, character: MusicCh
  * never the current one. Otherwise keep the current option if it still fits
  * (at least `keep` of the best), else move to a near-best one. `pick01`
  * chooses among the near-best. Unlike a genome shift, a new song in the same
- * genre keeps a world that fits it.
+ * genre keeps a world that fits it. `recent` options (shown not long ago)
+ * give way to other good fits, so two genres that like the same world or
+ * palette do not wear the same one: they only win when nothing else fits.
  */
 export function mandalaAnswer(
 	axis: 'world' | 'palette',
@@ -356,14 +399,20 @@ export function mandalaAnswer(
 	character: MusicCharacter,
 	pick01: number,
 	leave = false,
-	keep = axis === 'world' ? 0.6 : 0.5
+	keep = axis === 'world' ? 0.6 : 0.5,
+	recent: readonly number[] = []
 ): number {
 	const prototypes = axis === 'world' ? MANDALA_WORLDS.map((world) => WORLD_PROTOTYPES[world]) : PALETTE_PROTOTYPES;
 	const weights = characterWeights(prototypes, character, axis === 'world' ? 8 : 8.8, 0.02, []);
 	if (leave) weights[current] = 0;
 	const best = Math.max(...weights);
 	if (!leave && (weights[current] ?? 0) >= best * keep) return current;
-	const near = weights.flatMap((weight, option) => (weight >= best * 0.7 ? [option] : []));
+	// Only options that genuinely fit compete; among them, recent ones step back.
+	const scores = weights.map((weight, option) =>
+		weight < best * 0.6 ? 0 : weight * (option === current ? 1 : freshness(axis, option, recent))
+	);
+	const top = Math.max(...scores);
+	const near = scores.flatMap((score, option) => (score > 0 && score >= top * 0.7 ? [option] : []));
 	return near[Math.min(near.length - 1, Math.floor(pick01 * near.length))] ?? current;
 }
 
@@ -416,6 +465,28 @@ export class MandalaFollower {
 		const m = Math.min(1, Math.max(0, this.mix));
 		return m * m * (3 - 2 * m);
 	}
+}
+
+/**
+ * Turn a colour's hue by `angle` radians about the grey axis in YIQ, which
+ * keeps its luma: an authored jewel stop drifts toward its neighbours on the
+ * wheel (honey toward amber or toward chartreuse) without greying or
+ * brightening. Never a cosine ramp: the stops stay the authored ones, turned.
+ */
+export function turnHue(c: Rgb, angle: number): Rgb {
+	if (!angle) return c;
+	const y = 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+	const i0 = 0.596 * c[0] - 0.274 * c[1] - 0.322 * c[2];
+	const q0 = 0.211 * c[0] - 0.523 * c[1] + 0.312 * c[2];
+	const cs = Math.cos(angle);
+	const sn = Math.sin(angle);
+	const i = i0 * cs - q0 * sn;
+	const q = i0 * sn + q0 * cs;
+	return [
+		Math.max(0, y + 0.956 * i + 0.621 * q),
+		Math.max(0, y - 0.272 * i - 0.647 * q),
+		Math.max(0, y - 1.106 * i + 1.703 * q)
+	];
 }
 
 export function mixRgb(a: Rgb, b: Rgb, t: number): Rgb {

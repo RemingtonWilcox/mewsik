@@ -33,11 +33,13 @@
 		mandalaSlotParts,
 		mandalaWorldFit,
 		mixRgb,
+		turnHue,
 		type Rgb
 	} from '$lib/visualizer/mandala/look';
 	import { FoldSpring, JuliaTrack, MandalaVoyage } from '$lib/visualizer/mandala/flight';
 	import { HeardPulse } from '$lib/visualizer/mandala/pulse';
 	import { VariationGenome, type ContinuousAxis } from '$lib/visualizer/variation';
+	import { Wander } from '$lib/visualizer/motion';
 	import type { MusicCharacter } from '$lib/visualizer/character';
 
 	const vis = useVisualizer();
@@ -171,8 +173,12 @@
 		nextCheck: number;
 		/** Recent peak of the character's contrast (how different the music is). */
 		contrastPeak: number;
-		/** Eased continuous look values (see glideValues). */
+		/** Eased continuous targets (see glideValues), before the wander. */
+		base: Record<string, number>;
+		/** What the picture reads: the eased targets plus their continuous wander. */
 		vals: Record<string, number>;
+		/** Mandala's own wander of every continuous axis (it glides targets itself). */
+		wander: Wander;
 		/** Seconds of transient surge left over from the last kick. */
 		surge: number;
 		/**
@@ -180,8 +186,12 @@
 		 * held until the genome's next boundary that may move that axis.
 		 */
 		answers: Record<'world' | 'palette', { option: number; boundary: number } | null>;
+		/** Worlds and palettes shown lately, newest last: answers prefer other good fits. */
+		recent: Record<'world' | 'palette', number[]>;
 		/** Seconds the running world and palette morphs take (fixed at their start). */
 		sceneTau: number;
+		/** The world the scene is heading to, to notice a change of world once. */
+		worldTarget: number;
 		paletteTau: number;
 	};
 
@@ -231,6 +241,10 @@
 	const CONTINUOUS = MANDALA_AXES.flatMap((axis, index) =>
 		axis.kind === 'continuous' ? [{ axis: axis as ContinuousAxis, index }] : []
 	);
+	/** Seconds per wander undulation, by the axis's scale (as the genome's). */
+	const WANDER_PERIODS = CONTINUOUS.map(
+		({ axis }) => axis.wanderPeriod ?? (axis.scale === 'phrase' ? 24 : axis.scale === 'section' ? 50 : 110)
+	);
 
 	/**
 	 * Mandala glides the genome's continuous targets itself: patiently after a
@@ -240,20 +254,36 @@
 	function glideValues(run: MandalaRun, dt: number) {
 		const targets = genome.targetVector();
 		const hurry = run.sinceShift < 3.5 ? 5 : 1;
-		for (const { axis, index } of CONTINUOUS) {
-			const target = axis.min + (targets[index] ?? 0.5) * (axis.max - axis.min);
-			const current = run.vals[axis.name] ?? target;
+		// Between boundaries nothing parks: every axis wanders on smooth,
+		// never-repeating noise around its eased target.
+		const drift = run.wander.update(dt, (0.75 + env01(run.env.energy) * 0.5) * (1 - run.env.silence * 0.6));
+		CONTINUOUS.forEach(({ axis, index }, lane) => {
+			const range = axis.max - axis.min;
+			const target = axis.min + (targets[index] ?? 0.5) * range;
+			const current = run.base[axis.name] ?? target;
 			const k = 1 - Math.exp((-dt * hurry) / Math.max(0.3, axis.tau));
+			const amount = (axis.wander ?? Math.min(0.12, axis.step * 0.6)) * range;
 			if (axis.wrap) {
-				const range = axis.max - axis.min;
 				let delta = (target - current) % range;
 				if (delta > range / 2) delta -= range;
 				if (delta < -range / 2) delta += range;
-				run.vals[axis.name] = axis.min + ((((current + delta * k - axis.min) % range) + range) % range);
+				const base = axis.min + ((((current + delta * k - axis.min) % range) + range) % range);
+				run.base[axis.name] = base;
+				run.vals[axis.name] = axis.min + ((((base + drift[lane] * amount - axis.min) % range) + range) % range);
 			} else {
-				run.vals[axis.name] = current + (target - current) * k;
+				const base = current + (target - current) * k;
+				run.base[axis.name] = base;
+				// Reflect at the bounds so the drift never sticks to an edge.
+				let v = base + drift[lane] * amount;
+				if (v > axis.max) v = axis.max - (v - axis.max);
+				if (v < axis.min) v = axis.min + (axis.min - v);
+				run.vals[axis.name] = clamp(v, axis.min, axis.max);
 			}
-		}
+		});
+	}
+
+	function env01(value: number) {
+		return clamp(finite(value), 0, 1);
 	}
 
 	/**
@@ -282,6 +312,23 @@
 	function answerRoll(run: MandalaRun): number {
 		answerSerial += 1;
 		return (run.voyage.phase[0] * 0.37 + answerSerial * 0.6180339887) % 1;
+	}
+
+	/** How many recently shown worlds / palettes an answer steps away from. */
+	const RECENT = { world: 4, palette: 6 } as const;
+
+	function answerFor(run: MandalaRun, axis: 'world' | 'palette', current: number, heard: MusicCharacter, leave: boolean) {
+		return mandalaAnswer(axis, current, heard, answerRoll(run), leave, undefined, run.recent[axis]);
+	}
+
+	/** Remember what is on screen, so a later change of music prefers something else. */
+	function noteShown(run: MandalaRun, axis: 'world' | 'palette', option: number) {
+		const list = run.recent[axis];
+		if (list[list.length - 1] === option) return;
+		const at = list.indexOf(option);
+		if (at >= 0) list.splice(at, 1);
+		list.push(option);
+		if (list.length > RECENT[axis]) list.shift();
 	}
 
 	function sceneTarget(): number {
@@ -326,10 +373,14 @@
 			settleChecks: 0,
 			nextCheck: 0,
 			contrastPeak: 0,
+			base: Object.fromEntries(CONTINUOUS.map(({ axis }) => [axis.name, genome.value(axis.name)])),
 			vals: Object.fromEntries(CONTINUOUS.map(({ axis }) => [axis.name, genome.value(axis.name)])),
+			wander: new Wander(CONTINUOUS.length, seed + 0.291, WANDER_PERIODS),
 			surge: 0,
 			answers: { world: null, palette: null },
+			recent: { world: [], palette: [] },
 			sceneTau: 6.5,
+			worldTarget: mandalaSlotParts(sceneTarget()).world,
 			paletteTau: 5
 		};
 	}
@@ -346,7 +397,7 @@
 		}
 		if (lookState.epoch !== sourceEpoch) {
 			genome.reseed(seed);
-			lookState.run.voyage.continueSource(seed);
+			lookState.run.voyage.continueSource();
 			lookState.epoch = sourceEpoch;
 		}
 	}
@@ -643,18 +694,28 @@
 	 * empty to near black for part of each period). A dive never glides into
 	 * another (the path between them crosses dust where the picture empties):
 	 * a new dive is a new variant, which morphs on the GPU like any slot.
+	 *
+	 * Inside each dive the multiplier drifts, so the self-similar loop never
+	 * shows the same set twice: |lambda| across 1.16..1.38 and the angle
+	 * within a small window around its rest (the last two numbers, in turns),
+	 * both swept by eye to keep the set's topology. The 0.31 dive turns
+	 * from dust into connected filaments just above its rest, so it only
+	 * drifts below it.
 	 */
-	const JULIA_DIVES: readonly [number, number, number, number][] = [
-		[0.4, 1.22, 1.3, 0.35],
-		[0.31, 1.22, 1.3, 0.35],
-		[0.13, 1.22, 1.3, 0.35],
-		[0.6, 1.22, 1.3, 0.35]
+	const JULIA_DIVES: readonly [number, number, number, number, number, number][] = [
+		[0.4, 1.16, 1.38, 0.35, -0.012, 0.012],
+		[0.31, 1.16, 1.38, 0.35, -0.012, 0],
+		[0.13, 1.16, 1.38, 0.35, -0.01, 0.01],
+		[0.6, 1.16, 1.38, 0.35, -0.012, 0.012]
 	];
 
 	// The 3D flights are paced to their own scale: the sponge's period is a
 	// whole x3 descent with three turns, the cavern's phase unit a quarter of
 	// its lattice, so they take several log units of travel per period.
-	const PERIOD_LOG = [1.1, 1, Math.log(1.6180339887) * 3, 4.5, 3.2, 6.5, 0.25, 0.33];
+	// Bloom zooms e^1.1 per layer but takes its layers at 0.7 of the travel:
+	// slower turnover lets each Kaliset layer be seen before the next arrives.
+	const BLOOM_PACE = 0.7;
+	const PERIOD_LOG = [1.1 / BLOOM_PACE, 1, Math.log(1.6180339887) * 3, 4.5, 3.2, 6.5, 0.25, 0.33];
 
 	// Dev-only probe for the beat-timing evidence: one entry per rendered frame.
 	type ProbeFrame = {
@@ -823,7 +884,7 @@
 				const fit = axis === 'world' ? mandalaWorldFit(current, heard) : mandalaPaletteFit(current, heard);
 				if (fit < 0.3) {
 					settling = true;
-					run.answers[axis] = { option: mandalaAnswer(axis, current, heard, answerRoll(run), true), boundary: boundaryCount(axis) };
+					run.answers[axis] = { option: answerFor(run, axis, current, heard, true), boundary: boundaryCount(axis) };
 				}
 			}
 			if (settling) run.settleChecks -= 1;
@@ -843,18 +904,20 @@
 			run.earSlow = [...run.earFast];
 			const keptWorld = answered('world');
 			const keptPalette = answered('palette');
-			mandalaApplyCharacter(genome, heard, 8);
+			mandalaApplyCharacter(genome, heard, 8, run.recent);
 			genome.shift(shiftStrength, character.energy);
 			// The genome moved every axis; world and palette answer for themselves.
-			run.answers.world = { option: mandalaAnswer('world', keptWorld, heard, answerRoll(run), changed), boundary: boundaryCount('world') };
-			run.answers.palette = { option: mandalaAnswer('palette', keptPalette, heard, answerRoll(run), changed), boundary: boundaryCount('palette') };
+			run.answers.world = { option: answerFor(run, 'world', keptWorld, heard, changed), boundary: boundaryCount('world') };
+			run.answers.palette = { option: answerFor(run, 'palette', keptPalette, heard, changed), boundary: boundaryCount('palette') };
 			mandalaPullCharacter(genome, heard, 0.75 * shiftStrength);
+			// New music: the camera heads somewhere new now.
+			run.voyage.redirect();
 			run.weightsIn = 0.5;
 		}
 		run.weightsIn -= dt;
 		if (run.weightsIn <= 0) {
 			run.weightsIn = 0.5;
-			mandalaApplyCharacter(genome, heard, 6);
+			mandalaApplyCharacter(genome, heard, 6, run.recent);
 		}
 		if (feat) mandalaPullCharacter(genome, heard, Math.min(1, dt * 0.12));
 		const glide = 1.4 * genome.glideSpeed;
@@ -882,10 +945,27 @@
 			// Never quicker than two seconds for a new world: faster reads as a cut.
 			run.sceneTau = Math.max(worldMove ? 2.0 : 1.2, (worldMove ? 6.5 : 4.5) / leap);
 		}
+		// A new world brings its own light: another palette that fits the
+		// music nearly as well, so a change of world never wears the last
+		// world's colour. Right after a change of music the answer already
+		// chose the palette.
+		const nextWorld = mandalaSlotParts(nextScene).world;
+		if (nextWorld !== run.worldTarget) {
+			run.worldTarget = nextWorld;
+			if (forced()?.palette === undefined && run.sinceShift > 1.5) {
+				const current = answered('palette');
+				const alt = mandalaAnswer('palette', current, heard, answerRoll(run), true, undefined, run.recent.palette);
+				if (alt !== current && mandalaPaletteFit(alt, heard) >= 0.45) {
+					run.answers.palette = { option: alt, boundary: boundaryCount('palette') };
+				}
+			}
+		}
 		run.scene.update(nextScene, run.sceneTau, dt);
+		if (run.scene.mix >= 1) noteShown(run, 'world', mandalaSlotParts(run.scene.to).world);
 		const paletteTarget = answered('palette');
 		if (paletteTarget !== run.palette.to || run.palette.mix >= 1) run.paletteTau = Math.max(0.8, 5 / leap);
 		run.palette.update(paletteTarget, run.paletteTau, dt);
+		if (run.palette.mix >= 1) noteShown(run, 'palette', run.palette.to);
 
 		// Palette: the family crossfades, warmth leans it, the result glides
 		// (fast right after a shift).
@@ -896,11 +976,14 @@
 		const colourRate = 1.2 * leap;
 		const warmTint: Rgb = [1 + (lean - 0.5) * 0.14, 1, 1 - (lean - 0.5) * 0.18];
 		const colours = run.colours;
+		// The family's stops turn slowly round the wheel: a palette is a
+		// continuum the look drifts through, never the same colouring twice.
+		const tint = run.voyage.tint;
 		for (let i = 0; i < 4; i++) {
-			const c = mixRgb(pa.stops[i], pb.stops[i], pw);
+			const c = turnHue(mixRgb(pa.stops[i], pb.stops[i], pw), tint);
 			approachRgb(colours.stops[i], [c[0] * warmTint[0], c[1] * warmTint[1], c[2] * warmTint[2]], colourRate, dt);
 		}
-		approachRgb(colours.spark, mixRgb(pa.spark, pb.spark, pw), colourRate, dt);
+		approachRgb(colours.spark, turnHue(mixRgb(pa.spark, pb.spark, pw), tint), colourRate, dt);
 		colours.sheen = approach(colours.sheen, pa.sheen + (pb.sheen - pa.sheen) * pw, colourRate, dt);
 
 		// ── Beats, heard: the kick band's own transient, never the predicted
@@ -926,6 +1009,8 @@
 			// that into a flex of its folds (see the shaders' motion.x).
 			if (!forced()?.nosnap) run.spring.kick(strength * punchiness);
 			if (!forced()?.nosurge) run.surge = Math.max(run.surge, strength * punchiness);
+			// The roaming camera leans in on a heard kick.
+			run.voyage.kick(strength * punchiness * 0.6);
 		}
 		run.surge *= Math.exp(-dt / 0.16);
 		run.spring.update(dt, 2.6 + env.tempo * 1.6, 0.45);
@@ -937,7 +1022,7 @@
 		const spiralTrack = run.julia[sceneTo.world === WORLD_INDEX.spiral ? sceneTo.variant : 0];
 		const rates = PERIOD_LOG.map((period, world) =>
 			// The spiral turns arg(lambda) per period: cap the turn rate, not just the zoom.
-			world === WORLD_INDEX.spiral ? 1 / Math.max(0.15, spiralTrack.periodLog, spiralTrack.periodTurn / 1.4) : 1 / period
+			world === WORLD_INDEX.spiral ? 1 / Math.max(0.15, spiralTrack.periodLog, spiralTrack.periodTurn / 0.8) : 1 / period
 		);
 		run.voyage.update({
 			dt,
@@ -947,20 +1032,24 @@
 			surge: run.surge * (0.35 + env.tempo * 0.4),
 			restless: clamp(env.tempo * 0.7 + finite(directed.motion) * 0.3 + env.harsh * 0.2, 0, 1),
 			drift: clamp(val('drift'), 0, 1) * (0.5 + env.harsh * 0.3),
+			tempo: env.tempo,
 			silence: env.silence
 		});
 
-		// Julia dives are chosen by their spiral: the multiplier rests on a
-		// rational angle p/q (a q-armed rosette) with a small twist, picked by
-		// formA and moved between only when the genome moves it. Gliding
-		// continuously through the angles would cross bifurcations every
-		// second and read as flicker.
-		const juliaGrowth = clamp(val('formC') * 0.85 + env.harsh * 0.15, 0, 1);
-		const juliaTwist = (val('formB') - 0.5) * 0.03;
+		// Julia dives are chosen by their spiral: the multiplier rests near a
+		// rational angle p/q (a q-armed rosette). Gliding through the angles
+		// would cross bifurcations every second and read as flicker, so the
+		// angle only drifts inside the dive's own safe window, on slow noise;
+		// |lambda| (how far the rosettes have broken into dust) drifts with
+		// formC and a noise lane.
+		const voyage = run.voyage;
+		const juliaGrowth = clamp(val('formC') * 0.7 + env.harsh * 0.15 + voyage.morph[1] * 0.3 + 0.1, 0, 1);
+		const juliaLean = clamp(voyage.morph[2] * 0.8 + (val('formB') - 0.5) * 0.6, -1, 1) * 0.5 + 0.5;
 		run.julia.forEach((track, variant) => {
-			const [turns, low, high] = JULIA_DIVES[variant];
-			const radius = low + (high - low) * juliaGrowth + run.spring.value * 0.003;
-			track.steer(turns * Math.PI * 2 + juliaTwist, radius, dt, 0.35 * Math.sqrt(leap));
+			const [turns, low, high, , lowTurn, highTurn] = JULIA_DIVES[variant];
+			const radius = (forced()?.jr ?? low + (high - low) * juliaGrowth) + run.spring.value * 0.003;
+			const lean = forced()?.jt ?? lowTurn + (highTurn - lowTurn) * juliaLean;
+			track.steer((turns + lean) * Math.PI * 2, radius, dt, 0.35 * Math.sqrt(leap));
 		});
 
 		const forcedPhase = forced()?.phase;
@@ -980,7 +1069,20 @@
 		values.time = (now / 1000) % 1000;
 		values.steps = quality.steps;
 		values.detail = quality.detail * (1 + env.harsh * 0.15);
-		values.focal = 1.25;
+		values.focal = 1.25 * voyage.focal;
+		values.panX = voyage.panX;
+		values.panY = voyage.panY;
+		values.zoomLog = voyage.zoom;
+		values.roll = voyage.roll;
+		values.dolly = voyage.dolly;
+		values.orbit = voyage.orbit;
+		values.paint = voyage.paint;
+		values.eye = voyage.eye;
+		values.lampX = voyage.lampX;
+		values.lampY = voyage.lampY;
+		values.lampReach = voyage.lampReach;
+		values.extent = voyage.extent;
+		[values.morphA, values.morphB, values.morphC, values.morphD] = voyage.morph;
 		values.occlusion = quality.occlusion;
 		values.formA = clamp(val('formA'), 0, 1);
 		values.formB = clamp(val('formB'), 0, 1);
@@ -1024,6 +1126,8 @@
 			const world = mandalaSlotParts(slot).world;
 			// Planes zoom; flights turn as they travel, so their trail barely zooms.
 			if (world === WORLD_INDEX.crystal || world === WORLD_INDEX.bulb) return 0.15;
+			// Bloom dives at BLOOM_PACE of the travel (see PERIOD_LOG): its trail follows suit.
+			if (world === WORLD_INDEX.bloom) return BLOOM_PACE;
 			return MANDALA_RAYMARCHED.has(MANDALA_WORLDS[world]) ? 0.3 : 1;
 		};
 		const zoomWeight = mixing
@@ -1052,8 +1156,11 @@
 		values.feedbackRoll = -run.voyage.stepTurn * (1 - marchWeight);
 		values.bloomThreshold = 0.9 - env.energy * 0.2;
 		values.aberration = 0.8 + env.harsh * 1.4 + run.surge * 0.5;
-		values.vanishX = 0.5;
-		values.vanishY = 0.5;
+		// The planes zoom about their own centre, wherever the camera has
+		// drifted it; the flights stream from the middle of the frame.
+		const planeWeight = 1 - marchWeight;
+		values.vanishX = 0.5 + (voyage.panX * planeWeight * size.height) / Math.max(1, size.width);
+		values.vanishY = 0.5 - voyage.panY * planeWeight;
 		values.exposure = 1;
 		values.bloomWeight = 0.45 + val('glow') * 0.35;
 		values.contrast = 1.04 + env.punch * 0.08;

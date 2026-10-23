@@ -193,7 +193,7 @@ test.describe('visualizer engine roster', () => {
 		await expect(page.getByRole('radio', { name: 'Mandala' })).toHaveAttribute('aria-checked', 'true');
 		const mandalaCanvas = page.getByLabel('Mandala audio visualizer');
 		await expect(mandalaCanvas).toHaveAttribute('data-mandala-render-passes', '9');
-		await expect(mandalaCanvas).toHaveAttribute('data-mandala-uniform-bytes', '416');
+		await expect(mandalaCanvas).toHaveAttribute('data-mandala-uniform-bytes', '480');
 		if (await hasUsableWebGpu(page)) {
 			await expect(mandalaCanvas).toHaveAttribute('data-mandala-ready', 'true', { timeout: 15_000 });
 			await expect(mandalaCanvas).toHaveAttribute(

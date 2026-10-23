@@ -11,6 +11,15 @@
 //   life       - the animal swims, contracts on the beat, grows across a
 //                phrase; a diver-like camera follows it with lag and sway
 //
+// Nothing here runs on a closed loop. The species are seeds in one continuous
+// anatomy space, not a set of animals: the genome's species is only the
+// dominant kin, every other species drifts in and out of the body on its own
+// slow noise lane, and independent trait lanes (proportions, splay, curl,
+// shells, combs, cerata, frills, photophore patterns...) wander across all of
+// them, so the animal keeps becoming one never seen before. The camera roams
+// a space of good viewpoints (motion.ts Roamer) instead of orbiting at a fixed
+// rate; the authored camera regimes are only biases inside that space.
+//
 // Across all three runs the mood: what kind of music the animal hears (the
 // shared MusicCharacter, read through calm / agitation / pulse / mass /
 // warmth). It steers continuous parameters at once (swim and pulse from
@@ -23,6 +32,7 @@
 // renderer is deterministic per seed and input stream.
 
 import { VariationGenome, type ChoiceState } from '../variation';
+import { Roamer, Wander, noise1 } from '../motion';
 import type { VisualDirectorFrame } from '../director/types';
 import type { SignalSpectrumProfile } from '../signal/spectrum';
 import type { Mk2ConductorFrame } from './conductor';
@@ -119,11 +129,14 @@ export type SomaFrame = {
 		keyPower: number;
 		ambient: number;
 		exposure: number;
+		/** Deep scattering layer: world height and glow density. */
+		layerY: number;
+		layer: number;
 	};
 	/** The mood the animal is in, 0..1 each. */
 	mood: SomaMood;
 	/** Integrated phases and the animal's light power, for the water. */
-	flow: { snow: number; shiver: number; light: number };
+	flow: { snow: number; shiver: number; light: number; current: number; comb: number; film: number; life: number };
 	keyColor: Rgb;
 	colors: { water: Rgb; haze: Rgb; body: Rgb; glow: Rgb; accent: Rgb; organ: Rgb };
 	organism: {
@@ -330,6 +343,63 @@ const SKIN_MODS: readonly Partial<Record<'opacity' | 'rimGlow' | 'iridescence' |
 	{ organGlow: [1.35, 0.15], vacuole: [1, 0.25], opacity: [0.9, 0.05] }
 ];
 
+/**
+ * Trait lanes of the anatomy continuum: each drifts on its own period, so the
+ * combination of body parts never comes round again. Periods are seconds per
+ * undulation, deliberately incommensurate.
+ */
+const TRAIT = {
+	aspect: 0,
+	reach: 1,
+	splay: 2,
+	curl: 3,
+	sinuous: 4,
+	spacing: 5,
+	scallop: 6,
+	skirt: 7,
+	spines: 8,
+	shell: 9,
+	combs: 10,
+	pigment: 11,
+	cerata: 12,
+	lures: 13,
+	frills: 14,
+	spots: 15,
+	squash: 16,
+	neck: 17,
+	organs: 18,
+	sheen: 19,
+	ring: 20,
+	hybrid: 21
+} as const;
+const TRAIT_PERIODS = [41, 37, 53, 29, 67, 47, 31, 59, 83, 97, 71, 61, 89, 43, 79, 33, 73, 101, 57, 39, 49, 113];
+
+/** Rig dimensions the camera roams (each -1..1). */
+const RIG = { azimuth: 0, elevation: 1, distance: 2, focus: 3, frameX: 4, frameY: 5, focal: 6, roll: 7, follow: 8 } as const;
+const RIG_DIMS = 9;
+
+/** Slow free drifts: orbit rate, heading, breath rate, companion, diver sway (3), diver roll, hue lean, light lean. */
+const DRIFT = { orbit: 0, heading: 1, breath: 2, companion: 3, swayX: 4, swayY: 5, swayZ: 6, roll: 7, hue: 8, light: 9, current: 10, depth: 11, murk: 12, layer: 13, layerY: 14, life: 15 } as const;
+const DRIFT_PERIODS = [43, 61, 23, 37, 17, 23, 19, 29, 71, 53, 31, 59, 41, 47, 67, 53];
+
+/** How much deep-scattering plankton glows in each world (in SOMA_ENVIRONMENTS order): most where nothing else lights the water. */
+const PLANKTON = [1, 0.45, 0.25, 0.3, 0.3, 1];
+
+/**
+ * Wander lanes are gradient noise, which spends most of its time near zero
+ * (90% within +-0.25). Stretch them so -1..1 is really visited: after this,
+ * half the time a lane is beyond +-0.34 and a tenth of the time beyond 0.7.
+ */
+function stretch(src: Float32Array, out: Float32Array): Float32Array {
+	for (let i = 0; i < out.length; i += 1) out[i] = clamp(src[i] * 2.8, -1, 1);
+	return out;
+}
+
+/** smoothstep on a stretched lane: an occasional feature, absent much of the time. */
+function sometimes(x: number, from = 0.25, to = 0.8): number {
+	return smoothstep(from, to, x);
+}
+
 export class SomaLook {
 	readonly genome: VariationGenome;
 	private seed = 0.5;
@@ -410,6 +480,28 @@ export class SomaLook {
 	private readonly moodVelocity: SomaMood = { ...NEUTRAL_MOOD };
 	private readonly moodPrevious: SomaMood = { ...NEUTRAL_MOOD };
 	private moodPickAge = 1e6;
+	// Organic motion: every lane below is deterministic per seed and lives with
+	// the look, so a remount resumes it and a new song carries it on.
+	/** One slow lane per species: how much of each kin is in the body now. */
+	private kin = new Wander(SOMA_SPECIES.length, 'soma-kin', 60);
+	/** Anatomy trait lanes (TRAIT). */
+	private traits = new Wander(TRAIT_PERIODS.length, 'soma-traits', TRAIT_PERIODS);
+	/** The camera's roaming point in the space of good viewpoints (RIG). */
+	private rig = new Roamer(RIG_DIMS, 'soma-rig', { meanHold: 12, minHold: 3.5, response: 5, wander: 0.3, wanderPeriod: 27 });
+	/** Free drifts (DRIFT). */
+	private drift = new Wander(DRIFT_PERIODS.length, 'soma-drift', DRIFT_PERIODS);
+	private noiseSeed = 0;
+	/** Water current, comb-row and iridescent film phases: integrated, at wandering rates. */
+	private currentPhase = 0;
+	private combPhase = 0;
+	private filmPhase = 0;
+	private lastImpact = 0;
+	private sinceNudge = 0;
+	private readonly kinWeights = new Float32Array(SOMA_SPECIES.length);
+	/** Stretched copies of the lanes above (see stretch), refreshed every frame. */
+	private readonly kn = new Float32Array(SOMA_SPECIES.length);
+	private readonly tr = new Float32Array(TRAIT_PERIODS.length);
+	private readonly dr = new Float32Array(DRIFT_PERIODS.length);
 	private readonly frame: SomaFrame;
 	private readonly colorScratch: Rgb = [0, 0, 0];
 
@@ -427,9 +519,9 @@ export class SomaLook {
 			palette: { from: 0, to: 0, mix: 1 },
 			camera: { from: 0, to: 0, mix: 1 },
 			beatForm: { from: 0, to: 0, mix: 1 },
-			env: { fog: 0.08, floorY: -7, surfaceY: 30, reflect: 0.1, snow: 1, shafts: 0.3, absorb: [1.8, 1, 0.8], down: 0.05, keyDir: [0, 1, 0], keyPower: 0.5, ambient: 0.05, exposure: 1 },
+			env: { fog: 0.08, floorY: -7, surfaceY: 30, reflect: 0.1, snow: 1, shafts: 0.3, absorb: [1.8, 1, 0.8], down: 0.05, keyDir: [0, 1, 0], keyPower: 0.5, ambient: 0.05, exposure: 1, layerY: 0, layer: 0 },
 			mood: { ...NEUTRAL_MOOD },
-			flow: { snow: 0, shiver: 0, light: 1 },
+			flow: { snow: 0, shiver: 0, light: 1, current: 0, comb: 0, film: 0, life: 0.3 },
 			keyColor: [0.5, 0.7, 1],
 			colors: {
 				water: [0.002, 0.008, 0.02],
@@ -486,6 +578,18 @@ export class SomaLook {
 		this.moodPalettePicks = 0;
 		this.answeredShift = -1;
 		this.weightsAge = 0;
+		// The organic lanes start from this session's seed; reseed (a new song)
+		// never touches them, so the walk carries on across songs.
+		const word = `${seed}`;
+		this.kin = new Wander(SOMA_SPECIES.length, `soma-kin:${word}`, SOMA_SPECIES.map((_, i) => 48 + ((i * 37) % 53)));
+		this.traits = new Wander(TRAIT_PERIODS.length, `soma-traits:${word}`, TRAIT_PERIODS);
+		this.rig = new Roamer(RIG_DIMS, `soma-rig:${word}`, { meanHold: 12, minHold: 3.5, response: 5, wander: 0.3, wanderPeriod: 27 });
+		this.drift = new Wander(DRIFT_PERIODS.length, `soma-drift:${word}`, DRIFT_PERIODS);
+		this.noiseSeed = Math.floor(this.seed * 0xffffffff) >>> 0;
+		this.currentPhase = this.seed * 40;
+		this.combPhase = 0;
+		this.filmPhase = this.seed * 7;
+		this.lastImpact = 0;
 		this.applyWeights();
 	}
 
@@ -506,6 +610,8 @@ export class SomaLook {
 			this.camEye.map(r).join(','),
 			r(this.clock),
 			r(this.orbit),
+			Array.from(this.rig.value, r).join(','),
+			Array.from(this.kin.value, r).join(','),
 			String(this.answeredShift),
 			Object.values(this.mood).map(r).join(',')
 		].join('|');
@@ -691,16 +797,74 @@ export class SomaLook {
 		g.pull('bodySize', clamp(0.2 + m.mass * 0.7, 0, 1), amount);
 		g.pull('clarity', clamp(0.8 - m.mass * 0.5, 0, 1), amount);
 		g.shift(strength, Math.max(this.energy, m.energy));
+		// The diver heads for a new viewpoint now, not when its hold runs out.
+		this.rig.redirect();
 		return true;
 	}
 
+	/**
+	 * The body as a blend of kin. The genome's species (mid-crossfade or not)
+	 * is the dominant kin; every other species drifts in and out on its own
+	 * slow lane, leaning toward kin that fit the music, and a 'hybrid' lane
+	 * sets how far from a pure species the animal strays at all. Weights are
+	 * continuous in time, so the body never steps.
+	 */
 	private speciesBlend(out: Float32Array, choice: ChoiceState): void {
-		const a = somaSpeciesAnatomy(choice.from);
-		const b = somaSpeciesAnatomy(choice.to);
-		for (let i = 0; i < SOMA_ANATOMY_SIZE; i += 1) {
-			const key = SOMA_ANATOMY_KEYS[i];
-			out[i] = lerp(a[key], b[key], choice.mix);
+		const n = SOMA_SPECIES.length;
+		const kin = this.kn;
+		const fit = moodWeights(SOMA_SPECIES_MOODS, this.mood, 3, 0.25);
+		const hybrid = 0.2 + 0.8 * smoothstep(-0.6, 0.6, this.tr[TRAIT.hybrid]);
+		const w = this.kinWeights;
+		let total = 0;
+		for (let i = 0; i < n; i += 1) {
+			const dominant = (i === choice.from ? 1 - choice.mix : 0) + (i === choice.to ? choice.mix : 0);
+			const guest = sometimes(kin[i], 0.3, 0.9) * 0.45 * hybrid * fit[i];
+			w[i] = dominant + guest;
+			total += w[i];
 		}
+		out.fill(0);
+		for (let i = 0; i < n; i += 1) {
+			if (w[i] <= 1e-4) continue;
+			const share = w[i] / total;
+			const a = somaSpeciesAnatomy(i);
+			for (let k = 0; k < SOMA_ANATOMY_SIZE; k += 1) out[k] += a[SOMA_ANATOMY_KEYS[k]] * share;
+		}
+	}
+
+	/**
+	 * Parts and proportions that wander across every kin: the same body plan
+	 * grows a lattice shell, comb rows, cerata, lures or frills for a while and
+	 * loses them again, each on its own clock.
+	 */
+	private applyTraits(t: Float32Array): void {
+		const tr = this.tr;
+		t[A.bellH] *= 1 + 0.24 * tr[TRAIT.aspect];
+		t[A.bellR] *= 1 - 0.1 * tr[TRAIT.aspect];
+		t[A.tentLen] *= 1 + 0.3 * tr[TRAIT.reach];
+		t[A.tentDir] = clamp(t[A.tentDir] + 0.32 * tr[TRAIT.splay], 0.25, Math.PI);
+		t[A.tentCurl] += 0.55 * tr[TRAIT.curl];
+		t[A.chainCurve] = Math.max(0, t[A.chainCurve] + 0.35 * tr[TRAIT.sinuous]);
+		t[A.chainSpacing] *= 1 + 0.18 * tr[TRAIT.spacing];
+		t[A.lobeAmp] = Math.max(0, t[A.lobeAmp] + 0.06 * tr[TRAIT.scallop]);
+		t[A.fin] += 0.45 * sometimes(tr[TRAIT.skirt]);
+		t[A.spines] += 0.45 * sometimes(tr[TRAIT.spines], 0.35, 0.9);
+		t[A.lattice] += 0.65 * sometimes(tr[TRAIT.shell], 0.35, 0.9);
+		t[A.combs] += 0.75 * sometimes(tr[TRAIT.combs]);
+		t[A.chromato] += 0.55 * sometimes(tr[TRAIT.pigment]);
+		t[A.cerata] += 0.6 * sometimes(tr[TRAIT.cerata], 0.35, 0.9);
+		t[A.tipBulb] += 0.7 * sometimes(tr[TRAIT.lures]);
+		t[A.oral] += 0.7 * sometimes(tr[TRAIT.frills]);
+		t[A.photoDensity] *= 0.6 + 0.8 * smoothstep(-0.7, 0.7, tr[TRAIT.spots]);
+		t[A.photoRim] *= 0.6 + 0.8 * smoothstep(-0.7, 0.7, tr[TRAIT.ring]);
+		t[A.photoTentacle] *= 0.6 + 0.8 * smoothstep(-0.7, 0.7, -tr[TRAIT.ring]);
+		t[A.squash] = clamp(t[A.squash] * (1 + 0.22 * tr[TRAIT.squash]), 0.15, 1.3);
+		t[A.bellNeck] += 0.45 * sometimes(tr[TRAIT.neck], 0.3, 0.85);
+		const organs = tr[TRAIT.organs];
+		t[A.gonad] += 0.6 * sometimes(organs);
+		t[A.nucleus] += 0.6 * sometimes(-organs);
+		t[A.vacuole] += 0.4 * sometimes(organs * 0.6 + tr[TRAIT.sheen] * 0.6);
+		t[A.canal] += 0.5 * sometimes(tr[TRAIT.neck] * 0.5 - organs * 0.5);
+		t[A.iridescence] += 0.45 * sometimes(tr[TRAIT.sheen]);
 	}
 
 	private applySkin(values: Float32Array, skin: number, weight: number): void {
@@ -716,6 +880,7 @@ export class SomaLook {
 		const g = this.genome;
 		this.speciesBlend(this.target, this.pick('species'));
 		const t = this.target;
+		this.applyTraits(t);
 		const bellShape = g.value('bellShape');
 		t[A.bellH] *= 1 + 0.22 * bellShape;
 		t[A.bellR] *= 1 - 0.08 * bellShape;
@@ -783,6 +948,10 @@ export class SomaLook {
 		t[A.rimGlow] *= 0.75 + 0.35 * bloom + 0.2 * this.energy - 0.25 * dormancy;
 		t[A.organGlow] *= 0.8 + 0.3 * bloom + 0.15 * shedding;
 		t[A.bellOpen] = clamp(t[A.bellOpen] * (1 - dormancy * 0.15), 0, 1);
+		// The fin skirt is a blade along a long, slender body; wrapped round a
+		// wide bell it nearly coincides with the bell's own surface and the
+		// march shows banded moire. Only a slender body keeps its skirt.
+		t[A.fin] *= 1 - smoothstep(0.4, 0.62, t[A.bellR] / Math.max(0.1, t[A.bellH]));
 	}
 
 	/** hurry: how much faster than a living pace the genome wants the counts to change (after a shift). */
@@ -790,7 +959,19 @@ export class SomaLook {
 		const species = this.pick('species');
 		const dominant = species.mix >= 0.5 ? species.to : species.from;
 		const lobesTarget = somaSpeciesFold(dominant, this.pick('fold').to);
-		const armsTarget = somaSpeciesArms(dominant, this.pick('arms').to);
+		let armsTarget = somaSpeciesArms(dominant, this.pick('arms').to);
+		// A hybrid that has inherited real tentacles from its kin wears them,
+		// even when its dominant kin has none: count them from the strongest
+		// armed kin in the blend. (A body with tentacle length but no tentacles
+		// also renders badly: the bare membrane loses its shading.)
+		if (armsTarget === 0 && this.target[A.tentLen] > 0.25) {
+			let best = -1;
+			for (let i = 0; i < SOMA_SPECIES.length; i += 1) {
+				if (i === dominant || somaSpeciesArms(i, 0) === 0) continue;
+				if (best < 0 || this.kinWeights[i] > this.kinWeights[best]) best = i;
+			}
+			if (best >= 0 && this.kinWeights[best] > 0.02) armsTarget = somaSpeciesArms(best, this.pick('arms').to);
+		}
 		// A count cannot glide, so the feature folds away and regrows at the new
 		// count: scallops relax smooth, tentacles retract into the body.
 		if (lobesTarget !== this.lobes) {
@@ -813,7 +994,10 @@ export class SomaLook {
 				this.armFade = 0;
 			}
 		} else this.armFade = Math.min(1, this.armFade + Math.min((dt * hurry) / 2.2, tipLimit));
-		this.armPresence = approach(this.armPresence, this.arms > 0 ? 1 : 0, 0.6, dt);
+		// Slow on purpose: the bounding radius follows it, and the animal's light
+		// in the water is softened by that radius, so a fast change reads as a
+		// whole-body flash or blackout when tentacles first appear or vanish.
+		this.armPresence = approach(this.armPresence, this.arms > 0 ? 1 : 0, 2.5, dt);
 	}
 
 	private resolvePalette(dt: number, director: VisualDirectorFrame, rate: number): void {
@@ -823,8 +1007,11 @@ export class SomaLook {
 		const from = SOMA_PALETTES[palette.from];
 		const to = SOMA_PALETTES[palette.to];
 		const context = director.context;
+		// A hue lean that never parks: the genome's drift, the key, and a slow
+		// free lane wide enough to carry a palette into a neighbouring colour.
 		const lean =
 			g.value('hueDrift') * 0.035 +
+			this.dr[DRIFT.hue] * 0.075 +
 			(finite(context.keyPitchClass, 0.5) - 0.5) * 0.04 * clamp(finite(context.keyConfidence), 0, 1);
 		const colors = this.frame.colors;
 		// Colour temperature of the living light from the music's warmth: a white
@@ -880,20 +1067,36 @@ export class SomaLook {
 		const murk = g.value('murk');
 		const dwell = this.anatomy[A.dwell];
 		const md = this.mood;
-		env.fog = approach(env.fog, lerp(a.fog, b.fog, m) * (0.75 + 0.55 * murk) * (1 + md.calm * 0.2 + md.agitation * 0.15), rate, dt);
-		for (let i = 0; i < 3; i += 1) env.absorb[i] = approach(env.absorb[i], lerp(a.absorb[i], b.absorb[i], m), rate, dt);
-		env.down = approach(env.down, lerp(a.down, b.down, m), rate, dt);
+		// The animal drifts up toward the light and sinks into the dark on its
+		// own slow lane: deeper water gets less daylight, fainter shafts and
+		// loses its reds; the water's clarity wanders too.
+		const deep = 0.5 + 0.5 * this.dr[DRIFT.depth];
+		const clarity = 1 + 0.35 * this.dr[DRIFT.murk];
+		env.fog = approach(env.fog, lerp(a.fog, b.fog, m) * (0.75 + 0.55 * murk) * (1 + md.calm * 0.2 + md.agitation * 0.15) * clarity, rate, dt);
+		for (let i = 0; i < 3; i += 1) {
+			const absorb = lerp(a.absorb[i], b.absorb[i], m) * (i === 0 ? lerp(0.9, 1.25, deep) : i === 2 ? lerp(1.05, 0.92, deep) : 1);
+			env.absorb[i] = approach(env.absorb[i], absorb, rate, dt);
+		}
+		env.down = approach(env.down, lerp(a.down, b.down, m) * lerp(1, 0.1, deep), rate, dt);
 		// The seabed rises to meet a floor-dwelling animal.
-		this.envFloor = approach(this.envFloor, lerp(lerp(a.floorY, b.floorY, m), -2.7, dwell), rate * 0.8, dt);
+		// Deep water is near the bottom: as the animal sinks the seabed rises
+		// into view, lit only by the animal's own light pooling on it.
+		const seabed = lerp(lerp(a.floorY, b.floorY, m), Math.max(lerp(a.floorY, b.floorY, m), -3.4), smoothstep(0.45, 0.95, deep));
+		this.envFloor = approach(this.envFloor, lerp(seabed, -2.7, dwell), rate * 0.8, dt);
 		env.floorY = this.envFloor;
 		env.surfaceY = approach(env.surfaceY, lerp(a.surfaceY, b.surfaceY, m), rate, dt);
 		env.reflect = approach(env.reflect, lerp(a.reflect, b.reflect, m), rate, dt);
 		env.snow = approach(env.snow, lerp(a.snow, b.snow, m) * (0.5 + g.value('snow')) * (0.75 + md.agitation * 0.8 + md.calm * 0.2), rate, dt);
-		env.shafts = approach(env.shafts, lerp(a.shafts, b.shafts, m) * (1 + md.calm * 0.3 - md.agitation * 0.4), rate, dt);
-		env.keyPower = approach(env.keyPower, lerp(a.keyPower, b.keyPower, m), rate, dt);
-		env.ambient = approach(env.ambient, lerp(a.ambient, b.ambient, m), rate, dt);
-		env.exposure = approach(env.exposure, lerp(a.exposure, b.exposure, m) * (1 + md.calm * 0.25), rate, dt);
-		const azimuth = (g.value('lightAzimuth') - 0.5) * 1.4;
+		env.shafts = approach(env.shafts, lerp(a.shafts, b.shafts, m) * (1 + md.calm * 0.3 - md.agitation * 0.4) * lerp(1.2, 0.35, deep), rate, dt);
+		env.keyPower = approach(env.keyPower, lerp(a.keyPower, b.keyPower, m) * lerp(1.1, 0.7, deep), rate, dt);
+		env.ambient = approach(env.ambient, lerp(a.ambient, b.ambient, m) * lerp(1.1, 0.6, deep), rate, dt);
+		env.exposure = approach(env.exposure, lerp(a.exposure, b.exposure, m) * (1 + md.calm * 0.1), rate, dt);
+		// The plankton layer drifts up and down past the animal and thickens and
+		// thins on its own lanes; deeper water holds more of it.
+		const layer = lerp(PLANKTON[environment.from] ?? 0.5, PLANKTON[environment.to] ?? 0.5, m);
+		env.layer = approach(env.layer, layer * (0.25 + 0.75 * (0.5 + 0.5 * this.dr[DRIFT.layer])) * lerp(0.7, 1.2, deep), rate, dt);
+		env.layerY = approach(env.layerY, 0.6 + 3.4 * this.dr[DRIFT.layerY], rate, dt);
+		const azimuth = (g.value('lightAzimuth') - 0.5) * 1.4 + this.dr[DRIFT.light] * 0.6;
 		const ca = Math.cos(azimuth);
 		const sa = Math.sin(azimuth);
 		const kx = lerp(a.keyDir[0], b.keyDir[0], m);
@@ -914,7 +1117,10 @@ export class SomaLook {
 	}
 
 	/** The animal's extent and bounding sphere in its own body frame. */
-	private bounds(t: Float32Array = this.anatomy, armFade = this.armFade): { centerY: number; centerChain: number; radius: number; extent: number } {
+	private bounds(
+		t: Float32Array = this.anatomy,
+		armFade = this.armFade
+	): { centerY: number; centerChain: number; radius: number; extent: number; core: number } {
 		const R = Math.max(t[A.bellR] * (1 + 0.45 * t[A.fin]), t[A.bellH]);
 		const len = t[A.tentLen] * (0.3 * this.armPresence + 0.7 * armFade * (this.arms > 0 ? 1 : 0));
 		const rootR = t[A.tentRoot] * t[A.bellR];
@@ -930,7 +1136,9 @@ export class SomaLook {
 		const chain = Math.max(0, Math.ceil(t[A.chainCount]) - 1) * t[A.chainSpacing];
 		const radius = (Math.hypot(half, radial) + chain * 0.5 + t[A.chainCurve] * 0.6 + 0.15) * 1.08;
 		const extent = Math.max(half, radial) + chain * 0.5;
-		return { centerY: (top + bottom) / 2, centerChain: chain * 0.5, radius, extent };
+		// The body without its trailing appendages: what framing must keep in shot.
+		const core = Math.max(t[A.bellR], t[A.bellH]) + t[A.spines] * 0.2 + Math.max(0, t[A.chainCount] - 1) * t[A.chainSpacing] * 0.5;
+		return { centerY: (top + bottom) / 2, centerChain: chain * 0.5, radius, extent, core };
 	}
 
 	update(input: SomaLookInput): SomaFrame {
@@ -943,6 +1151,12 @@ export class SomaLook {
 		const impactScale = input.impactScale ?? 1;
 		this.clock += dt;
 		this.feel(dt, input.character);
+		// The anatomy continuum drifts faster in loud, busy music and nearly
+		// holds in silence; never on a loop, never parked.
+		const drifting = (0.75 + this.energy * 0.5 + this.mood.agitation * 0.35) * (1 - this.silence * 0.7);
+		stretch(this.kin.update(dt, drifting), this.kn);
+		stretch(this.traits.update(dt, drifting), this.tr);
+		stretch(this.drift.update(dt, 0.8 + this.energy * 0.4), this.dr);
 
 		// ── Envelopes, owned here so a new source never dips them.
 		const rms = live ? clamp(finite(spectrum.bass * 0.4 + spectrum.mid * 0.4 + spectrum.treble * 0.2), 0, 1) : 0;
@@ -1053,7 +1267,7 @@ export class SomaLook {
 			this.camTarget[i] = this.pos[i];
 			this.camBase[i] = this.pos[i];
 		}
-		const pose = this.cameraPose(b.extent * this.anatomy[A.size]);
+		const pose = this.cameraPose(b.extent * this.anatomy[A.size], b.core * this.anatomy[A.size]);
 		this.camAzimuth = pose.azimuth;
 		this.camElevation = pose.elevation;
 		this.camDistance = pose.distance;
@@ -1088,28 +1302,59 @@ export class SomaLook {
 		};
 	}
 
-	private cameraPose(extent: number): { azimuth: number; elevation: number; distance: number; aperture: number; focal: number } {
+	/**
+	 * Where the diver wants to be. The genome's camera regime is only a bias
+	 * (below, alongside, close, far back...); the rig roams freely around it,
+	 * so the same regime never films the same shot twice.
+	 */
+	private cameraPose(extent: number, core: number): { azimuth: number; elevation: number; distance: number; aperture: number; focal: number } {
 		const spec = this.cameraSpec();
 		const g = this.genome;
+		const r = this.rig.value;
 		// A floor dweller is filmed from a little above, as a diver would, so the
 		// seabed never pushes the eye up underneath it.
-		const elevation = clamp(spec.elevation + g.value('camHeight') * 0.16 + this.target[A.dwell] * 0.3, -0.75, 0.95);
+		const elevation = clamp(
+			spec.elevation * 0.55 + r[RIG.elevation] * 0.6 + g.value('camHeight') * 0.12 + this.target[A.dwell] * 0.3,
+			-0.75,
+			0.95
+		);
 		// Heading-relative regimes (profile) track the animal's side; the rest
 		// orbit in world space so the animal turns within the shot.
 		// Both angles are unwrapped; the 2-pi branch only re-anchors while the
 		// regime ignores the heading, so the result is continuous.
+		const follow = clamp(spec.follow + r[RIG.follow] * 0.4, 0, 1);
 		const relative = this.heading + Math.PI * 0.5 - this.orbit;
-		if (spec.follow < 0.02) this.followBranch = Math.round(relative / (Math.PI * 2)) * Math.PI * 2;
+		if (follow < 0.02) this.followBranch = Math.round(relative / (Math.PI * 2)) * Math.PI * 2;
 		const toHeading = relative - this.followBranch;
-		const azimuth = this.orbit + spec.azimuth + spec.follow * toHeading + g.value('camSide') * 0.55;
+		const azimuth = this.orbit + spec.azimuth + follow * toHeading + g.value('camSide') * 0.45 + r[RIG.azimuth] * 1.1;
 		// Never inside the animal: at least its bounding radius plus a margin.
 		// Calm music steps back to show the animal in its water; frantic music
 		// moves in close and hand-held; a groove sits a little closer.
 		const md = this.mood;
 		const moodDistance = lerp(1, 1.2, md.calm) * lerp(1, 0.78, md.agitation) * lerp(1, 0.92, md.pulse);
-		const distance = Math.max(spec.distance * moodDistance * (0.9 + extent * 0.85), this.frame.organism.boundRadius * 1.2 + 0.4);
+		// The roamed distance spans intimate to far; calm music roams the far
+		// half (the animal small in its water), agitation the near half.
+		const near = 0.72 + 0.2 * md.calm - 0.08 * md.agitation;
+		const far = 1.9 + 0.2 * md.calm - 0.65 * md.agitation;
+		const roam = lerp(near, far, 0.5 + 0.5 * r[RIG.distance]);
+		// Far, but never so far the body shrinks to a speck: the core's
+		// projected radius stays at least a third of the frame height (the
+		// core estimate is generous, so the visible body reads smaller). A
+		// small animal alone in black water reads as the same picture whatever
+		// the animal is.
+		const furthest = Math.max(3, (core * spec.focal) / 0.34);
+		const distance = Math.max(
+			Math.min(spec.distance * roam * moodDistance * (0.9 + extent * 0.85), furthest),
+			this.frame.organism.boundRadius * 1.2 + 0.4
+		);
 		// Calm music holds a deeper focus, so the long slow animal stays readable.
-		return { azimuth, elevation, distance, aperture: spec.aperture * 0.85 * (1 - 0.5 * md.calm), focal: spec.focal };
+		return {
+			azimuth,
+			elevation,
+			distance,
+			aperture: spec.aperture * 0.85 * (1 - 0.5 * md.calm) * (1 - 0.25 * r[RIG.distance]),
+			focal: spec.focal * (1 + 0.1 * r[RIG.focal])
+		};
 	}
 
 	private live(dt: number, input: SomaLookInput, live: boolean, motionScale: number): void {
@@ -1126,6 +1371,13 @@ export class SomaLook {
 		const pulse = md.pulse;
 		this.snowPhase += dt * (0.6 + md.tempo * 0.9 + ag * 2.4) * motionScale;
 		this.shiverPhase = (this.shiverPhase + dt * Math.PI * 2 * 7.5) % (Math.PI * 2);
+		// Shader phases, integrated at rates that wander (never time * k): the
+		// water current, the comb rows' running light (treble drives it) and the
+		// iridescent film's slide.
+		const d = this.dr;
+		this.currentPhase += dt * 0.35 * (0.55 + 0.45 * (1 + d[DRIFT.current])) * (0.7 + md.tempo * 0.6) * motionScale;
+		this.combPhase = (this.combPhase + dt * 9 * (0.4 + this.treble)) % 6283.1853;
+		this.filmPhase += dt * 0.35 * (0.5 + 0.5 * (1 + d[DRIFT.hue])) * motionScale;
 
 		// Muscle: a jet contraction locked to the beat (fast squeeze, slow
 		// refill). Fast tempos contract every other beat, like a real bell.
@@ -1136,7 +1388,7 @@ export class SomaLook {
 		// A groove squeezes hard on every beat; calm music barely flexes; agitation
 		// adds a fine tremor on top, the bell shivering.
 		const strength = (0.4 + 0.45 * this.energy + 0.5 * this.kick) * (0.75 + pulse * 0.7 - calm * 0.2);
-		this.breathe += dt * (0.28 + this.energy * 0.1) * (1 - calm * 0.35);
+		this.breathe += dt * (0.28 + this.energy * 0.1) * (1 - calm * 0.35) * (0.75 + 0.3 * (1 + d[DRIFT.breath]));
 		const idle = (0.5 + 0.5 * Math.sin(this.breathe * Math.PI * 2)) * 0.22;
 		const tremor = ag * 0.07 * (0.5 + 0.5 * Math.sin(this.shiverPhase)) * awake;
 		const contractionTarget = (live ? Math.max(squeeze * strength * awake, idle * 0.6) : idle) + (live ? tremor : 0);
@@ -1212,7 +1464,8 @@ export class SomaLook {
 		// species' posture plus a lean into the swim.
 		const vh = Math.hypot(this.vel[0], this.vel[2]);
 		if (vh > 0.01) this.heading = approachAngle(this.heading, Math.atan2(this.vel[2], this.vel[0]), lerp(2.2, 0.45, ag), dt);
-		this.heading += dt * 0.025 * motionScale;
+		// A slow turn of its own that wanders, and sometimes reverses.
+		this.heading += dt * 0.05 * d[DRIFT.heading] * motionScale;
 		const posture = t[A.pitch];
 		const horizontal = Math.sin(Math.min(Math.PI, posture));
 		const lean = clamp(vh * 2.2, 0, 0.5) * (1 - horizontal) * (posture < 1.6 ? 1 : -1);
@@ -1222,11 +1475,29 @@ export class SomaLook {
 		this.roll = t[A.undulate] * 0.1 * Math.sin(this.fin * 0.5) + this.genome.value('tilt') * 0.08;
 
 		// ── Companion: a juvenile of the same species keeping station nearby.
-		this.companionPhase += dt * (0.04 + this.energy * 0.05) * motionScale;
-		// ── Camera: the diver follows with lag, orbits slowly with the music.
+		this.companionPhase += dt * (0.04 + this.energy * 0.05) * 1.6 * d[DRIFT.companion] * motionScale;
+		// ── Camera: the diver follows with lag and roams a space of viewpoints.
+		// Tempo sets the pace, energy and agitation the restlessness; a heard
+		// hit (a big rise of the transient rail) pushes the diver in a little.
 		const spec = this.cameraSpec();
-		this.orbit += dt * spec.orbit * (0.35 + this.energy) * (0.5 + md.tempo * 1.2 + pulse * 0.4) * motionScale * awake;
-		const focusAlong = spec.focusAlong * b.extent;
+		const impact = live ? clamp(finite(input.mk2.impact), 0, 1) : 0;
+		// Only a real hit counts (a drop, a slam), not every kick: a refractory
+		// keeps the diver from pumping on the beat.
+		this.sinceNudge += dt;
+		if (impact > 0.7 && impact - this.lastImpact > 0.4 && this.sinceNudge > 6) {
+			this.rig.impulse(RIG.distance, -0.45 * impact);
+			this.rig.impulse(RIG.azimuth, (hash01(this.seed, this.lastBeat, 13) - 0.5) * 0.5 * impact);
+			this.sinceNudge = 0;
+		}
+		this.lastImpact = impact;
+		this.rig.update(dt, (0.75 + md.tempo * 0.45 + ag * 0.3) * motionScale * awake, clamp(0.25 + this.energy * 0.5 + ag * 0.4, 0, 1));
+		// The orbit is no longer a constant spin: its rate wanders through zero,
+		// so the diver drifts round one way, slows, and comes back.
+		this.orbit +=
+			dt * spec.orbit * 1.6 * d[DRIFT.orbit] * (0.35 + this.energy) * (0.5 + md.tempo * 1.2 + pulse * 0.4) * motionScale * awake;
+		// The aim leans along the body (bell or trailing tentacles) by a body's
+		// width at most, so the animal never slides out of shot.
+		const focusAlong = spec.focusAlong * b.extent + 0.12 * this.rig.value[RIG.focus] * b.core;
 		// Look at the whole animal (colony included), leaning towards the regime's part.
 		const centre = this.frame.organism.boundCenter;
 		const target: Vec3 = [
@@ -1234,6 +1505,18 @@ export class SomaLook {
 			centre[1] + (this.pos[1] - this.frame.organism.pos[1]) + axisY[1] * focusAlong,
 			centre[2] + (this.pos[2] - this.frame.organism.pos[2]) + axisY[2] * focusAlong
 		];
+		// Lean the aim from the bounds' centre toward the body, and never further
+		// from the body than a fraction of its own size, so long trailing
+		// tentacles cannot push the body itself out of the shot.
+		const reachAim = b.core * t[A.size] * 0.45;
+		const ox = lerp(target[0], this.pos[0], 0.35) - this.pos[0];
+		const oy = lerp(target[1], this.pos[1], 0.35) - this.pos[1];
+		const oz = lerp(target[2], this.pos[2], 0.35) - this.pos[2];
+		const aimOff = Math.hypot(ox, oy, oz);
+		const keep = aimOff > reachAim ? reachAim / aimOff : 1;
+		target[0] = this.pos[0] + ox * keep;
+		target[1] = this.pos[1] + oy * keep;
+		target[2] = this.pos[2] + oz * keep;
 		for (let i = 0; i < 3; i += 1) {
 			// A darting animal is followed tightly, so it stays in the shot.
 			this.camTarget[i] = approach(this.camTarget[i], target[i], lerp(1.1, 0.35, ag), dt);
@@ -1241,7 +1524,8 @@ export class SomaLook {
 		}
 		// Frame the body the animal is becoming, not the one it is leaving, so
 		// the shot lands together with the metamorphosis instead of trailing it.
-		const pose = this.cameraPose(this.bounds(this.target, 1).extent * this.target[A.size]);
+		const becoming = this.bounds(this.target, 1);
+		const pose = this.cameraPose(becoming.extent * this.target[A.size], becoming.core * this.target[A.size]);
 		// A diver cannot whip round the animal: cap the rig's angular speed.
 		const limit = (current: number, next: number, rate: number) => current + clamp(next - current, -rate * dt, rate * dt);
 		// After a shift the diver moves to the new shot faster, still as one glide.
@@ -1254,9 +1538,23 @@ export class SomaLook {
 		this.placeEye();
 		this.camAperture = approach(this.camAperture, pose.aperture, 1.5, dt);
 		this.camFocal = approach(this.camFocal, pose.focal, 1.5, dt);
+		// Framing roams too: the animal sits on a third, high, low, centred...
 		const framing = this.genome.value('framing');
-		this.shiftX = approach(this.shiftX, framing * 0.12 * Math.min(1.6, input.aspect), 2, dt);
-		this.shiftY = approach(this.shiftY, -0.03 + Math.abs(framing) * 0.04, 2, dt);
+		// ...but never so far that a big animal leaves the frame: the room to
+		// move is what the screen has left around the animal's apparent size
+		// (screen half-height is 0.5, half-width aspect / 2).
+		const r = this.rig.value;
+		// Trailing appendages may leave the frame; the body itself may not.
+		const apparent = (b.core * t[A.size] * this.camFocal) / Math.max(0.5, this.camDistance);
+		const roomX = clamp(Math.min(1.8, input.aspect) * 0.5 - apparent * 1.1, 0.05, 0.5);
+		const roomY = clamp(0.5 - apparent * 0.95, 0.03, 0.24);
+		// Thirds more often than dead centre: the roam eases out of the middle.
+		const side = clamp(framing * 0.4 + r[RIG.frameX] * 0.9, -1, 1);
+		const thirds = Math.sign(side) * smoothstep(0, 0.5, Math.abs(side));
+		this.shiftX = approach(this.shiftX, thirds * roomX, 2, dt);
+		// Vertically it may sit low in the frame, or a little high.
+		const lift = clamp(Math.abs(framing) * 0.3 + r[RIG.frameY] * 0.9, -1, 1);
+		this.shiftY = approach(this.shiftY, -0.03 + (lift < 0 ? lift : lift * 0.5) * roomY, 2, dt);
 	}
 
 	private publish(aspect: number): SomaFrame {
@@ -1307,29 +1605,31 @@ export class SomaLook {
 			const local = (this.vel[0] * axis[0] + this.vel[1] * axis[1] + this.vel[2] * axis[2]) / Math.max(0.3, size);
 			f.drag[i] = clamp(local * 0.5, -0.25, 0.25);
 		}
-		const companionAmount = smoothstep(0.55, 0.85, g.value('companion'));
+		// A juvenile keeps station some of the time, at a distance that wanders.
+		const companionAmount = smoothstep(0.4, 0.7, g.value('companion') * 0.7 + (0.5 + 0.5 * this.dr[DRIFT.companion]) * 0.45);
 		const cAngle = this.companionPhase;
-		const cDist = o.extent * 2.1 + 1;
+		const cDist = (o.extent * 2.1 + 1) * (0.75 + 0.5 * (0.5 + 0.5 * this.tr[TRAIT.spacing]));
 		f.companion.pos[0] = o.pos[0] + Math.cos(cAngle) * cDist;
-		f.companion.pos[1] = o.pos[1] + 0.6 + Math.sin(cAngle * 0.7) * 0.5;
+		f.companion.pos[1] = o.pos[1] + 0.6 + noise1(this.noiseSeed, 31, this.clock / 23) * 0.8;
 		f.companion.pos[2] = o.pos[2] + Math.sin(cAngle) * cDist - 1.2;
 		f.companion.scale = companionAmount * 0.42;
 		f.companion.boundRadius = b.radius * size * 0.42;
 
-		// Camera basis, with a diver's slow sway and roll.
+		// Camera basis, with a diver's slow sway and roll: free noise lanes, no sines.
 		const c = f.camera3;
-		const sway = (a: number, b2: number) => Math.sin(this.clock * a + this.seed * 13 + b2);
+		const d = this.dr;
+		const jitter = (lane: number, rate: number) => noise1(this.noiseSeed, lane, this.clock * rate);
 		// Agitated music films hand-held: a faster, smaller shake on top of the drift.
-		const shake = this.mood.agitation * (0.4 + 0.6 * this.energy) * 0.014;
+		const shake = this.mood.agitation * (0.4 + 0.6 * this.energy) * 0.025;
 		const eye: Vec3 = [
-			this.camEye[0] + sway(0.37, 0) * 0.04 + sway(0.11, 2) * 0.05 + sway(3.1, 5) * shake,
-			this.camEye[1] + sway(0.29, 1) * 0.03 + sway(3.7, 6) * shake,
-			this.camEye[2] + sway(0.23, 4) * 0.04 + sway(2.9, 7) * shake
+			this.camEye[0] + d[DRIFT.swayX] * 0.08 + jitter(40, 0.5) * shake,
+			this.camEye[1] + d[DRIFT.swayY] * 0.05 + jitter(41, 0.6) * shake,
+			this.camEye[2] + d[DRIFT.swayZ] * 0.07 + jitter(42, 0.45) * shake
 		];
 		const fwd = normalize([this.camTarget[0] - eye[0], this.camTarget[1] - eye[1], this.camTarget[2] - eye[2]]);
 		const right = normalize(cross(fwd, [0, 1, 0], [0, 0, 0]));
 		const up = cross(right, fwd, [0, 0, 0]);
-		const rollAngle = sway(0.13, 3) * 0.025;
+		const rollAngle = d[DRIFT.roll] * 0.03 + this.rig.value[RIG.roll] * 0.06;
 		const crl = Math.cos(rollAngle);
 		const srl = Math.sin(rollAngle);
 		for (let i = 0; i < 3; i += 1) {
@@ -1368,6 +1668,11 @@ export class SomaLook {
 		Object.assign(f.mood, this.mood);
 		f.flow.snow = this.snowPhase;
 		f.flow.shiver = this.shiverPhase;
+		f.flow.current = this.currentPhase;
+		f.flow.comb = this.combPhase;
+		f.flow.film = this.filmPhase;
+		// Far life: how many distant animals glow in the water, on its own lane.
+		f.flow.life = smoothstep(-0.8, 0.8, this.dr[DRIFT.life]);
 		f.flow.light = 0.8 + this.mood.mass * 0.3 + this.mood.pulse * 0.3 + this.energy * 0.2;
 		let form = 0;
 		for (let i = 1; i < 6; i += 1) if (this.lifecycle[i] > this.lifecycle[form]) form = i;

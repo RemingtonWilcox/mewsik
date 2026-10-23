@@ -222,40 +222,62 @@ test.describe('Prism render foundations', () => {
 		const result = await page.evaluate(async () => {
 			const prism = await import('/src/lib/visualizer/prism/composition.ts');
 			const rig = await import('/src/lib/visualizer/prism/camera.ts');
-			const path = (regime: number, travel: number, side = 0, focus = 0) =>
-				rig.prismCameraPath(regime, { travel, side, focus, drift: 0, anchor: 0 });
-			const straight = prism.prismCameraBasis(path(0, 0));
+			const at = (regime: number, shot: number[], side = 0, focus = 0) =>
+				rig.prismCameraAt(regime, shot, { side, focus, drift: 0, anchor: 0 });
+			const straight = prism.prismCameraBasis(at(0, [0, 0, 0, 0, 0, 0]));
+			// Shots across the whole roaming box: its corners and a scatter inside.
+			const shots: number[][] = [];
+			for (let corner = 0; corner < 64; corner += 1) {
+				shots.push(Array.from({ length: 6 }, (_, k) => ((corner >> k) & 1 ? 1.2 : -1.2)));
+			}
+			let state = 0x2545f491;
+			const rand = () => {
+				state ^= state << 13;
+				state ^= state >>> 17;
+				state ^= state << 5;
+				return ((state >>> 0) / 0x100000000) * 2.4 - 1.2;
+			};
+			for (let i = 0; i < 40; i += 1) shots.push(Array.from({ length: 6 }, rand));
 			const centre = prism.prismProject(straight, [0, prism.PRISM_ROSE_Y, 0]);
 			const edge = prism.prismProject(straight, [prism.PRISM_ROSE_R, prism.PRISM_ROSE_Y, 0]);
 			const lows: number[] = [];
-			let worstAim = 0;
+			let lost = 0;
+			let worstScreen = 0;
 			for (let from = 0; from < prism.PRISM_CAMERAS.length; from += 1) {
 				for (let to = 0; to < prism.PRISM_CAMERAS.length; to += 1) {
 					for (const mix of [0, 0.25, 0.5, 0.75, 1]) {
 						for (const side of [-1, 0.3, 1]) {
-							for (let travel = 0; travel < 60; travel += 1.7) {
-								const a = path(from, travel, side, 0.4);
-								const b = path(to, travel, side, 0.4);
+							for (const shot of shots) {
+								const a = at(from, shot, side, 0.4);
+								const b = at(to, shot, side, 0.4);
 								const cam = rig.prismBlendCameras(a, b, mix);
-								lows.push(prism.prismCameraBasis(cam).pos[1]);
-								// Every path looks at a point on the working window.
-								worstAim = Math.max(worstAim, Math.hypot(cam.tx, cam.ty - prism.PRISM_ROSE_Y) / prism.PRISM_ROSE_R);
+								const basis = prism.prismCameraBasis(cam);
+								lows.push(basis.pos[1]);
+								// Every shot keeps the working window in the frame (on a third
+								// at most), or looks at a point on its glass.
+								const onGlass = Math.hypot(cam.tx, cam.ty - prism.PRISM_ROSE_Y) / prism.PRISM_ROSE_R < 1.05;
+								const hero = prism.prismProject(basis, [0, prism.PRISM_ROSE_Y, 0]);
+								const screen = hero ? Math.max(Math.abs(hero[0]) / 0.84, Math.abs(hero[1]) / 0.46) : 9;
+								if (!onGlass) worstScreen = Math.max(worstScreen, screen);
+								if (!onGlass && screen > 1) lost += 1;
 							}
 						}
 					}
 				}
 			}
-			const regimes = prism.PRISM_CAMERAS.map((_: string, regime: number) => path(regime, 3.1, 0.7, 0.2));
-			return { centre, edge, lowest: Math.min(...lows), floor: prism.PRISM_FLOOR_Y, regimes, worstAim };
+			const regimes = prism.PRISM_CAMERAS.map((_: string, regime: number) =>
+				at(regime, [0.3, -0.5, 0.2, 0.4, -0.3, 0.6], 0.7, 0.2)
+			);
+			return { centre, edge, lowest: Math.min(...lows), floor: prism.PRISM_FLOOR_Y, regimes, lost, worstScreen };
 		});
 
-		// The orbit starts square-on: the original framing, the rose at (0, 0.07), radius 0.32.
+		// The orbit's centre is square-on: the original framing, the rose at (0, 0.07), radius 0.32.
 		expect(result.centre[0]).toBeCloseTo(0, 5);
 		expect(result.centre[1]).toBeCloseTo(0.07, 5);
 		expect(result.edge[0]).toBeCloseTo(0.32, 5);
 		expect(result.lowest).toBeGreaterThan(result.floor);
-		expect(result.worstAim).toBeLessThan(1.25);
-		// Regimes are genuinely different framings, not one camera jittered.
+		expect(result.lost, `worst screen offset ${result.worstScreen}`).toBe(0);
+		// Regions are genuinely different framings, not one camera jittered.
 		const signatures = new Set(
 			result.regimes.map((c: { yaw: number; pitch: number; roll: number; dist: number }) =>
 				[c.yaw.toFixed(1), c.pitch.toFixed(1), c.roll.toFixed(1), c.dist.toFixed(1)].join()
@@ -357,7 +379,7 @@ test.describe('Prism continuity', () => {
 		result.before.forEach((value: number, index: number) => expect(result.after[index]).toBeCloseTo(value, 6));
 	});
 
-	test('the mosaic re-draft glides through phrase-clock jumps', async ({ page }) => {
+	test('the mosaic re-drafts at irregular phrase ends and glides through clock jumps', async ({ page }) => {
 		await page.goto('/');
 		const result = await page.evaluate(async () => {
 			const { MosaicDraft } = await import('/src/lib/visualizer/prism/continuity.ts');
@@ -370,17 +392,21 @@ test.describe('Prism continuity', () => {
 				maxStep = Math.max(maxStep, Math.abs(position - previous));
 				previous = position;
 			};
-			// Three natural 8-second phrases.
-			for (let phrase = 0; phrase < 3; phrase += 1) {
+			// Forty natural 8-second phrases: note which ones end in a re-draft.
+			const redrafts: number[] = [];
+			for (let phrase = 0; phrase < 40; phrase += 1) {
+				const at = draft.phrase;
 				for (let frame = 0; frame < 480; frame += 1) {
 					draft.update(phrase, frame / 480, dt);
 					sample();
 				}
+				if (draft.phrase > at) redrafts.push(phrase);
 			}
 			const natural = draft.phrase;
+			const gaps = new Set(redrafts.slice(1).map((p, i) => p - redrafts[i]));
 			// A new song mid-phrase: the clock restarts at phrase 0, position 0.
 			for (let frame = 0; frame < 200; frame += 1) {
-				draft.update(3, 0.3 + frame / 2000, dt);
+				draft.update(40, 0.3 + frame / 2000, dt);
 				sample();
 			}
 			draft.continueSource();
@@ -393,10 +419,13 @@ test.describe('Prism continuity', () => {
 				draft.update(0, frame < 60 ? 0.95 : 0.1, dt);
 				sample();
 			}
-			return { maxStep, natural, final: draft.phrase };
+			return { maxStep, natural, final: draft.phrase, count: redrafts.length, gaps: gaps.size };
 		});
-		expect(result.natural).toBeGreaterThanOrEqual(2);
-		expect(result.final).toBeGreaterThan(result.natural);
+		// Some phrases re-draft the glass, not every one, and not on a fixed count.
+		expect(result.count).toBeGreaterThan(12);
+		expect(result.count).toBeLessThan(36);
+		expect(result.gaps).toBeGreaterThanOrEqual(3);
+		expect(result.final).toBeGreaterThanOrEqual(result.natural);
 		// Never more than a hair of a re-draft per frame at 60 fps.
 		expect(result.maxStep).toBeLessThan(0.03);
 	});
@@ -506,7 +535,7 @@ test.describe('Prism continuity', () => {
 			}
 			const sides = Array.from({ length: 201 }, (_, i) => -1 + i / 100);
 			const yaws = sides.map(
-				(side) => rig.prismCameraPath(1, { travel: 0, side, focus: 0.3, drift: 0, anchor: 0 }).yaw
+				(side) => rig.prismCameraAt(1, [0.2, 0, 0, 0, 0, 0], { side, focus: 0.3, drift: 0, anchor: 0 }).yaw
 			);
 			const yawStep = Math.max(...yaws.slice(1).map((yaw: number, i: number) => Math.abs(yaw - yaws[i])));
 			return { maxTurn, maxClockStep, clock: motion.clock, turn: motion.turn, yawStep };

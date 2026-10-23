@@ -1071,7 +1071,8 @@ export class LoomConductor {
 			key: this.key,
 			dt,
 			character: character ?? null,
-			listen: this.listen
+			listen: this.listen,
+			impact: this.impact
 		});
 		this.storeCarry();
 

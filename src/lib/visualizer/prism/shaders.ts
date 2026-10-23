@@ -915,11 +915,12 @@ struct Cell {
 };
 
 // One mosaic seed. xy: position in cell space, z: division progress. Each grid
-// cell owns a mother and a daughter; the daughter only exists once the phrase
+// cell owns a mother and a daughter; the daughter only exists once the
 // growth passes the cell's own threshold, then drifts apart from its mother so
 // the cell visibly divides. Positions glide into the next draft at the end of
-// every phrase; the CPU owns the draft counter and its eased progress, so a
-// phrase-clock jump (a new song, a re-sync) glides instead of re-cutting.
+// some phrases (irregular runs); the CPU owns the draft counter and its eased
+// progress, so a phrase-clock jump (a new song, a re-sync) glides instead of
+// re-cutting.
 fn mosaicSeed(g: vec2<f32>, which: u32, salt: u32, jitter: f32) -> vec3<f32> {
 	let phrase = u32(max(u.organism.y, 0.0));
 	let jNow = hcell(g, salt ^ (phrase * 0x9e3779b1u));
@@ -1055,20 +1056,26 @@ fn backlightFlat(rel: vec2<f32>) -> f32 {
 
 // Beat light travelling through the window in one of six forms. Glass forms
 // read a cell's centre so light jumps piece to piece; lightning runs along the
-// lead itself. Returns (glass, came).
+// lead itself. Each form is a family, not a fixed move: the look's slow drift
+// (shaft.w, morph.w, rig.w, each -1..1) widens or tightens the ring, twists
+// the spiral and spreads the wheel, so no two passages carry the same shape.
+// Returns (glass, came).
 fn packetForm(form: f32, cellRn: f32, cellAngle: f32, n: f32, cellHash: f32, pixRn: f32, pixAngle: f32) -> vec2<f32> {
 	let age = clamp(u.light.z, 0.0, 1.0);
-	let front = 0.1 + age * 1.15;
-	let ring = exp(-pow((cellRn - front) * 6.5, 2.0));
+	let f0 = clamp(u.shaft.w, -1.0, 1.0);
+	let f1 = clamp(u.morph.w, -1.0, 1.0);
+	let f2 = clamp(u.rig.w, -1.0, 1.0);
+	let front = 0.1 + age * (1.15 + 0.2 * f1);
+	let ring = exp(-pow((cellRn - front) * 6.5 * (1.0 + 0.4 * f0), 2.0));
 	let seg = TAU / n;
 	let beat = u.light.w;
 	if (form < 0.5) {
 		return vec2<f32>(ring, 0.0);
 	}
 	if (form < 1.5) {
-		let sweep = (beat + age) * seg;
+		let sweep = (beat + age * (1.0 + 0.5 * f1)) * seg;
 		let angDist = abs(wrapAngle(cellAngle - sweep));
-		return vec2<f32>(exp(-pow(angDist / (seg * 0.55), 2.0)) * exp(-pow((cellRn - (0.14 + age * 0.86)) * 3.4, 2.0)) * 1.2, 0.0);
+		return vec2<f32>(exp(-pow(angDist / (seg * (0.55 + 0.3 * f2)), 2.0)) * exp(-pow((cellRn - (0.14 + age * 0.86)) * 3.4, 2.0)) * 1.2, 0.0);
 	}
 	if (form < 2.5) {
 		let chosen = floor(hnum(beat, seedSalt() ^ 0x7a3du) * n);
@@ -1082,14 +1089,14 @@ fn packetForm(form: f32, cellRn: f32, cellAngle: f32, n: f32, cellHash: f32, pix
 	}
 	if (form < 3.5) {
 		let phase = hnum(beat, seedSalt() ^ 0x51u) * TAU;
-		let arm = abs(wrapAngle(cellAngle * 2.0 - cellRn * 7.0 + age * 4.5 + phase)) * 0.5;
-		return vec2<f32>(exp(-pow(arm / 0.3, 2.0)) * exp(-pow((cellRn - 0.1 - age * 0.9) * 2.2, 2.0)) * 1.2, 0.0);
+		let arm = abs(wrapAngle(cellAngle * 2.0 - cellRn * (7.0 + 3.5 * f2) + age * (4.5 + 1.5 * f0) + phase)) * 0.5;
+		return vec2<f32>(exp(-pow(arm / (0.3 + 0.1 * f1), 2.0)) * exp(-pow((cellRn - 0.1 - age * 0.9) * 2.2, 2.0)) * 1.2, 0.0);
 	}
 	if (form < 4.5) {
 		let oa = hnum(beat, seedSalt() ^ 0x9du) * TAU;
 		let origin = vec2<f32>(cos(oa), sin(oa)) * (0.25 + 0.4 * hnum(beat, seedSalt() ^ 0x3fu));
 		let cp = vec2<f32>(cos(cellAngle), sin(cellAngle)) * cellRn;
-		let at = length(cp - origin) * 0.55 + cellHash * 0.3;
+		let at = length(cp - origin) * (0.55 + 0.15 * f2) + cellHash * (0.3 + 0.12 * f0);
 		return vec2<f32>(exp(-pow((age - at) * 8.0, 2.0)) * 1.3, 0.0);
 	}
 	let boltA = hnum(beat, seedSalt() ^ 0xb017u) * TAU;
@@ -1104,9 +1111,12 @@ fn packetForm(form: f32, cellRn: f32, cellAngle: f32, n: f32, cellHash: f32, pix
 fn rainOnGlass(pn: vec2<f32>) -> vec3<f32> {
 	let g = vec2<f32>(pn.x * 7.0, pn.y * 3.5);
 	let id = floor(g);
-	let h = hcell(id, 211u);
+	let h0 = hcell(id, 211u);
 	let f = fract(g) - vec2<f32>(0.5);
-	let slide = fract(u.time * (0.12 + h.y * 0.2) + h.x);
+	let slideRun = u.time * (0.12 + h0.y * 0.2) + h0.x;
+	let slide = fract(slideRun);
+	// A new drop each pass: its lane and size re-roll, so no drop retraces a path.
+	let h = hcell(id + vec2<f32>(floor(slideRun) * 7.0, 0.0), 211u);
 	let c = vec2<f32>((h.x - 0.5) * 0.6, 0.42 - slide * 0.84);
 	let d = vec2<f32>(f.x - c.x, (f.y - c.y) * 0.62);
 	let r = 0.07 + h.y * 0.06;
@@ -2223,7 +2233,9 @@ fn dustMotes(ro: vec3<f32>, rd: vec3<f32>, tEnd: f32, pix: f32) -> vec3<f32> {
 		if (t > tEnd) { continue; }
 		let P = ro + rd * t;
 		let cell = 0.055;
-		let sway = vec2<f32>(sin(u.time * 0.07 + fk * 1.7) * 0.03, u.time * (0.004 + fk * 0.0012));
+		// The air's slow drift (env.x, env.y from the look's noise) sways the
+		// slices against one another; it never cycles.
+		let sway = vec2<f32>(u.env.x * (0.6 + fk * 0.15) + u.env.y * 0.01 * fk, u.time * (0.004 + fk * 0.0012));
 		let g = (P.xy + sway) / cell;
 		let c = floor(g);
 		let h = hcell(c + vec2<f32>(fk * 131.0, 0.0), 0x6d2bu);
@@ -2288,8 +2300,11 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 			let rg = F.xz * 7.0;
 			let rc = floor(rg);
 			let rh = hcell(rc, 0x41u);
-			let life = fract(u.time * 0.8 + rh.x);
-			let rl = rg - rc - 0.5 - (rh - 0.5) * 0.5;
+			let lifeRun = u.time * 0.8 + rh.x;
+			let life = fract(lifeRun);
+			// Each ring lands somewhere new in its cell.
+			let rp = hcell(rc + vec2<f32>(floor(lifeRun) * 5.0, 3.0), 0x43u);
+			let rl = rg - rc - 0.5 - (rp - 0.5) * 0.5;
 			let ringD = length(rl) - life * 0.45;
 			let ring = exp(-pow(ringD * 40.0, 2.0)) * (1.0 - life) * step(0.35, rh.y) * rain;
 			ringN = normalize(rl + vec2<f32>(1e-4)) * ring;
