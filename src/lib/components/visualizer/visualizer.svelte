@@ -72,6 +72,7 @@
 	} from '$lib/visualizer/character';
 	import {
 		ChoiceFollower,
+		HeardKick,
 		MosaicDraft,
 		PRISM_FOLLOWED_CHOICES,
 		PrismMotion,
@@ -81,6 +82,7 @@
 		type PrismFollowedChoice
 	} from '$lib/visualizer/prism/continuity';
 	import { VariationGenome, type ChoiceState, type ChoiceAxis } from '$lib/visualizer/variation';
+	import { Wander, noise1 } from '$lib/visualizer/motion';
 
 	const vis = useVisualizer();
 
@@ -140,8 +142,17 @@
 		draft: MosaicDraft;
 		motion: PrismMotion;
 		choices: Record<Followed, ChoiceFollower>;
-		/** The travelling camera. */
+		/** The roaming camera. */
 		rig: PrismCameraRig;
+		/** Kicks as the audio played them: they push the camera, never the beat clock. */
+		kick: HeardKick;
+		/**
+		 * Slow non-repeating drift of the window's own motion: how beat light
+		 * travels (ring width, spiral twist, wheel spread), how the cells
+		 * divide, where the dust sways, how the glass leans in hue inside its
+		 * family and in temperature. Never a fixed-rate loop.
+		 */
+		flow: Wander;
 		/** The music character, smoothed into glides of a second or two. */
 		feel: Record<CharacterFeature, number>;
 		/** 1 right after a shift, easing to 0: every smoother hurries in step. */
@@ -341,10 +352,17 @@
 	}
 
 	/** Exposure lift for the current camera/environment crossfade (>= 1). */
-	function regimeExposure(camera: ChoiceState, environment: ChoiceState, energy: number): number {
-		const cam =
+	function regimeExposure(
+		camera: ChoiceState,
+		environment: ChoiceState,
+		energy: number,
+		excursion: { region: number; away: number }
+	): number {
+		const home =
 			CAMERA_EXPOSURE[PRISM_CAMERAS[camera.from]] * (1 - camera.mix) +
 			CAMERA_EXPOSURE[PRISM_CAMERAS[camera.to]] * camera.mix;
+		const away = CAMERA_EXPOSURE[PRISM_CAMERAS[excursion.region]] ?? 1;
+		const cam = home + (away - home) * clamp(excursion.away, 0, 1);
 		const room =
 			ENVIRONMENT_EXPOSURE[PRISM_ENVIRONMENTS[environment.from]] * (1 - environment.mix) +
 			ENVIRONMENT_EXPOSURE[PRISM_ENVIRONMENTS[environment.to]] * environment.mix;
@@ -795,6 +813,8 @@
 			motion: new PrismMotion(seed),
 			choices,
 			rig: new PrismCameraRig(seed),
+			kick: new HeardKick(),
+			flow: new Wander(8, `prism-flow:${salt}`, [37, 53, 29, 71, 43, 61, 97, 131]),
 			feel: characterRecord(undefined),
 			hurry: 0,
 			holdMorph: 0,
@@ -1016,6 +1036,13 @@
 			1
 		);
 		env.energy = approach(env.energy, energyTarget, 3, dt);
+		// The window's own slow drift (beat-light shapes, division, dust): faster
+		// in loud music, never still, never periodic.
+		const flow = r.flow.update(dt, 0.7 + env.energy * 0.6);
+		// The music sets the glass's temperature; the look's own slow drift
+		// leans it, so quiet passages in different songs are not all one cold
+		// blue (the lean moves over minutes; a change of music still reads).
+		if (feelForce?.temperature === undefined) feel.temperature = clamp(feel.temperature + flow[7] * 0.4, -1, 1);
 
 		const impactTarget = feat
 			? clamp(clock.beatPulse * (0.35 + directed.bassPunch * 0.75) + spectrum.novelty * 0.3, 0, 1)
@@ -1073,18 +1100,18 @@
 		const compB = r.morph.b;
 		const morph = r.morph.uniforms();
 		const radial = prismGrammarIsRadial(compB.grammar);
-		// The glass re-drafts at phrase ends; a phrase-clock jump glides.
+		// The glass re-drafts at some phrase ends (irregularly); a phrase-clock jump glides.
 		r.draft.update(phraseIndex, phrasePos, dt);
 
-		// Organism: cells divide as a phrase builds and as the section climbs,
-		// then fold back and re-draft when the next phrase begins. Noisy, punchy
-		// music keeps the glass more divided.
+		// Organism: cells divide as the section climbs and a build rises, and
+		// breathe on their own slow drift (not a ramp per phrase, which every
+		// phrase would repeat). Noisy, punchy music keeps the glass more divided.
 		const growthTarget =
 			clamp(
 				0.08 +
 					sectionEnergy * 0.32 +
 					directed.drop.buildProgress * 0.22 +
-					phrasePos * 0.22 +
+					(0.5 + 0.5 * flow[3]) * 0.22 +
 					directed.density * 0.12 +
 					feel.divide * 0.45,
 				0,
@@ -1094,8 +1121,10 @@
 		env.growth = approach(env.growth, growthTarget, 0.5 * (1 + r.hurry * 3), dt);
 
 		const daylight = prismDaylight(val('timeOfDay'));
+		// Quiet passages keep the glass legible (the camera also comes closer
+		// in them); loud ones still burn brightest.
 		const lightTarget =
-			(drive.light * (0.55 + env.energy * 0.6) + directed.drop.anticipation * 0.12) *
+			(drive.light * (0.64 + env.energy * 0.51) + directed.drop.anticipation * 0.12) *
 			(1 - env.silence * 0.72) *
 			daylight.power *
 			feel.light;
@@ -1105,8 +1134,8 @@
 		// Beat light: strength is latched as each beat starts and then carried
 		// through the window by the shader over the beat's own phase. The serial
 		// the shader hashes is the look's own, so a new song's beat counter
-		// restarting at zero does not jump the beat forms. Kicks and downbeats
-		// also push the camera in on its spring.
+		// restarting at zero does not jump the beat forms. The camera answers
+		// heard kicks only (below), never this predicted clock.
 		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex)));
 		if (r.resyncBeat) {
 			r.lastBeatCount = beatCount;
@@ -1128,7 +1157,6 @@
 						1.6
 					)
 				: 0;
-			r.rig.punch(env.packetStrength * (isDownbeat ? 0.8 : 0.35) * (0.4 + directed.bassPunch * 0.6) * response.motion);
 			r.lastBeatCount = beatCount;
 			r.beatSerial += 1;
 			r.beatAge = 0;
@@ -1137,6 +1165,14 @@
 			r.beatAge = Math.min(1, r.beatAge + dt / beatSeconds);
 		}
 		const beatForm = pick(r, 'beatForm');
+		// Kicks as heard push the camera in on its spring and nudge the shot.
+		const hit = r.kick.update(
+			dt,
+			feat ? finite(spectrum.levels.kick) : 0,
+			feat ? finite(spectrum.deltas.kick) : 0,
+			feat ? clamp(env.energy * 0.7 + env.rms * 2, 0, 1) * (1 - env.silence) : 0
+		);
+		if (hit > 0) r.rig.punch(hit * (0.3 + directed.bassPunch * 0.45) * response.motion);
 
 		// Suns behind the glass: where they sit and how many are phrase moves.
 		// The light itself is a direction: it sets where the shafts fall, and it
@@ -1145,17 +1181,20 @@
 		const sunX = Math.cos(sunAngle) * 0.2;
 		const sunY = 0.06 + Math.sin(sunAngle) * 0.15;
 		const sunPower = 0.45 + env.energy * 0.7;
-		const lightX = -Math.cos(sunAngle) * 0.42 + 0.14 * Math.sin(motion.clock * 0.019 + r.salt);
-		const lightY = 0.52 + Math.sin(sunAngle) * 0.16 + 0.05 * Math.sin(motion.clock * 0.013 + 1.7);
+		const lightX = -Math.cos(sunAngle) * 0.42 + 0.14 * noise1(0x11a7, r.salt, motion.clock / 52);
+		const lightY = 0.52 + Math.sin(sunAngle) * 0.16 + 0.05 * noise1(0x11a7, r.salt + 1, motion.clock / 77);
 		const lightLen = Math.hypot(lightX, lightY, 1);
 
 		// Palette: family (era) and roles (section) crossfade; harmony and
 		// energy lean it; the music tempers it (warm or cold, bright or deep,
 		// greyed by noise); the result glides, faster right after a shift.
+		// The glass also leans slowly in hue inside its family (up to ~25
+		// degrees, a rotation that keeps the family's relationships), so a long
+		// era never sits on one colour.
 		const roles = prismPalette(
 			pick(r, 'palette'),
 			pick(r, 'roles'),
-			val('tint'),
+			val('tint') + flow[6] * 1.8,
 			{
 				keyPitchClass: directed.context.keyPitchClass,
 				keyMinor: directed.context.keyMode === 'minor',
@@ -1187,8 +1226,9 @@
 		const tSec = motion.clock;
 		const rotationDelta = clamp(motion.rotation - motion.previousRotation, -0.02, 0.02);
 
-		// ── Camera: always travelling. The regime crossfade blends two moving
-		// paths; tempo sets the travel rate, a shift surges it, beats push it.
+		// ── Camera: always roaming. The regime crossfade blends two regions of
+		// viewpoint space under one roaming shot; tempo sets the roam rate, a
+		// shift redirects and surges it, heard kicks push it.
 		const spacing = prismBaySpacing(val('baySpacing'));
 		const camSide = val('camSide');
 		const camera = pick(r, 'camera');
@@ -1304,9 +1344,9 @@
 		writeVec4(u, O.accentCol, ...palette.accent, 0);
 		writeVec4(u, O.fieldCol, ...palette.field, 0);
 		writeVec4(u, O.post, feedbackFade, feedbackZoom, bloomThreshold, aberration);
-		writeVec4(u, O.env, 0, 0, env.silence, motion.rotation);
+		writeVec4(u, O.env, flow[4] * 0.04, flow[5], env.silence, motion.rotation);
 		writeVec4(u, O.bands, env.bass, env.mid, env.treble, env.impact);
-		writeVec4(u, O.motion, trailTurn, frameIndex % 60, env.energy, regimeExposure(camera, environment, env.energy));
+		writeVec4(u, O.motion, trailTurn, frameIndex % 60, env.energy, regimeExposure(camera, environment, env.energy, { region: r.rig.excursion, away: r.rig.away }));
 		writeVec4(u, O.camPos, basis.pos[0], basis.pos[1], basis.pos[2], basis.focal);
 		writeVec4(u, O.camRight, basis.right[0], basis.right[1], basis.right[2], spacing);
 		writeVec4(u, O.camUp, basis.up[0], basis.up[1], basis.up[2], 0);
@@ -1315,8 +1355,8 @@
 		writeVec4(u, O.world, environment.from, environment.to, environment.mix, rain);
 		writeVec4(u, O.sky, sky[0], sky[1], sky[2], daylight.night);
 		writeVec4(u, O.atmos, val('fog'), dust, val('caustics'), val('sunCount'));
-		writeVec4(u, O.shaft, sideShaft, val('shaftAngle'), -prismSoftSign(camSide) * 0.7, 0);
-		writeVec4(u, O.morph, compA.salt, compB.salt, morph.globalMix, 0);
+		writeVec4(u, O.shaft, sideShaft, val('shaftAngle'), -prismSoftSign(camSide) * 0.7, flow[0]);
+		writeVec4(u, O.morph, compA.salt, compB.salt, morph.globalMix, flow[1]);
 		writeVec4(u, O.prevPos, prev.pos[0], prev.pos[1], prev.pos[2], historyValid);
 		writeVec4(u, O.prevRight, prev.right[0], prev.right[1], prev.right[2], 0);
 		writeVec4(u, O.prevUp, prev.up[0], prev.up[1], prev.up[2], 0);
@@ -1327,7 +1367,7 @@
 		writeVec4(u, O.arcade, arcade[0], arcade[1], arcade[2], arcade[3]);
 		writeVec4(u, O.side, sideX / sideLen, 0.62 / sideLen, -0.8 / sideLen, sideStrength);
 		writeVec4(u, O.feel, feel.edge, roomWeight(2), 0.22, frameIndex % 64);
-		writeVec4(u, O.rig, anchorX, dt, r.rig.kick, 0);
+		writeVec4(u, O.rig, anchorX, dt, r.rig.kick, flow[2]);
 		prevBasis = basis;
 		frameIndex += 1;
 
@@ -1345,10 +1385,11 @@
 		if (frameIndex % (forced()?.debugEvery ?? 15) === 0) {
 			hudDebug = [
 				`cam ${PRISM_CAMERAS[camera.from]}>${PRISM_CAMERAS[camera.to]}@${camera.mix.toFixed(2)} pal ${PRISM_PALETTES[pick(r, 'palette').from].name}>${PRISM_PALETTES[pick(r, 'palette').to].name}@${pick(r, 'palette').mix.toFixed(2)} env ${environment.from}>${environment.to}@${environment.mix.toFixed(2)} morph ${morph.front.toFixed(2)}`,
-				`travel ${r.rig.travel.toFixed(2)} rate ${r.rig.rate.toFixed(3)} surge ${r.rig.surge.toFixed(2)}`,
+				`travel ${r.rig.travel.toFixed(2)} rate ${r.rig.rate.toFixed(3)} surge ${r.rig.surge.toFixed(2)} away ${PRISM_CAMERAS[r.rig.excursion]}@${r.rig.away.toFixed(2)}`,
 				`shift ${lookState.answeredShift}+${localAnswers} hurry ${r.hurry.toFixed(2)} pace ${PACE_FEATURES.map((name) => r.pace.memory[name].toFixed(2)).join(',')}`,
 				`temp ${feel.temperature.toFixed(2)} frag ${feel.frag.toFixed(2)} haze ${haze.toFixed(2)}`,
-				`pose ${[cam.yaw, cam.pitch, cam.roll, cam.dist, cam.tx, cam.ty].map((v) => v.toFixed(3)).join(',')}`
+				`pose ${[cam.yaw, cam.pitch, cam.roll, cam.dist, cam.tx, cam.ty].map((v) => v.toFixed(3)).join(',')}`,
+				`hero ${heroCentre[0].toFixed(2)},${heroCentre[1].toFixed(2)},${heroRadius.toFixed(2)}`
 			].join(' | ');
 		}
 

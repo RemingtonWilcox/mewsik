@@ -1,20 +1,28 @@
-// Prism's camera rig: a camera that never holds a pose. Each regime is a
-// continuous path through the nave (an orbit around the window, a sweep along
-// the arcade, a crane rise, a close pass over the glass, a dolly along the
-// wall of windows, a glide over the flooded floor, a push through the nave, a
-// Dutch-rolled arc), parameterised by one shared travel phase. The phase
-// integrates a tempo-driven rate with a floor, so even the calmest passage
-// drifts with parallax; regime changes are long crossfades between two moving
-// paths; kicks and downbeats push the lens on a damped spring; a change of
-// music surges the travel so the camera visibly reframes within a second or
-// two, then settles back to cruising speed. Everything here is continuous in
-// time, and the whole rig lives in the look so a new song or a remount carries
-// the shot on.
+// Prism's camera rig: a camera that roams the nave and never walks a loop.
 //
-// Pure, renderer-free state; the renderer reads `pose()` and builds the basis
-// with prismCameraBasis (composition.ts).
+// There are no authored paths. The shot is a point in a six-dimensional box
+// (swing, height, distance, where the window sits in the frame, roll) that a
+// Roamer carries between destinations picked at irregular times, on
+// critically damped springs, with non-repeating noise on top. What that point
+// means is set by a *region* of viewpoint space: an orbit around the window,
+// the arcade seen from one side, a crane from the floor, a close pass over
+// the glass, a dolly along the wall of windows, a glide over the flooded
+// floor, the far end of the nave, a Dutch-rolled arc. The genome's camera
+// choice crossfades between regions, so a region is a bias of the space, not
+// a path: the same region visited twice is roamed from wherever the shot is,
+// and every region's centre drifts on its own slow noise, so it is never the
+// same place twice either.
+//
+// Tempo sets how fast the shot roams, energy how restless it is (shorter
+// holds), a change of music redirects it at once and surges the roam, heard
+// kicks push the lens on a damped spring. Everything integrates, and the
+// whole rig lives in the look, so a new song or a remount carries the shot on.
+//
+// Pure, renderer-free state; the renderer reads `update()` and builds the
+// basis with prismCameraBasis (composition.ts).
 
 import type { ChoiceState } from '../variation';
+import { Roamer, Wander } from '../motion';
 import {
 	PRISM_CAMERAS,
 	PRISM_FLOOR_Y,
@@ -40,153 +48,123 @@ function approach(current: number, target: number, rate: number, dt: number): nu
 	return current + (target - current) * (1 - Math.exp(-rate * dt));
 }
 
-/** What a regime path reads besides the travel phase. */
-export type PrismPathInput = {
-	/** Shared travel phase (radians of path); grows forever. */
-	travel: number;
+/** Shot dimensions the rig roams: swing, height, distance, frame x, frame y, roll. */
+export const PRISM_SHOT_DIMS = 6;
+
+/** A [centre, reach] pair: the region spans centre ± reach as the shot goes -1..1. */
+type Span = readonly [number, number];
+
+/**
+ * One region of viewpoint space. Angles in radians, distance as a centre and
+ * a log reach (a dolly feels even), the look-at offset in world units.
+ * `side*` terms lean the centre toward the section's preferred wall.
+ */
+export type PrismCameraRegion = {
+	yaw: Span;
+	sideYaw: number;
+	pitch: Span;
+	dist: Span;
+	tx: Span;
+	sideTx: number;
+	ty: Span;
+	roll: Span;
+	/** > 0 shapes the roll toward its extremes (tanh), so a Dutch angle stays off level. */
+	rollShape: number;
+	bays: number;
+	wet: number;
+};
+
+/**
+ * The eight regions, in PRISM_CAMERAS order. The reaches are wide on purpose:
+ * each region holds many framings (square-on or raking, near or far, the
+ * window centred, on a third or high or low, level or rolled), and
+ * neighbouring regions overlap so a crossfade travels through good shots.
+ */
+export const PRISM_CAMERA_REGIONS: readonly PrismCameraRegion[] = [
+	// Orbit: around the window, swinging through square-on, near and far, the
+	// window drifting off centre toward a third or the frame's edge.
+	{ yaw: [0, 0.62], sideYaw: 0.08, pitch: [0, 0.13], dist: [1.8, 0.6], tx: [0, 0.5], sideTx: 0, ty: [0, 0.14], roll: [0, 0.06], rollShape: 0, bays: 1.5, wet: 0.1 },
+	// Arcade: from one side, the window at an angle and its neighbours receding.
+	{ yaw: [0, 0.2], sideYaw: 0.52, pitch: [-0.035, 0.06], dist: [1.7, 0.4], tx: [0, 0.4], sideTx: 0.12, ty: [0.03, 0.1], roll: [0, 0.04], rollShape: 0, bays: 2.5, wet: 0.1 },
+	// Crane: from just above the floor looking up into the window to above it
+	// looking down.
+	{ yaw: [0, 0.22], sideYaw: 0.06, pitch: [0.02, 0.2], dist: [1.42, 0.35], tx: [0, 0.36], sideTx: 0, ty: [PRISM_ROSE_Y * 0.6, 0.12], roll: [0, 0.05], rollShape: 0, bays: 1, wet: 0.15 },
+	// Glass: a close pass over the window, facets and tracery filling the frame.
+	{ yaw: [0, 0.24], sideYaw: 0, pitch: [0.06, 0.1], dist: [0.47, 0.25], tx: [0, PRISM_ROSE_R * 0.62], sideTx: 0, ty: [PRISM_ROSE_Y, PRISM_ROSE_R * 0.5], roll: [0, 0.16], rollShape: 0, bays: 0, wet: 0 },
+	// Gallery: raking along the wall of windows (the anchor travels while this
+	// region leads; see PrismCameraRig).
+	{ yaw: [0, 0.13], sideYaw: 0.72, pitch: [-0.03, 0.04], dist: [1.9, 0.3], tx: [0, 0.4], sideTx: 0, ty: [0.03, 0.08], roll: [0, 0.02], rollShape: 0, bays: 4.5, wet: 0.2 },
+	// Flooded: low over the mirroring floor.
+	{ yaw: [0, 0.26], sideYaw: 0.05, pitch: [0.115, 0.035], dist: [2.0, 0.4], tx: [0, 0.4], sideTx: 0, ty: [-0.02, 0.06], roll: [0, 0.03], rollShape: 0, bays: 1.5, wet: 1 },
+	// Nave: from the far end, in and out through the arcade.
+	{ yaw: [0, 0.1], sideYaw: 0.12, pitch: [-0.035, 0.04], dist: [2.55, 0.4], tx: [0, 0.36], sideTx: 0, ty: [0.03, 0.08], roll: [0, 0.02], rollShape: 0, bays: 3, wet: 0.3 },
+	// Dutch: mid-distance, the horizon rolled well off level.
+	{ yaw: [0, 0.34], sideYaw: 0, pitch: [0, 0.08], dist: [1.35, 0.4], tx: [0, 0.4], sideTx: 0, ty: [0.05, 0.1], roll: [0, 0.29], rollShape: 2.2, bays: 1, wet: 0.1 }
+];
+
+/** What a region reads besides the shot. */
+export type PrismShotContext = {
 	/** Section's side preference, -1..1 (soft-signed into a wall). */
 	side: number;
-	/** Section's focus, 0..1 wrapping: where on the glass a close pass looks. */
+	/** Section's focus, 0..1 wrapping: turns where on the glass a close pass looks. */
 	focus: number;
-	/** Phrase drift, -1..1. */
+	/** Phrase drift, -1..1: a small swing lean. */
 	drift: number;
 	/** World x of the bay the camera is working on. */
 	anchor: number;
 };
 
-/**
- * How fast each regime's path is walked, relative to the shared travel rate,
- * so a close pass across the glass and a wide orbit move the picture by a
- * similar amount on screen.
- */
-export const PRISM_PATH_RATE: readonly number[] = [1, 0.9, 0.85, 0.32, 0.8, 0.9, 0.85, 0.8];
-
-/**
- * One regime's camera at a point on its path. Every regime looks at the
- * working window (or a point on its glass), so the composition keeps reading
- * while the camera travels.
- */
-export function prismCameraPath(regime: number, i: PrismPathInput): PrismCameraParams {
-	const r = Math.round(finite(regime));
-	const phi = finite(i.travel) * (PRISM_PATH_RATE[r] ?? 1);
-	const side = clamp(finite(i.side), -1, 1);
-	const sgn = prismSoftSign(side);
-	const focus = finite(i.focus);
-	const drift = clamp(finite(i.drift), -1, 1);
-	const x0 = finite(i.anchor);
-	switch (r) {
-		case 1:
-			// Arcade: from one side of the nave, the window at an angle and its
-			// neighbours receding, the camera sweeping along the arcade.
-			return {
-				yaw: sgn * (0.5 + 0.16 * Math.sin(phi * 0.5)) + drift * 0.05,
-				pitch: -0.035 + 0.05 * Math.sin(phi * 0.37 + 1.1),
-				roll: 0.03 * Math.sin(phi * 0.29),
-				dist: 1.7 + 0.22 * Math.sin(phi * 0.41 + 0.6),
-				tx: x0 + sgn * 0.12 + 0.24 * Math.sin(phi * 0.33),
-				ty: 0.03,
-				bays: 2.5,
-				wet: 0.1
-			};
-		case 2: {
-			// Crane: from just above the floor looking up into the window to above
-			// it looking down, and back.
-			const pitch = 0.02 + 0.19 * Math.sin(phi * 0.45 + side * 1.4);
-			return {
-				yaw: 0.16 * Math.sin(phi * 0.31 + side) + drift * 0.04,
-				pitch,
-				roll: 0.04 * Math.sin(phi * 0.23 + 2),
-				dist: 1.42 + 0.12 * Math.sin(phi * 0.6),
-				tx: x0 + 0.05 * Math.sin(phi * 0.27),
-				ty: PRISM_ROSE_Y * 0.6,
-				bays: 1,
-				wet: 0.15
-			};
-		}
-		case 3: {
-			// Glass: a close pass over the window, the facets and tracery sliding
-			// past on a Lissajous path, the lens rolling a little.
-			const a = focus * Math.PI * 2;
-			return {
-				yaw: 0.2 * Math.sin(phi * 0.5 + a),
-				pitch: 0.06 + 0.1 * Math.sin(phi * 0.41),
-				roll: 0.14 * Math.sin(phi * 0.27 + side * 2) + drift * 0.05,
-				dist: 0.46 + 0.07 * Math.sin(phi * 0.8),
-				tx: x0 + PRISM_ROSE_R * 0.62 * Math.sin(phi * 0.9 + a),
-				ty: PRISM_ROSE_Y + PRISM_ROSE_R * 0.5 * Math.sin(phi * 0.63 + a * 0.5),
-				bays: 0,
-				wet: 0
-			};
-		}
-		case 4:
-			// Gallery: a lateral dolly along the wall of windows (the anchor itself
-			// travels while this regime leads; see PrismCameraRig).
-			return {
-				yaw: sgn * (0.72 + 0.1 * Math.sin(phi * 0.4)) + drift * 0.04,
-				pitch: -0.03 + 0.03 * Math.sin(phi * 0.33),
-				roll: 0,
-				dist: 1.9 + 0.15 * Math.sin(phi * 0.5),
-				tx: x0,
-				ty: 0.03,
-				bays: 4.5,
-				wet: 0.2
-			};
-		case 5:
-			// Flooded: low over the mirroring floor, gliding in and out.
-			return {
-				yaw: 0.22 * Math.sin(phi * 0.3 + side * 1.3) + drift * 0.05,
-				pitch: 0.115 + 0.025 * Math.sin(phi * 0.5),
-				roll: 0.02 * Math.sin(phi * 0.21),
-				dist: 2.0 + 0.32 * Math.sin(phi * 0.38),
-				tx: x0 + 0.08 * Math.sin(phi * 0.24),
-				ty: -0.02,
-				bays: 1.5,
-				wet: 1
-			};
-		case 6:
-			// Nave: from the far end, pushing in through the arcade and drawing back.
-			return {
-				yaw: side * 0.12 + 0.07 * Math.sin(phi * 0.4),
-				pitch: -0.035 + 0.035 * Math.sin(phi * 0.29 + 0.4),
-				roll: 0.015 * Math.sin(phi * 0.31),
-				dist: 2.55 + 0.62 * Math.sin(phi * 0.3),
-				tx: x0 + 0.1 * Math.sin(phi * 0.25),
-				ty: 0.03,
-				bays: 3,
-				wet: 0.3
-			};
-		case 7:
-			// Dutch: a mid-distance arc with the horizon rolling well off level.
-			return {
-				yaw: 0.3 * Math.sin(phi * 0.45),
-				pitch: 0.07 * Math.sin(phi * 0.5 + 1),
-				roll: 0.27 * Math.sin(phi * 0.35 + side * 2),
-				dist: 1.35 + 0.18 * Math.sin(phi * 0.6),
-				tx: x0 + 0.1 * Math.sin(phi * 0.5),
-				ty: 0.05,
-				bays: 1,
-				wet: 0.1
-			};
-		default:
-			// Orbit: a slow orbit around the window, breathing in and out; square-on
-			// at the start of its path, the original framing.
-			// The yaw swings through square-on rather than resting there, and the
-			// height and lateral offset ride other periods, so the camera is
-			// almost never frontal, level and centred all at once.
-			return {
-				yaw: 0.62 * Math.sin(phi * 0.7 + side * 0.3) + drift * 0.04,
-				pitch: 0.13 * Math.sin(phi * 0.45 + focus * 6.28) * Math.min(1, Math.abs(phi) * 4),
-				roll: 0.05 * Math.sin(phi * 0.5),
-				dist: 1.8 + 0.32 * Math.sin(phi * 0.33),
-				tx: x0 + 0.12 * Math.sin(phi * 0.6 + 1.3) * Math.min(1, Math.abs(phi) * 4),
-				ty: 0,
-				bays: 1.5,
-				wet: 0.1
-			};
-	}
+function shaped(value: number, k: number): number {
+	return k > 0 ? Math.tanh(k * value) / Math.tanh(k) : value;
 }
 
-/** Blend two regime cameras (distance in log space, so a dolly feels even). */
+/**
+ * The camera of one region at a shot (each dimension about -1..1; the rig
+ * feeds a roaming point plus the region's slow drift). Every region looks at
+ * the working window or a point on its glass, so the composition reads
+ * wherever the shot roams. The zero shot of the orbit is the original
+ * framing: square-on, the rose centred.
+ */
+export function prismCameraAt(regime: number, shot: ArrayLike<number>, ctx: PrismShotContext): PrismCameraParams {
+	const r = clamp(Math.round(finite(regime)), 0, PRISM_CAMERA_REGIONS.length - 1);
+	const R = PRISM_CAMERA_REGIONS[r];
+	const s = (i: number) => clamp(finite(shot[i] ?? 0), -1.2, 1.2);
+	const sgn = prismSoftSign(clamp(finite(ctx.side), -1, 1));
+	const drift = clamp(finite(ctx.drift), -1, 1);
+	let nx = s(3);
+	let ny = s(4);
+	if (r === 3) {
+		// The close pass turns its offset by the section's focus, so the part
+		// of the glass it lingers over is the section's, not the shot's.
+		const a = finite(ctx.focus) * Math.PI * 2;
+		const c = Math.cos(a);
+		const sn = Math.sin(a);
+		[nx, ny] = [nx * c - ny * sn, nx * sn + ny * c];
+	}
+	// Off-centre framing is a screen offset: a far camera moves its aim
+	// further so the window lands on the same third. Shaped so the window
+	// spends its time on a third or near one, passing through the centre
+	// rather than parking there.
+	const glass = r === 3;
+	// Distance is shaped toward its ends: the window is often big in the frame
+	// or small in the nave, and passes through the middle distance.
+	const dist = R.dist[0] * Math.exp(R.dist[1] * (glass ? s(2) : shaped(s(2), 1.3)));
+	const reach = glass ? 1 : dist / 1.8;
+	const fx = R.tx[1] * (glass ? nx : shaped(nx, 1.5)) * reach;
+	const fy = R.ty[1] * (glass ? ny : shaped(ny, 1.2)) * reach;
+	return {
+		yaw: R.yaw[0] + R.sideYaw * sgn + R.yaw[1] * s(0) + drift * 0.04,
+		pitch: R.pitch[0] + R.pitch[1] * s(1),
+		roll: R.roll[0] + R.roll[1] * shaped(s(5), R.rollShape),
+		dist,
+		tx: finite(ctx.anchor) + R.sideTx * sgn + fx,
+		ty: R.ty[0] + fy,
+		bays: R.bays,
+		wet: R.wet
+	};
+}
+
+/** Blend two region cameras (distance in log space, so a dolly feels even). */
 export function prismBlendCameras(a: PrismCameraParams, b: PrismCameraParams, t: number): PrismCameraParams {
 	return {
 		yaw: lerp(a.yaw, b.yaw, t),
@@ -202,7 +180,7 @@ export function prismBlendCameras(a: PrismCameraParams, b: PrismCameraParams, t:
 
 export type PrismRigInput = {
 	dt: number;
-	/** Crossfade between the regime on screen and the next one. */
+	/** Crossfade between the region on screen and the next one. */
 	regime: ChoiceState;
 	side: number;
 	focus: number;
@@ -212,57 +190,147 @@ export type PrismRigInput = {
 	/** Music character tempo, 0..1 (60..180 bpm). */
 	tempo: number;
 	energy: number;
-	/** 0..1; silence slows the travel to its floor but never stops it. */
+	/** 0..1; silence slows the roam to its floor but never stops it. */
 	silence: number;
 	/** VISUALIZER_TUNING.mk1.motion. */
 	motion: number;
 };
 
+/** Cruise rate (rateFor) at which the shot roams at its authored pace. */
+const ROAM_UNIT = 0.088;
+
 /**
- * The travelling camera. Owned by the look; every field integrates, so there
+ * The roaming camera. Owned by the look; every field integrates, so there
  * is no state from which the shot could jump.
  */
 export class PrismCameraRig {
-	/** Shared path phase. */
-	travel: number;
-	/** Seconds of rig time, for the breathing layer. */
+	/** Roam odometer: authored seconds of roaming travelled (surges count more). */
+	travel = 0;
+	/** Seconds of rig time. */
 	clock = 0;
-	/** Travel rate actually in use (eased, so tempo changes never jerk). */
-	rate = 0.1;
+	/** Cruise rate in use (rateFor units, eased so tempo changes never jerk). */
+	rate = ROAM_UNIT;
 	/** Working bay, in bay units; the gallery dolly moves it. */
 	anchorBay = 0;
 	/** Shift surge, 0..1, decaying. */
 	surge = 0;
 	private surgeEased = 0;
-	/** Beat push spring (unitless displacement and velocity). */
+	/** Kick push spring (unitless displacement and velocity). */
 	kick = 0;
 	private kickVel = 0;
+	/** Hashed hit counter: which way a kick swings the shot. */
+	private hits = 0x51ed;
 	private readonly phase: number;
+	/** The shot: where in its region the camera is heading and travelling. */
+	private readonly shot: Roamer;
+	/** Each dimension's slow drift of the region centres (minutes per undulation). */
+	private readonly drift: Wander;
+	/**
+	 * Intimacy: quiet music draws the camera in toward the glass, loud music
+	 * pulls it back so the light can fill the nave. A distance multiplier,
+	 * eased over many seconds.
+	 */
+	reach = 1;
+	/** Hand-held breath on top: seconds per undulation, never periodic. */
+	private readonly breath: Wander;
+	/**
+	 * Excursions: on its own irregular schedule the shot strays from the
+	 * section's region toward another one (a close pass over the glass, a
+	 * pull back down the nave, a dip to the flooded floor) and comes home.
+	 * The region it strays toward only changes while the shot is home.
+	 */
+	private readonly wanderlust: Roamer;
+	/** Region the shot strays toward. */
+	excursion: number;
+	/** How far it has strayed, 0..1 (eased). */
+	away = 0;
+	private awaySlew = 0;
+	private excursions = 0;
+	/** The excursion target was picked during this stay at home. */
+	private chosen = false;
+	private readonly mix = new Float32Array(PRISM_SHOT_DIMS);
 	/** The last pose, for velocity-continuous smoothing. */
 	private smoothed: PrismCameraParams | null = null;
 
 	constructor(seed: number) {
 		const s = clamp(finite(seed, 0.5), 0, 1);
 		this.phase = s;
-		this.travel = s * 40;
+		const word = Math.floor(s * 0xffffff);
+		this.shot = new Roamer(PRISM_SHOT_DIMS, `prism-shot:${word}`, {
+			meanHold: 13,
+			minHold: 4,
+			response: 5,
+			wander: 0.24,
+			wanderPeriod: 21
+		});
+		this.drift = new Wander(PRISM_SHOT_DIMS, `prism-region:${word}`, [83, 61, 97, 71, 113, 67]);
+		this.breath = new Wander(6, `prism-breath:${word}`, [7.3, 9.1, 11.7, 13.3, 8.6, 10.4]);
+		this.wanderlust = new Roamer(1, `prism-excursion:${word}`, {
+			meanHold: 15,
+			minHold: 5,
+			response: 7,
+			wander: 0.3,
+			wanderPeriod: 23
+		});
+		this.excursion = (word % 7) + 1;
 	}
 
-	/** The music changed: surge along the path so the shot reframes now. */
+	/** How much of the shot is the close pass over the glass. */
+	private glassWeight(regime: ChoiceState): number {
+		const home = (regime.from === 3 ? 1 - regime.mix : 0) + (regime.to === 3 ? regime.mix : 0);
+		return home + ((this.excursion === 3 ? 1 : 0) - home) * this.away;
+	}
+
+	/**
+	 * Next region to stray toward: hashed, never the one at home or the last
+	 * one, and likelier the more its distance differs from home's, so an
+	 * excursion from the far nave goes in to the glass and a close pass pulls
+	 * back down the nave.
+	 */
+	private nextExcursion(home: number): number {
+		const count = PRISM_CAMERA_REGIONS.length;
+		const homeDist = Math.log(PRISM_CAMERA_REGIONS[home].dist[0]);
+		const weights = PRISM_CAMERA_REGIONS.map((region, index) =>
+			index === home || index === this.excursion ? 0 : 0.25 + Math.abs(Math.log(region.dist[0]) - homeDist)
+		);
+		const total = weights.reduce((sum, w) => sum + w, 0);
+		this.excursions += 1;
+		let h = Math.imul(this.excursions ^ 0x5bd1e995, 0x9e3779b1) ^ Math.floor(this.phase * 0xffff);
+		h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d) >>> 0;
+		let pick = (h / 0x100000000) * total;
+		for (let index = 0; index < count; index += 1) {
+			pick -= weights[index];
+			if (pick < 0 && weights[index] > 0) return index;
+		}
+		return (home + 3) % count;
+	}
+
+	/** The music changed: head somewhere new now, and roam faster for a while. */
 	shift(strength: number): void {
-		this.surge = Math.max(this.surge, clamp(finite(strength), 0, 1));
+		const s = clamp(finite(strength), 0, 1);
+		this.surge = Math.max(this.surge, s);
+		// Excursions keep their own schedule: a reframing answers the music,
+		// a long dolly to the glass would only blur the answer.
+		if (s >= 0.3) this.shot.redirect();
 	}
 
-	/** A kick or downbeat: push the lens in on the spring. */
+	/** A heard kick: push the lens in on the spring, and nudge the shot. */
 	punch(amount: number): void {
-		this.kickVel += clamp(finite(amount), 0, 1.5) * 1.4;
+		const a = clamp(finite(amount), 0, 1.5);
+		this.kickVel += a * 1.4;
+		// The shot leans into the hit: a little closer, a little swing, the side
+		// chosen by the hit itself so kicks never push the same way twice.
+		this.hits = (Math.imul(this.hits ^ (this.hits >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0;
+		this.shot.impulse(2, -a * 0.05);
+		this.shot.impulse(0, (this.hits & 0x100 ? 1 : -1) * a * 0.025);
 	}
 
-	/** Base travel rate (path radians per second) for the playing music. */
+	/** Base cruise rate for the playing music (silence slows it to a floor). */
 	static rateFor(tempo: number, energy: number, silence: number, motion: number): number {
 		const t = clamp(finite(tempo, 0.5), 0, 1);
 		const e = clamp(finite(energy), 0, 1);
 		const quiet = clamp(finite(silence), 0, 1);
-		const cruise = 0.088 * (0.65 + t * 0.7) * (0.8 + e * 0.45);
+		const cruise = ROAM_UNIT * (0.65 + t * 0.7) * (0.8 + e * 0.45);
 		// The floor: silence slows the camera, it never parks it.
 		return Math.max(0.035, cruise * (1 - quiet * 0.55)) * Math.max(0.2, finite(motion, 1));
 	}
@@ -272,16 +340,25 @@ export class PrismCameraRig {
 		this.clock += dt;
 		const regime = input.regime;
 		const wFrom = 1 - regime.mix;
+		const energy = clamp(finite(input.energy), 0, 1);
+		const m = clamp(finite(input.motion, 1), 0.2, 2);
 
-		// Travel: tempo sets the cruise, a shift surges it, both eased.
-		this.surge *= Math.exp(-dt / 1.5);
+		// Roam rate: tempo sets the cruise, a shift surges it, both eased. The
+		// surged rate is capped so a reframing is fast but never a whip.
+		this.surge *= Math.exp(-dt / 2.4);
 		this.surgeEased = approach(this.surgeEased, this.surge, 3.2, dt);
-		const target = PrismCameraRig.rateFor(input.tempo, input.energy, input.silence, input.motion);
+		const target = PrismCameraRig.rateFor(input.tempo, energy, input.silence, input.motion);
 		this.rate = approach(this.rate, target, 0.9, dt);
-		this.travel += dt * this.rate * (1 + this.surgeEased * 4.5);
+		const roam = Math.min(2.8, (this.rate / ROAM_UNIT) * (1 + this.surgeEased * 1.8));
+		this.travel += dt * roam;
+		const restless = clamp(energy * 0.8 + this.surgeEased * 0.6, 0, 1);
+		const shot = this.shot.update(dt, roam, restless);
+		// The regions' own drift: slower than the shot, never still.
+		const drift = this.drift.update(dt, 0.6 + roam * 0.4);
+		for (let i = 0; i < PRISM_SHOT_DIMS; i += 1) this.mix[i] = shot[i] * 0.8 + drift[i] * 0.38;
 
 		// Anchor: the gallery dolly walks along the wall of windows; every other
-		// regime settles on the nearest bay. Bay units, so a glide of the bay
+		// region settles on the nearest bay. Bay units, so a glide of the bay
 		// spacing never slides the camera.
 		const gallery = (regime.from === 4 ? wFrom : 0) + (regime.to === 4 ? regime.mix : 0);
 		const dir = prismSoftSign(input.side) >= 0 ? 1 : -1;
@@ -290,31 +367,52 @@ export class PrismCameraRig {
 		this.anchorBay += dt * gallery * dolly * dir;
 		this.anchorBay = approach(this.anchorBay, Math.round(this.anchorBay), 0.35 * (1 - gallery), dt);
 
-		const path: PrismPathInput = {
-			travel: this.travel,
+		const ctx: PrismShotContext = {
 			side: input.side,
 			focus: input.focus,
 			drift: input.drift,
 			anchor: this.anchorBay * spacing
 		};
-		const a = prismCameraPath(regime.from, path);
-		const b = prismCameraPath(regime.to, path);
-		const blended = prismBlendCameras(a, b, regime.mix);
+		const a = prismCameraAt(regime.from, this.mix, ctx);
+		const b = prismCameraAt(regime.to, this.mix, ctx);
+		const home = prismBlendCameras(a, b, regime.mix);
+		// Excursion: stray toward another region and back. Some of the time
+		// the shot is home; the target region only changes while it is.
+		// Excursions keep their own unhurried pace, even through a surge.
+		const lust = this.wanderlust.update(dt, Math.min(roam, 1.4), restless)[0];
+		const t = clamp((lust + 0.1) / 0.75, 0, 1);
+		// Slew-limited, then eased: an excursion from the far nave to the glass
+		// is a long dolly, and it must read as one (8 s or more), never a lunge.
+		const goal = t * t * (3 - 2 * t) * 0.95;
+		this.awaySlew += clamp(goal - this.awaySlew, -0.12 * dt, 0.12 * dt);
+		this.away = approach(this.away, this.awaySlew, 2.2, dt);
+		if (this.away > 0.05) this.chosen = false;
+		else if (this.away < 0.003 && (!this.chosen || this.excursion === regime.to)) {
+			this.excursion = this.nextExcursion(regime.to);
+			this.chosen = true;
+		}
+		const blended =
+			this.away > 0 ? prismBlendCameras(home, prismCameraAt(this.excursion, this.mix, ctx), this.away) : home;
+		// Quiet passages come closer, loud ones stand back (never the close pass
+		// itself, which is already at the glass).
+		const quiet = clamp(finite(input.silence), 0, 1);
+		this.reach = approach(this.reach, Math.exp(0.5 * (energy * (1 - quiet) - 0.55)), 0.25, dt);
+		const closeness = 1 - this.glassWeight(regime);
+		blended.dist *= 1 + (this.reach - 1) * closeness;
+		blended.tx = ctx.anchor + (blended.tx - ctx.anchor) * (1 + (this.reach - 1) * closeness);
 
-		// Breath: a slow multi-sine layer on the rig's own clock, so the camera
-		// drifts with parallax even when the travel is at its floor.
-		const t = this.clock;
-		const p = this.phase * 6.28;
-		const m = clamp(finite(input.motion, 1), 0.2, 2);
-		blended.yaw += (0.03 * Math.sin(t * 0.13 + p) + 0.017 * Math.sin(t * 0.29 + p * 2)) * m;
-		blended.pitch += (0.016 * Math.sin(t * 0.17 + p * 3) + 0.008 * Math.sin(t * 0.37)) * m;
-		blended.roll += 0.012 * Math.sin(t * 0.11 + p * 5) * m;
-		blended.tx += 0.025 * Math.sin(t * 0.09 + p * 7) * m;
-		blended.ty += 0.012 * Math.sin(t * 0.15 + p * 1.7) * m;
-		blended.dist *= 1 + 0.035 * Math.sin(t * 0.19 + p * 4) * m;
+		// Breath: a hand-held drift on smooth noise, so the camera keeps its
+		// parallax alive between destinations without any loop the eye learns.
+		const br = this.breath.update(dt, 0.8 + energy * 0.5);
+		blended.yaw += 0.04 * br[0] * m;
+		blended.pitch += 0.02 * br[1] * m;
+		blended.roll += 0.014 * br[2] * m;
+		blended.tx += 0.03 * br[3] * m;
+		blended.ty += 0.014 * br[4] * m;
+		blended.dist *= 1 + 0.04 * br[5] * m;
 
-		// Second-order smoothing removes any corner a crossfade or a rate change
-		// could leave in the motion.
+		// Second-order smoothing removes any corner a crossfade, an impulse or a
+		// rate change could leave in the motion.
 		if (!this.smoothed) this.smoothed = { ...blended };
 		const s = this.smoothed;
 		const k = 4.5;
@@ -327,7 +425,7 @@ export class PrismCameraRig {
 		s.bays = approach(s.bays, blended.bays, k, dt);
 		s.wet = approach(s.wet, blended.wet, k, dt);
 
-		// Beat push: a damped spring, a few per cent in and a hair of nod.
+		// Kick push: a damped spring, a few per cent in and a hair of nod.
 		const omega = 9;
 		const zeta = 0.62;
 		this.kickVel += (-omega * omega * this.kick - 2 * zeta * omega * this.kickVel) * dt;
@@ -346,6 +444,6 @@ export class PrismCameraRig {
 	}
 }
 
-/** Lowest camera height any path asks for (the basis clamps to the floor too). */
+/** Lowest camera height any region asks for (the basis clamps to the floor too). */
 export const PRISM_CAMERA_FLOOR = PRISM_FLOOR_Y + 0.05;
 export const PRISM_CAMERA_REGIMES = PRISM_CAMERAS;

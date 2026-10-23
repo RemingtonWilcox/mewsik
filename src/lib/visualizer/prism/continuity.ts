@@ -8,15 +8,19 @@
 //   ChoiceFollower  a discrete axis as a two-slot crossfade that can never
 //                   drop a half-shown option (a retarget mid-fade reverses or
 //                   queues instead of snapping)
-//   MosaicDraft     the glass re-drafts at phrase ends; any phrase-clock jump
-//                   (new song, re-sync) glides instead of re-cutting
+//   MosaicDraft     the glass re-drafts at some phrase ends (irregular runs,
+//                   never every phrase); any phrase-clock jump (new song,
+//                   re-sync) glides instead of re-cutting
 //   PrismMotion     clock, rose turn and sway owned by the look (the camera
 //                   rig lives in camera.ts), so a source reset (timeline,
 //                   trace phase, seed) moves nothing
 //   StructureMorph  window structure changes ride a cell-level dissolve that
 //                   washes outward and finishes with a global fade
+//   HeardKick       kicks as the audio actually played them (the kick band's
+//                   attack), never the predicted beat clock
 
 import type { ChoiceState } from '../variation';
+import { noise1 } from '../motion';
 import { PRISM_FAMILY_DRIVE, type PrismFamily, type PrismLive, type PrismStructure, prismStructureKey } from './composition';
 
 function clamp(value: number, low: number, high: number): number {
@@ -121,19 +125,41 @@ export class ChoiceFollower {
 }
 
 // ── Mosaic re-draft ───────────────────────────────────────────────────────
-/** Glass seeds drift from draft `phrase` toward `phrase + 1` by `mix`. */
+/**
+ * Glass seeds drift from draft `phrase` toward `phrase + 1` by `mix`. The
+ * glass re-drafts at the end of *some* phrases, not every one: whether a
+ * phrase ends in a re-draft follows smooth noise across phrases plus a roll,
+ * so re-drafts come in irregular runs and lulls instead of on the phrase
+ * clock. Any phrase-clock jump (new song, re-sync) glides.
+ */
 export class MosaicDraft {
 	phrase = 0;
 	mix = 0;
 	private pending = false;
 	private lastIndex: number | null = null;
+	/** Phrase turns seen, and whether the phrase now playing ends in a re-draft. */
+	private turns = 0;
+	private planned = true;
 	/** Fastest re-draft, in mix per second, for a phrase-clock jump. */
 	static readonly RATE = 1 / 1.4;
+
+	/** Whether phrase turn `turn` re-drafts: clustered (noise) and rolled (hash). */
+	static plan(turn: number): boolean {
+		const mood = noise1(0x6d7a, 0, turn * 0.37);
+		const roll = mix32(Math.imul(turn + 1, 0x9e3779b1) ^ 0x51ed) / 0x100000000;
+		return mood * 0.55 + (roll - 0.5) * 0.9 > -0.12;
+	}
 
 	update(phraseIndex: number, phrasePos: number, dt: number): void {
 		const index = Math.floor(finite(phraseIndex));
 		const step = Math.max(0, finite(dt)) * MosaicDraft.RATE;
-		if (this.lastIndex !== null && index !== this.lastIndex) this.pending = true;
+		if (this.lastIndex !== null && index !== this.lastIndex) {
+			// A re-draft already under way always completes; an unplanned turn
+			// with still glass passes without one.
+			if (this.planned || this.mix > 0.02) this.pending = true;
+			this.turns += 1;
+			this.planned = MosaicDraft.plan(this.turns);
+		}
 		this.lastIndex = index;
 		if (this.pending) {
 			// The phrase turned (naturally, or because the clock jumped): finish
@@ -146,7 +172,7 @@ export class MosaicDraft {
 			}
 			return;
 		}
-		const target = smooth01(clamp(finite(phrasePos), 0, 1), 0.82, 1);
+		const target = this.planned ? smooth01(clamp(finite(phrasePos), 0, 1), 0.82, 1) : 0;
 		// Rate-limited both ways: a phrase-position jump glides, never re-cuts.
 		this.mix = clamp(this.mix + clamp(target - this.mix, -step, step * 2), 0, 1);
 	}
@@ -198,8 +224,10 @@ export class PrismMotion {
 		this.lastTrace = null;
 	}
 
+	/** A slow sway of the turn on smooth noise (minutes per undulation, never periodic). */
 	private sway(t: number): number {
-		return Math.sin(t * 0.041 + this.phase * 6.28) * 0.05 + Math.sin(t * 0.017 + this.phase * 11) * 0.04;
+		const lane = Math.floor(this.phase * 0xffff);
+		return noise1(0x5a7e, lane, t / 150) * 0.09;
 	}
 
 	update(input: PrismMotionInput): void {
@@ -373,4 +401,39 @@ export function prismEnterSource<R extends PrismContinuable>(
 		return 'continue';
 	}
 	return 'resume';
+}
+
+// ── Heard kicks ───────────────────────────────────────────────────────────
+/**
+ * A kick is a sharp rise of the kick band's level within a frame or two,
+ * confirmed by the band rising over its own slow context. The attack, not
+ * the level, so a sustained bass line never holds the trigger; an adaptive
+ * peak, so quiet and loud mixes both trigger; a refractory gap, so a flam
+ * is one hit. Nothing here reads the predicted beat clock.
+ */
+export class HeardKick {
+	/** Seconds since the last hit. */
+	since = 10;
+	hits = 0;
+	private previous = 0;
+	private armed = true;
+	private peak = 0.2;
+
+	/** Returns the hit strength (0..1) on the frame a kick is heard, else 0. */
+	update(dt: number, level: number, delta: number, loudness: number): number {
+		const step = Math.max(0, Math.min(0.25, finite(dt)));
+		this.since += step;
+		const now = clamp(finite(level), 0, 1);
+		const scale = step > 0 ? clamp(1 / 60 / step, 0.5, 2) : 1;
+		const attack = (now - this.previous) * scale;
+		this.previous = now;
+		this.peak = Math.max(this.peak * Math.exp(-step / 6), attack, 0.06);
+		const threshold = Math.max(0.035, this.peak * 0.3);
+		if (!this.armed && attack < threshold * 0.3) this.armed = true;
+		if (!this.armed || attack < threshold || finite(delta) <= 0.02 || this.since < 0.14) return 0;
+		this.armed = false;
+		this.since = 0;
+		this.hits += 1;
+		return clamp(attack / this.peak, 0.3, 1) * clamp(finite(loudness), 0, 1);
+	}
 }

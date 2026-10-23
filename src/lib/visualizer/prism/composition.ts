@@ -155,15 +155,15 @@ const ROLE_PERMUTATIONS: readonly [number, number, number][] = [
 export const PRISM_AXES: readonly VariationAxis[] = [
 	// Era: a new reel. Palette family, the building, the hour, the weather.
 	{ kind: 'choice', name: 'palette', options: PRISM_PALETTES.length, scale: 'era', chance: 1, memory: 12, tau: 9 },
-	{ kind: 'choice', name: 'environment', options: PRISM_ENVIRONMENTS.length, scale: 'era', chance: 0.85, memory: 2, tau: 8 },
+	{ kind: 'choice', name: 'environment', options: PRISM_ENVIRONMENTS.length, scale: 'era', chance: 0.85, memory: 3, tau: 8 },
 	{ kind: 'continuous', name: 'timeOfDay', min: 0, max: 1, wrap: true, scale: 'era', step: 0.3, tau: 14 },
 	{ kind: 'continuous', name: 'rain', min: 0, max: 1, scale: 'era', step: 0.55, chance: 0.6, tau: 10 },
 	{ kind: 'continuous', name: 'wetness', min: 0, max: 1, scale: 'era', step: 0.45, tau: 10 },
 	{ kind: 'continuous', name: 'caustics', min: 0, max: 1, scale: 'era', step: 0.5, tau: 10 },
 	// Section: a new scene in the same film. Window, cut, camera, beat form.
-	{ kind: 'choice', name: 'grammar', options: PRISM_GRAMMARS.length, scale: 'section', chance: 0.8, memory: 4, tau: 3 },
+	{ kind: 'choice', name: 'grammar', options: PRISM_GRAMMARS.length, scale: 'section', chance: 0.8, memory: 5, tau: 3 },
 	{ kind: 'choice', name: 'fold', options: 8, scale: 'section', chance: 0.85, memory: 2, tau: 3 },
-	{ kind: 'choice', name: 'camera', options: PRISM_CAMERAS.length, scale: 'section', chance: 0.72, memory: 3, tau: 11 },
+	{ kind: 'choice', name: 'camera', options: PRISM_CAMERAS.length, scale: 'section', chance: 0.72, memory: 5, tau: 11 },
 	{ kind: 'choice', name: 'beatForm', options: PRISM_BEAT_FORMS.length, scale: 'section', chance: 0.75, memory: 2, tau: 2.5 },
 	{ kind: 'choice', name: 'mosaic', options: PRISM_MOSAICS.length, scale: 'section', chance: 0.6, memory: 2, tau: 3 },
 	{ kind: 'choice', name: 'roles', options: ROLE_PERMUTATIONS.length, scale: 'section', chance: 0.55, memory: 2, tau: 5 },
