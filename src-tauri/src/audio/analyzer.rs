@@ -1,10 +1,14 @@
 //! Audio feature extraction for the visualizer.
 //!
 //! `TappedSource` wraps a rodio `Source<Item = i16>` and passes samples through
-//! unchanged to the sink while pushing downmixed-mono f32 samples to the analyzer
-//! thread over a non-blocking channel. The analyzer accumulates a sliding window,
-//! runs a windowed real-FFT, and emits log-grouped magnitude bins + envelope
-//! features to the frontend at ~60Hz.
+//! unchanged to the sink while pushing one frame per sample instant to the
+//! analyzer thread over a non-blocking channel: the downmixed mono sample the
+//! features are computed from, plus the left and right channels for the scope.
+//! The analyzer accumulates a sliding mono window, runs a windowed real-FFT,
+//! and emits log-grouped magnitude bins + envelope features to the frontend at
+//! ~60Hz. Each event also carries the stereo pairs heard since the previous
+//! one (`scope`), which the Signal visualizer draws as a real XY beam; the
+//! features never read them.
 
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -21,6 +25,14 @@ const BIN_COUNT: usize = 64;
 const EMIT_HZ: u64 = 60;
 // Bound the tap channel so a stalled analyzer cannot blow memory; samples drop on overflow.
 const TAP_CAPACITY: usize = 1 << 16;
+/// Highest scope rate sent to the frontend. Sources above it are decimated by
+/// a whole factor (96 kHz by 2, 192 kHz by 4), so a 60 Hz event carries about
+/// 800 pairs whatever the source rate.
+const SCOPE_MAX_RATE: u32 = 50_000;
+/// Most stereo pairs one event carries. A stalled emit keeps only the newest.
+const SCOPE_MAX_PAIRS: usize = 1024;
+/// A chunk whose peak stays under this (about -80 dBFS) is sent empty.
+const SCOPE_SILENCE: f32 = 1e-4;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct AudioFeatures {
@@ -40,10 +52,17 @@ pub struct AudioFeatures {
     // chroma_key=0 corresponds to C, then C# … B (in 1/12 increments).
     pub chroma_key: f32,      // 0..1
     pub chroma_strength: f32, // 0..1, low when atonal/noisy
+    // Stereo scope: the pairs heard since the previous event, interleaved
+    // little-endian i16 L, R (scaled by 32767), base64-encoded. Empty while
+    // silent. Renderer-only; none of the features above read it.
+    pub scope: String,
+    pub scope_rate: u32, // pair rate after decimation, Hz
 }
 
 pub struct TapFrame {
-    pub sample: f32, // -1.0..1.0 mono
+    pub sample: f32, // -1.0..1.0 mono downmix (the analyzer's input)
+    pub left: f32,   // -1.0..1.0, channel 0
+    pub right: f32,  // -1.0..1.0, channel 1 (= left for mono sources)
     pub sample_rate: u32,
 }
 
@@ -57,6 +76,8 @@ pub struct TappedSource<S: Source<Item = i16>> {
     tap: Sender<TapFrame>,
     channel_idx: u16,
     accumulator: f32,
+    left: f32,
+    right: f32,
 }
 
 impl<S: Source<Item = i16>> TappedSource<S> {
@@ -66,6 +87,8 @@ impl<S: Source<Item = i16>> TappedSource<S> {
             tap,
             channel_idx: 0,
             accumulator: 0.0,
+            left: 0.0,
+            right: 0.0,
         }
     }
 }
@@ -77,11 +100,19 @@ impl<S: Source<Item = i16>> Iterator for TappedSource<S> {
         let normalized = sample as f32 / 32768.0;
         let channels = self.inner.channels().max(1);
         self.accumulator += normalized;
+        match self.channel_idx {
+            0 => self.left = normalized,
+            1 => self.right = normalized,
+            _ => {}
+        }
         self.channel_idx += 1;
         if self.channel_idx >= channels {
             let mono = self.accumulator / channels as f32;
             let _ = self.tap.try_send(TapFrame {
                 sample: mono,
+                left: self.left,
+                // A mono source draws the scope's diagonal: x = y.
+                right: if channels >= 2 { self.right } else { self.left },
                 sample_rate: self.inner.sample_rate(),
             });
             self.accumulator = 0.0;
@@ -159,6 +190,110 @@ fn pcm_levels(samples: &[f32]) -> (f32, f32) {
     (rms.clamp(0.0, 1.0), peak.clamp(0.0, 1.0))
 }
 
+/// Whole decimation factor that brings a source rate under SCOPE_MAX_RATE.
+fn scope_decimation(sample_rate: u32) -> u32 {
+    sample_rate.max(1).div_ceil(SCOPE_MAX_RATE).max(1)
+}
+
+/// Collects the stereo pairs heard between two emits. Sources above
+/// SCOPE_MAX_RATE are box-averaged by a whole factor that depends only on the
+/// rate, so the pair rate never changes from one event to the next; a partial
+/// group carries over to the next emit, keeping the stream continuous.
+struct ScopeCollector {
+    pairs: VecDeque<[f32; 2]>,
+    rate: u32,
+    factor: u32,
+    group: [f32; 2],
+    grouped: u32,
+}
+
+impl ScopeCollector {
+    fn new() -> Self {
+        Self {
+            pairs: VecDeque::with_capacity(SCOPE_MAX_PAIRS),
+            rate: 0,
+            factor: 1,
+            group: [0.0; 2],
+            grouped: 0,
+        }
+    }
+
+    fn push(&mut self, left: f32, right: f32, sample_rate: u32) {
+        if sample_rate != self.rate {
+            // A new rate is a new stream: drop the old partial group.
+            self.rate = sample_rate;
+            self.factor = scope_decimation(sample_rate);
+            self.group = [0.0; 2];
+            self.grouped = 0;
+            self.pairs.clear();
+        }
+        self.group[0] += left;
+        self.group[1] += right;
+        self.grouped += 1;
+        if self.grouped < self.factor {
+            return;
+        }
+        let scale = 1.0 / self.grouped as f32;
+        if self.pairs.len() >= SCOPE_MAX_PAIRS {
+            self.pairs.pop_front();
+        }
+        self.pairs
+            .push_back([self.group[0] * scale, self.group[1] * scale]);
+        self.group = [0.0; 2];
+        self.grouped = 0;
+    }
+
+    /// The pair rate the drained pairs are at.
+    fn pair_rate(&self) -> u32 {
+        self.rate / self.factor.max(1)
+    }
+
+    /// Take everything collected since the last drain as base64 i16 pairs.
+    fn drain(&mut self) -> String {
+        let peak = self.pairs.iter().fold(0.0f32, |peak, pair| {
+            peak.max(pair[0].abs()).max(pair[1].abs())
+        });
+        if peak < SCOPE_SILENCE {
+            self.pairs.clear();
+            return String::new();
+        }
+        let mut bytes = Vec::with_capacity(self.pairs.len() * 4);
+        for pair in self.pairs.drain(..) {
+            for value in pair {
+                let quantized = (value.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                bytes.extend_from_slice(&quantized.to_le_bytes());
+            }
+        }
+        base64_encode(&bytes)
+    }
+}
+
+const BASE64_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 (RFC 4648, padded). Small enough not to need a crate.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(BASE64_TABLE[(triple >> 18) as usize & 63] as char);
+        out.push(BASE64_TABLE[(triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_TABLE[(triple >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_TABLE[triple as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
 pub fn spawn_analyzer(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>>>) {
     std::thread::Builder::new()
         .name("audio-analyzer".to_string())
@@ -177,6 +312,7 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
     let mut last_emit = Instant::now();
     let emit_interval = Duration::from_millis(1000 / EMIT_HZ);
     let mut prev_energy: f32 = 0.0;
+    let mut scope = ScopeCollector::new();
 
     // BPM tracker — onset flux ring buffer, ~4s long at 60Hz emit. Long enough
     // to autocorrelate down to 60 BPM (1-beat-per-second period).
@@ -202,11 +338,13 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
         ring[ring_head] = first.sample;
         ring_head = (ring_head + 1) % FFT_SIZE;
         sr = first.sample_rate;
+        scope.push(first.left, first.right, first.sample_rate);
 
         while let Ok(frame) = rx.try_recv() {
             ring[ring_head] = frame.sample;
             ring_head = (ring_head + 1) % FFT_SIZE;
             sr = frame.sample_rate;
+            scope.push(frame.left, frame.right, frame.sample_rate);
         }
 
         if last_emit.elapsed() < emit_interval {
@@ -359,6 +497,8 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
             beat_phase,
             chroma_key,
             chroma_strength,
+            scope: scope.drain(),
+            scope_rate: scope.pair_rate(),
         };
 
         let handle = app_handle.lock().clone();
@@ -370,7 +510,210 @@ fn analyzer_loop(rx: Receiver<TapFrame>, app_handle: Arc<Mutex<Option<AppHandle>
 
 #[cfg(test)]
 mod tests {
-    use super::pcm_levels;
+    use super::{
+        base64_encode, pcm_levels, scope_decimation, AudioFeatures, ScopeCollector, BASE64_TABLE,
+        SCOPE_MAX_PAIRS,
+    };
+
+    /// Decode the scope payload back into (left, right) pairs.
+    fn decode_scope(text: &str) -> Vec<(i16, i16)> {
+        let mut bytes = Vec::new();
+        for chunk in text.as_bytes().chunks(4) {
+            let mut triple = 0u32;
+            let mut valid = 0;
+            for (i, &c) in chunk.iter().enumerate() {
+                if c != b'=' {
+                    let v = BASE64_TABLE.iter().position(|&t| t == c).unwrap() as u32;
+                    triple |= v << (18 - 6 * i);
+                    valid += 1;
+                }
+            }
+            let out = [(triple >> 16) as u8, (triple >> 8) as u8, triple as u8];
+            bytes.extend_from_slice(&out[..valid - 1]);
+        }
+        bytes
+            .chunks(4)
+            .map(|c| {
+                (
+                    i16::from_le_bytes([c[0], c[1]]),
+                    i16::from_le_bytes([c[2], c[3]]),
+                )
+            })
+            .collect()
+    }
+
+    /// Music-like stereo: a few partials per channel, decorrelated.
+    fn music_pair(i: usize) -> (f32, f32) {
+        let t = i as f32 / 48_000.0;
+        let tau = std::f32::consts::TAU;
+        let left = 0.35 * (tau * 110.0 * t).sin()
+            + 0.2 * (tau * 277.2 * t + 0.4).sin()
+            + 0.08 * (tau * 1661.0 * t).sin();
+        let right = 0.33 * (tau * 110.4 * t + 1.1).sin()
+            + 0.22 * (tau * 329.6 * t).sin()
+            + 0.07 * (tau * 1975.0 * t + 2.0).sin();
+        (left, right)
+    }
+
+    #[test]
+    fn base64_matches_rfc_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn scope_carries_stereo_pairs_at_48k() {
+        let mut scope = ScopeCollector::new();
+        for i in 0..800 {
+            let t = i as f32 / 48_000.0;
+            let left = (std::f32::consts::TAU * 100.0 * t).sin() * 0.5;
+            let right = (std::f32::consts::TAU * 100.0 * t).cos() * 0.5;
+            scope.push(left, right, 48_000);
+        }
+        assert_eq!(scope.pair_rate(), 48_000);
+        let text = scope.drain();
+        let pairs = decode_scope(&text);
+        assert_eq!(pairs.len(), 800);
+        assert_eq!(pairs[0], (0, 16384));
+        // A quarter period of 100 Hz at 48 kHz: left peaks, right crosses zero.
+        assert_eq!(pairs[120], (16384, 0));
+        // Draining empties the collector.
+        assert!(scope.drain().is_empty());
+    }
+
+    #[test]
+    fn scope_event_payload_stays_compact() {
+        let mut scope = ScopeCollector::new();
+        for i in 0..800 {
+            let (left, right) = music_pair(i);
+            scope.push(left, right, 48_000);
+        }
+        let text = scope.drain();
+        // 800 pairs x 4 bytes in base64: 4268 characters per 60 Hz event.
+        assert_eq!(text.len(), 4268);
+        // The same pairs as a JSON integer array would be well over twice that.
+        let pairs = decode_scope(&text);
+        let as_json = serde_json::to_string(
+            &pairs
+                .iter()
+                .flat_map(|&(l, r)| [l, r])
+                .collect::<Vec<i16>>(),
+        )
+        .unwrap();
+        assert!(as_json.len() > text.len() * 2, "json {}", as_json.len());
+        // Measure the whole event as the frontend receives it.
+        let features = AudioFeatures {
+            bins: vec![0.523_456_7; 64],
+            rms: 0.31,
+            peak: 0.82,
+            centroid: 0.12,
+            onset: false,
+            bass: 0.6,
+            mid: 0.4,
+            treble: 0.2,
+            sample_rate: 48_000,
+            bpm: 128.0,
+            beat_phase: 0.25,
+            chroma_key: 0.5,
+            chroma_strength: 0.3,
+            scope: text,
+            scope_rate: 48_000,
+        };
+        let event = serde_json::to_string(&features).unwrap();
+        eprintln!(
+            "audio:features event: {} bytes ({} of them scope); json i16 scope would be {}",
+            event.len(),
+            features.scope.len(),
+            as_json.len()
+        );
+        assert!(event.len() < 6_500, "event {} bytes", event.len());
+    }
+
+    #[test]
+    fn scope_decimates_high_rates_by_a_whole_factor() {
+        assert_eq!(scope_decimation(44_100), 1);
+        assert_eq!(scope_decimation(48_000), 1);
+        assert_eq!(scope_decimation(96_000), 2);
+        assert_eq!(scope_decimation(192_000), 4);
+        let mut scope = ScopeCollector::new();
+        // 1600 samples at 96 kHz = one 60 Hz frame, alternating so the box
+        // average is exact.
+        for i in 0..1600 {
+            let v = if i % 2 == 0 { 0.25 } else { 0.75 };
+            scope.push(v, -v, 96_000);
+        }
+        assert_eq!(scope.pair_rate(), 48_000);
+        let pairs = decode_scope(&scope.drain());
+        assert_eq!(pairs.len(), 800);
+        assert!(pairs.iter().all(|&(l, r)| l == 16384 && r == -16384));
+    }
+
+    #[test]
+    fn scope_keeps_a_partial_group_across_emits() {
+        let mut scope = ScopeCollector::new();
+        // Three samples at 192 kHz (factor 4): no pair yet.
+        for _ in 0..3 {
+            scope.push(0.5, 0.5, 192_000);
+        }
+        assert!(decode_scope(&scope.drain()).is_empty());
+        scope.push(0.5, 0.5, 192_000);
+        assert_eq!(decode_scope(&scope.drain()), vec![(16384, 16384)]);
+    }
+
+    #[test]
+    fn scope_is_empty_in_silence_and_capped_when_stalled() {
+        let mut scope = ScopeCollector::new();
+        for _ in 0..800 {
+            scope.push(0.0, 0.0, 48_000);
+        }
+        assert!(scope.drain().is_empty());
+        for i in 0..(SCOPE_MAX_PAIRS * 3) {
+            scope.push(i as f32 / (SCOPE_MAX_PAIRS * 3) as f32, 0.1, 48_000);
+        }
+        let pairs = decode_scope(&scope.drain());
+        assert_eq!(pairs.len(), SCOPE_MAX_PAIRS);
+        // The newest pairs survive.
+        assert!(pairs.last().unwrap().0 > 32700);
+    }
+
+    #[test]
+    fn tapped_source_keeps_mono_for_features_and_stereo_for_the_scope() {
+        use super::{tap_channel, TappedSource};
+        use rodio::buffer::SamplesBuffer;
+        let (tx, rx) = tap_channel();
+        let stereo = SamplesBuffer::new(2, 48_000, vec![16384i16, -8192, 8192, 0]);
+        let passed: Vec<i16> = TappedSource::new(stereo, tx.clone()).collect();
+        // Samples pass through to the sink unchanged.
+        assert_eq!(passed, vec![16384, -8192, 8192, 0]);
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert_close(frames[0].left, 0.5);
+        assert_close(frames[0].right, -0.25);
+        assert_close(frames[0].sample, 0.125);
+        assert_close(frames[1].left, 0.25);
+        assert_close(frames[1].right, 0.0);
+        assert_eq!(frames[1].sample_rate, 48_000);
+
+        // A mono source puts the same signal on both scope axes.
+        let mono = SamplesBuffer::new(1, 44_100, vec![16384i16, -16384]);
+        let _: Vec<i16> = TappedSource::new(mono, tx).collect();
+        let frames: Vec<_> = rx.try_iter().collect();
+        assert_eq!(frames.len(), 2);
+        assert_close(frames[0].sample, 0.5);
+        assert_close(frames[0].left, 0.5);
+        assert_close(frames[0].right, 0.5);
+        assert_close(frames[1].right, -0.5);
+    }
+
+    #[test]
+    fn scope_clamps_out_of_range_samples() {
+        let mut scope = ScopeCollector::new();
+        scope.push(2.0, -2.0, 48_000);
+        assert_eq!(decode_scope(&scope.drain()), vec![(32767, -32767)]);
+    }
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(

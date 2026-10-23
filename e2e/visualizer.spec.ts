@@ -230,7 +230,16 @@ test.describe('visualizer engine roster', () => {
 		);
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'signal');
-		await expect(page.getByLabel('Signal audio visualizer')).toHaveCount(1);
+		const signalCanvas = page.getByLabel('Signal audio visualizer');
+		await expect(signalCanvas).toHaveCount(1);
+		// Beams, phosphor, glow prefilter, tight H/V, wide prefilter, wide H/V, present.
+		await expect(signalCanvas).toHaveAttribute('data-signal-render-passes', '9');
+		// 53 vec4 slots: the instrument plus beam physics and the XY beam.
+		await expect(signalCanvas).toHaveAttribute('data-signal-uniform-bytes', '848');
+		if (await hasUsableWebGpu(page)) {
+			await expect(signalCanvas).toHaveAttribute('data-signal-ready', 'true', { timeout: 15_000 });
+			await expect(page.getByText('Signal unavailable', { exact: true })).toHaveCount(0);
+		}
 		await page.keyboard.press('ArrowRight');
 		await expectProductionEngine(page, 'loom');
 		const loomCanvas = page.getByLabel('Loom audio visualizer');

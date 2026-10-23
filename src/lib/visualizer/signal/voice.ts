@@ -223,7 +223,8 @@ export const SIGNAL_FAMILY_PROTOTYPES = prototypes([
 	'club', // phase plot: bass against mids
 	'noise', // attractor
 	'noise', // polar loop: the spectrum's own outline
-	'swing' // torus knot
+	'swing', // torus knot
+	'rare' // scope: weighted by the stereo image instead (genome.ts)
 ]);
 
 /** Layouts, in SIGNAL_LAYOUT_NAMES order. */

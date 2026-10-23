@@ -13,11 +13,24 @@ const FFT_SIZE = 2048;
 const EMIT_HZ = 60;
 const FLUX_HIST_LEN = 256;
 
+/** Scope analysers hold this many samples: covers a tick gap of ~85 ms at 48 kHz. */
+const SCOPE_WINDOW = 4096;
+/** Most pairs one tick sends, like the native event cap. */
+const SCOPE_MAX_PAIRS = 2048;
+
 export class WebAnalyzer {
 	private ctx: AudioContext;
 	private analyser: AnalyserNode;
 	private frequencyDb: Float32Array;
 	private timeDomain: Float32Array;
+	// Stereo scope: a splitter (which up-mixes a mono source to both outputs)
+	// feeding one time-domain analyser per channel. Each tick sends the pairs
+	// rendered since the previous tick, read off the end of their windows.
+	private scopeLeft: AnalyserNode;
+	private scopeRight: AnalyserNode;
+	private scopeL = new Float32Array(SCOPE_WINDOW);
+	private scopeR = new Float32Array(SCOPE_WINDOW);
+	private scopeEnd = -1;
 	private fluxHist: number[] = [];
 	private beatPeriodFrames = 0;
 	private beatPhase = 0;
@@ -35,6 +48,39 @@ export class WebAnalyzer {
 		this.frequencyDb = new Float32Array(this.analyser.frequencyBinCount);
 		this.timeDomain = new Float32Array(this.analyser.fftSize);
 		this.emitIntervalMs = 1000 / EMIT_HZ;
+		const splitter = ctx.createChannelSplitter(2);
+		sourceNode.connect(splitter);
+		this.scopeLeft = ctx.createAnalyser();
+		this.scopeRight = ctx.createAnalyser();
+		for (const node of [this.scopeLeft, this.scopeRight]) {
+			node.fftSize = SCOPE_WINDOW;
+			node.smoothingTimeConstant = 0;
+		}
+		splitter.connect(this.scopeLeft, 0);
+		splitter.connect(this.scopeRight, 1);
+	}
+
+	/** Interleaved pairs rendered since the previous call (null when silent). */
+	private scopePairs(): Float32Array | null {
+		const rate = this.ctx.sampleRate;
+		const end = Math.round(this.ctx.currentTime * rate);
+		const previous = this.scopeEnd;
+		this.scopeEnd = end;
+		if (previous < 0 || end <= previous) return null;
+		const count = Math.min(end - previous, SCOPE_WINDOW, SCOPE_MAX_PAIRS);
+		this.scopeLeft.getFloatTimeDomainData(this.scopeL as Float32Array<ArrayBuffer>);
+		this.scopeRight.getFloatTimeDomainData(this.scopeR as Float32Array<ArrayBuffer>);
+		const pairs = new Float32Array(count * 2);
+		const offset = SCOPE_WINDOW - count;
+		let peak = 0;
+		for (let index = 0; index < count; index += 1) {
+			const left = this.scopeL[offset + index];
+			const right = this.scopeR[offset + index];
+			pairs[index * 2] = left;
+			pairs[index * 2 + 1] = right;
+			peak = Math.max(peak, Math.abs(left), Math.abs(right));
+		}
+		return peak < 1e-4 ? null : pairs;
 	}
 
 	/** Compute features for the current audio frame. Returns null if not yet
@@ -138,6 +184,7 @@ export class WebAnalyzer {
 			}
 		}
 		const bpm = this.beatPeriodFrames > 0 ? (EMIT_HZ * 60) / this.beatPeriodFrames : 0;
+		const scopePcm = this.scopePairs();
 
 		// Chroma (12 pitch classes)
 		const chroma = new Array(12).fill(0) as number[];
@@ -177,7 +224,9 @@ export class WebAnalyzer {
 			bpm,
 			beat_phase: this.beatPhase,
 			chroma_key: chromaKey,
-			chroma_strength: chromaStrength
+			chroma_strength: chromaStrength,
+			scope_rate: sampleRate,
+			...(scopePcm ? { scope_pcm: scopePcm } : {})
 		};
 	}
 }

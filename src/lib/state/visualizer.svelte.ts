@@ -8,6 +8,7 @@ import {
 	type VisualizerJourneySnapshot
 } from '$lib/visualizer/journey';
 import { VISUALIZER_ENGINES, type VisualizerEngine } from '$lib/visualizer/catalog';
+import { ScopeStream } from '$lib/visualizer/scope';
 
 export type { VisualizerJourneySnapshot } from '$lib/visualizer/journey';
 export {
@@ -136,16 +137,27 @@ class VisualizerState {
 		return this.journeyRuntime.sourceEpoch;
 	}
 
+	/**
+	 * The stereo pairs the tap heard, in one reusable ring (see scope.ts).
+	 * Renderer-only: frames reach the journey without their scope fields.
+	 */
+	readonly scope = new ScopeStream();
+
 	/** Publish one analyzer frame and timestamp it on the shared monotonic clock. */
 	setLatest(features: AudioFeatures, now = featureClockNow()) {
-		this.latestFrame = features;
+		const { scope, scope_rate, scope_pcm, ...frame } = features;
+		const rate = scope_rate ?? frame.sample_rate;
+		if (scope_pcm) this.scope.pushPairs(scope_pcm, scope_pcm.length >> 1, rate, now);
+		else if (scope) this.scope.pushBase64(scope, rate, now);
+		this.latestFrame = frame;
 		this.latestFrameAt = now;
-		this.journeyRuntime.advance(features, now);
+		this.journeyRuntime.advance(frame, now);
 		this.nextJourneyNullTickAt = null;
 	}
 
 	/** Immediately invalidate audio during known playback discontinuities. */
 	clearLatest(now = featureClockNow()) {
+		this.scope.clear();
 		this.latestFrame = null;
 		this.latestFrameAt = null;
 		this.journeyRuntime.advance(null, now);

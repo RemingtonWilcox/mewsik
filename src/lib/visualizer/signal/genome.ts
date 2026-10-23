@@ -37,7 +37,9 @@ import {
 } from './voice';
 
 export const SIGNAL_LAYOUT_COUNT = 8;
-export const SIGNAL_FAMILY_COUNT = 8;
+export const SIGNAL_FAMILY_COUNT = 9;
+/** The family whose hero is the real stereo signal (figures.ts). */
+const SCOPE_FAMILY = 8;
 export const SIGNAL_PALETTE_COUNT = 22;
 export const SIGNAL_CAMERA_COUNT = 5;
 export const SIGNAL_DISPLAY_COUNT = 6;
@@ -154,6 +156,12 @@ export class SignalVariation {
 	/** Phrase index the genome is held on during an answer's hold. */
 	private heldPhrase: number | null = null;
 	private readonly view: SignalCharacterView = signalCharacterView(null);
+	/**
+	 * 0..1 how worth showing the real stereo signal is right now (wide,
+	 * structured, decorrelated, and actually arriving). Measured by the
+	 * renderer from the scope stream; it only weights the scope family.
+	 */
+	private stereoInterest = 0;
 	private readonly weightScratch = {
 		layout: [] as number[],
 		family: [] as number[],
@@ -203,9 +211,11 @@ export class SignalVariation {
 	respond(
 		character: Readonly<MusicCharacter> | null | undefined,
 		energy: number,
-		dt: number
+		dt: number,
+		stereoInterest = 0
 	): SignalShiftEvent | null {
 		const step = Math.min(0.5, Math.max(0, Number.isFinite(dt) ? dt : 0));
+		this.stereoInterest = Number.isFinite(stereoInterest) ? Math.min(1, Math.max(0, stereoInterest)) : 0;
 		this.holdSeconds = Math.max(0, this.holdSeconds - step);
 		if (!character) return null;
 		const view = signalCharacterView(character, this.view);
@@ -255,7 +265,17 @@ export class SignalVariation {
 		const genome = this.genome;
 		const c = view as unknown as MusicCharacter;
 		genome.setWeights('layout', characterWeights(SIGNAL_LAYOUT_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.layout));
-		genome.setWeights('family', characterWeights(SIGNAL_FAMILY_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.family));
+		// The real signal is a frequent, prominent hero whatever the genre,
+		// weighted by how much picture the stereo image holds: up to well
+		// above the best-fitting synthesized family, down to a rare pick for
+		// mono or noise (where it would be a diagonal or a fuzzy cloud).
+		const family = characterWeights(SIGNAL_FAMILY_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.family);
+		let best = 0;
+		for (let index = 0; index < family.length; index += 1) {
+			if (index !== SCOPE_FAMILY && family[index] > best) best = family[index];
+		}
+		family[SCOPE_FAMILY] = best * (0.06 + this.stereoInterest * 1.9);
+		genome.setWeights('family', family);
 		genome.setWeights('palette', characterWeights(SIGNAL_PALETTE_PROTOTYPES, c, WEIGHT_SHARPNESS * 1.4, 0.005, w.palette));
 		genome.setWeights('camera', characterWeights(SIGNAL_CAMERA_PROTOTYPES, c, 3, 0.15, w.camera));
 		genome.setWeights('display', characterWeights(SIGNAL_DISPLAY_PROTOTYPES, c, WEIGHT_SHARPNESS, 0.01, w.display));
