@@ -382,9 +382,11 @@ export class PrismCameraRig {
 		const lust = this.wanderlust.update(dt, Math.min(roam, 1.4), restless)[0];
 		const t = clamp((lust + 0.1) / 0.75, 0, 1);
 		// Slew-limited, then eased: an excursion from the far nave to the glass
-		// is a long dolly, and it must read as one (8 s or more), never a lunge.
+		// is a long dolly, and it must read as one (12 s or more), never a lunge:
+		// a dolly moves the whole frame at once, so it stays unhurried and the
+		// music shows in the window's parts instead.
 		const goal = t * t * (3 - 2 * t) * 0.95;
-		this.awaySlew += clamp(goal - this.awaySlew, -0.12 * dt, 0.12 * dt);
+		this.awaySlew += clamp(goal - this.awaySlew, -0.08 * dt, 0.08 * dt);
 		this.away = approach(this.away, this.awaySlew, 2.2, dt);
 		if (this.away > 0.05) this.chosen = false;
 		else if (this.away < 0.003 && (!this.chosen || this.excursion === regime.to)) {
@@ -403,13 +405,15 @@ export class PrismCameraRig {
 
 		// Breath: a hand-held drift on smooth noise, so the camera keeps its
 		// parallax alive between destinations without any loop the eye learns.
-		const br = this.breath.update(dt, 0.8 + energy * 0.5);
-		blended.yaw += 0.04 * br[0] * m;
-		blended.pitch += 0.02 * br[1] * m;
-		blended.roll += 0.014 * br[2] * m;
-		blended.tx += 0.03 * br[3] * m;
-		blended.ty += 0.014 * br[4] * m;
-		blended.dist *= 1 + 0.04 * br[5] * m;
+		// It stays small and slow: the whole frame moving at once is the one
+		// motion that hides the window's parts answering the band.
+		const br = this.breath.update(dt, 0.6 + energy * 0.3);
+		blended.yaw += 0.025 * br[0] * m;
+		blended.pitch += 0.012 * br[1] * m;
+		blended.roll += 0.009 * br[2] * m;
+		blended.tx += 0.018 * br[3] * m;
+		blended.ty += 0.009 * br[4] * m;
+		blended.dist *= 1 + 0.025 * br[5] * m;
 
 		// Second-order smoothing removes any corner a crossfade, an impulse or a
 		// rate change could leave in the motion.

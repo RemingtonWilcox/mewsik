@@ -176,7 +176,7 @@ export const PRISM_AXES: readonly VariationAxis[] = [
 	{ kind: 'continuous', name: 'baySpacing', min: 0, max: 1, scale: 'section', step: 0.35, tau: 6 },
 	{ kind: 'continuous', name: 'fog', min: 0, max: 1, scale: 'section', step: 0.3, tau: 6 },
 	{ kind: 'continuous', name: 'sideShaft', min: 0, max: 1, scale: 'section', step: 0.45, tau: 6 },
-	{ kind: 'continuous', name: 'shaftAngle', min: -1, max: 1, scale: 'section', step: 0.4, tau: 8 },
+	{ kind: 'continuous', name: 'shaftAngle', min: -1, max: 1, scale: 'section', step: 0.4, tau: 13 },
 	{ kind: 'continuous', name: 'camSide', min: -1, max: 1, scale: 'section', step: 0.6, tau: 8 },
 	{ kind: 'continuous', name: 'camFocus', min: 0, max: 1, wrap: true, scale: 'section', step: 0.33, tau: 8 },
 	// Phrase: the window breathes. Proportions, light, tint, dust, camera drift.
@@ -186,7 +186,7 @@ export const PRISM_AXES: readonly VariationAxis[] = [
 	{ kind: 'continuous', name: 'tracery', min: 0, max: 1, scale: 'phrase', step: 0.22, tau: 3 },
 	{ kind: 'continuous', name: 'sprinkle', min: 0, max: 1, scale: 'phrase', step: 0.25, tau: 3 },
 	{ kind: 'continuous', name: 'tint', min: -1, max: 1, scale: 'phrase', step: 0.18, tau: 5 },
-	{ kind: 'continuous', name: 'sunAngle', min: 0, max: 1, wrap: true, scale: 'phrase', step: 0.25, tau: 7 },
+	{ kind: 'continuous', name: 'sunAngle', min: 0, max: 1, wrap: true, scale: 'phrase', step: 0.25, tau: 13 },
 	{ kind: 'continuous', name: 'sunCount', min: 0, max: 1, scale: 'phrase', step: 0.35, chance: 0.4, tau: 6 },
 	{ kind: 'continuous', name: 'dust', min: 0, max: 1, scale: 'phrase', step: 0.3, tau: 5 },
 	{ kind: 'continuous', name: 'camDrift', min: -1, max: 1, scale: 'phrase', step: 0.3, tau: 9 }

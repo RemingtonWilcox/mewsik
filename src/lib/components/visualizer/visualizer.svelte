@@ -64,6 +64,7 @@
 		type Rgb
 	} from '$lib/visualizer/prism/composition';
 	import { PrismCameraRig } from '$lib/visualizer/prism/camera';
+	import { PrismVoices } from '$lib/visualizer/prism/voices';
 	import {
 		CHARACTER_FEATURES,
 		characterWeights,
@@ -112,13 +113,11 @@
 			centroid: 0.5,
 			rms: 0,
 			energy: 0,
-			impact: 0,
 			growth: 0,
 			backlight: 0,
 			air: 0.8,
 			silence: 1,
-			quietFor: 0,
-			packetStrength: 0
+			quietFor: 0
 		};
 	}
 
@@ -194,16 +193,17 @@
 			primed: boolean;
 			since: number;
 		};
-		/** Look salt for beat packets and clouds; compositions carry their own. */
+		/** Look salt for clouds; compositions carry their own. */
 		salt: number;
-		beatSerial: number;
 		/**
-		 * Age of the current beat's light, 0..1, on the look's own clock: the
-		 * shared beat phase can jump when a station changes tempo, and a beat
-		 * packet must fade out, never vanish.
+		 * The ensemble's voices: every part of the window answers its own part
+		 * of the band (heard drums as packets in their own ring, chords voicing
+		 * the rings one at a time, the bass walking the low light, and a
+		 * modulation matrix routing the rest of the nave). Its packets age on
+		 * the look's own clock, so a new song's counters never jump them.
 		 */
-		beatAge: number;
-		lastBeatCount: number;
+		voices: PrismVoices;
+		/** Set by a new source; nothing on the beat clock reads it any more. */
 		resyncBeat: boolean;
 	};
 
@@ -826,9 +826,7 @@
 			weightClock: 0,
 			pace: { memory: paceRecord(), before: paceRecord(), upgradeFor: 0, primed: false, since: 0 },
 			salt,
-			beatSerial: 0,
-			beatAge: 1,
-			lastBeatCount: -1,
+			voices: new PrismVoices(seed),
 			resyncBeat: true
 		};
 	}
@@ -872,6 +870,7 @@
 		const response = VISUALIZER_TUNING.mk1;
 		const directed = journey.director;
 		const spectrum = journey.spectrum;
+		const ensemble = journey.ensemble;
 		const clock = directed.clock;
 		const sectionNow = directed.section;
 		const family = prismFamily(sectionNow);
@@ -904,6 +903,8 @@
 		}
 		const r = run;
 		if (!r) return;
+		// A look persisted before the ensemble existed (dev reload) gains its voices.
+		r.voices ??= new PrismVoices(songSeed);
 		const env = r.env;
 		const palette = r.palette;
 		const motion = r.motion;
@@ -919,6 +920,8 @@
 		if (r.hurryHold <= 0) r.hurry = Math.max(0, r.hurry - dt / 3);
 		const pace = r.pace;
 		pace.since += dt;
+		/** A change of music this frame re-routes the voices too. */
+		let reroute = 0;
 		const reelAnswer = (strength: number) => {
 			genome.shift(Math.max(strength, 0.8), Math.max(env.energy, character.energy));
 			r.hurry = Math.max(r.hurry, 0.4 + strength * 0.6);
@@ -939,6 +942,7 @@
 				r.hurryHold = 1;
 			}
 			r.rig.shift(strength);
+			reroute = Math.max(reroute, strength);
 			r.weightClock = 0;
 			r.holdMorph = 0;
 			r.feelSettle = 6;
@@ -1044,10 +1048,10 @@
 		// blue (the lean moves over minutes; a change of music still reads).
 		if (feelForce?.temperature === undefined) feel.temperature = clamp(feel.temperature + flow[7] * 0.4, -1, 1);
 
-		const impactTarget = feat
-			? clamp(clock.beatPulse * (0.35 + directed.bassPunch * 0.75) + spectrum.novelty * 0.3, 0, 1)
-			: 0;
-		env.impact = approach(env.impact, impactTarget * response.impact, impactTarget > env.impact ? 30 : 6, dt);
+		// ── The ensemble's voices: each part of the window answers its own
+		// instrument (voices.ts). Heard drums only, never the predicted clock.
+		const playing = !!feat && !directed.silence && env.silence < 0.5;
+		const voice = r.voices.update({ ensemble, dt, live: playing, energy: env.energy, reroute });
 
 		// ── Variety: the genome only moves at phrase and section boundaries and
 		// glides from there. Silence holds the look where it is.
@@ -1092,7 +1096,9 @@
 			held ? r.morph.b : forceStructure(prismStructure(genome, family)),
 			held ? r.morph.family : family,
 			live,
-			dt * (r.morphFast ? 1.6 : 0.7)
+			// A natural morph (a new section) washes slowly, so the window re-sets
+			// region by region; one that answers a change of music runs fast.
+			dt * (r.morphFast ? 1.6 : 0.5)
 		);
 		if (r.morph.serial !== serialBefore) r.morphFast = answering;
 		if (!r.morph.morphing) r.morphFast = false;
@@ -1113,12 +1119,13 @@
 					directed.drop.buildProgress * 0.22 +
 					(0.5 + 0.5 * flow[3]) * 0.22 +
 					directed.density * 0.12 +
-					feel.divide * 0.45,
+					feel.divide * 0.45 +
+					voice.growth * 0.3,
 				0,
 				1
 			) *
 			(1 - env.silence * 0.6);
-		env.growth = approach(env.growth, growthTarget, 0.5 * (1 + r.hurry * 3), dt);
+		env.growth = approach(env.growth, growthTarget, 0.3 * (1 + r.hurry * 3), dt);
 
 		const daylight = prismDaylight(val('timeOfDay'));
 		// Quiet passages keep the glass legible (the camera also comes closer
@@ -1128,51 +1135,30 @@
 			(1 - env.silence * 0.72) *
 			daylight.power *
 			feel.light;
-		env.backlight = approach(env.backlight, lightTarget, 1.4 * (1 + r.hurry * 1.5), dt);
+		// The whole window's light is the slow container (section, energy, the
+		// hour); the music shows in its parts, so this only glides.
+		env.backlight = approach(env.backlight, lightTarget, 0.6 * (1 + r.hurry * 3), dt);
 		env.air = approach(env.air, drive.air * (1 - env.silence * 0.4), 0.8, dt);
 
-		// Beat light: strength is latched as each beat starts and then carried
-		// through the window by the shader over the beat's own phase. The serial
-		// the shader hashes is the look's own, so a new song's beat counter
-		// restarting at zero does not jump the beat forms. The camera answers
-		// heard kicks only (below), never this predicted clock.
-		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + Math.floor(finite(clock.beatIndex)));
-		if (r.resyncBeat) {
-			r.lastBeatCount = beatCount;
-			r.resyncBeat = false;
-		}
-		if (beatCount !== r.lastBeatCount) {
-			const isDownbeat = Math.floor(finite(clock.beatIndex)) === 0;
-			// Very fast music lands its beats a little lighter, so 170 bpm reads as
-			// a pulse in the glass rather than a strobe.
-			const beatWeight = 1 - 0.35 * smooth01(r.feel.tempo, 0.6, 1);
-			env.packetStrength = feat
-				? clamp(
-						(0.3 + directed.bassPunch * 0.7 + env.energy * 0.35 + (isDownbeat ? 0.25 : 0)) *
-							beatWeight *
-							response.impact *
-							drive.packet *
-							(1 - env.silence),
-						0,
-						1.6
-					)
-				: 0;
-			r.lastBeatCount = beatCount;
-			r.beatSerial += 1;
-			r.beatAge = 0;
-		} else {
-			const beatSeconds = 60 / clamp(finite(clock.tempoBpm, 120), 50, 200);
-			r.beatAge = Math.min(1, r.beatAge + dt / beatSeconds);
-		}
+		// Heard hits light the glass, each instrument in its own ring: kicks
+		// travel the inner ring in the look's beat form, snares crack the middle,
+		// hats glint on the outer panes, fills cascade round the rose. Very fast
+		// music lands them a little lighter, so 170 bpm reads as a pulse in the
+		// glass rather than a strobe.
+		r.resyncBeat = false;
+		const beatWeight = 1 - 0.35 * smooth01(r.feel.tempo, 0.6, 1);
+		const hitGain = beatWeight * response.impact * drive.packet * (1 - env.silence);
+		const kickStrength = clamp(voice.kick.strength * (0.6 + env.energy * 0.4) * hitGain, 0, 1.6);
 		const beatForm = pick(r, 'beatForm');
-		// Kicks as heard push the camera in on its spring and nudge the shot.
+		// Kicks as heard give the camera only a small push: the weight of the
+		// kick is in the inner ring, not in a whole-frame lurch.
 		const hit = r.kick.update(
 			dt,
 			feat ? finite(spectrum.levels.kick) : 0,
 			feat ? finite(spectrum.deltas.kick) : 0,
 			feat ? clamp(env.energy * 0.7 + env.rms * 2, 0, 1) * (1 - env.silence) : 0
 		);
-		if (hit > 0) r.rig.punch(hit * (0.3 + directed.bassPunch * 0.45) * response.motion);
+		if (hit > 0) r.rig.punch(hit * (0.3 + directed.bassPunch * 0.45) * response.motion * 0.25);
 
 		// Suns behind the glass: where they sit and how many are phrase moves.
 		// The light itself is a direction: it sets where the shafts fall, and it
@@ -1180,7 +1166,7 @@
 		const sunAngle = val('sunAngle') * Math.PI * 2;
 		const sunX = Math.cos(sunAngle) * 0.2;
 		const sunY = 0.06 + Math.sin(sunAngle) * 0.15;
-		const sunPower = 0.45 + env.energy * 0.7;
+		const sunPower = (0.45 + env.energy * 0.7) * voice.sun.hotspot;
 		const lightX = -Math.cos(sunAngle) * 0.42 + 0.14 * noise1(0x11a7, r.salt, motion.clock / 52);
 		const lightY = 0.52 + Math.sin(sunAngle) * 0.16 + 0.05 * noise1(0x11a7, r.salt + 1, motion.clock / 77);
 		const lightLen = Math.hypot(lightX, lightY, 1);
@@ -1219,7 +1205,7 @@
 		motion.update({
 			tracePhase: journey.signal.tracePhase,
 			dt,
-			motion: response.motion,
+			motion: response.motion * voice.turn,
 			energy: env.energy,
 			silence: env.silence
 		});
@@ -1233,14 +1219,15 @@
 		const camSide = val('camSide');
 		const camera = pick(r, 'camera');
 		const cam = r.rig.update({
-			dt,
+			// Lab diagnostics can hold the shot (window.__PRISM_FORCE__.camFreeze).
+			dt: forced()?.camFreeze ? 0 : dt,
 			regime: camera,
 			side: camSide,
 			focus: val('camFocus'),
 			drift: val('camDrift'),
 			spacing,
 			tempo: r.feel.tempo,
-			energy: env.energy,
+			energy: clamp(env.energy * 0.75 + (voice.cameraRestless - 0.5) * 0.5, 0, 1),
 			silence: env.silence,
 			motion: response.motion
 		});
@@ -1270,24 +1257,25 @@
 		// Haze: the music's own (thick and soft for slow quiet music, gritty for
 		// noise) times the section's fog; it thins in silence but never clears.
 		const haze = (0.1 + feel.haze * 0.55) * (0.55 + val('fog') * 0.9) * (1 - env.silence * 0.3);
-		const dust = clamp(val('dust') * 0.45 + feel.dust * 0.65, 0, 1);
-		const shaftPower = (0.45 + env.energy * 0.55) * daylight.power * (1 - env.silence * 0.5);
+		const dust = clamp((val('dust') * 0.45 + feel.dust * 0.65) * voice.dust.density, 0, 1.6);
+		const shaftPower = (0.45 + env.energy * 0.55) * daylight.power * (1 - env.silence * 0.5) * voice.sun.power;
 		// The clerestory light comes from behind the camera on the side away
 		// from the camera's wall, so its beams cross the nave toward the glass.
 		const sideX = -prismSoftSign(camSide) * 0.32 + val('shaftAngle') * 0.25;
 		const sideLen = Math.hypot(sideX, 0.62, 0.8);
-		const sideStrength = sideShaft * (0.25 + env.energy * 0.4) * (1 - env.silence * 0.6);
+		const sideStrength = sideShaft * (0.25 + env.energy * 0.4) * (1 - env.silence * 0.6) * voice.clerestory;
 
-		// Post: trails shorten on impact and in silence; the bloom knee drops
-		// with energy so peaks glow and quiet sections stay graphic; punchy music
-		// keeps a higher knee so edges stay crisp. History is only cleared for
-		// fresh render targets (a resize or a new canvas).
+		// Post: trails lengthen with legato and shorten in silence; the bloom
+		// knee drops with energy so peaks glow and quiet sections stay graphic;
+		// punchy music keeps a higher knee so edges stay crisp. No whole-frame
+		// beat pulse: the trails and the lens never flash on a hit. History is
+		// only cleared for fresh render targets (a resize or a new canvas).
 		const historyValid = feedbackResetFrames > 0 || !prevBasis ? 0 : 1;
 		const feedbackFade =
 			feedbackResetFrames > 0
 				? 0
 				: clamp(
-						(0.86 + env.energy * 0.05 - env.impact * 0.08 + response.feedbackFadeOffset) *
+						(0.86 + env.energy * 0.05 + voice.trails * 0.08 + response.feedbackFadeOffset) *
 							(1 - env.silence * 0.3),
 						0.4,
 						0.95
@@ -1295,7 +1283,7 @@
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
 		const feedbackZoom = 1 - (0.0012 + env.bass * 0.0022) * response.motion;
 		const bloomThreshold = 0.82 - env.energy * 0.18 + feel.edge * 0.08 + response.bloomThresholdOffset;
-		const aberration = 1 + env.impact * 1.5;
+		const aberration = 1 + env.energy * 0.3;
 		const prev = prevBasis ?? basis;
 
 		// Lab-only preset override; production is always the rose.
@@ -1312,7 +1300,7 @@
 		u[5] = env.treble;
 		u[6] = env.centroid;
 		u[7] = env.rms;
-		u[8] = env.impact;
+		u[8] = 0;
 		u[9] = bloomThreshold;
 		u[10] = feedbackFade;
 		u[11] = motion.rotation;
@@ -1334,9 +1322,9 @@
 		writeShape(u, O.shapeB, compB, feel.frag);
 		writeGrammar(u, O.gramA, compA);
 		writeGrammar(u, O.gramB, compB);
-		writeVec4(u, O.detail, clamp(live.tracery * 0.5 + feel.weight * 0.6, 0, 1), live.cusp, live.sprinkle, cam.bays);
+		writeVec4(u, O.detail, clamp(live.tracery * 0.5 + feel.weight * 0.6, 0, 1), live.cusp, live.sprinkle, Math.min(5, cam.bays + voice.bays.spread));
 		writeVec4(u, O.organism, env.growth, r.draft.phrase, r.draft.mix, r.salt);
-		writeVec4(u, O.light, env.backlight, env.packetStrength, r.beatAge, r.beatSerial);
+		writeVec4(u, O.light, env.backlight, kickStrength, voice.kick.progress, voice.kick.serial);
 		writeVec4(u, O.modes, beatForm.from, beatForm.to, beatForm.mix, family === 'drift' ? 1 : 0);
 		writeVec4(u, O.sun, sunX, sunY, sunPower, env.air);
 		writeVec4(u, O.heroCol, ...palette.hero, 0);
@@ -1345,7 +1333,7 @@
 		writeVec4(u, O.fieldCol, ...palette.field, 0);
 		writeVec4(u, O.post, feedbackFade, feedbackZoom, bloomThreshold, aberration);
 		writeVec4(u, O.env, flow[4] * 0.04, flow[5], env.silence, motion.rotation);
-		writeVec4(u, O.bands, env.bass, env.mid, env.treble, env.impact);
+		writeVec4(u, O.bands, env.bass, env.mid, env.treble, 0);
 		writeVec4(u, O.motion, trailTurn, frameIndex % 60, env.energy, regimeExposure(camera, environment, env.energy, { region: r.rig.excursion, away: r.rig.away }));
 		writeVec4(u, O.camPos, basis.pos[0], basis.pos[1], basis.pos[2], basis.focal);
 		writeVec4(u, O.camRight, basis.right[0], basis.right[1], basis.right[2], spacing);
@@ -1366,8 +1354,33 @@
 		writeVec4(u, O.lightBox, anchorX - 3.6, PRISM_FLOOR_Y - 0.01, 7.2, 1.35);
 		writeVec4(u, O.arcade, arcade[0], arcade[1], arcade[2], arcade[3]);
 		writeVec4(u, O.side, sideX / sideLen, 0.62 / sideLen, -0.8 / sideLen, sideStrength);
-		writeVec4(u, O.feel, feel.edge, roomWeight(2), 0.22, frameIndex % 64);
+		writeVec4(u, O.feel, clamp(feel.edge * 0.7 + (voice.tracery.edge - 0.5) * 0.6, 0, 1), roomWeight(2), 0.22, frameIndex % 64);
 		writeVec4(u, O.rig, anchorX, dt, r.rig.kick, flow[2]);
+		const rings = voice.rings;
+		const prevRings = voice.ringsPrev;
+		writeVec4(u, O.ringPrevIn, prevRings[0].hue, prevRings[0].warmth, prevRings[0].sat, prevRings[0].value);
+		writeVec4(u, O.ringPrevMid, prevRings[1].hue, prevRings[1].warmth, prevRings[1].sat, prevRings[1].value);
+		writeVec4(u, O.ringPrevOut, prevRings[2].hue, prevRings[2].warmth, prevRings[2].sat, prevRings[2].value);
+		writeVec4(u, O.ringSweep, voice.ringSweep[0], voice.ringSweep[1], voice.ringSweep[2], 0);
+		writeVec4(u, O.ringStart, voice.ringStart[0], voice.ringStart[1], voice.ringStart[2], 0);
+		writeVec4(u, O.ringIn, rings[0].hue, rings[0].warmth, rings[0].sat, rings[0].value);
+		writeVec4(u, O.ringMid, rings[1].hue, rings[1].warmth, rings[1].sat, rings[1].value);
+		writeVec4(u, O.ringOut, rings[2].hue, rings[2].warmth, rings[2].sat, rings[2].value);
+		writeVec4(u, O.ringLight, voice.ringLight[0], voice.ringLight[1], voice.ringLight[2], voice.petalContrast);
+		const chroma = voice.chroma;
+		writeVec4(u, O.chromaA, chroma[0], chroma[1], chroma[2], chroma[3]);
+		writeVec4(u, O.chromaB, chroma[4], chroma[5], chroma[6], chroma[7]);
+		writeVec4(u, O.chromaC, chroma[8], chroma[9], chroma[10], chroma[11]);
+		writeVec4(u, O.snarePk, clamp(voice.snare.strength * hitGain, 0, 1.4), voice.snare.progress, voice.snare.serial, voice.snare.angle);
+		writeVec4(u, O.hatPk, clamp(voice.hat.strength * hitGain, 0, 1.4), voice.hat.progress, voice.hat.serial, voice.hat.density);
+		writeVec4(u, O.fillPk, clamp(voice.fill.strength * hitGain, 0, 1.4), voice.fill.progress, voice.fill.angle, voice.fill.direction);
+		writeVec4(u, O.low, voice.low.x, voice.low.z, voice.low.power, voice.low.haze);
+		writeVec4(u, O.parts, voice.bays.left, voice.bays.right, voice.hazeHigh, voice.caustic);
+		writeVec4(u, O.parts2, voice.dust.glint * (1 - env.silence), voice.candles, voice.tracery.glow, voice.swingLean);
+		const flare = voice.bayFlare;
+		writeVec4(u, O.bayPk, flare.left * (1 - env.silence), flare.right * (1 - env.silence), flare.leftAngle, flare.rightAngle);
+		writeVec4(u, O.arcs, voice.kick.angle, voice.kick.width, voice.hat.angle, voice.hat.width);
+		writeVec4(u, O.notePk, clamp(voice.note.strength * (1 - env.silence) * response.impact, 0, 1.4), voice.note.progress, voice.note.fifths, voice.withdraw);
 		prevBasis = basis;
 		frameIndex += 1;
 
