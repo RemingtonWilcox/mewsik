@@ -76,6 +76,12 @@ export type LoomConductorFrame = {
 	signedAsymmetry: number;
 	motion: number;
 	macroEnergy: number;
+	/**
+	 * The song's energy, slowly (about 20 s; fast for a few seconds after a
+	 * change of music). The whole-frame light follows this, not the section:
+	 * sections show through the ensemble's parts instead.
+	 */
+	songEnergy: number;
 	phrase: number;
 	phraseIndex: number;
 	phraseVariation: number;
@@ -336,7 +342,8 @@ const CARRY_RAILS = [
 	'cameraYaw',
 	'cameraPitch',
 	'cameraDistance',
-	'cameraRoll'
+	'cameraRoll',
+	'songEnergy'
 ] as const;
 type CarryRail = (typeof CARRY_RAILS)[number];
 
@@ -534,6 +541,7 @@ export class LoomConductor {
 	private signedAsymmetry = 0;
 	private motion = SECTION_PROFILES.intro.motion;
 	private macroEnergy = 0.16;
+	private songEnergy = 0.16;
 	private tempo = 0.5;
 	private key = 0;
 	private mode = 0;
@@ -575,6 +583,7 @@ export class LoomConductor {
 		signedAsymmetry: 0,
 		motion: SECTION_PROFILES.intro.motion,
 		macroEnergy: 0.16,
+		songEnergy: 0.16,
 		phrase: 0,
 		phraseIndex: 0,
 		phraseVariation: 0.5,
@@ -639,6 +648,7 @@ export class LoomConductor {
 		this.signedAsymmetry = 0;
 		this.motion = intro.motion;
 		this.macroEnergy = 0.16;
+		this.songEnergy = 0.16;
 		this.tempo = 0.5;
 		this.key = 0;
 		this.mode = 0;
@@ -675,6 +685,7 @@ export class LoomConductor {
 		this.output.signedAsymmetry = this.signedAsymmetry;
 		this.output.motion = this.motion;
 		this.output.macroEnergy = this.macroEnergy;
+		this.output.songEnergy = this.songEnergy;
 		this.output.phrase = 0;
 		this.output.phraseIndex = 0;
 		this.output.phraseVariation = 0.5;
@@ -873,6 +884,8 @@ export class LoomConductor {
 			...LOOM_CONDUCTOR_LIMITS.motion
 		);
 		this.macroEnergy = approach(this.macroEnergy, macroEnergyTarget, 1.5, dt);
+		const freshMusic = character ? finite(character.sinceShift, 1e6) < 4 : false;
+		this.songEnergy = approach(this.songEnergy, this.macroEnergy, freshMusic ? 1.2 : 20, dt);
 		this.motion = approach(this.motion, motionTarget, 1.1, dt);
 
 		for (let i = 0; i < 6; i += 1) {
@@ -1044,6 +1057,7 @@ export class LoomConductor {
 		this.output.signedAsymmetry = this.signedAsymmetry;
 		this.output.motion = this.motion;
 		this.output.macroEnergy = this.macroEnergy;
+		this.output.songEnergy = this.songEnergy;
 		this.output.phrase = clamp01(finite(frame.clock.phrasePos, finite(frame.phrase)));
 		this.output.phraseIndex = phraseIndex;
 		this.output.phraseVariation = this.phraseVariation;
@@ -1067,12 +1081,14 @@ export class LoomConductor {
 			phraseIndex,
 			sectionKey: frame.section,
 			energy: this.macroEnergy,
+			songEnergy: this.songEnergy,
 			mode: this.mode,
 			key: this.key,
 			dt,
 			character: character ?? null,
 			listen: this.listen,
-			impact: this.impact
+			impact: this.impact,
+			busy: this.motion
 		});
 		this.storeCarry();
 

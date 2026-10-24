@@ -4,6 +4,21 @@
 // camera regime, environment and beat form. Every grammar is a parametric
 // surface; rails, weft and chorus strands are curves on it, so a grammar change
 // morphs the same threads into a new architecture instead of cutting.
+//
+// The weave is an ensemble (ensemble.ts): each strand group plays its own
+// instrument, and the floor, mist, dust, far threads and key light each their
+// own voice. They are read from the parts storage buffer (LOOM_PART_*),
+// so the music moves many small parts of the picture independently instead of
+// pulsing the whole frame.
+
+import {
+	LOOM_CRAWL_WRAP,
+	LOOM_GROUP_VEC4S,
+	LOOM_PART,
+	LOOM_PART_PACKETS,
+	LOOM_PACKET_SLOTS,
+	LOOM_PART_VEC4S
+} from '$lib/visualizer/loom/ensemble';
 
 export const LOOM_SEGMENTS = 208;
 export const LOOM_PRIMARY_RAILS = 3;
@@ -140,6 +155,14 @@ fn hsvToRgb(hsv: vec3<f32>) -> vec3<f32> {
 fn mixHueShortest(hueA: f32, hueB: f32, amount: f32) -> f32 {
 	let delta = fract(hueB - hueA + 0.5) - 0.5;
 	return fract(hueA + delta * amount);
+}
+
+// Turn a colour's hue by a fraction of the wheel (rotation about grey).
+fn hueRotate(c: vec3<f32>, turns: f32) -> vec3<f32> {
+	let a = turns * 6.28318530718;
+	let k = vec3<f32>(0.57735027);
+	let ca = cos(a);
+	return max(c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca), vec3<f32>(0.0));
 }
 
 fn rotateX(point: vec3<f32>, angle: f32) -> vec3<f32> {
@@ -295,6 +318,58 @@ fn noise3(p: vec3<f32>) -> f32 {
 }
 `;
 
+// The ensemble's parts (ensemble.ts): per strand group five vec4 (A glow,
+// width, slack, hue; B detail, lift, lean, sparkle; C crossing offset,
+// crossing phase, presence, hit; D cluster, spark seed, slow glow, slow width;
+// E wave phase, crawl, hero weight on the rails), the light packets
+// in flight on each group, then the stage's own voices. Each module that
+// includes this declares the parts binding itself.
+const PARTS_WGSL = /* wgsl */ `
+const PART_PACKETS: u32 = ${LOOM_PART_PACKETS}u;
+const PACKET_SLOTS: u32 = ${LOOM_PACKET_SLOTS}u;
+const PART_FLOOR: u32 = ${LOOM_PART.floor}u;
+const PART_RING_A: u32 = ${LOOM_PART.ringA}u;
+const PART_MIST: u32 = ${LOOM_PART.mist}u;
+const PART_DUST: u32 = ${LOOM_PART.dust}u;
+const PART_THREADS: u32 = ${LOOM_PART.threads}u;
+const PART_LIGHT: u32 = ${LOOM_PART.light}u;
+const PART_SHUTTLE: u32 = ${LOOM_PART.shuttle}u;
+const PART_BASS: u32 = ${LOOM_PART.bass}u;
+const PART_BASS_WALK: u32 = ${LOOM_PART.bassWalk}u;
+const PART_THREADS_B: u32 = ${LOOM_PART.threadsB}u;
+
+const GROUP_VEC4S: u32 = ${LOOM_GROUP_VEC4S}u;
+fn voiceA(g: u32) -> vec4<f32> { return parts[g * GROUP_VEC4S]; }
+fn voiceB(g: u32) -> vec4<f32> { return parts[g * GROUP_VEC4S + 1u]; }
+fn voiceC(g: u32) -> vec4<f32> { return parts[g * GROUP_VEC4S + 2u]; }
+fn voiceD(g: u32) -> vec4<f32> { return parts[g * GROUP_VEC4S + 3u]; }
+// E: the group's own wave phase (it sways at the pace of its instrument),
+// crawl (its surface ticks forward a little on each of its own hits) and, on
+// the rails, the hero weight (the rail whose instrument leads).
+fn voiceE(g: u32) -> vec4<f32> { return parts[g * GROUP_VEC4S + 4u]; }
+
+// The light packets of one group at curve position s; widen > 1 spreads them
+// (the ribbon lights are sampled at only a few points).
+fn packetLight(g: u32, s: f32, widen: f32) -> f32 {
+	var sum = 0.0;
+	for (var k = 0u; k < PACKET_SLOTS; k = k + 1u) {
+		let p = parts[PART_PACKETS + g * PACKET_SLOTS + k];
+		let d = (s - p.x) / max(p.z * widen, 0.004);
+		sum = sum + p.y * exp(-d * d);
+	}
+	return sum;
+}
+
+// The shuttle of a fill: a band running along one group's threads (the one
+// playing the fill), a local cascade through one part of the weave.
+fn shuttleBandAt(g: u32, s: f32, widen: f32) -> f32 {
+	let sh = parts[PART_SHUTTLE];
+	if (u32(sh.w + 0.5) != g) { return 0.0; }
+	let d = (s - sh.x) / max(sh.z * widen, 0.004);
+	return sh.y * exp(-d * d);
+}
+`;
+
 export const LOOM_SCENE_WGSL = /* wgsl */ `
 ${PARAMS_WGSL}
 ${SHARED_WGSL}
@@ -312,6 +387,11 @@ const LIGHT_POINTS: u32 = ${LOOM_LIGHT_POINTS}u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> detailBins: array<f32, 64>;
+@group(0) @binding(3) var<storage, read> parts: array<vec4<f32>, ${LOOM_PART_VEC4S}>;
+// The stage's adapted exposure (written by cs_lights last frame), read by the
+// strands so a dim era's threads are lifted a little and a bright one's held.
+@group(0) @binding(4) var<storage, read> lightsIn: array<vec4<f32>, ${LOOM_LIGHT_VEC4S}>;
+${PARTS_WGSL}
 
 struct LoomOut {
 	@builtin(position) position: vec4<f32>,
@@ -325,7 +405,7 @@ struct LoomOut {
 	@location(5) tangent: vec3<f32>,
 	// x: lane, y: strand hash, z: spark, w: hotspot phase
 	@location(6) dataC: vec4<f32>,
-	// x: height above the floor, y: mirrored, z: reflection dim, w: unused
+	// x: height above the floor, y: mirrored, z: reflection dim, w: the group's crawl
 	@location(7) envData: vec4<f32>,
 };
 
@@ -353,6 +433,8 @@ struct Strand {
 	// switch family outright, which snapped the rail's shape and width).
 	familyHi: u32,
 	bandT: f32,
+	// Ensemble group: 0..2 rails, 3..4 weft, 5..8 chorus (ensemble.ts).
+	group: u32,
 };
 
 fn smoothDetail(position: f32) -> f32 {
@@ -415,7 +497,7 @@ fn taperEnv(s: f32) -> f32 {
 
 // Grammar 0, the original Loom ribbon bundle: rails sweep a coiled throat,
 // pinch into knots under tension and fan open as ghosts in silence.
-fn architecturePoint(s: f32, rail: f32, family: u32, role: f32, band: f32) -> vec3<f32> {
+fn architecturePoint(s: f32, rail: f32, family: u32, role: f32, band: f32, group: u32) -> vec3<f32> {
 	let q = s * 2.0 - 1.0;
 	let env = pow(max(0.0, 1.0 - q * q), 0.72);
 	let rails = compositionRails();
@@ -438,7 +520,7 @@ fn architecturePoint(s: f32, rail: f32, family: u32, role: f32, band: f32) -> ve
 	p.z = p.z + cos(q * TAU * 0.5 + phase) * env * (0.08 + params.shapeB.z * 0.12);
 
 	let osc = sin(q * TAU * (0.85 + familyUnit * 0.7 + params.shapeB.w * 0.55)
-		+ params.cloth.y * (0.42 + params.macroRails.w * 0.38)
+		+ voiceE(group).x
 		+ f32(family) * 1.41);
 	let slow = sin(q * 2.2 + params.cloth.w * 0.21 + rail * 2.0);
 	p.y = p.y + osc * env * (0.045 + band * 0.09 + params.macroRails.y * 0.035) * params.view.w;
@@ -464,13 +546,10 @@ fn architecturePoint(s: f32, rail: f32, family: u32, role: f32, band: f32) -> ve
 	let detail = bandDetail(family, s);
 	p.z = p.z + detail * env * (0.05 + band * 0.08) * params.view.w;
 
-	let beatCenter = fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + role * 0.13);
-	let beatWindow = exp(-pow(s - beatCenter, 2.0) * 95.0);
-	p.y = p.y + beatWindow * params.pulse.x * (0.05 + band * 0.08) * sign(rail + 0.001);
-	p.z = p.z + beatWindow * params.pulse.x * (0.10 + band * 0.07);
-
-	p.x = p.x + params.pulse.y * env * sin(q * 15.0 + rail * 4.0) * 0.035;
-	p.y = p.y + params.pulse.z * env * sin(q * 8.0 - params.view.z * 4.0) * 0.035;
+	// Each group's own hits push its threads where its packets sit.
+	let beatWindow = min(packetLight(group, s, 1.6), 1.5);
+	p.y = p.y + beatWindow * (0.05 + band * 0.08) * sign(rail + 0.001);
+	p.z = p.z + beatWindow * (0.10 + band * 0.07);
 	return p;
 }
 
@@ -697,7 +776,7 @@ fn grammarPoint(g: u32, s: f32, strand: Strand, lane: f32) -> GPoint {
 		case 11u: { out = gRings(s, lane, strand.sid); }
 		case 12u: { out = gCurtain(s, lane); }
 		default: {
-			let p = architecturePoint(s, lane * 1.08, strand.family, strand.role, strandBand(strand));
+			let p = architecturePoint(s, lane * 1.08, strand.family, strand.role, strandBand(strand), strand.group);
 			out = GPoint(p, vec3<f32>(0.0, 0.28, 0.96), vec3<f32>(0.0, 0.96, -0.28), 0.0, 0.0);
 		}
 	}
@@ -769,19 +848,10 @@ fn deformFigure(p0: vec3<f32>) -> vec3<f32> {
 	return rotateZ(rotateX(p, params.figure.x), params.figure.y);
 }
 
-// Which primary rail leads this phrase. The centre rail leads most phrases;
-// roughly one in three hands the lead to an outer rail.
-fn heroRail(phrase: f32) -> u32 {
-	let h = hashUnit(u32(max(phrase, 0.0)) + 3u, 41u, 7u);
-	if (h < 0.66) { return 1u; }
-	return select(0u, 2u, h > 0.83);
-}
-
+// Which primary rail leads: the one whose instrument leads the band right now
+// (ensemble.ts), handed over in a slow glide; never on a predicted phrase.
 fn heroWeight(instanceIndex: u32) -> f32 {
-	let clock = phraseClock();
-	let now = select(0.0, 1.0, heroRail(clock.x) == instanceIndex);
-	let next = select(0.0, 1.0, heroRail(clock.x + 1.0) == instanceIndex);
-	return mix(now, next, clock.y);
+	return clamp(voiceE(min(instanceIndex, 2u)).z, 0.0, 1.0);
 }
 
 // One weft draft: how many times a filament crosses between its two rails in
@@ -796,14 +866,14 @@ fn weftDraft(phrase: f32, index: u32) -> vec2<f32> {
 	return vec2<f32>(crossings, h2 * TAU);
 }
 
+// Each weft strand keeps its own draft; the whole weave no longer re-drafts at
+// once on every phrase. Chord changes re-thread one weft group at a time (its
+// crossings and phase glide to the chord, ensemble.ts).
 fn weftAngle(s: f32, index: u32) -> f32 {
-	let phrase = floor(params.cloth.x / 32.0);
-	let phrasePos = fract(params.cloth.x / 32.0);
-	let draftNow = weftDraft(phrase, index);
-	let draftNext = weftDraft(phrase + 1.0, index);
-	let blend = smoothstep(0.92, 1.0, phrasePos);
-	let crossings = mix(draftNow.x, draftNext.x, blend);
-	let phase = mix(draftNow.y, draftNext.y, blend) + params.harmony.z * TAU * 0.5;
+	let draft = weftDraft(0.0, index);
+	let rethread = voiceC(3u + (index & 1u));
+	let crossings = max(0.5, draft.x + rethread.x);
+	let phase = draft.y + params.harmony.z * TAU * 0.5 + rethread.y;
 	return s * TAU * crossings + phase;
 }
 
@@ -827,6 +897,7 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.role = 0.0;
 		st.sid = hashUnit(instanceIndex, 71u, 3u);
 		st.weft = 0u;
+		st.group = instanceIndex;
 	} else if (instanceIndex < FIRST_CHORUS) {
 		let sub = instanceIndex - PRIMARY;
 		let pairA = sub & 1u;
@@ -839,6 +910,7 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.role = 0.0;
 		st.sid = hashUnit(sub, 73u, 5u);
 		st.weft = sub;
+		st.group = 3u + pairA;
 	} else {
 		let k = instanceIndex - FIRST_CHORUS;
 		// Bit-reversed lane order: any visible prefix is spread evenly.
@@ -852,6 +924,10 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 		st.role = f32(k & 1u);
 		st.sid = f32(k & 1u) * 0.6 + hashUnit(k, 79u, 7u) * 0.4;
 		st.weft = k;
+		// Chorus groups are bands of four neighbouring lanes, so each answers
+		// its instrument in its own part of the weave (the first visible
+		// strands, in bit-reversed order, fall one in each band).
+		st.group = 5u + (rev / 4u);
 	}
 	return st;
 }
@@ -859,11 +935,17 @@ fn strandInfo(instanceIndex: u32) -> Strand {
 // World-space point on strand: grammar surface, weft threading, the shared
 // reactive layer and the genome's beat form. w = how closed the loop is.
 fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
-	var lane = laneSpacing(st.lane);
+	let va = voiceA(st.group);
+	let vb = voiceB(st.group);
+	let vc = voiceC(st.group);
+	// A build gathers a chorus group toward the middle, a diminished chord
+	// clusters it, stereo width spreads it.
+	let gather = 1.0 - voiceD(st.group).x;
+	var lane = laneSpacing(st.lane) * gather;
 	var weftLift = 0.0;
 	if (st.kind == 1.0) {
 		let angle = weftAngle(s, st.weft);
-		lane = mix(laneSpacing(st.lane), laneSpacing(st.laneB), 0.5 + 0.5 * sin(angle));
+		lane = mix(laneSpacing(st.lane), laneSpacing(st.laneB), 0.5 + 0.5 * sin(angle)) * gather;
 		weftLift = cos(angle);
 	}
 	let g = surfacePoint(s, st, lane);
@@ -879,16 +961,34 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 	let sw = fract(s);
 	let q = sw * 2.0 - 1.0;
 	if (g.react > 0.001) {
+		// Swing (lean) skews the group's wave, so it leans off the beat.
 		let osc = sin(q * TAU * (0.85 + familyUnit * 0.7 + params.shapeB.w * 0.55)
-			+ params.cloth.y * (0.42 + params.macroRails.w * 0.38) + f32(st.family) * 1.41);
-		var r = g.n * osc * env * (0.04 + band * 0.085 + params.macroRails.y * 0.03) * params.view.w;
-		r = r + g.b * bandDetail(st.family, sw) * env * (0.045 + band * 0.075) * params.view.w;
-		let beatCenter = fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + st.role * 0.13);
-		let beatWindow = exp(-pow(sw - beatCenter, 2.0) * 95.0);
-		r = r + (g.n * (0.05 + band * 0.08) + g.b * (0.06 + band * 0.06)) * beatWindow * params.pulse.x;
-		r = r + g.n * params.pulse.y * env * sin(q * 15.0 + lane * 6.0) * 0.032;
-		r = r + g.b * params.pulse.z * env * sin(q * 8.0 - params.view.z * 4.0) * 0.032;
+			+ voiceE(st.group).x + f32(st.family) * 1.41 + vb.z * q * 1.4);
+		var r = g.n * osc * env * (0.04 + band * 0.05 + params.macroRails.y * 0.03) * params.view.w;
+		// Legato smooths a group's ribbon; hats and staccato roughen it.
+		r = r + g.b * bandDetail(st.family, sw) * env * (0.022 + band * 0.025) * params.view.w * vb.x;
+		// The group's own hits push its threads where its packets sit.
+		let beatWindow = min(packetLight(st.group, sw, 1.6), 1.5);
+		r = r + (g.n * (0.05 + band * 0.08) + g.b * (0.06 + band * 0.06)) * beatWindow;
 		p = p + r * g.react;
+	}
+
+	// Slack: a loosened group sags and sways; a breakdown lets withdrawn groups
+	// fall away. Lean tilts the group along its length.
+	let slack = va.z;
+	let sag = mix(sin(PI * sw), 1.0, g.closed);
+	p.y = p.y - slack * 0.3 * sag * env;
+	p = p + g.b * slack * 0.1 * sin(sw * TAU * 2.0 + params.postB.w * 1.3 + st.sid * 5.0) * env;
+	p = p + g.n * vb.z * 0.035 * q * env;
+	if (st.group == 0u) {
+		// The bass line: the low rail rises and falls with the bass pitch, a
+		// leap plucks it, a walking bass ripples along it.
+		let bass = parts[PART_BASS];
+		let walk = parts[PART_BASS_WALK];
+		let pluck = bass.x * 0.075 * sin(PI * sw * bass.y) * cos(bass.z);
+		let walking = bass.w * 0.04 * sin(sw * TAU * 1.5 - walk.x * 2.0);
+		p.y = p.y + vb.y * 0.09 * env;
+		p = p + (g.n + vec3<f32>(0.0, 0.6, 0.0)) * (pluck + walking) * env;
 	}
 
 	// Turbulence (noisy, restless music): the threads churn in an eddying
@@ -911,10 +1011,12 @@ fn loomPoint(s: f32, st: Strand) -> vec4<f32> {
 
 	// Beat forms. Plucked strings ring a standing wave on each kick; the
 	// shuttle bump rides the threads one step per beat.
+	// Plucked strings ring a standing wave on each of their own group's hits;
+	// a fill's shuttle lifts every thread as it passes.
 	let modeCount = 2.0 + f32(st.family % 3u);
-	let pluck = params.beat.y * params.pulse.x * 0.085 * sin(PI * sw * modeCount)
+	let pluck = params.beat.y * vc.w * 0.085 * sin(PI * sw * modeCount)
 		* sin(params.view.z * TAU * 6.5 + st.sid * 9.0) * mix(env, 1.0, 0.4);
-	let shuttle = params.beat.w * exp(-pow((sw - shuttleS()) * 14.0, 2.0)) * (0.03 + params.pulse.w * 0.05);
+	let shuttle = shuttleBandAt(st.group, sw, 1.6) * 0.05;
 	p = p + g.n * (pluck + shuttle) * params.beatB.y;
 	return vec4<f32>(deformFigure(p), g.closed);
 }
@@ -931,7 +1033,9 @@ fn mirrorStage(q: vec3<f32>) -> vec4<f32> {
 	let floorY = floorStageY();
 	let height = q.y - floorY;
 	let t = params.view.z;
-	let swell = params.envA.z * (0.45 + params.audioA.y * 0.8 + params.audioA.z * 0.9) * (0.2 + max(height, 0.0));
+	// The water swells with the bass notes' rings (ensemble.ts), not the mix.
+	let rings = parts[PART_RING_A].w + parts[PART_RING_A + 1u].w;
+	let swell = params.envA.z * (0.45 + rings * 0.9) * (0.2 + max(height, 0.0));
 	let wobble = vec2<f32>(
 		sin(q.z * 6.3 + t * 1.3 + sin(q.x * 3.1 - t * 0.7)) + 0.5 * sin(q.x * 13.0 - t * 2.1),
 		sin(q.x * 5.7 - t * 1.1) + 0.5 * sin(q.z * 11.0 + t * 1.7)
@@ -996,29 +1100,37 @@ fn strandVertex(vertexIndex: u32, instanceIndex: u32, mirrored: bool) -> LoomOut
 	// Thickness profile from the genome: tapered, even, beaded or swelling.
 	let capEnds = mix(smoothstep(0.0, 0.05, s) * smoothstep(1.0, 0.95, s), 1.0, closed);
 	let taper = mix(1.0, 0.45 + 0.55 * pow(max(0.0, 1.0 - q * q), 0.5), params.formB.y * (1.0 - closed));
-	let bead = 1.0 + params.formB.z * 0.95 * pow(0.5 + 0.5 * sin(s * TAU * 9.0 - params.cloth.x * 0.25 + st.sid * 4.0), 6.0);
+	let crawl = voiceE(st.group).y;
+	let bead = 1.0 + params.formB.z * 0.95 * pow(0.5 + 0.5 * sin(s * TAU * 9.0 - crawl * 0.25 + st.sid * 4.0), 6.0);
 	let swell = 1.0 + params.formB.w * 0.75 * (0.5 + 0.5 * sin(s * TAU * 1.5 + params.cloth.w * 0.4 + st.sid * 3.0));
 	// Fraying (noisy music): the tube surface goes ragged, fibre by fibre.
 	let frayNoise = hashUnit(sample + instanceIndex * 409u, radialIndex % sides, 29u);
 	let fray = 1.0 + params.weave.x * (frayNoise - 0.4) * 0.9;
 	let profile = capEnds * taper * bead * swell * fray * params.frame.z;
 
+	let va = voiceA(st.group);
+	let vb = voiceB(st.group);
+	let vc = voiceC(st.group);
+	let vd = voiceD(st.group);
 	var hero = 0.0;
 	var radius = params.style.x;
 	var visible = 1.0;
 	if (kind == 0.0) {
 		hero = heroWeight(instanceIndex);
 		// Hierarchy: the hero rail is clearly the thickest line in the frame.
-		radius = params.style.x * (1.22 + hero * 1.2 + band * 0.6);
+		radius = params.style.x * (1.22 + hero * 1.2 + band * 0.15);
 	} else if (kind == 1.0) {
-		radius = params.style.x * 0.55 * (0.5 + band * 0.2) * (1.0 - params.cloth.z * 0.6);
+		radius = params.style.x * 0.55 * (0.5 + band * 0.12) * (1.0 - params.cloth.z * 0.6);
 	} else {
 		let k = f32(instanceIndex - FIRST_CHORUS);
 		visible = smoothstep(k, k + 1.0, params.topo.w * 16.0);
 		// chorusLevel is the light budget's chorus width: thin when the grammar is dense.
-		radius = params.style.x * (0.56 + band * 0.34) * visible * params.materialD.z;
+		radius = params.style.x * (0.56 + band * 0.16) * visible * params.materialD.z;
 	}
-	radius = radius * profile;
+	// Each group's own voice sets its weight (and a withdrawn group thins out).
+	// A hit swells its own thread where its packet sits (weight on the beat).
+	let packet = packetLight(st.group, fract(s), 1.0);
+	radius = radius * profile * va.y * (1.0 + min(packet, 1.5) * 0.5);
 
 	// A reflection deep below a rough floor spreads and dims (energy kept).
 	var mirrorDim = 1.0;
@@ -1037,34 +1149,46 @@ fn strandVertex(vertexIndex: u32, instanceIndex: u32, mirrored: bool) -> LoomOut
 	let clip = projectView(position);
 
 	let detail = bandDetail(family, fract(s));
-	let intersection = exp(-pow(abs(fract(s) - fract(params.cloth.x * 0.03125 + familyUnit * 0.23)), 2.0) * 70.0);
+	let intersection = exp(-pow(abs(fract(s) - fract(crawl * 6.0 / ${LOOM_CRAWL_WRAP.toFixed(6)} + familyUnit * 0.23)), 2.0) * 70.0);
 	// Phosphor core: rails carry an HDR emissive charge that bloom and the
-	// feedback trail pick up; each beat launches a light packet along it.
-	let packetsW = 0.45 + params.beat.x * 0.55;
-	let packet = exp(-pow(fract(s) - fract(params.cloth.x * 0.1618 + familyUnit * 0.37 + st.role * 0.13), 2.0) * 95.0);
-	var emission = 0.16 + band * 0.3 + packet * params.pulse.x * 0.9 * packetsW;
+	// feedback trail pick up. Light packets are the group's own hits, sitting
+	// where they fell in the bar (ensemble.ts): kick on one rail, snare on
+	// another, hats glittering in a chorus group, chord tones in another.
+	let packetsW = 0.6 + params.beat.x * 0.4;
+	var emission = 0.2 + band * 0.08;
+	var flash = packet * 1.1 * packetsW;
 	if (kind == 0.0) {
-		emission = (0.42 + hero * 0.62) + band * (0.62 + hero * 0.6) + packet * params.pulse.x * 4.2 * packetsW + params.pulse.w * 0.3;
+		emission = (0.48 + hero * 0.66) + band * 0.15;
+		flash = packet * 3.6 * packetsW;
 	} else if (kind == 2.0) {
 		// Chorus strands are structure: their glow comes from the light budget.
-		emission = (0.3 + band * 0.5 + packet * params.pulse.x * 2.2 * packetsW + params.pulse.w * 0.15) * params.beatB.w;
+		emission = (0.36 + band * 0.1) * params.beatB.w;
+		flash = packet * 2.4 * packetsW * max(params.beatB.w, 0.6);
 	}
-	// Crossing pulses: where the weft passes over a thread, beats flash.
+	// Crossing pulses: where the weft passes over a thread, the group's hits flash.
 	let crossAngle = weftAngle(s, st.weft + select(0u, 1u, kind == 0.0 && instanceIndex == 2u));
 	let crossing = pow(abs(sin(crossAngle)), 22.0);
-	emission = emission + params.beat.z * crossing * (params.pulse.w * 2.4 + params.pulse.x * 2.2) * select(1.0, 0.5, kind == 1.0);
-	// Shuttle: a bright band crossing every thread, one throw per beat.
-	let shuttleBand = exp(-pow((fract(s) - shuttleS()) * 16.0, 2.0));
-	emission = emission + params.beat.w * shuttleBand * (0.9 + params.pulse.x * 3.0);
-	// Sparks: fine glints shed along the threads, fed by air, impacts and fraying.
-	let sparkSeed = hashUnit(u32(fract(s) * 61.0) + 1u, instanceIndex + 3u, u32(params.cloth.x * 2.0));
-	let spark = select(0.0, 1.0, sparkSeed > 0.95 - params.weave.x * 0.04) * pow(max(0.0, sin(s * 157.0 + st.sid * 13.7 - params.view.z * 11.0)), 40.0)
-		* (params.beatB.x * (0.3 + params.audioB.z * 1.2 + params.pulse.x * 1.6) + params.materialD.y * params.audioB.z * 0.25 + params.weave.x * 0.35)
+	flash = flash + params.beat.z * crossing * vc.w * 2.6 * select(1.0, 0.5, kind == 1.0);
+	// Shuttle: a fill throws a bright band along one group's threads, once.
+	flash = flash + shuttleBandAt(st.group, fract(s), 1.0) * (1.4 + params.beat.w * 1.2);
+	// Sparks: fine glints shed along the threads; the hat group glitters with
+	// every hat (a new scatter of glints per hit), fraying sheds more.
+	let sparkSeed = hashUnit(u32(fract(s) * 61.0) + 1u, instanceIndex + 3u, u32(vd.y) + u32(crawl * 0.5) * 977u);
+	let spark = select(0.0, 1.0, sparkSeed > 0.95 - params.weave.x * 0.04 - vb.w * 0.07) * pow(max(0.0, sin(s * 157.0 + st.sid * 13.7 - params.view.z * 11.0)), 40.0)
+		* (params.beatB.x * (0.3 + vc.w * 1.6) + vb.w * 2.2 + params.materialD.y * 0.12 + params.weave.x * 0.35)
 		* select(1.0, 0.5, kind == 2.0);
-	emission = emission * params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
+	// The music's flashes keep their contrast in dark, drawn tones: light
+	// where the music puts it, even when the weave itself is dim.
+	// The eye adapts slowly to how much steady light the rails give: the
+	// whole song keeps one exposure while the parts carry the music.
+	let adapted = lightsIn[LIGHT_RAILS * LIGHT_POINTS * 2u].z;
+	let eye = select(1.0, clamp(pow(max(adapted, 0.01), 0.6), 0.7, 1.4), adapted > 0.0);
+	let emissionScale = params.style.z * (1.0 - params.style.w * 0.8) * eye;
+	emission = emission * emissionScale * params.frame.w * va.x
+		+ flash * emissionScale * max(params.frame.w, 0.75) * mix(1.0, va.x, 0.5);
 	// Beats read as a colour event, not only a brightness event: the packet
 	// shifts toward the weft colour as it travels.
-	let packetMix = clamp(packet * params.pulse.x * 1.6 * packetsW, 0.0, 1.0) * select(0.5, 1.0, kind == 0.0);
+	let packetMix = clamp(packet * 1.5 * packetsW, 0.0, 1.0) * select(0.8, 1.0, kind == 0.0);
 
 	// Three colour roles, not a sweep: hero rail = hero, supporting rails =
 	// support, weft = weft; chorus strands span support to weft across lanes.
@@ -1082,6 +1206,9 @@ fn strandVertex(vertexIndex: u32, instanceIndex: u32, mirrored: bool) -> LoomOut
 		value = value * 0.92;
 	}
 	base = mix(base, weftC, max(0.0, -params.harmony.w) * 0.12);
+	// The chord's colour relation, per group: major warm, minor cool,
+	// diminished clashing (alternate groups pulled apart round the wheel).
+	base = hueRotate(base, va.w);
 	value = value * (1.0 - params.style.w * 0.56);
 
 	let cameraPoint = vec3<f32>(0.0, 0.0, params.camera.z);
@@ -1089,12 +1216,15 @@ fn strandVertex(vertexIndex: u32, instanceIndex: u32, mirrored: bool) -> LoomOut
 	out.position = clip;
 	out.worldNormal = radial;
 	out.viewDirection = normalize(cameraPoint - position);
-	out.color = mix(base * value, weftC * value * 1.35, packetMix);
+	// A packet runs hot: the weft colour lifted toward white, so it reads on
+	// a bright ribbon as well as on a dim one.
+	let hot = mix(colorPeak(weftC), vec3<f32>(1.0, 0.96, 0.9), 0.35) * max(value, 0.45) * 1.5;
+	out.color = mix(base * value, hot, packetMix);
 	out.dataA = vec4<f32>(s, kind, band, select(st.role, hero, kind == 0.0));
 	out.dataB = vec4<f32>(detail, emission, intersection, depth);
 	out.tangent = tangent;
-	out.dataC = vec4<f32>(st.lane, st.sid, spark * params.style.z * (1.0 - params.style.w), visible);
-	out.envData = vec4<f32>(height, select(0.0, 1.0, mirrored), mirrorDim, 0.0);
+	out.dataC = vec4<f32>(st.lane, st.sid, spark * params.style.z * (1.0 - params.style.w) * min(va.x, 1.4), visible);
+	out.envData = vec4<f32>(height, select(0.0, 1.0, mirrored), mirrorDim, crawl);
 	return out;
 }
 
@@ -1131,7 +1261,9 @@ fn envReflection(r: vec3<f32>, keyLight: vec3<f32>, keyColor: vec3<f32>) -> vec3
 fn shadeStrand(in: LoomOut) -> vec3<f32> {
 	let normal = normalize(in.worldNormal);
 	let view = normalize(in.viewDirection);
-	let az = params.light.x * TAU;
+	// The key light has its own slow voice (the chord's warmth, the fill).
+	let lightVoice = parts[PART_LIGHT];
+	let az = (params.light.x + lightVoice.z) * TAU;
 	let keyLight = normalize(vec3<f32>(-0.66 * cos(az), params.light.y, 0.5 + 0.32 * sin(az)));
 	let rimLight = normalize(vec3<f32>(0.72 * cos(az), -0.24, 0.52 - 0.2 * sin(az)));
 	let kind = in.dataA.y;
@@ -1155,20 +1287,20 @@ fn shadeStrand(in: LoomOut) -> vec3<f32> {
 	// visible on the surface; the hero carries the strongest pattern.
 	// Coarse enough to resolve at Loom's pixel cap: finer striations alias into
 	// shimmering noise on thin strands.
-	let stripePhase = in.dataA.x * select(190.0, 330.0, isSecondary) - params.cloth.x * 1.5707963;
+	let stripePhase = in.dataA.x * select(190.0, 330.0, isSecondary) - in.envData.w * 1.5;
 	let stripeAmount = clamp((0.015 + hero * 0.075) * matC.y + max(0.0, matC.y - 2.0) * 0.09, 0.0, 0.62);
 	let striation = (1.0 - stripeAmount) + stripeAmount * cos(stripePhase);
 	// Fibre grain (noisy, dark timbres): a fixed, coarse grain on the surface.
 	let grainNoise = hashUnit(u32(in.dataA.x * 420.0), u32(in.dataC.y * 977.0) + u32(kind), 17u);
 	let grain = 1.0 - params.weave.y * 0.5 * grainNoise;
 
-	let warm = params.light.z;
+	let warm = clamp(params.light.z + lightVoice.x, 0.0, 1.0);
 	let warmTint = mix(vec3<f32>(0.96, 0.98, 1.04), vec3<f32>(1.06, 0.94, 0.8), warm);
 	let rimColor = mix(vec3<f32>(1.0), colorPeak(params.weftTint.rgb), 0.6) * 1.05;
 	// Coloured light rig: key carries the support colour, fill the hero, so
 	// highlights never bleach the palette to white.
 	let keyColor = mix(vec3<f32>(1.0), colorPeak(params.supportTint.rgb), 0.45) * warmTint;
-	let fillColor = colorPeak(params.heroTint.rgb) * params.light.w;
+	let fillColor = colorPeak(params.heroTint.rgb) * params.light.w * lightVoice.y;
 	let detailShade = 1.0 + in.dataB.x * select(0.18, 0.5, !isSecondary);
 
 	// Pearl: the body colour slides toward the weft colour at grazing angles.
@@ -1187,7 +1319,7 @@ fn shadeStrand(in: LoomOut) -> vec3<f32> {
 	let coreExponent = mix(1.5, 4.2, edge);
 	let core = pow(max(ndv, 0.0), coreExponent) * mix(0.85, 1.35, edge);
 	// Molten glass: long, slowly flowing heat bands along the thread.
-	let hot = 1.0 + matC.w * 0.9 * pow(0.5 + 0.5 * sin(in.dataA.x * TAU * 1.5 + in.dataC.y * 6.0 - params.cloth.x * 0.125), 2.5);
+	let hot = 1.0 + matC.w * 0.9 * pow(0.5 + 0.5 * sin(in.dataA.x * TAU * 1.5 + in.dataC.y * 6.0 - in.envData.w * 0.125), 2.5);
 	let emissive = body * in.dataB.y * (0.4 + core * 1.3) * (1.0 + in.dataB.x * 0.6 * hero) * matB.y * hot;
 	let whiteCore = vec3<f32>(1.0, 0.97, 0.94) * in.dataB.y * pow(max(ndv, 0.0), 5.0) * matB.w * 0.32;
 	let crossingGlow = rimColor * in.dataB.z * (0.16 + params.pulse.y * 0.12);
@@ -1224,22 +1356,29 @@ fn fs_mirror(in: LoomOut) -> @location(0) vec4<f32> {
 // (view space) with the light it gives off, so the floor, the medium, the far
 // threads and the dust can be lit by it. Packets and the shuttle travel along
 // it, so beats light the room where they run.
-fn railLight(s: f32, rail: u32, st: Strand) -> vec3<f32> {
+// rgb: the rail's steady light (its slow glow and width); w: how much its
+// transients (packets, the shuttle, the band) multiply that right now. The far
+// stage takes only the steady light, so a kick on one rail never relights the
+// whole room; surfaces near the rails take the transients too.
+fn railLight(s: f32, rail: u32, st: Strand) -> vec4<f32> {
 	let hero = heroWeight(rail);
 	let band = strandBand(st);
-	let familyUnit = f32(st.family % 6u) / 5.0;
-	let packetsW = 0.45 + params.beat.x * 0.55;
+	let packetsW = 0.6 + params.beat.x * 0.4;
+	let va = voiceA(rail);
+	let vd = voiceD(rail);
 	// Wider than the visible packet: the light is sampled at only a few points.
-	let packet = exp(-pow(s - fract(params.cloth.x * 0.1618 + familyUnit * 0.37), 2.0) * 26.0);
-	let shuttle = params.beat.w * exp(-pow((s - shuttleS()) * 7.0, 2.0)) * (0.5 + params.pulse.x * 1.5);
-	var emission = (0.42 + hero * 0.62) + band * (0.62 + hero * 0.6) + packet * params.pulse.x * 2.4 * packetsW
-		+ params.pulse.w * 0.3 + shuttle;
-	emission = emission * params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
-	let base = mix(params.supportTint.rgb * params.supportTint.w, params.heroTint.rgb * params.heroTint.w, hero);
-	let value = 0.36 + hero * 0.2 + band * 0.3 + params.macroRails.x * 0.1;
+	let packet = packetLight(rail, s, 2.6);
+	let shuttle = shuttleBandAt(rail, s, 2.4) * 1.2;
+	let gain = params.style.z * (1.0 - params.style.w * 0.8) * params.frame.w;
+	let steadyEmission = (0.42 + hero * 0.62) * vd.z * gain;
+	let transientEmission = (band * 0.2 + packet * 2.4 * packetsW + shuttle) * gain;
+	let base = hueRotate(mix(params.supportTint.rgb * params.supportTint.w, params.heroTint.rgb * params.heroTint.w, hero), va.w);
+	let value = 0.36 + hero * 0.2 + params.macroRails.x * 0.1;
 	let glowing = clamp(params.materialB.y, 0.2, 2.2);
-	let width = (1.22 + hero * 1.2 + band * 0.6) * params.style.x * 60.0;
-	return base * value * (0.3 + emission * glowing) * width * params.envC.z;
+	let width = (1.22 + hero * 1.2) * params.style.x * 60.0 * vd.w;
+	let steady = base * value * (0.3 + steadyEmission * glowing) * width * params.envC.z;
+	let full = (0.3 + (steadyEmission + transientEmission) * glowing) / (0.3 + steadyEmission * glowing);
+	return vec4<f32>(steady, full);
 }
 
 @group(0) @binding(2) var<storage, read_write> lightsOut: array<vec4<f32>, ${LOOM_LIGHT_VEC4S}>;
@@ -1258,21 +1397,25 @@ fn cs_lights(@builtin(local_invocation_index) index: u32) {
 		let world = loomPoint(s, st);
 		let light = railLight(s, rail, st);
 		lightsOut[index * 2u] = vec4<f32>(viewPoint(world.xyz), 0.0);
-		lightsOut[index * 2u + 1u] = vec4<f32>(light, 0.0);
-		level = dot(light, vec3<f32>(0.2126, 0.7152, 0.0722));
+		lightsOut[index * 2u + 1u] = light;
+		level = dot(light.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
 	}
 	lightLevels[index] = level;
 	workgroupBarrier();
 	if (index == 0u) {
-		// The stage's eye adapts (about a second) to how much light the ribbons
-		// give, so a quiet, dim weave still shows the space it lives in, while
-		// beats, which are faster than the adaptation, still light it up.
+		// The stage's eye adapts (about a second) to how much steady light the
+		// ribbons give, so a quiet, dim weave still shows the space it lives in;
+		// transients never pump it.
 		var total = 0.0;
 		for (var i = 0u; i < count; i = i + 1u) { total = total + lightLevels[i]; }
 		let goal = clamp(pow(9.0 / max(total, 0.05), 0.8), 0.4, 8.0);
 		let previous = lightsOut[count * 2u].x;
 		let adapted = select(mix(previous, goal, 0.025), goal, previous <= 0.0);
-		lightsOut[count * 2u] = vec4<f32>(adapted, total, 0.0, 0.0);
+		// z: the same goal, adapted over about ten seconds: the strands' eye,
+		// slow enough never to pulse, quick enough to follow a new era.
+		let previousSlow = lightsOut[count * 2u].z;
+		let slowAdapted = select(mix(previousSlow, goal, clamp(parts[PART_LIGHT].w, 0.0005, 0.1)), goal, previousSlow <= 0.0);
+		lightsOut[count * 2u] = vec4<f32>(adapted, total, slowAdapted, 0.0);
 	}
 }
 `;
@@ -1320,7 +1463,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let centered = in.uv - 0.5;
 	// The genome picks the trail's drift and spin per section, so trails smear
 	// in a different direction from scene to scene.
-	let theta = (sin(params.cloth.y * 0.35) * 0.0025 + params.postB.z) * params.view.w;
+	let theta = params.postB.z * params.view.w;
 	let c = cos(theta);
 	let sn = sin(theta);
 	let rotated = vec2<f32>(centered.x * c - centered.y * sn, centered.x * sn + centered.y * c) * params.post.y;
@@ -1413,6 +1556,9 @@ const THREAD_SEGMENTS: u32 = ${LOOM_THREAD_SEGMENTS}u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> lights: array<vec4<f32>, ${LOOM_LIGHT_VEC4S}>;
+// Every stage pipeline (floor, threads, dust, medium) reads its own voice here.
+@group(0) @binding(2) var<storage, read> parts: array<vec4<f32>, ${LOOM_PART_VEC4S}>;
+${PARTS_WGSL}
 
 // Light arriving at p from the ribbons. Each segment between two light samples
 // is a uniformly emitting line; its contribution is the closed-form integral
@@ -1420,15 +1566,19 @@ const THREAD_SEGMENTS: u32 = ${LOOM_THREAD_SEGMENTS}u;
 // blends in a Lambert term toward the closest point (surfaces), fibreWeight a
 // Kajiya-Kay term for thin fibres with tangent t (threads); extinction is how
 // fast the light dies out with distance through the medium.
-fn ribbonLight(p: vec3<f32>, n: vec3<f32>, normalWeight: f32, t: vec3<f32>, fibreWeight: f32, core: f32, extinction: f32) -> vec3<f32> {
+// transient 0..1: how much of the rails' packets and shuttle this surface takes
+// (near surfaces all of it, the far stage none: see railLight).
+fn ribbonLight(p: vec3<f32>, n: vec3<f32>, normalWeight: f32, t: vec3<f32>, fibreWeight: f32, core: f32, extinction: f32, transient: f32) -> vec3<f32> {
 	var sum = vec3<f32>(0.0);
 	for (var rail = 0u; rail < LIGHT_RAILS; rail = rail + 1u) {
 		let first = rail * LIGHT_POINTS;
 		var a = lights[first * 2u].xyz;
-		var ca = lights[first * 2u + 1u].rgb;
+		let la = lights[first * 2u + 1u];
+		var ca = la.rgb * mix(1.0, la.w, transient);
 		for (var k = 1u; k < LIGHT_POINTS; k = k + 1u) {
 			let b = lights[(first + k) * 2u].xyz;
-			let cb = lights[(first + k) * 2u + 1u].rgb;
+			let lb = lights[(first + k) * 2u + 1u];
+			let cb = lb.rgb * mix(1.0, lb.w, transient);
 			let d = b - a;
 			let len = max(length(d), 1e-4);
 			let dir = d / len;
@@ -1498,8 +1648,14 @@ fn floorHeight(xz: vec2<f32>) -> f32 {
 	var h = sin(dot(xz, vec2<f32>(1.7, 0.6)) * 3.1 - t * 1.4) * 0.5;
 	h = h + sin(dot(xz, vec2<f32>(-0.8, 1.3)) * 4.3 - t * 1.9) * 0.35;
 	h = h + sin(dot(xz, vec2<f32>(0.3, -1.9)) * 6.7 - t * 2.6) * 0.2;
-	let r = length(xz);
-	h = h + sin(r * 9.0 - params.view.z * 5.0) * exp(-r * 0.7) * (0.25 + params.audioA.z * 1.4 + params.audioA.y * 0.6);
+	// Bass notes drop rings on the water where they land (two alternate, so a
+	// new note never cuts the last one off).
+	for (var k = 0u; k < 2u; k = k + 1u) {
+		let ring = parts[PART_RING_A + k];
+		let d = length(xz - ring.xy);
+		let front = d - ring.z * 1.3;
+		h = h + sin(front * 12.0) * exp(-front * front * 5.0) * exp(-d * 0.35) * ring.w * 1.6;
+	}
 	return h * params.envA.z * 0.012;
 }
 
@@ -1539,10 +1695,11 @@ fn fs_floor(in: FloorOut) -> FloorFragment {
 
 	// The ribbons' light pooling on the floor, tinted a touch by the family.
 	let tint = mix(vec3<f32>(1.0), colorPeakEnv(params.deepTint.rgb), 0.3);
-	let pooled = ribbonLight(hit, normal, 1.0, vec3<f32>(0.0), 0.0, 0.004, 0.3) * params.envA.w * 6.5 * tint
+	let floorVoice = parts[PART_FLOOR];
+	let pooled = ribbonLight(hit, normal, 1.0, vec3<f32>(0.0), 0.0, 0.004, 0.3, 0.25) * params.envA.w * 6.5 * tint * floorVoice.y
 		* albedoVariation * (1.0 - fresnel * 0.5) * (1.0 - wet * params.envA.x * 0.4);
 	// Mirror strength over the reflected strands drawn beneath this surface.
-	let reflectance = clamp(params.envA.x * wet * (0.24 + 0.76 * fresnel) * (1.0 - params.envA.y * 0.35), 0.0, 1.0) * fog;
+	let reflectance = clamp(params.envA.x * floorVoice.x * wet * (0.24 + 0.76 * fresnel) * (1.0 - params.envA.y * 0.35), 0.0, 1.0) * fog;
 
 	// Pooled light rolls off well below the ribbons: a floor right under a hot
 	// rail glows, it never floods the frame.
@@ -1602,10 +1759,16 @@ fn threadPoint(i: u32, u: f32) -> vec3<f32> {
 	let freeness = mix(u, sin(PI * u), reach);
 	let phase = hashUnit(i, 109u, 4u) * TAU;
 	let t = params.postB.w;
+	// The far threads have their own voice: chord changes make them ring.
+	let voice = parts[PART_THREADS];
 	let sway = vec2<f32>(sin(y * 0.9 + t * 0.6 + phase), cos(y * 0.7 + t * 0.5 + phase * 1.3))
-		* (0.04 + params.weave.z * 0.12) * freeness;
+		* (0.04 + params.weave.z * 0.12) * freeness * voice.w;
 	let mode = f32(1u + i % 3u);
-	let pluck = params.pulse.x * 0.012 * sin(PI * u * mode) * sin(params.view.z * 21.0 + phase * 3.0);
+	// Only the threads in the sector the chord's root points to ring.
+	let sector = parts[PART_THREADS_B].x;
+	let away = abs(fract((atan2(anchor.y, anchor.x) - sector) / TAU + 0.5) - 0.5) * TAU;
+	let ring = smoothstep(1.1, 0.3, away);
+	let pluck = voice.y * ring * 0.024 * sin(PI * u * mode) * sin(voice.z + phase * 3.0);
 	return vec3<f32>(anchor.x + sway.x + pluck, y, anchor.y + sway.y);
 }
 
@@ -1636,7 +1799,7 @@ fn vs_threads(
 	let drawnPx = clamp(physicalPx, 1.8, 3.0);
 	clip = vec4<f32>(clip.xy + vec2<f32>(perpendicular.x / aspect, perpendicular.y) * side * drawnPx / height * clip.w, clip.zw);
 
-	let light = ribbonLight(here, vec3<f32>(0.0), 0.0, tangent, 1.0, 0.01, 0.05);
+	let light = ribbonLight(here, vec3<f32>(0.0), 0.0, tangent, 1.0, 0.01, 0.05, 0.0);
 	// Threads between the camera and the figure step aside (fade) so they
 	// never veil it; distance hides the rest in fog.
 	let front = 1.0 - smoothstep(0.2, 1.4, here.z);
@@ -1646,7 +1809,7 @@ fn vs_threads(
 	var out: ThreadOut;
 	out.position = clip;
 	out.color = light * tint * 6.0 * (physicalPx / drawnPx) * front * near * fogTransmittance(depth) * params.envD.x
-		* threadWeight(instanceIndex);
+		* threadWeight(instanceIndex) * parts[PART_THREADS].x;
 	out.across = side;
 	return out;
 }
@@ -1702,12 +1865,13 @@ fn vs_dust(
 	let coverage = min(1.0, (physicalPx * physicalPx) / (drawnPx * drawnPx) * 4.0);
 	// Steep falloff: a mote glints only within reach of a strand, so dust never
 	// spreads over the frame like a field of stars.
-	let light = ribbonLight(view, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.004, 1.6);
+	let light = ribbonLight(view, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.004, 1.6, 1.0);
 	// Motes right at the lens would streak past like stars: they fade first.
 	let near = smoothstep(1.0, 2.6, depth);
 	var out: DustOut;
 	out.position = clip;
-	out.color = light * (0.4 + h.x * 0.8) * coverage * edgeFade * near * fogTransmittance(depth) * params.envD.w * 22.0;
+	out.color = light * (0.4 + h.x * 0.8) * coverage * edgeFade * near * fogTransmittance(depth) * params.envD.w * 22.0
+		* parts[PART_DUST].x;
 	out.corner = corner;
 	return out;
 }
@@ -1743,9 +1907,11 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let stepLength = stepDepth * rayLength;
 	let jitter = ign(in.position.xy);
 	let floorY = floorStageY();
-	let density = params.envB.x * params.hazeTint.w;
+	// The medium has its own slow voice (pads thicken it, the groove stirs it).
+	let voice = parts[PART_MIST];
+	let density = params.envB.x * params.hazeTint.w * voice.x;
 	let flow = params.postB.w;
-	let stir = params.weave.z;
+	let stir = params.weave.z + voice.w;
 	var transmittance = 1.0;
 	var light = vec3<f32>(0.0);
 	for (var i = 0; i < steps; i = i + 1) {
@@ -1753,7 +1919,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		let pv = eye + ray * d;
 		let ps = viewToStage(pv);
 		let height = ps.y - floorY;
-		let layer = exp(-max(height, 0.0) / max(params.envB.y, 0.05)) + 0.004;
+		let layer = exp(-max(height, 0.0) / max(params.envB.y * voice.y, 0.05)) + 0.004;
 		let drift = vec3<f32>(flow * 0.05, -flow * 0.015, flow * 0.03);
 		let curl = vec3<f32>(sin(ps.y * 1.3 + flow * 0.4), 0.0, cos(ps.x * 1.1 - flow * 0.3)) * stir * 0.6;
 		// Banks and wisps with clear air between them, so the light shows the
@@ -1766,13 +1932,13 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		if (sigma > 1e-4) {
 			// A wide core: the medium right at a strand is lit softly, so the
 			// scattering pools in the mist instead of haloing the figure.
-			let scatter = ribbonLight(pv, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.09, 1.1);
+			let scatter = ribbonLight(pv, vec3<f32>(0.0), 0.0, vec3<f32>(0.0), 0.0, 0.09, 1.1, 0.15);
 			light = light + scatter * (transmittance * sigma * stepLength);
 			transmittance = transmittance * exp(-sigma * stepLength);
 		}
 	}
 	let tint = mix(vec3<f32>(1.0), colorPeakEnv(params.hazeTint.rgb), 0.3);
-	return vec4<f32>(light * tint * 5.0, 1.0);
+	return vec4<f32>(light * tint * 5.0 * voice.z, 1.0);
 }
 `;
 

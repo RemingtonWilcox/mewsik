@@ -554,13 +554,15 @@ test.describe('Loom harmony conductor', () => {
 		expect(result.triples).toBeGreaterThanOrEqual(40);
 		expect(result.liveTriples).toBeGreaterThanOrEqual(40);
 		expect(result.grammars).toBe(result.grammarCount);
-		expect(result.palettes).toBeGreaterThan(24);
+		// Palette families are era-scale (the slow container): fewer families
+		// per hour, while each strand group's colour answers its own chords.
+		expect(result.palettes).toBeGreaterThan(15);
 		expect(result.cameras).toBe(7);
 		expect(result.materials).toBe(7);
 		expect(result.environments).toBe(6);
 		expect(result.beatForms).toBe(5);
 		expect(result.liveGrammars).toBeGreaterThanOrEqual(10);
-		expect(result.livePalettes).toBeGreaterThanOrEqual(15);
+		expect(result.livePalettes).toBeGreaterThanOrEqual(9);
 		// Colour glides: at 8 updates per second no colour channel jumps.
 		expect(result.maxStepJump).toBeLessThan(0.2);
 		expect(result.invalid).toBe(0);
@@ -806,7 +808,8 @@ test.describe('Loom harmony conductor', () => {
 		});
 		// Camera holds at most three phrases (maxHold), so no scene lingers past that.
 		expect(result.longest).toBeLessThanOrEqual(3);
-		expect(result.tones).toBe(result.toneCount);
+		// Tones are era-scale (they relight the whole room): most still rotate.
+		expect(result.tones).toBeGreaterThanOrEqual(result.toneCount - 1);
 		expect(result.compositions).toBe(result.compositionCount);
 		expect(result.environments).toBe(6);
 	});
