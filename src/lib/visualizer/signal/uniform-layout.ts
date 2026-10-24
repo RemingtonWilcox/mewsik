@@ -18,7 +18,8 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['figureA', ['figAX', 'figAY', 'figAScale', 'figAVis']],
 	['figureB', ['figBX', 'figBY', 'figBScale', 'figBScreen']],
 	['head', ['headU', 'headX', 'headY', 'lightLevel']],
-	['sweep', ['sweepPhase', 'channels', 'feed', 'feedPhase']],
+	// traceLevel: the X/Y traces' own energy, on its own (slower) time.
+	['sweep', ['sweepPhase', 'channels', 'feed', 'traceLevel']],
 	// Channel trace frames: origin, time axis, value axis, scroll mode, visibility.
 	['trace0', ['t0ox', 't0oy', 't0tx', 't0ty']],
 	['trace0v', ['t0vx', 't0vy', 't0scroll', 't0vis']],
@@ -28,8 +29,40 @@ export const SIGNAL_UNIFORM_GROUPS = [
 	['trace2v', ['t2vx', 't2vy', 't2scroll', 't2vis']],
 	['trace3', ['t3ox', 't3oy', 't3tx', 't3ty']],
 	['trace3v', ['t3vx', 't3vy', 't3scroll', 't3vis']],
-	['band2', ['band2Level', 'band2Lo', 'band2Hi', 'band2Cycles']],
-	['band3', ['band3Level', 'band3Lo', 'band3Hi', 'band3Cycles']],
+	// Voice lanes (band.ts): traces 2..7 are bass, harmony, kick, snare, hat
+	// and perc, each written by its own head into the voice buffer.
+	['trace4', ['t4ox', 't4oy', 't4tx', 't4ty']],
+	['trace4v', ['t4vx', 't4vy', 't4scroll', 't4vis']],
+	['trace5', ['t5ox', 't5oy', 't5tx', 't5ty']],
+	['trace5v', ['t5vx', 't5vy', 't5scroll', 't5vis']],
+	['trace6', ['t6ox', 't6oy', 't6tx', 't6ty']],
+	['trace6v', ['t6vx', 't6vy', 't6scroll', 't6vis']],
+	['trace7', ['t7ox', 't7oy', 't7tx', 't7ty']],
+	['trace7v', ['t7vx', 't7vy', 't7scroll', 't7vis']],
+	// Each lane's presence, and the fill cascade down the horizon rows.
+	['voiceVis', ['vis2', 'vis3', 'vis4', 'vis5']],
+	['voiceVis2', ['vis6', 'vis7', 'fillTravel', 'fillAmount']],
+	// Each lane's write head, the breakdown withdrawal and the build's gather.
+	['voiceHead', ['head2', 'head3', 'head4', 'head5']],
+	['voiceHead2', ['head6', 'head7', 'withdraw', 'gather']],
+	// Each lane's phosphor and light.
+	['voiceColor2', ['v2r', 'v2g', 'v2b', 'v2light']],
+	['voiceColor3', ['v3r', 'v3g', 'v3b', 'v3light']],
+	['voiceColor4', ['v4r', 'v4g', 'v4b', 'v4light']],
+	['voiceColor5', ['v5r', 'v5g', 'v5b', 'v5light']],
+	['voiceColor6', ['v6r', 'v6g', 'v6b', 'v6light']],
+	['voiceColor7', ['v7r', 'v7g', 'v7b', 'v7light']],
+	// Rail lights (each rail listens to its own part of the band) and the
+	// graticule's light.
+	['rails', ['rail0', 'rail1', 'rail2', 'rail3']],
+	['rails2', ['rail4', 'rail5', 'rail6', 'graticule']],
+	// Feed dots: travel after the snare (X), the kick (Y), a bass note (drip).
+	['feeds', ['feedX', 'feedY', 'feedDrip', 'feedLight']],
+	// The horizon's zones: each drum lights its own stretch of the rows (kick
+	// under the figure, snares to the sides, hats at the rims, perc between),
+	// and the chord root and the bass note light their pitch places.
+	['floorDrums', ['floorKick', 'floorSnare', 'floorHat', 'floorPerc']],
+	['floorPitch', ['chordTurn', 'chordLight', 'bassTurn', 'bassLight']],
 	// Horizon surfaces. Rig A is the leaving bench's camera and geometry, rig B
 	// the arriving bench's; the shader blends their projections on screen.
 	['surface', ['surfaceA', 'surfaceB', 'surfaceMix', 'terrainVis']],

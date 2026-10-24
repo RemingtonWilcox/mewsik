@@ -23,6 +23,7 @@
 import { SignalFigureEngine } from './figures';
 import { SignalVoice } from './voice';
 import type { SignalRoam } from './roam';
+import type { SignalBand } from './band';
 import { SIGNAL_TERRAIN_BINS, SIGNAL_TERRAIN_FLOATS } from './shaders';
 
 /** Quintic ease: zero velocity and acceleration at both ends. */
@@ -31,7 +32,35 @@ export function smootherstep(t: number): number {
 	return x * x * x * (x * (x * 6 - 15) + 10);
 }
 
-export type SignalMorph = { from: number; to: number; mix: number };
+export type SignalMorph = {
+	from: number;
+	to: number;
+	/** Eased share of the target, 0..1. */
+	mix: number;
+	/** Linear progress of the morph, 0..1 (1 settled), for per-part staggers. */
+	progress: number;
+};
+
+/**
+ * One part's share of a staggered morph: each part of the bench takes its
+ * own window of the morph's progress (its delay is a fraction of the run,
+ * `span` how much of the run it moves through), so a scene change turns the
+ * cubies one after another instead of a whole face at once. Ends exactly at
+ * 0 and 1 with the morph, so nothing is left halfway.
+ */
+export function signalPartMix(progress: number, delay: number, span = 0.55): number {
+	const d = Math.max(0, Math.min(1 - span, delay));
+	return smootherstep((progress - d) / Math.max(1e-3, span));
+}
+
+/** A deterministic 0..1 per (morph, part), for the stagger order. */
+export function signalPartDelay(from: number, to: number, part: number, span = 0.55): number {
+	let h = Math.imul((from + 1) | 0, 0x9e3779b1) ^ Math.imul((to + 7) | 0, 0x85ebca6b) ^ Math.imul((part + 13) | 0, 0xc2b2ae35);
+	h ^= h >>> 15;
+	h = Math.imul(h, 0x2c1b3c6d);
+	h ^= h >>> 12;
+	return ((h >>> 0) / 0x1_0000_0000) * (1 - span);
+}
 
 export class SignalChoiceMorph {
 	private fromOption = 0;
@@ -41,7 +70,7 @@ export class SignalChoiceMorph {
 	private pending: number | null = null;
 	private wait = 0;
 	private settled = false;
-	private readonly out: SignalMorph = { from: 0, to: 0, mix: 1 };
+	private readonly out: SignalMorph = { from: 0, to: 0, mix: 1, progress: 1 };
 
 	constructor(
 		/** Seconds for one morph. */
@@ -110,27 +139,32 @@ export class SignalChoiceMorph {
 		this.out.from = this.fromOption;
 		this.out.to = this.toOption;
 		this.out.mix = this.fromOption === this.toOption ? 1 : smootherstep(this.progress);
+		this.out.progress = this.fromOption === this.toOption ? 1 : this.progress;
 		return this.out;
 	}
 }
 
 /**
  * Morph lengths and stagger for each choice axis, in seconds. A scene change
- * lands on the genome all at once; these spread it over roughly ten seconds:
+ * lands on the genome all at once; these spread it over fifteen seconds or so:
  * the phosphor turns first, the camera and bench rearrange, the figure
  * re-forms last, and the tube character drifts on its own slow clock. When the
  * music changes character the renderer runs the same staggered move several
  * times faster (see SignalChoiceMorph.update), so it lands in two or three.
  */
 export const SIGNAL_MORPH_TIMING = {
-	palette: { seconds: 6, delay: 0 },
-	camera: { seconds: 7, delay: 1.2 },
-	layout: { seconds: 7.5, delay: 0.6 },
-	family: { seconds: 6.5, delay: 2.8 },
-	display: { seconds: 8, delay: 0 },
+	// Slow on purpose: the scene is the container, not the way the music
+	// shows (the band's parts do that), so an ordinary section change glides
+	// over ten seconds or more, each part in its own window of it. A change
+	// of character still lands in a few seconds (the renderer speeds these up).
+	palette: { seconds: 11, delay: 0 },
+	camera: { seconds: 12, delay: 1.2 },
+	layout: { seconds: 13, delay: 0.6 },
+	family: { seconds: 9, delay: 2.8 },
+	display: { seconds: 14, delay: 0 },
 	traceMap: { seconds: 4.5, delay: 0.4 },
 	// The bench turning round is the biggest rearrangement: it takes longest.
-	mirror: { seconds: 10, delay: 2 }
+	mirror: { seconds: 16, delay: 2 }
 } as const;
 
 export type SignalMorphAxis = keyof typeof SIGNAL_MORPH_TIMING;
@@ -229,6 +263,12 @@ export type SignalRendererMemory = {
 	 * seeded by that journey, and then carried through every source after.
 	 */
 	roam: SignalRoam | null;
+	/**
+	 * The band on the bench (see band.ts): voice lanes, their written
+	 * phosphor and the modulation matrix. Created with the roam, carried
+	 * through every source after, so a remount resumes every part.
+	 */
+	band: SignalBand | null;
 	readonly carry: SignalCarry;
 	readonly figure: SignalFigureEngine;
 	/** The music's character as an instrument, glided (see voice.ts). */
@@ -247,6 +287,7 @@ export function signalRendererMemory(): SignalRendererMemory {
 		scalars: null,
 		morphs: createSignalMorphs(),
 		roam: null,
+		band: null,
 		// Three seconds: long enough that a new song's rails glide in, short
 		// enough that the new music's own rails show by the time it is heard.
 		carry: new SignalCarry(3),

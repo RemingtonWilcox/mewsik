@@ -33,8 +33,13 @@
 		type LoomUniformValues
 	} from '$lib/visualizer/loom/uniform-layout';
 	import { parseLoomLookOverride, setLoomLookOverride, setLoomMotionQa } from '$lib/visualizer/loom/look';
+	import { LOOM_PART_BYTES, LoomEnsemble } from '$lib/visualizer/loom/ensemble';
 
 	const vis = useVisualizer();
+	// The weave as an ensemble: each strand group plays its own instrument
+	// (ensemble.ts). It lives in the journey, so a remount or a new song
+	// carries on with the same routing, packets and breakdown state.
+	const voices = vis.persistentLook('loom-ensemble', () => new LoomEnsemble());
 
 	const DETAIL_BYTES = 64 * 4;
 	const TARGET_FRAME_RATE = 60;
@@ -59,6 +64,7 @@
 	let hudBeatForm = $state('');
 	let hudTone = $state('');
 	let hudComposition = $state('');
+	let hudVoices = $state('');
 	let raf = 0;
 	let running = false;
 	let unsubscribe: (() => void) | null = null;
@@ -75,12 +81,15 @@
 	let rms = 0;
 	let renderCentroid = 0;
 	let renderSpectralMotion = 0;
+	/** The low end, slowly: the trail's outward drift, never a pulse. */
+	let slowSub = 0;
+	/** 0..1 fade up from black after the renderer becomes ready. */
+	let fadeIn = 0;
 	let silence = 1;
 	let quietFor = 0;
 	let poseSyncRequested = true;
 	let renderBeats = 0;
 	let renderBpm = 120;
-	let beatGlow = 0;
 	let swayPhase = 0;
 	let driftPhase = 0;
 	/** Flow clock for the environment (dust, mist, threads, water); rate follows tempo. */
@@ -125,6 +134,8 @@
 		sampler: GPUSampler;
 		uniformBuffer: GPUBuffer;
 		detailBuffer: GPUBuffer;
+		/** The ensemble's parts (ensemble.ts), written each frame. */
+		partsBuffer: GPUBuffer;
 		/** The ribbons as light sources, written each frame by the lights compute pass. */
 		lightBuffer: GPUBuffer;
 		uniforms: Float32Array;
@@ -195,6 +206,7 @@
 		'sectionPulse',
 		'motion',
 		'macroEnergy',
+		'songEnergy',
 		'tempo',
 		'key',
 		'mode',
@@ -419,6 +431,7 @@
 		let context: GPUCanvasContext | null = null;
 		let uniformBuffer: GPUBuffer | null = null;
 		let detailBuffer: GPUBuffer | null = null;
+		let partsBuffer: GPUBuffer | null = null;
 		let lightBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
@@ -563,15 +576,23 @@
 				size: LOOM_LIGHT_BYTES,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
 			});
+			partsBuffer = device.createBuffer({
+				size: LOOM_PART_BYTES,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
 			const uniformEntry = { binding: 0, resource: { buffer: uniformBuffer } };
 			const detailEntry = { binding: 1, resource: { buffer: detailBuffer } };
 			const lightEntry = { binding: 1, resource: { buffer: lightBuffer } };
+			// The strands read the parts at binding 3, the stage at binding 2.
+			const strandParts = { binding: 3, resource: { buffer: partsBuffer } };
+			const strandLights = { binding: 4, resource: { buffer: lightBuffer } };
+			const stageParts = { binding: 2, resource: { buffer: partsBuffer } };
 			const group = (
 				pipeline: GPURenderPipeline | GPUComputePipeline,
 				label: string,
 				entries: GPUBindGroupEntry[]
 			) => device.createBindGroup({ label, layout: pipeline.getBindGroupLayout(0), entries });
-			const sceneBindGroup = group(pipelines[0], 'Loom instrument', [uniformEntry, detailEntry]);
+			const sceneBindGroup = group(pipelines[0], 'Loom instrument', [uniformEntry, detailEntry, strandParts, strandLights]);
 			const state: LoomGpu = {
 				device,
 				context,
@@ -579,25 +600,27 @@
 				sampler: device.createSampler({ magFilter: 'linear', minFilter: 'linear' }),
 				uniformBuffer,
 				detailBuffer,
+				partsBuffer,
 				lightBuffer,
 				uniforms: new Float32Array(LOOM_UNIFORM_FLOATS),
 				lightsPipeline,
 				lightsBindGroup: group(lightsPipeline, 'Loom ribbon lights', [
 					uniformEntry,
 					detailEntry,
-					{ binding: 2, resource: { buffer: lightBuffer } }
+					{ binding: 2, resource: { buffer: lightBuffer } },
+					strandParts
 				]),
 				scenePipeline: pipelines[0],
 				mirrorPipeline,
-				mirrorBindGroup: group(mirrorPipeline, 'Loom reflection', [uniformEntry, detailEntry]),
+				mirrorBindGroup: group(mirrorPipeline, 'Loom reflection', [uniformEntry, detailEntry, strandParts, strandLights]),
 				floorPipeline,
-				floorBindGroup: group(floorPipeline, 'Loom floor', [uniformEntry, lightEntry]),
+				floorBindGroup: group(floorPipeline, 'Loom floor', [uniformEntry, lightEntry, stageParts]),
 				threadsPipeline,
-				threadsBindGroup: group(threadsPipeline, 'Loom threads', [uniformEntry, lightEntry]),
+				threadsBindGroup: group(threadsPipeline, 'Loom threads', [uniformEntry, lightEntry, stageParts]),
 				dustPipeline,
-				dustBindGroup: group(dustPipeline, 'Loom dust', [uniformEntry, lightEntry]),
+				dustBindGroup: group(dustPipeline, 'Loom dust', [uniformEntry, lightEntry, stageParts]),
 				volumePipeline,
-				volumeBindGroup: group(volumePipeline, 'Loom medium', [uniformEntry, lightEntry]),
+				volumeBindGroup: group(volumePipeline, 'Loom medium', [uniformEntry, lightEntry, stageParts]),
 				feedbackPipeline: pipelines[1],
 				bloomDownPipeline: pipelines[2],
 				blurHPipeline: pipelines[3],
@@ -623,6 +646,7 @@
 		} catch (error) {
 			uniformBuffer?.destroy();
 			detailBuffer?.destroy();
+			partsBuffer?.destroy();
 			lightBuffer?.destroy();
 			try {
 				context?.unconfigure();
@@ -639,6 +663,7 @@
 		destroyTargets(state.targets);
 		state.uniformBuffer.destroy();
 		state.detailBuffer.destroy();
+		state.partsBuffer.destroy();
 		state.lightBuffer.destroy();
 		try {
 			state.context.unconfigure();
@@ -705,6 +730,8 @@
 				beatOffset = 0;
 				swayPhase = 0;
 				poseSyncRequested = true;
+				// The ensemble carries on from here, not from the hits it missed.
+				voices.resume();
 				quietFor = feature ? 0 : 0.5;
 				silence = feature ? 0 : 1;
 			} else {
@@ -760,8 +787,6 @@
 			}
 			renderBeats += diff * (1 - Math.exp(-dt / 0.45));
 		}
-		const beatPhase = clamp(clock.beatPhase, 0, 1);
-		beatGlow = approach(beatGlow, feature ? Math.exp(-beatPhase * 5) : 0, 30, dt);
 		const response = VISUALIZER_TUNING.loom;
 		const responseMotion = response.motion;
 		const responseImpact = response.impact;
@@ -770,27 +795,43 @@
 		// The clocks' rates wander a little (look.pace), so sway and flow never
 		// settle into one fixed tempo of their own.
 		const pace = 1 + loom.look.pace * 0.3;
-		swayPhase +=
-			(0.25 + pose.motion * 0.75 + pose.tempo * 0.3) * weave.flow * pace * responseMotion * dt;
+		// The sheet's own breathing is the slow container: each group's wave
+		// runs at the pace of its own instrument (ensemble.ts).
+		// It breathes against the band: a little more in sparse passages.
+		const containerPace = 1.35 - clamp(pose.motion, 0, 1) * 0.6;
+		swayPhase += (0.2 + pose.tempo * 0.15) * containerPace * weave.flow * pace * responseMotion * dt;
 		flowPhase += weave.flow * (1 - silence * 0.7) * (1 + loom.look.pace * 0.2) * dt;
 
-		const energy = clamp(
-			pose.macroEnergy * 0.72 + rms * 0.18 + renderSpectralMotion * 0.1,
-			0,
-			1
-		);
-		const impact = clamp(pose.impact * responseImpact, 0, 1);
+		// Energy is the slow container only (the song's energy, conductor
+		// songEnergy): sections, loudness and transients answer through the
+		// ensemble's parts, never the whole frame.
+		const energy = clamp(pose.songEnergy * 0.8 + pose.macroEnergy * 0.2, 0, 1);
+		fadeIn = Math.min(1, fadeIn + dt / 1.2);
+		// The conductor's kick/novelty impact no longer flashes the whole frame
+		// (trail, aberration, every packet at once): each group answers its own
+		// instrument (ensemble.ts).
+		const impact = 0;
+		// The ensemble: every strand group, the floor, mist, dust, far threads,
+		// the key light and the camera each answer their own part of the music.
+		voices.update(shared.ensemble, shared.character, dt, {
+			identity: loom.look.identity,
+			silence,
+			shuttleForm: loom.look.beat[3],
+			flow: loom.look.weave.flow
+		});
+		const ensembleCamera = voices.camera;
+		slowSub = approach(slowSub, renderBands.sub, 0.5, dt);
 		// The long-listen look (genome) supplies camera regime, grammar, palette,
 		// material and environment; the conductor's patient rails ride on top.
 		const look = loom.look;
 		const budget = look.exposure;
 		// The look's roaming camera leads; the conductor's section rails only
 		// lean it a little, so no section or phrase owns a fixed shot.
-		const cameraYaw = pose.cameraYaw * 0.35 + look.camYaw;
+		const cameraYaw = pose.cameraYaw * 0.35 + look.camYaw + ensembleCamera.yaw;
 		const figure = look.figure;
 
-		// Post stack: trails shorten on impact and in silence; the bloom knee
-		// drops with energy so drops glow and verses stay graphic.
+		// Post stack: trails shorten in silence; the bloom knee drops with
+		// energy so drops glow and verses stay graphic.
 		// The light budget shortens trails when the scene is busy, so they never
 		// smear into fog; the reset only ever happens on a resize.
 		const feedbackFade =
@@ -800,8 +841,7 @@
 						(0.86 +
 							look.trail * 0.05 +
 							look.material.trail +
-							energy * 0.04 -
-							impact * 0.16 +
+							energy * 0.04 +
 							budget.trailOffset +
 							response.feedbackFadeOffset) *
 							(1 - silence * 0.35),
@@ -809,14 +849,14 @@
 						0.93
 					);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
-		const feedbackZoom = 1 - (0.0025 + renderBands.sub * 0.004) * responseMotion;
+		const feedbackZoom = 1 - (0.0025 + slowSub * 0.004) * responseMotion;
 		const bloomThreshold =
 			0.75 -
 			energy * 0.2 +
 			(0.5 - look.bloom) * 0.14 +
 			budget.bloomThresholdOffset +
 			response.bloomThresholdOffset;
-		const aberration = 1 + impact * 1.8;
+		const aberration = 1;
 
 		const values: LoomUniformValues = {
 			width: size.width,
@@ -824,9 +864,12 @@
 			elapsed: (now - startTime) / 1000,
 			responseMotion,
 			impact,
-			reweave: pose.reweave,
-			sectionPulse: pose.sectionPulse,
-			beatPhase: beatGlow,
+			// Phrase and section boundaries no longer unlace the whole weave, and
+			// nothing pulses on the predicted beat: chord changes re-thread one
+			// group, fills throw the shuttle (ensemble.ts).
+			reweave: 0,
+			sectionPulse: 0,
+			beatPhase: 0,
 			rms,
 			sub: renderBands.sub,
 			kick: renderBands.kick,
@@ -856,8 +899,8 @@
 			rimHue: renderPalette.rimHue,
 			saturation: renderPalette.saturation,
 			yaw: cameraYaw,
-			pitch: pose.cameraPitch * 0.6 + look.camPitch,
-			distance: pose.cameraDistance * look.camDistance,
+			pitch: pose.cameraPitch * 0.6 + look.camPitch + ensembleCamera.pitch,
+			distance: pose.cameraDistance * look.camDistance * Math.exp(ensembleCamera.dolly),
 			roll: pose.cameraRoll * 0.5 + look.camRoll,
 			beatConveyor: renderBeats,
 			swayPhase,
@@ -865,7 +908,7 @@
 			driftPhase,
 			// Bass gives the ribbons their weight: heavy music, broad bands.
 			warpRadius: clamp(
-				(0.016 + renderBands.body * 0.003 + impact * 0.001) * response.width * (0.72 + weave.weight * 0.62),
+				(0.016 + renderBands.body * 0.003) * response.width * (0.72 + weave.weight * 0.62),
 				0.009,
 				0.03
 			),
@@ -896,7 +939,7 @@
 			nearFade: 1,
 			widthScale: look.material.width,
 			emissionGain: budget.emissionGain,
-			focal: look.focal,
+			focal: look.focal * Math.exp(ensembleCamera.focal),
 			lensShiftX: look.lensShiftX,
 			lensShiftY: look.lensShiftY,
 			orbitYaw: look.orbit,
@@ -915,7 +958,9 @@
 			deepR: look.deep[0],
 			deepG: look.deep[1],
 			deepB: look.deep[2],
-			envGain: budget.envGain,
+			// The first second after the GPU is ready fades up from black, so a
+			// slow shader compile never ends in a pop.
+			envGain: budget.envGain * fadeIn * fadeIn * (3 - 2 * fadeIn),
 			hazeR: look.haze[0],
 			hazeG: look.haze[1],
 			hazeB: look.haze[2],
@@ -1021,6 +1066,13 @@
 			renderDetailBins.byteOffset,
 			renderDetailBins.byteLength
 		);
+		state.device.queue.writeBuffer(
+			state.partsBuffer,
+			0,
+			voices.parts.buffer,
+			voices.parts.byteOffset,
+			voices.parts.byteLength
+		);
 
 		hudSection = loom.section;
 		hudTopology = dominantTopology(loom.topologyWeights);
@@ -1032,6 +1084,7 @@
 		hudBeatForm = look.names.beatForm;
 		hudTone = look.names.tone;
 		hudComposition = look.names.composition;
+		hudVoices = voices.voices().join(',');
 		const encoder = state.device.createCommandEncoder({ label: 'Loom frame' });
 		{
 			// The rails become light sources before anything is lit by them.
@@ -1196,6 +1249,7 @@
 					});
 				}
 				startTime = performance.now();
+				fadeIn = 0;
 				schedulerTickAt = 0;
 				refreshIntervalMs = 1000 / 60;
 				activeFrameStride = 1;
@@ -1258,6 +1312,7 @@
 			data-loom-beat-form={hudBeatForm}
 			data-loom-tone={hudTone}
 			data-loom-composition={hudComposition}
+			data-loom-voices={hudVoices}
 			data-loom-render-passes="9"
 			data-loom-strands={LOOM_STRANDS}
 			data-loom-frame-stride={activeFrameStride}

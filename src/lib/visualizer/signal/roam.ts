@@ -44,8 +44,69 @@ export type SignalRoamDrive = {
 	ringOut: number;
 };
 
+/**
+ * The bench's recent compositions, so each part can follow the roam a little
+ * behind the others: a rearrangement travels through the bench piece by
+ * piece, the hero first and each trace after its own lag, instead of every
+ * part sliding at once. Recorded on music time (nothing is written while the
+ * roam holds still in silence).
+ */
+export class SignalComposeEcho {
+	private readonly ring: Float32Array;
+	private head = 0;
+	private filled = 0;
+	private carry = 0;
+	private readonly size: number;
+
+	constructor(
+		readonly dims = SIGNAL_COMPOSE_DIMS,
+		readonly rate = 10,
+		seconds = 16
+	) {
+		this.size = Math.ceil(seconds * rate) + 2;
+		this.ring = new Float32Array(this.size * dims);
+	}
+
+	push(values: ArrayLike<number>, dt: number): void {
+		if (this.filled === 0) this.write(values);
+		this.carry += Math.max(0, Number.isFinite(dt) ? dt : 0);
+		const step = 1 / this.rate;
+		while (this.carry >= step) {
+			this.carry -= step;
+			this.write(values);
+		}
+	}
+
+	/** The composition `delay` seconds of music ago (the oldest kept if longer). */
+	sample(delay: number, out: number[]): number[] {
+		const dims = this.dims;
+		if (this.filled === 0) {
+			for (let d = 0; d < dims; d += 1) out[d] = 0;
+			return out;
+		}
+		const back = Math.min(Math.max(0, delay * this.rate), this.filled - 1);
+		const i0 = Math.floor(back);
+		const f = back - i0;
+		const i1 = Math.min(i0 + 1, this.filled - 1);
+		const slot = (i: number) => (((this.head - 1 - i) % this.size) + this.size) % this.size;
+		const a = slot(i0) * dims;
+		const b = slot(i1) * dims;
+		for (let d = 0; d < dims; d += 1) out[d] = this.ring[a + d] + (this.ring[b + d] - this.ring[a + d]) * f;
+		return out;
+	}
+
+	private write(values: ArrayLike<number>) {
+		const o = this.head * this.dims;
+		for (let d = 0; d < this.dims; d += 1) this.ring[o + d] = Number(values[d] ?? 0);
+		this.head = (this.head + 1) % this.size;
+		this.filled = Math.min(this.filled + 1, this.size);
+	}
+}
+
 export class SignalRoam {
 	readonly compose: Roamer;
+	/** Recent compositions, for parts that follow the roam behind the hero. */
+	readonly echo = new SignalComposeEcho();
 	readonly camera: Roamer;
 	/** Seed word for the noise lanes. */
 	readonly noiseSeed: number;
@@ -57,14 +118,14 @@ export class SignalRoam {
 		this.compose = new Roamer(SIGNAL_COMPOSE_DIMS, `${seed}:compose`, {
 			meanHold: 10,
 			minHold: 3.5,
-			response: 4.5,
+			response: 6.5,
 			wander: 0.36,
 			wanderPeriod: 22
 		});
 		this.camera = new Roamer(SIGNAL_CAMERA_ROAM_DIMS, `${seed}:camera`, {
 			meanHold: 8,
 			minHold: 3,
-			response: 3.6,
+			response: 5,
 			wander: 0.3,
 			wanderPeriod: 19
 		});
@@ -82,6 +143,7 @@ export class SignalRoam {
 		const energy = clamp01(drive.energy);
 		const rate = 0.65 + tempo * 0.8;
 		this.compose.update(dt, rate, 0.25 + energy * 0.6);
+		this.echo.push(this.compose.value, dt);
 		this.camera.update(dt, rate * 1.1, 0.3 + energy * 0.7);
 		this.driftTime += Math.max(0, dt) * rate;
 		// A landing: the camera drops and tips toward the bench, then the

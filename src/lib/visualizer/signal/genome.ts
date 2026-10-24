@@ -4,7 +4,7 @@
 // and walks it forward at musical boundaries for as long as the stream runs.
 //
 // Scales:
-//   phrase  - figure parameters, spin, tilt, hue lean, band-trace mapping
+//   phrase  - figure parameters, spin, tilt, hue lean, chord-lane style
 //   section - instrument layout, figure family, phosphor palette, camera,
 //             persistence, relief, grid, history coupling
 //   era     - display character (tube type, scan, curvature, grain, grade)
@@ -57,9 +57,9 @@ export const SIGNAL_VARIATION_AXES: readonly VariationAxis[] = [
 	// Section scale: a new scene.
 	// Long memories: a bench, family or phosphor seen in the last few scenes
 	// does not come straight back, so the walk keeps finding new ground.
-	{ kind: 'choice', name: 'layout', options: SIGNAL_LAYOUT_COUNT, scale: 'section', chance: 0.8, memory: 10, maxHold: 3, tau: 3.2 },
+	{ kind: 'choice', name: 'layout', options: SIGNAL_LAYOUT_COUNT, scale: 'section', chance: 0.4, memory: 10, maxHold: 3, tau: 3.2 },
 	{ kind: 'choice', name: 'family', options: SIGNAL_FAMILY_COUNT, scale: 'section', chance: 0.85, memory: 4, tau: 2.6 },
-	{ kind: 'choice', name: 'palette', options: SIGNAL_PALETTE_COUNT, scale: 'section', chance: 1, memory: 9, tau: 3.6 },
+	{ kind: 'choice', name: 'palette', options: SIGNAL_PALETTE_COUNT, scale: 'section', chance: 0.8, memory: 9, tau: 3.6 },
 	{ kind: 'choice', name: 'camera', options: SIGNAL_CAMERA_COUNT, scale: 'section', chance: 0.55, memory: 3, tau: 4.5 },
 	// Which way round the bench stands. Doubles every bench's room of
 	// arrangements; the pieces slide across, nothing flips.
@@ -135,8 +135,11 @@ function seedHash(seed: number | string): number {
 }
 /** A new section label must hold this long before it counts as a scene. */
 const SECTION_DEBOUNCE_SECONDS = 3;
-/** Never cut two scenes closer together than this. */
-const MIN_SCENE_SECONDS = 9;
+/**
+ * Never move two scenes closer together than this. The scene is the slow
+ * container now: the band's parts carry the music between scene moves.
+ */
+const MIN_SCENE_SECONDS = 18;
 /** After the music changes character, the look it answered with holds this long. */
 const SHIFT_HOLD_SECONDS = 15;
 /** The shared tracker's fast envelope time constant (character.ts FAST_TAU_S). */

@@ -32,16 +32,21 @@
 // Colour is the palette's four authored jewel stops, cycled by orbit traps
 // and view angle for iridescence. There is no ambient light: the background
 // is black, light comes from the camera's lamp, the fractal's own emissive
-// filigree and its specular glints. The spectrum lives in the structure:
-// coarse scales answer the bass, the finest filigree the treble. Beats are
-// local: a heard kick lights a sparse scatter of elements and flexes the
-// folds; it never lifts the frame.
+// filigree and its specular glints. The spectrum lives in the structure only
+// as timbre (compressed and slow). The music speaks through the rose (see
+// rose.ts): the frame is read as rings x petals of panes round the mandala's
+// centre, and each pane sets how its part of the structure is lit, voiced
+// on the palette, drawn (line softness), struck (its filigree flashes on its
+// instrument's hits), glinted, warmed or cooled, and how long it trails. The
+// kick pushes the core outward as a local lens and the bass line turns it.
+// Nothing lifts or flexes the whole frame on a hit.
 //
 // Post stack: temporal feedback (zoomed and rolled with the travel), a
 // highlight meter that can only bring exposure down, half-res bloom, and a
 // composite with chromatic aberration and dither.
 
 import { mandalaParamsWgsl } from './uniform-layout';
+import { ROSE_ARRIVAL_SLOT, ROSE_FRAME_SLOT, ROSE_LEAVING_SLOT, ROSE_PETALS, ROSE_RING_RADII, ROSE_VEC4S } from './rose';
 
 export const MANDALA_BIN_COUNT = 64;
 
@@ -74,10 +79,152 @@ ${FULLSCREEN_WGSL}
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> bins: array<f32, ${MANDALA_BIN_COUNT}>;
+// The rose: two vec4 per pane (rings x petals), then the frame (see rose.ts).
+@group(0) @binding(2) var<storage, read> rose: array<vec4<f32>, ${ROSE_VEC4S}>;
 
 const PI = 3.14159265359;
 const TAU = 6.28318530718;
 const PHI = 1.61803398875;
+const ROSE_FRAME = ${ROSE_FRAME_SLOT}u;
+const ROSE_ARRIVAL = ${ROSE_ARRIVAL_SLOT}u;
+const ROSE_LEAVING = ${ROSE_LEAVING_SLOT}u;
+const PETALS = ${ROSE_PETALS}u;
+
+// The pane this pixel belongs to, blended softly with its neighbours: how
+// its part of the structure is lit and drawn. Set once per pixel in fs_main.
+struct Pane {
+	light: f32,
+	tone: f32,
+	soft: f32,
+	glint: f32,
+	crack: f32,
+	warm: f32,
+	trail: f32,
+	seed: f32,
+	// How far a new palette has reached this pane (0: still the old one).
+	arrival: f32,
+};
+var<private> pane: Pane;
+// This pixel's screen position (before the core's warp), for the solid
+// worlds to look their pane up again by depth.
+var<private> paneUv: vec2<f32>;
+
+fn arrivalOf(i: u32) -> f32 {
+	return rose[ROSE_ARRIVAL + i / 4u][i % 4u];
+}
+
+fn paneFrom(a: vec4<f32>, b: vec4<f32>, seed: f32) -> Pane {
+	var p: Pane;
+	p.light = a.x;
+	p.tone = a.y;
+	p.soft = a.z;
+	p.glint = a.w;
+	p.crack = b.x;
+	p.warm = b.y;
+	p.trail = b.z;
+	p.seed = seed;
+	return p;
+}
+
+// Continuous ring coordinate: 0 at the core's centre, 1, 2, 3 at the inner,
+// middle and outer rings' centres.
+fn roseRing(r: f32) -> f32 {
+	let r1 = ${ROSE_RING_RADII[1].toFixed(3)};
+	let r2 = ${ROSE_RING_RADII[2].toFixed(3)};
+	let r3 = ${ROSE_RING_RADII[3].toFixed(3)};
+	if (r < r1) {
+		return r / r1;
+	}
+	if (r < r2) {
+		return 1.0 + (r - r1) / (r2 - r1);
+	}
+	return min(3.0, 2.0 + (r - r2) / (r3 - r2));
+}
+
+// Soft pane borders: a pane holds its own value over most of its width.
+fn paneEdge(x: f32) -> f32 {
+	return smoothstep(0.25, 0.75, x);
+}
+
+// One ring's pair of neighbouring panes at this angle. Rings are staggered
+// by half a petal (brick-wise, like the panes of a rose window), so the
+// panes above and below a seam never share it.
+struct RingPanes {
+	a: vec4<f32>,
+	b: vec4<f32>,
+	arrival: f32,
+	near: u32,
+};
+
+fn ringPanes(ring: u32, angle: f32) -> RingPanes {
+	let th = fract(angle / TAU + f32(ring) * 0.5 / f32(PETALS)) * f32(PETALS);
+	let p0 = u32(floor(th)) % PETALS;
+	let p1 = (p0 + 1u) % PETALS;
+	let f = paneEdge(fract(th));
+	let i0 = ring * PETALS + p0;
+	let i1 = ring * PETALS + p1;
+	var out: RingPanes;
+	out.a = mix(rose[i0 * 2u], rose[i1 * 2u], f);
+	out.b = mix(rose[i0 * 2u + 1u], rose[i1 * 2u + 1u], f);
+	out.arrival = mix(arrivalOf(i0), arrivalOf(i1), f);
+	out.near = select(i0, i1, f > 0.5);
+	return out;
+}
+
+// The pane at a screen position. depthRing >= 0 (the solid worlds, once a
+// ray has hit) leans the ring coordinate toward the structure's depth: far
+// structure belongs to the core, near walls to the outer ring, so the rings
+// follow the flight's own layers instead of drawing circles over an object.
+fn roseAt(uv: vec2<f32>, depthRing: f32) -> Pane {
+	let frame = rose[ROSE_FRAME];
+	let d = uv - frame.xy;
+	let r = length(d) / max(frame.w, 0.2);
+	var rho = roseRing(r);
+	if (depthRing >= 0.0) {
+		rho = mix(rho, depthRing, 0.4);
+	}
+	let ring0 = u32(min(floor(rho), 2.0));
+	let fr = paneEdge(rho - f32(ring0));
+	let angle = atan2(d.y, d.x) - frame.z;
+	var inner = ringPanes(ring0, angle);
+	let outer = ringPanes(ring0 + 1u, angle);
+	// At the very centre the core's petals meet in its mean (no pinwheel).
+	let hubW = select(0.0, 1.0 - smoothstep(0.0, 0.45, rho), ring0 == 0u);
+	inner.a = mix(inner.a, rose[ROSE_FRAME + 3u], hubW);
+	inner.b = mix(inner.b, rose[ROSE_FRAME + 4u], hubW);
+	inner.arrival = mix(inner.arrival, rose[ROSE_FRAME + 5u].x, hubW);
+	// Glint seeds do not blend: the nearest pane's.
+	let near = select(inner.near, outer.near, fr > 0.5);
+	var p = paneFrom(mix(inner.a, outer.a, fr), mix(inner.b, outer.b, fr), rose[near * 2u + 1u].w);
+	p.arrival = mix(inner.arrival, outer.arrival, fr);
+	return p;
+}
+
+// The kick pushes the core outward (a local lens) and the bass line turns it.
+fn roseWarp(uv: vec2<f32>) -> vec2<f32> {
+	let frame = rose[ROSE_FRAME];
+	let warp = rose[ROSE_FRAME + 1u];
+	let d = uv - frame.xy;
+	let core = 0.22 * frame.w;
+	let w = exp(-dot(d, d) / (core * core));
+	return frame.xy + rot2(d, warp.y * w) * (1.0 - warp.x * 0.11 * w);
+}
+
+// A pane's line sharpness: soft (legato) panes draw wider lines with a
+// dimmer core, crisp (staccato) ones thin bright ones. Multiplies the
+// falloff rate; lineGain keeps the light a line carries about the same.
+fn paneSharp() -> f32 {
+	return exp2((0.4 - pane.soft) * 1.25);
+}
+
+fn lineGain(k: f32) -> f32 {
+	return sqrt(k);
+}
+
+// A snare crack: the pane's filigree flashes (lines, not fills).
+fn crackLine() -> f32 {
+	return 1.0 + pane.crack * 4.0;
+}
 
 fn mixU(x0: u32) -> u32 {
 	var x = x0;
@@ -105,21 +252,29 @@ fn cmul(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 	return vec2<f32>(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-// Spectrum at a position 0 (sub) .. 1 (air), interpolated.
+// Spectrum at a position 0 (sub) .. 1 (air), interpolated, as timbre: which
+// bands are alive shapes the structure a little (compressed about a typical
+// level), so a loud stab or drum never brightens every scale at once. The
+// music's events speak through the rose's panes instead.
 fn band(x: f32) -> f32 {
 	let f = clamp(x, 0.0, 1.0) * ${(MANDALA_BIN_COUNT - 2).toFixed(1)};
 	let i = i32(floor(f));
-	return clamp(mix(bins[i], bins[i + 1], fract(f)), 0.0, 1.0);
+	let b = clamp(mix(bins[i], bins[i + 1], fract(f)), 0.0, 1.0);
+	return 0.4 + (b - 0.4) * 0.3;
 }
 
 // ---- palette: four authored stops, never a cosine ----
+// A new palette reaches the window pane by pane: each pane shows the stops
+// being left until the new ones arrive there.
 fn palStop(i: i32) -> vec3<f32> {
+	var stop: vec3<f32>;
 	switch (i) {
-		case 0: { return params.pal0.xyz; }
-		case 1: { return params.pal1.xyz; }
-		case 2: { return params.pal2.xyz; }
-		default: { return params.pal3.xyz; }
+		case 0: { stop = params.pal0.xyz; }
+		case 1: { stop = params.pal1.xyz; }
+		case 2: { stop = params.pal2.xyz; }
+		default: { stop = params.pal3.xyz; }
 	}
+	return mix(rose[ROSE_LEAVING + u32(i)].xyz, stop, pane.arrival);
 }
 
 // Deep to hot, clamped.
@@ -143,9 +298,10 @@ fn tri(x: f32) -> f32 {
 
 // The colour of structure at ramp position t; iri moves it round the cycle.
 // The drifting paint offset moves which structure burns hot and which stays
-// deep, so a world never wears the same colouring twice.
+// deep, so a world never wears the same colouring twice; the pane's tone
+// voices each part of the window in its own place on the same palette.
 fn jewel(t: f32, iri: f32) -> vec3<f32> {
-	let paint = params.cameraB.z;
+	let paint = params.cameraB.z + pane.tone;
 	return mix(ramp(tri(t + paint)), cycle(t * 0.75 + iri + params.tone.z + paint * 0.5), params.tone.y);
 }
 
@@ -157,17 +313,15 @@ fn foldN(p: vec2<f32>, n: f32) -> vec2<f32> {
 	return vec2<f32>(cos(a), sin(a)) * length(p);
 }
 
-// Local beat sparks: a heard kick lights a sparse, seeded scatter of small
-// elements (about one in thirty); an onset lights another. The rest of
-// the structure gives back what the sparks take, so the frame's mean
-// brightness does not move on the beat. Returns a brightness multiplier.
+// Glints: each pane lights its own sparse, seeded scatter of small elements,
+// re-scattered by its own instrument's hits (the core's kicks, the inner
+// ring's notes, the middle ring's hats, the outer ring's snares), as bright
+// as its glint parameter. Never the whole frame at once. Returns a
+// brightness multiplier.
 fn sparkle(id: f32) -> f32 {
-	let h1 = hash11(id * 13.0 + floor(params.pulse.y * 977.0) * 7.0);
-	let h2 = hash11(id * 7.0 + floor(params.pulse.w * 613.0) * 11.0);
-	let kick = params.pulse.x;
-	let onset = params.pulse.z;
-	let lit = step(0.97, h1) * kick * 3.5 + step(0.97, h2) * onset * 2.4;
-	return 1.0 + lit - kick * 0.105 - onset * 0.072;
+	let h = hash11(id * 13.0 + floor(pane.seed * 977.0) * 7.0);
+	let g = pane.glint;
+	return 1.0 + step(0.975 - g * 0.05, h) * g * 3.4;
 }
 
 struct Slot {
@@ -312,8 +466,9 @@ fn kaliLayer(p0: vec2<f32>, c: vec2<f32>, itF: f32, pix: f32, s: Slot, layerId: 
 	let sp = sparkle(id);
 	let gainA = 0.35 + band(0.03 + fi * 0.9) * 1.6;
 	let gainB = 0.35 + band(0.03 + fj * 0.9) * 1.6;
-	var col = jewel(0.25 + fi * 0.75, fi + bestAng * 0.08) * (exp(-best * 0.8) * 1.2 + exp(-best * 0.1) * 0.06) * gainA * sp;
-	col = col + jewel(0.1 + fj * 0.6, fj + 0.5) * exp(-second * 1.0) * 0.35 * gainB;
+	let k = paneSharp();
+	var col = jewel(0.25 + fi * 0.75, fi + bestAng * 0.08) * (exp(-best * 0.8 * k) * 1.2 * lineGain(k) * crackLine() + exp(-best * 0.1) * 0.06) * gainA * sp;
+	col = col + jewel(0.1 + fj * 0.6, fj + 0.5) * exp(-second * 1.0 * k) * 0.35 * lineGain(k) * gainB;
 	return col;
 }
 
@@ -378,7 +533,8 @@ fn juliaLayer(w0: vec2<f32>, s: Slot, iters: i32, pixW: f32) -> vec3<f32> {
 	let t = fract(mu);
 	// Full light at the set's edge, less where a pixel sits wholly inside
 	// dense dust: a thick region reads as outlined filigree, not a blob.
-	let line = exp(-dPix * 0.9) * (0.1 + 0.9 * smoothstep(0.0, 0.9, dPix));
+	let k = paneSharp();
+	let line = exp(-dPix * 0.9 * k) * lineGain(k) * crackLine() * (0.1 + 0.9 * smoothstep(0.0, 0.9, dPix));
 	let halo = exp(-dPix * 0.12) * 0.035;
 	let gain = 0.4 + band(clamp(0.1 + t * 0.85, 0.0, 1.0)) * 1.4;
 	let sp = sparkle(floor(mu) * 5.0 + floor(t * 6.0) * 31.0 + floor(atan2(z.y, z.x) * 6.0) * 211.0);
@@ -528,7 +684,8 @@ fn yantraWorld(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 		let dPix = pat.x / (exp(uu) * pix);
 		let absLayer = layer + f32(j) + floor(s.phase);
 		let t = fract(absLayer * 0.381966 + pat.y * 0.13);
-		let line = exp(-dPix * 1.0) + exp(-dPix * 0.1) * 0.08;
+		let k = paneSharp();
+		let line = exp(-dPix * k) * lineGain(k) * crackLine() + exp(-dPix * 0.1) * 0.08;
 		let gain = 0.35 + band(fract(pat.y * 0.17 + 0.05) * 0.9) * 1.5;
 		let sp = sparkle(absLayer * 17.0 + pat.y * 5.0 + floor(atan2(q.y, q.x) * 6.0) * 131.0);
 		col = col + jewel(0.2 + t * 0.8, uu * 0.3) * line * gain * sp;
@@ -1009,7 +1166,8 @@ fn spongeRims(q: vec3<f32>, s: Slot, pix: f32) -> vec3<f32> {
 		if (hole > pix * 10.0) {
 			let c = abs(spongeHole(q * sc, variant, spongeWidth(m, s))) / sc;
 			let absLevel = f32(m) + s.level;
-			let line = exp(-c / (pix * 0.9)) * 0.4;
+			let k = paneSharp();
+			let line = exp(-c * k / (pix * 0.9)) * 0.4 * lineGain(k) * (1.0 + pane.crack * 1.4);
 			// Fine levels whisper, the level at the camera's own scale speaks.
 			let fineFade = smoothstep(pix * 10.0, pix * 90.0, hole);
 			let cell = floor(q * sc);
@@ -1034,6 +1192,9 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	if (!h.hit) {
 		return col;
 	}
+	// The pane by depth: the far structure is the core, the near the rim.
+	let depthQ = clamp(h.t / max(cam.reach * params.light.z * 2.2, 1e-4), 0.0, 1.0);
+	pane = roseAt(paneUv, 3.0 * pow(1.0 - depthQ, 1.3));
 	let p = cam.ro + cam.rd * h.t;
 	let pixAngle = pixelSize() / params.quality.z;
 	let pix = max(pixAngle * h.t, 1e-6 * cam.unit);
@@ -1087,7 +1248,7 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	// The sponge's rims spark per cell already.
 	if (s.world != 3) {
 		let cell = floor(p * (24.0 / cam.unit));
-		emit = emit * sparkle(id * 131.0 + dot(cell, vec3<f32>(7.0, 13.0, 29.0)));
+		emit = emit * sparkle(id * 131.0 + dot(cell, vec3<f32>(7.0, 13.0, 29.0))) * crackLine();
 	}
 
 	// Light: the camera's own lamp. It falls off over the world's own scale,
@@ -1115,11 +1276,15 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	let fres = pow(1.0 - ndv, 4.0);
 	let ao = occlusion(s, p, n, cam.unit);
 	// Orbit traps walk the whole palette, so one structure holds several jewels.
-	let albedo = mix(jewel(0.2 + t * 0.6, t), cycle(t * 1.7 + params.tone.z) * 0.8, 0.55);
-	let sheenCol = cycle(t + ndv * 1.3 + params.tone.z + params.cameraB.z * 0.5);
+	let albedo = mix(jewel(0.2 + t * 0.6, t), cycle(t * 1.7 + params.tone.z + pane.tone) * 0.8, 0.55);
+	let sheenCol = cycle(t + ndv * 1.3 + params.tone.z + params.cameraB.z * 0.5 + pane.tone);
 	let lampCol = mix(params.pal3.xyz, vec3<f32>(1.0), 0.6);
-	col = col + albedo * diff * atten * ao * 0.26 * matte;
-	col = col + lampCol * spec * atten * ao * (1.6 + params.character.z);
+	// A pane's strike also catches the lit surface (its glints flare in the
+	// lamp), so the solid worlds answer their instruments as the planes do;
+	// gently, since in a tunnel one pane can be the whole near wall.
+	let struck = 1.0 + pane.crack * 0.35;
+	col = col + albedo * diff * atten * ao * 0.26 * matte * struck;
+	col = col + lampCol * spec * atten * ao * (1.6 + params.character.z) * struck;
 	col = col + sheenCol * fres * atten * ao * (0.15 + params.tone.y * 0.6);
 	col = col + emit * (0.4 + 0.6 * ao);
 	// Objects seen from outside (crystal, bulb) also take a key light from
@@ -1138,13 +1303,26 @@ fn render3d(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	return col;
 }
 
-fn renderSlot(uv: vec2<f32>, s: Slot) -> vec3<f32> {
+fn worldAt(uv: vec2<f32>, s: Slot) -> vec3<f32> {
 	switch (s.world) {
 		case 0: { return bloomWorld(uv, s) * planeExtent(uv); }
 		case 1: { return spiralWorld(uv, s) * planeExtent(uv); }
 		case 2: { return yantraWorld(uv, s) * planeExtent(uv); }
 		default: { return render3d(uv, s); }
 	}
+}
+
+// Each pane lights its own part of the structure and sets its colour
+// temperature (the chord's quality: major warm, minor and diminished cool).
+// Black stays black: nothing here adds light where there is no structure.
+fn renderSlot(uv: vec2<f32>, s: Slot) -> vec3<f32> {
+	let w = pane.warm;
+	let temperature = vec3<f32>(1.0 + w * 0.15, 1.0 + w * 0.015, 1.0 - w * 0.18);
+	// On the planes a strike also lifts its pane's structure a little (lines
+	// on black: it never floods); the solid worlds keep it to their filigree
+	// and lit glints, since one pane there can be a whole near wall.
+	let struck = select(1.0 + pane.crack * 0.3, 1.0, s.world >= 3);
+	return worldAt(uv, s) * pane.light * struck * temperature;
 }
 
 fn luma(c: vec3<f32>) -> f32 {
@@ -1155,23 +1333,49 @@ fn luma(c: vec3<f32>) -> f32 {
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let res = params.view.xy;
 	let frag = in.uv * res;
-	let uv = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / max(res.y, 1.0);
-	let a = renderSlot(uv, slotA());
-	var color = a;
+	let screen = vec2<f32>(frag.x - 0.5 * res.x, 0.5 * res.y - frag.y) / max(res.y, 1.0);
+	paneUv = screen;
+	let screenPane = roseAt(screen, -1.0);
+	let uv = roseWarp(screen);
 	let m = params.slotA.w;
+	// One call site for both worlds, in a loop the compiler cannot unroll:
+	// the whole world library is inlined once, not twice, which halves the
+	// pipeline's compile time (several seconds on D3D).
+	let count = select(1u, 2u, m > 0.0005);
+	var a = vec3<f32>(0.0);
+	var b = vec3<f32>(0.0);
+	for (var k = 0u; k < count; k = k + 1u) {
+		var s: Slot;
+		if (k == 0u) {
+			s = slotA();
+		} else {
+			s = slotB();
+		}
+		pane = screenPane;
+		let c = renderSlot(uv, s);
+		if (k == 0u) {
+			a = c;
+		} else {
+			b = c;
+		}
+	}
+	var color = a;
 	if (m > 0.0005) {
-		let b = renderSlot(uv, slotB());
 		// The new world opens out of the centre and through the old one's
-		// structure, never as a flat dissolve.
+		// structure, never as a flat dissolve: a soft front that travels from
+		// the middle to the corners, so each part of the frame turns over in
+		// its own moment rather than all at once.
 		let r = length(uv) * 1.25;
 		let seed = params.slotB.w;
-		let swirl = sin(atan2(uv.y, uv.x) * 3.0 + seed * TAU) * 0.08;
-		let lead = (luma(b) - luma(a)) * 0.25;
-		let reveal = clamp(m * 1.6 - r * 0.6 + swirl + lead, 0.0, 1.0);
+		let swirl = sin(atan2(uv.y, uv.x) * 3.0 + seed * TAU) * 0.14;
+		let lead = (luma(b) - luma(a)) * 0.2;
+		let front = m * 2.2 - 0.45;
+		let reveal = clamp((front - r + swirl + lead) / 0.9 + 0.5, 0.0, 1.0);
 		color = mix(a, b, reveal);
 	}
 	color = color * params.tone.w;
-	return vec4<f32>(max(color, vec3<f32>(0.0)), 1.0);
+	// Alpha carries the pane's trail to the feedback pass.
+	return vec4<f32>(max(color, vec3<f32>(0.0)), clamp(pane.trail, 0.0, 1.0));
 }
 `;
 
@@ -1205,8 +1409,10 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let edge = min(min(previousUv.x, previousUv.y), min(1.0 - previousUv.x, 1.0 - previousUv.y));
 	let border = smoothstep(0.0, 0.02, edge);
 	let previous = textureSampleLevel(previousTexture, linearSampler, previousUv, 0.0).rgb;
-	let scene = textureSampleLevel(sceneTexture, linearSampler, in.uv, 0.0).rgb;
-	return vec4<f32>(max(previous * params.post.x * border, scene), 1.0);
+	let scene = textureSampleLevel(sceneTexture, linearSampler, in.uv, 0.0);
+	// Each pane keeps its own trail: legato parts smear long, staccato let go.
+	let fade = clamp(params.post.x * (0.8 + scene.a * 0.4), 0.0, 0.94);
+	return vec4<f32>(max(previous * fade * border, scene.rgb), 1.0);
 }
 `;
 

@@ -7,6 +7,11 @@
 // source for graticule, floor and rows. Layout, surface, camera, palette and
 // display character all come from the genome as uniforms.
 //
+// The band (band.ts) plays the rest of the bench: traces 2..7 are voice lanes
+// (bass, chord, kick, snare, hat, perc), each a written record in the voice
+// buffer that glows by the heat of each sample; each horizon zone, rail and
+// feed dot answers its own instrument; nothing pulses the whole frame.
+//
 // Beam physics (after the published vector-display maths of dood.al's
 // oscilloscope and woscope): every stroke is a Gaussian spot dragged along
 // each segment, shaded with the analytic integral of that drag. A segment
@@ -22,6 +27,7 @@
 // comment here; it terminates the string and silently breaks the shader.
 
 import { SIGNAL_FIGURE_POINTS, SIGNAL_FIGURE_SEGMENTS } from './figures';
+import { SIGNAL_CHANNEL_RECORDS, SIGNAL_VOICE_SAMPLES } from './band';
 import { signalParamsWgsl } from './uniform-layout';
 
 export const SIGNAL_SEGMENTS = SIGNAL_FIGURE_SEGMENTS;
@@ -36,7 +42,8 @@ export const SIGNAL_BEAM_UPSAMPLE = 6;
 export const SIGNAL_TIGHT_DIVISOR = 2;
 export const SIGNAL_WIDE_DIVISOR = 8;
 export const SIGNAL_HERO_INSTANCES = 2;
-export const SIGNAL_CHANNELS = 4;
+/** X and Y deflection, then the six voice lanes (band.ts). */
+export const SIGNAL_CHANNELS = 8;
 /** X feed, Y feed, and the drip from the beam head to the newest horizon row. */
 export const SIGNAL_FEEDS = 3;
 export const SIGNAL_RAILS = 7;
@@ -177,6 +184,7 @@ const CHANNEL_BASE: u32 = HERO_INSTANCES;
 const FEED_BASE: u32 = CHANNEL_BASE + CHANNELS;
 const RAIL_BASE: u32 = FEED_BASE + FEEDS;
 const ROW_BASE: u32 = RAIL_BASE + RAILS;
+const VOICE_SAMPLES: u32 = ${SIGNAL_VOICE_SAMPLES}u;
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> detailBins: array<f32, 64>;
@@ -185,6 +193,9 @@ const ROW_BASE: u32 = RAIL_BASE + RAILS;
 // The stereo window (oldest first); channel traces 0 and 1 read it as the
 // real left and right waveforms when the XY beam is up.
 @group(0) @binding(4) var<storage, read> scope: array<vec2<f32>, ${SIGNAL_SCOPE_WINDOW}>;
+// Every channel trace's written record (band.ts): X and Y, then the band's
+// voice lanes; deflection and heat per written sample.
+@group(0) @binding(5) var<storage, read> voices: array<vec2<f32>, ${SIGNAL_CHANNEL_RECORDS * SIGNAL_VOICE_SAMPLES}>;
 
 ${BEAM_COMMON_WGSL}
 
@@ -261,7 +272,11 @@ fn traceOrigin(k: u32) -> vec4<f32> {
 		case 0u: { return params.trace0; }
 		case 1u: { return params.trace1; }
 		case 2u: { return params.trace2; }
-		default: { return params.trace3; }
+		case 3u: { return params.trace3; }
+		case 4u: { return params.trace4; }
+		case 5u: { return params.trace5; }
+		case 6u: { return params.trace6; }
+		default: { return params.trace7; }
 	}
 }
 
@@ -270,42 +285,81 @@ fn traceAxis(k: u32) -> vec4<f32> {
 		case 0u: { return params.trace0v; }
 		case 1u: { return params.trace1v; }
 		case 2u: { return params.trace2v; }
-		default: { return params.trace3v; }
+		case 3u: { return params.trace3v; }
+		case 4u: { return params.trace4v; }
+		case 5u: { return params.trace5v; }
+		case 6u: { return params.trace6v; }
+		default: { return params.trace7v; }
+	}
+}
+
+// Voice lane i (trace i + 2): its presence, its write head and its phosphor.
+fn voiceVis(lane: u32) -> f32 {
+	switch lane {
+		case 0u: { return params.voiceVis.x; }
+		case 1u: { return params.voiceVis.y; }
+		case 2u: { return params.voiceVis.z; }
+		case 3u: { return params.voiceVis.w; }
+		case 4u: { return params.voiceVis2.x; }
+		default: { return params.voiceVis2.y; }
+	}
+}
+
+fn voiceHead(lane: u32) -> f32 {
+	switch lane {
+		case 0u: { return params.voiceHead.x; }
+		case 1u: { return params.voiceHead.y; }
+		case 2u: { return params.voiceHead.z; }
+		case 3u: { return params.voiceHead.w; }
+		case 4u: { return params.voiceHead2.x; }
+		default: { return params.voiceHead2.y; }
+	}
+}
+
+fn voiceColor(lane: u32) -> vec4<f32> {
+	switch lane {
+		case 0u: { return params.voiceColor2; }
+		case 1u: { return params.voiceColor3; }
+		case 2u: { return params.voiceColor4; }
+		case 3u: { return params.voiceColor5; }
+		case 4u: { return params.voiceColor6; }
+		default: { return params.voiceColor7; }
 	}
 }
 
 fn traceVisibility(k: u32) -> f32 {
 	let channels = params.sweep.y;
 	var gate = 1.0;
-	switch k {
-		case 0u: { gate = 1.0; }
-		case 1u: { gate = clamp(0.55 + channels * 0.45, 0.0, 1.0); }
-		case 2u: { gate = clamp(channels - 1.4, 0.0, 1.0); }
-		default: { gate = clamp(channels - 2.4, 0.0, 1.0); }
+	if (k == 1u) {
+		gate = clamp(0.55 + channels * 0.45, 0.0, 1.0);
+	} else if (k >= 2u) {
+		// A voice lane is lit by its own part being there; the section's
+		// channel count only leans on it.
+		gate = voiceVis(k - 2u) * clamp(0.55 + channels * 0.15, 0.0, 1.0);
 	}
 	return gate * traceAxis(k).w;
 }
 
-// Band traces 2 and 3: four partials whose strengths are the live detail of
-// the bins the band owns, on the figure's own time base.
-fn bandWave(k: u32, u: f32) -> f32 {
-	let band = select(params.band3, params.band2, k == 2u);
-	let level = band.x;
-	let drift = params.context.z * (0.21 + f32(k) * 0.13);
-	var wave = 0.0;
-	var total = 0.0;
-	for (var j = 0u; j < 4u; j = j + 1u) {
-		let partial = f32(j);
-		let bin = (band.y + (partial + 0.5) * 0.25 * (band.z - band.y)) / 63.0;
-		let strength = (0.32 / (1.0 + partial * 0.8)) + max(smoothDetail(bin), 0.0) * 3.0;
-		let harmonic = 1.0 + partial * (1.0 + params.bandsB.y * 0.6);
-		wave = wave + sin(TAU * (u * band.w * harmonic + drift * (1.0 + partial * 0.7) + partial * 1.3)) * strength;
-		total = total + strength;
+// Channel k's written sample at position f along its trace (deflection, heat).
+fn channelSample(k: u32, f: f32) -> vec2<f32> {
+	let scaled = clamp(f, 0.0, 1.0) * f32(VOICE_SAMPLES - 1u);
+	let i0 = min(u32(floor(scaled)), VOICE_SAMPLES - 2u);
+	let base = k * VOICE_SAMPLES;
+	return mix(voices[base + i0], voices[base + i0 + 1u], fract(scaled));
+}
+
+fn voiceSample(lane: u32, f: f32) -> vec2<f32> {
+	return channelSample(lane + 2u, f);
+}
+
+// The hat lane shimmers with the live air detail where it is lit.
+fn voiceDeflection(lane: u32, f: f32) -> f32 {
+	let sample = voiceSample(lane, f);
+	var value = sample.x;
+	if (lane == 4u) {
+		value = value + smoothDetail(0.82 + f * 0.17) * 0.25 * min(sample.y, 1.0);
 	}
-	let detail = smoothDetail((band.y + u * (band.z - band.y)) / 63.0);
-	wave = wave / max(total, 0.001) * 1.25 + detail * 0.8;
-	wave = wave * (0.6 + params.pulse.y * 0.7 * level);
-	return wave * (0.25 + level * 1.1 + params.pulse.x * 0.25) * (1.0 - params.tone.y);
+	return value;
 }
 
 // The real left (k = 0) or right (k = 1) waveform across a channel trace,
@@ -320,11 +374,7 @@ fn scopeWave(k: u32, f: f32) -> f32 {
 }
 
 fn traceValue(k: u32, u: f32) -> f32 {
-	switch k {
-		case 0u: { return figureLocal(0u, u).x; }
-		case 1u: { return figureLocal(0u, u).y; }
-		default: { return bandWave(k, fract(u)); }
-	}
+	return select(figureLocal(0u, u).y, figureLocal(0u, u).x, k == 0u);
 }
 
 // Sweep traces are written by a moving head that wraps across the frame;
@@ -340,11 +390,24 @@ struct TracePoint {
 fn tracePoint(k: u32, f: f32) -> TracePoint {
 	let origin = traceOrigin(k);
 	let axis = traceAxis(k);
+	if (k >= 2u) {
+		// Voice lanes: the written record along the lane, as on a triggered
+		// scope; build gathers their deflection a little larger.
+		var lane: TracePoint;
+		// Drum bursts are brief, so their lanes deflect harder to read.
+		let reach = select(1.0, 2.3, k >= 4u) * (1.0 + params.voiceHead2.w * 0.35);
+		lane.p = origin.xy + origin.zw * f + axis.xy * voiceDeflection(k - 2u, f) * reach;
+		lane.u = f;
+		return lane;
+	}
 	let head = params.head.x;
 	let uSweep = head - CHANNEL_TAIL * (1.0 - f);
 	let positionSweep = fract(uSweep);
 	let window = smoothstep(0.0, 0.05, positionSweep) * (1.0 - smoothstep(0.95, 1.0, positionSweep));
-	let pSweep = origin.xy + origin.zw * positionSweep + axis.xy * traceValue(k, uSweep) * mix(window, 1.0, select(0.0, 1.0, k < 2u) * 0.6);
+	// X and Y as written by the sweep head: each stretch keeps the deflection
+	// it had when the head passed, so the trace changes where it is written.
+	let written = channelSample(k, positionSweep).x;
+	let pSweep = origin.xy + origin.zw * positionSweep + axis.xy * written * mix(window, 1.0, 0.6);
 	let uScroll = head - (1.0 - f);
 	let pScroll = origin.xy + origin.zw * f + axis.xy * traceValue(k, uScroll);
 	var out: TracePoint;
@@ -534,6 +597,30 @@ fn edgeFade(u: f32, mixAB: f32) -> f32 {
 	return mix(fadeA, fadeB, mixAB);
 }
 
+fn turnDistance(a: f32, b: f32) -> f32 {
+	return abs(fract(a - b + 0.5) - 0.5);
+}
+
+fn zone(turn: f32, place: f32, width: f32) -> f32 {
+	let d = turnDistance(turn, place) / width;
+	return exp(-d * d);
+}
+
+// How much light this stretch of a row gets from the band: each drum owns its
+// own place round the figure (the same places it stamps), the chord root and
+// the bass note theirs. A dim floor keeps the rows readable in between.
+fn horizonZones(turn: f32) -> f32 {
+	let drums = params.floorDrums;
+	let pitch = params.floorPitch;
+	let lit = drums.x * zone(turn, 0.75, 0.11)
+		+ drums.y * max(zone(turn, 0.5, 0.09), zone(turn, 0.0, 0.09))
+		+ drums.z * max(zone(turn, 0.33, 0.07), zone(turn, 0.17, 0.07))
+		+ drums.w * zone(turn, 0.62, 0.06)
+		+ pitch.y * zone(turn, pitch.x, 0.05)
+		+ pitch.w * zone(turn, pitch.z, 0.05);
+	return 0.55 + min(lit, 1.4) * 0.85;
+}
+
 // Where along a row the beam head's turn lands on one surface kind.
 fn landingU(kind: u32, turn: f32) -> f32 {
 	return select(fract(turn - 0.25), turn, kind == 1u);
@@ -628,6 +715,38 @@ fn vs_main(
 			s.halfWidth = mix(0.7 + depth * 0.25, 0.8 + depth * 0.4, screen) * stroke * pixelScale;
 			s.hot = mix(heroRgb, hotRgb, 0.7) * spot * (0.4 + transient * 1.2) * params.hotColor.w * screen * (1.0 - beamMix);
 		}
+	} else if (instance >= CHANNEL_BASE + 2u && instance < FEED_BASE) {
+		// A voice lane: each written sample glows by its own heat, so the bar's
+		// hits stand on the lane and cool by the part's articulation.
+		let k = instance - CHANNEL_BASE;
+		let lane = k - 2u;
+		s.persist = 0.0;
+		let visibility = traceVisibility(k);
+		let a = tracePoint(k, f0);
+		let b = tracePoint(k, f1);
+		s.start = a.p;
+		s.end = b.p;
+		let tint = voiceColor(lane);
+		let heat = voiceSample(lane, s.along).y;
+		let head = voiceHead(lane);
+		// The write head: a small hot spot, and a short bright stretch just
+		// written behind it.
+		let behind = fract(head - s.along);
+		let fresh = exp(-behind * 60.0);
+		let spot = exp(-sq(behind / 0.006)) + exp(-sq((1.0 - behind) / 0.004)) * 0.5;
+		let ends = smoothstep(0.0, 0.03, s.along) * (1.0 - smoothstep(0.97, 1.0, s.along));
+		s.color = tint.rgb;
+		let drumBoost = select(1.0, 1.8, k >= 4u);
+		s.intensity = visibility * ends * tint.w * drumBoost * (0.07 + heat * 1.35 + fresh * 0.12)
+			* (1.0 - silence * 0.4) * gain * fractureGate(s.along, 22.0, f32(k) + 3.0);
+		s.halfWidth = (0.75 + min(heat, 1.2) * 0.35) * stroke * pixelScale;
+		s.hot = mix(tint.rgb, hotRgb, 0.5) * spot * visibility * ends * (0.35 + min(heat, 1.0) * 0.9);
+		// The lane's own sweep: one written sample per step along its axis.
+		s.reference = length(traceOrigin(k).zw) * halfHeight / f32(SEGMENTS);
+		if (visibility <= 0.001) {
+			s.start = vec2<f32>(-9.0, -9.0);
+			s.end = vec2<f32>(-9.0, -9.0);
+		}
 	} else if (instance < FEED_BASE) {
 		let k = instance - CHANNEL_BASE;
 		s.persist = mix(0.18, 0.0, traceAxis(k).z);
@@ -640,23 +759,24 @@ fn vs_main(
 		let scroll = axis.z;
 		// The real waveforms on X and Y draw as one triggered sweep.
 		let wave = select(0.0, params.scopeTrace.w, k < 2u);
-		let level = select(select(params.band3.x, params.band2.x, k == 2u), 0.6 + energy * 0.3, k < 2u);
+		let traceEnergy = params.sweep.w;
+		let level = 0.6 + traceEnergy * 0.3;
 		let tip = smoothstep(0.985, 1.0, s.along) * (1.0 - wave);
 		// Phosphor tail: brightest at the write head.
 		let age = 1.0 - s.along;
 		let tail = mix(mix(exp(-age * 2.2) * (1.0 - smoothstep(0.8, 1.0, age)), exp(-age * 1.3), scroll), 0.8, wave);
 		let wraps = select(0.0, 1.0, floor(a.u) != floor(b.u)) * (1.0 - scroll) * (1.0 - wave);
 		// X and Y lean toward the hero phosphor: they are the figure's own signals.
-		s.color = select(traceRgb, mix(traceRgb, heroRgb, 0.28), k < 2u);
+		s.color = mix(traceRgb, heroRgb, 0.28);
 		// Hierarchy: traces dim where they pass behind the figure.
 		let mid = (s.start + s.end) * 0.5;
 		let heroDistance = length((mid - params.figureA.xy) * vec2<f32>(0.8, 1.0)) / max(params.figureA.z, 0.05);
 		let behindHero = mix(0.3, 1.0, smoothstep(0.35, 1.25, heroDistance));
 		s.intensity = visibility * tail * behindHero * (1.0 - wraps)
-			* (0.5 + level * 0.6 + energy * 0.2) * (1.0 - silence * 0.4) * gain
+			* (0.5 + level * 0.6 + traceEnergy * 0.2) * (1.0 - silence * 0.4) * gain
 			* (1.0 + headLight(mid) * 0.6) * fractureGate(s.along, 22.0, f32(k) + 3.0);
 		s.halfWidth = (0.95 + level * 0.3) * stroke * pixelScale;
-		let flare = select(level * 0.6, 0.5 + transient * 1.2, k < 2u);
+		let flare = 0.5 + transient * 1.2;
 		s.hot = mix(traceRgb, hotRgb, 0.5) * tip * visibility * flare * 1.6 * (1.0 - wraps);
 		// A time-domain trace slows where the signal is flat and races up
 		// the edges: the reference is the sweep's own step along its axis.
@@ -701,26 +821,50 @@ fn vs_main(
 		s.end = mix(source, goal, f1);
 		let along = s.along;
 		let dash = smoothstep(0.18, 0.32, abs(fract(along * 26.0 - params.view.z * 0.7) - 0.5));
-		let travel = smoothstep(0.0, 0.62, params.sweep.w);
-		let dotGlow = exp(-sq((along - travel) / 0.03)) * (1.0 - smoothstep(0.62, 0.8, params.sweep.w));
+		// Each feed carries a dot after its own instrument plays: the X feed
+		// after the snare, the Y feed after the kick, the drip after a bass note.
+		var feedPhase = params.feeds.z;
+		if (k == 0u) {
+			feedPhase = params.feeds.x;
+		} else if (k == 1u) {
+			feedPhase = params.feeds.y;
+		}
+		let travel = smoothstep(0.0, 1.0, feedPhase);
+		let dotGlow = exp(-sq((along - travel) / 0.03)) * (1.0 - smoothstep(0.8, 1.0, feedPhase));
 		let visibility = select(traceVisibility(min(k, 1u)) * params.sweep.z, params.sweep.z * params.surface.w * 0.8 * dripFade, k == 2u);
 		s.color = select(mix(traceRgb, heroRgb, 0.5), mix(heroRgb, horizonRgb, along), k == 2u);
-		s.intensity = visibility * (0.13 + energy * 0.08) * dash * gain * smoothstep(0.0, 0.06, along) * (1.0 - smoothstep(0.94, 1.0, along));
+		s.intensity = visibility * (0.1 + params.feeds.w * 0.12) * dash * gain * smoothstep(0.0, 0.06, along) * (1.0 - smoothstep(0.94, 1.0, along));
 		s.halfWidth = 0.6 * stroke * pixelScale;
-		s.hot = hotRgb * dotGlow * visibility * (0.5 + transient * 1.2);
+		s.hot = hotRgb * dotGlow * visibility * (0.6 + params.feeds.w * 1.1);
 	} else if (instance < ROW_BASE) {
 		// Rails run along the age direction of the horizon surface; on radar
 		// benches rail zero is the rotating sweep arm.
 		let r = instance - RAIL_BASE;
 		s.persist = 0.0;
 		let arm = select(0.0, params.rings.w, r == 0u);
-		let u = mix((f32(r) + 0.5) / f32(RAILS), params.sweep.x, arm);
+		// A build gathers the rails in toward the figure's line.
+		let spread = mix((f32(r) + 0.5) / f32(RAILS), 0.5, params.voiceHead2.w * 0.3);
+		let u = mix(spread, params.sweep.x, arm);
+		// Each rail listens to its own part of the band; a breakdown puts them
+		// out one by one from the outside in.
+		var railLight = params.rails.x;
+		switch r {
+			case 1u: { railLight = params.rails.y; }
+			case 2u: { railLight = params.rails.z; }
+			case 3u: { railLight = params.rails.w; }
+			case 4u: { railLight = params.rails2.x; }
+			case 5u: { railLight = params.rails2.y; }
+			case 6u: { railLight = params.rails2.z; }
+			default: { }
+		}
+		let railOrder = abs(f32(r) - 3.0) / 3.0;
+		let railOut = smoothstep(1.0 - railOrder * 0.7 - 0.25, 1.0 - railOrder * 0.7, params.voiceHead2.z);
 		let a = blendedSurface(u, f0, 0u, false);
 		let b = blendedSurface(u, f1, 0u, false);
 		s.start = a.p;
 		s.end = b.p;
 		let fade = smoothstep(0.0, 0.25, s.along) * (1.0 - smoothstep(0.85, 1.0, s.along));
-		let railLevel = params.depth.w * (1.0 - a.ring) * (1.0 - arm) * 0.05;
+		let railLevel = params.depth.w * (1.0 - a.ring) * (1.0 - arm) * 0.05 * (0.25 + railLight * 1.6) * (1.0 - railOut * 0.9);
 		s.color = mix(horizonRgb, heroRgb, arm * 0.6);
 		s.intensity = railLevel * fade * min(a.valid, b.valid) * gain * params.surface.w
 			* (1.0 + headLight((a.p + b.p) * 0.5) * 2.0);
@@ -737,7 +881,12 @@ fn vs_main(
 		let fadeIn = smoothstep(0.0, 0.22, age);
 		let rowMix = surfaceMix(age);
 		let dense = clamp(surfaceDensity(rowMix), 0.0, 1.0);
-		let fadeOut = 1.0 - smoothstep(mix(0.78, 0.5, dense), mix(1.0, 0.82, dense), age);
+		// A breakdown withdraws the history from the far end in.
+		let reach = 1.0 - params.voiceHead2.z * 0.72;
+		let fadeOut = (1.0 - smoothstep(mix(0.78, 0.5, dense), mix(1.0, 0.82, dense), age))
+			* (1.0 - smoothstep(reach - 0.12, reach + 0.04, age) * params.voiceHead2.z);
+		// A fill cascades down the rows as one travelling band of light.
+		let cascade = params.voiceVis2.w * exp(-sq((age - params.voiceVis2.z) / 0.07));
 		let u = s.along;
 		let value = select(a.value, b.value, useEnd);
 		let edge = edgeFade(u, rowMix);
@@ -752,7 +901,10 @@ fn vs_main(
 		// P7 radar: rows glow only in the sweep's wake, a rotating reveal rather
 		// than a lit disc.
 		let radar = params.rings.w * a.ring * (exp(-behindArm * 2.6) * 2.1 - 0.9);
-		s.intensity = fadeIn * fadeOut * edge * (0.05 + max(value.x, 0.0) * 1.4) * (0.45 + age * 0.55)
+		let kindA = u32(params.surface.x + 0.5);
+		let kindB = u32(params.surface.y + 0.5);
+		let zones = mix(horizonZones(rowTurn(kindA, u)), horizonZones(rowTurn(kindB, u)), rowMix);
+		s.intensity = fadeIn * fadeOut * edge * zones * (0.05 + max(value.x, 0.0) * 1.4) * (0.45 + age * 0.55)
 			* (1.0 - silence * 0.5) * min(a.valid, b.valid) * gain * params.surface.w
 			* max(1.0 + light * 1.4 + radar, 0.06) * surfaceGain(rowMix)
 			* fractureGate(u, 30.0, f32(row) + 7.0);
@@ -761,8 +913,9 @@ fn vs_main(
 		// stamps from the beam head ride the rows down the horizon.
 		let fresh = 1.0 - smoothstep(0.0, 2.5 / f32(ROWS), age);
 		let stamp = clamp(value.y, 0.0, 2.0);
-		s.hot = (horizonRgb * fresh * params.terrain.z * 0.8 + hotRgb * stamp * (0.9 - age * 0.5))
-			* fadeIn * edge * min(a.valid, b.valid) * params.surface.w;
+		s.hot = (horizonRgb * fresh * params.terrain.z * 0.8 + hotRgb * stamp * (0.9 - age * 0.5)
+			+ mix(heroRgb, hotRgb, 0.5) * cascade * (0.25 + max(value.x, 0.0) * 1.2))
+			* fadeIn * fadeOut * edge * min(a.valid, b.valid) * params.surface.w;
 	}
 
 	// The spot: focused by the music's punch, never under a pixel wide.
@@ -941,7 +1094,9 @@ ${POST_COMMON_WGSL}
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let aspectRatio = params.view.x / max(params.view.y, 1.0);
 	let heroUv = vec2<f32>(params.figureA.x / aspectRatio * 0.5 + 0.5, 0.5 - params.figureA.y * 0.5);
-	let zoom = 1.0 - (0.0003 + params.bandsA.x * 0.0006 + params.pulse.w * 0.0006);
+	// A constant hair of outward drift: no part of the music zooms the whole
+	// phosphor at once.
+	let zoom = 1.0 - 0.0005;
 	let previousUv = heroUv + (in.uv - heroUv) * zoom;
 	let edge = min(min(previousUv.x, previousUv.y), min(1.0 - previousUv.x, 1.0 - previousUv.y));
 	let border = smoothstep(0.0, 0.02, edge);
@@ -1195,9 +1350,9 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let fresnel = 0.04 + 0.96 * pow(1.0 - cosTheta, 5.0);
 
 	// ---- Light on the face ----------------------------------------------------
-	// Chromatic aberration grows toward the rim and kicks with heard
-	// transients, never with the beat clock.
-	let caAmount = (0.0004 + r2 * 0.003) * params.display2.y * (1.0 + params.pulse.x * 1.6 + params.pulse.y * 0.5);
+	// Chromatic aberration grows toward the rim. It never kicks: a kick
+	// shifting the colour of the whole face would be a whole-frame pulse.
+	let caAmount = (0.0004 + r2 * 0.003) * params.display2.y;
 	let direction = normalize(centered + vec2<f32>(1e-4, 1e-4));
 	let phosphor = caSample(phosphorTexture, warped, direction * caAmount);
 	// Halation: the faceplate scatters the beam light, tightly around each
@@ -1219,9 +1374,11 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	}
 	reflection = reflection * params.glow.z * params.display2.x;
 
-	// The light the instrument puts into the room: the mean of the wide glow
-	// over the face. Everything that is not phosphor (glass, graticule, bezel,
-	// the bench) is lit by this and by the local glow, and by nothing else.
+	// The light the instrument puts into the room near here: a broad local
+	// average of the wide glow (a quarter of the face around this point).
+	// Everything that is not phosphor (glass, graticule, bezel, the bench)
+	// is lit by this and by the local glow, and by nothing else. Local, so a
+	// bright figure lights its own corner of the bench, not the whole face.
 	var spill = vec3<f32>(0.0);
 	for (var iy = 0u; iy < 3u; iy = iy + 1u) {
 		for (var ix = 0u; ix < 4u; ix = ix + 1u) {
@@ -1261,7 +1418,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	// The phosphor coat is pale grey: it shows faintly where light lands on it.
 	room = room + localLight * inside * 0.1;
 	let etch = mix(heroRgb, vec3<f32>(0.75, 0.85, 0.8), 0.4);
-	room = room + etch * grid * params.post.w * sqrt(localLum * 0.2) * (0.6 + params.pulse.z * 0.3);
+	room = room + etch * grid * params.post.w * sqrt(localLum * 0.2) * (0.4 + params.rails2.w * 0.6);
 	room = room + mix(heroRgb, vec3<f32>(0.8), 0.5) * frame * sqrt(localLum * 0.2) * 0.5;
 	// Bezel plastic: near-black, catching only the spill and the glow, a
 	// little more on its upper lip that faces the screen.

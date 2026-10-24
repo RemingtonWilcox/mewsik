@@ -46,10 +46,12 @@
 		SURFACE_FLOOR,
 		SURFACE_RING,
 		SURFACE_TUNNEL,
+		SIGNAL_LAYOUT_PARTS,
 		buildSignalLayout,
 		createSignalLayout,
 		lerpPreset,
 		lerpSignalLayout,
+		lerpSignalLayoutPart,
 		mirrorSignalLayout,
 		signalBenchName,
 		signalCompose,
@@ -65,9 +67,17 @@
 		type SignalVariation
 	} from '$lib/visualizer/signal/genome';
 	import {
+		signalPartDelay,
+		signalPartMix,
 		signalRendererMemory,
+		type SignalMorph,
 		type SignalRendererScalars
 	} from '$lib/visualizer/signal/continuity';
+	import {
+		SIGNAL_VOICE_FLOATS,
+		SIGNAL_VOICE_LANES,
+		SignalBand
+	} from '$lib/visualizer/signal/band';
 
 	const vis = useVisualizer();
 
@@ -142,6 +152,18 @@
 	let transient = 0;
 	let lastKickLevel = 0;
 	let sweepPhase = 0;
+	/** Section paces, each glided on its own time (see renderFrame). */
+	let sweepGlide = 0;
+	let traceEnergy = 0.4;
+	/** Chord lane root cycles per trace map style. */
+	const CHORD_CYCLES = [3, 4, 2.5];
+	let chordCycles = 3;
+	/** The hero's own glided pace (conductor trace phase per second). */
+	let heroPace = 0;
+	let headEnergy = 0.4;
+	let tickGlide = 0;
+	/** Where the X/Y record was last written up to. */
+	let lastSweepWritten = 0;
 	let figurePhase = 0;
 	let lastTracePhase = 0;
 	let tickPhase = 0;
@@ -152,6 +174,10 @@
 	let spectralMotion = 0;
 	let spinAngle = 0;
 	let lockStep = 0;
+	/** Kick-driven strides of a locked figure: target, eased value, last kick answered. */
+	let kickStrideTarget = 0;
+	let kickStride = 0;
+	let kickStrideSerial = -1;
 	let breathPhase = 0;
 	let grainClock = 0;
 	let fracturePhase = 0;
@@ -205,14 +231,67 @@
 	let roamPin: Record<string, number> = {};
 	let variation: SignalVariation | null = null;
 
+	/** One bench built at composition `k`, turned round by the mirror morph. */
+	function benchAt(index: number, aspectRatio: number, mirror: SignalMorph, k: SignalCompose): SignalLayout {
+		const amount = (m: number) => mirror.from + (mirror.to - mirror.from) * m;
+		if (mirror.from === mirror.to) {
+			return mirrorSignalLayout(buildSignalLayout(index, aspectRatio, k), amount(mirror.mix));
+		}
+		// Turning round, piece by piece: each part slides across in its own
+		// window of the move (the mirror is linear in its amount).
+		const plain = buildSignalLayout(index, aspectRatio, k);
+		const flipped = mirrorSignalLayout(buildSignalLayout(index, aspectRatio, k), 1);
+		const out = lerpSignalLayout(plain, flipped, amount(mirror.mix), createSignalLayout());
+		for (let part = 0; part < SIGNAL_LAYOUT_PARTS.length; part += 1) {
+			const delay = signalPartDelay(mirror.from + 17, mirror.to + 17, part, partSpan);
+			lerpSignalLayoutPart(plain, flipped, part, amount(signalPartMix(mirror.progress, delay, partSpan)), out);
+		}
+		return out;
+	}
+
+	/** Each part's share of a staggered move: short windows, so parts move one after another. */
+	const PART_SPAN = 0.32;
+	/**
+	 * This frame's stagger window. Right after the music changes character the
+	 * parts move together (a genre change is the one whole-bench gesture left),
+	 * easing back to the cubie-by-cubie stagger as the answer lands.
+	 */
+	let partSpan = PART_SPAN;
+	/**
+	 * How far behind the roam each trace follows, seconds of music (trace k
+	 * is layout part k + 1). The hero and its screens lead; the traces follow
+	 * in a scattered order, so a rearrangement ripples through the bench.
+	 */
+	const TRACE_LAG = [2.5, 7.5, 12.5, 4.5, 10, 1, 6, 14];
+
+	const echoValues: number[] = [];
+	const echoCompose: SignalCompose = { ...compose };
+
 	/**
 	 * One bench at the roam's current point in its room of arrangements,
-	 * turned round by the mirror morph. Built fresh every frame: the roam
-	 * never stops, so there is nothing to cache.
+	 * turned round by the mirror morph, each trace placed where the roam was
+	 * its own lag ago. Built fresh every frame: the roam never stops, so
+	 * there is nothing to cache.
 	 */
-	function layoutFor(index: number, aspectRatio: number, mirror: number): SignalLayout {
-		return mirrorSignalLayout(buildSignalLayout(index, aspectRatio, compose), mirror);
+	function layoutFor(index: number, aspectRatio: number, mirror: SignalMorph, roam: SignalRoam): SignalLayout {
+		// The hero, its screens and the horizon lead; each trace follows the
+		// roam on its own lag, so a rearrangement ripples through the bench.
+		const out = benchAt(index, aspectRatio, mirror, compose);
+		for (let trace = 0; trace < TRACE_LAG.length; trace += 1) {
+			roam.echo.sample(TRACE_LAG[trace], echoValues);
+			signalCompose(echoValues, echoCompose);
+			for (const key of Object.keys(echoCompose) as (keyof SignalCompose)[]) {
+				if (roamPin[key] !== undefined) echoCompose[key] = roamPin[key];
+			}
+			const lagged = benchAt(index, aspectRatio, mirror, echoCompose);
+			lerpSignalLayoutPart(out, lagged, trace + 1, 1, out);
+		}
+		return out;
 	}
+
+	/** Palette roles blended part by part: each role turns in its own window. */
+	const paletteScratch = createSignalPaletteOut();
+	const PALETTE_ROLES = ['hero', 'trace', 'horizon', 'hot'] as const;
 
 	/** The roam, created on the first frame of a session from its journey's seed. */
 	function roamFor(seed: number): SignalRoam {
@@ -220,21 +299,49 @@
 		return memory.roam;
 	}
 
-	// Band traces 2 and 3 by genome trace map: [level band, bin lo, bin hi, cycles].
-	const TRACE_MAPS = [
-		[
-			['kick', 6, 15, 2.5],
-			['sub', 0, 7, 1.25]
-		],
-		[
-			['mids', 22, 40, 5],
-			['presence', 40, 56, 13]
-		],
-		[
-			['body', 12, 24, 3.5],
-			['air', 50, 63, 17]
-		]
-	] as const;
+	/** The band on the bench, created on the first frame of a session (see band.ts). */
+	function bandFor(seed: number): SignalBand {
+		memory.band ??= new SignalBand(`signal-band:${seed}`);
+		return memory.band;
+	}
+
+	/** Lane colours, rebuilt each frame from the palette roles. */
+	const laneRgb = Array.from({ length: SIGNAL_VOICE_LANES }, () => [0, 0, 0] as [number, number, number]);
+	const leanScratch: [number, number, number] = [0, 0, 0];
+
+	/**
+	 * Lean a phosphor toward warm or cool at its own luminance, and twist its
+	 * hue a little round the grey axis (a chord's tension). Small moves only:
+	 * every part stays inside the tube's palette family.
+	 */
+	function leanColour(rgb: ArrayLike<number>, warmth: number, twist: number, out: [number, number, number]) {
+		const lum = rgb[0] * 0.3 + rgb[1] * 0.5 + rgb[2] * 0.2;
+		const w = clamp(warmth, -1, 1) * 0.32;
+		const tr = w > 0 ? 1.25 : 0.6;
+		const tg = w > 0 ? 0.85 : 0.95;
+		const tb = w > 0 ? 0.45 : 1.35;
+		let r = rgb[0] + (lum * tr - rgb[0]) * Math.abs(w);
+		let g = rgb[1] + (lum * tg - rgb[1]) * Math.abs(w);
+		let b = rgb[2] + (lum * tb - rgb[2]) * Math.abs(w);
+		// Rotation about the grey axis (Rodrigues), by up to ~40 degrees.
+		const angle = clamp(twist, 0, 1) * 0.7;
+		if (angle > 1e-3) {
+			const c = Math.cos(angle);
+			const sn = Math.sin(angle);
+			const k = (1 - c) / 3;
+			const q = sn / Math.sqrt(3);
+			const nr = r * (c + k) + g * (k - q) + b * (k + q);
+			const ng = r * (k + q) + g * (c + k) + b * (k - q);
+			const nb = r * (k - q) + g * (k + q) + b * (c + k);
+			r = nr;
+			g = ng;
+			b = nb;
+		}
+		out[0] = Math.max(0, r);
+		out[1] = Math.max(0, g);
+		out[2] = Math.max(0, b);
+		return out;
+	}
 
 	type SignalTargets = {
 		scene: GPUTexture;
@@ -261,6 +368,7 @@
 		terrainBuffer: GPUBuffer;
 		figureBuffer: GPUBuffer;
 		scopeBuffer: GPUBuffer;
+		voiceBuffer: GPUBuffer;
 		uniforms: Float32Array;
 		scenePipeline: GPURenderPipeline;
 		beamPipeline: GPURenderPipeline;
@@ -413,6 +521,17 @@
 		pendingRowFresh = false;
 	}
 
+	/** Stamp a part of the band into the row being written, at its own place. */
+	function stampRow(turn: number, width: number, amount: number) {
+		if (!(amount > 0.001)) return;
+		for (let bin = 0; bin < SIGNAL_TERRAIN_BINS; bin += 1) {
+			const d = Math.abs(((bin / SIGNAL_TERRAIN_BINS - turn + 1.5) % 1) - 0.5);
+			const heat = amount * Math.exp(-(d * d) / (width * width));
+			const o = bin * 2 + 1;
+			if (heat > pendingRow[o]) pendingRow[o] = heat;
+		}
+	}
+
 	function commitTerrainRow() {
 		terrainHead = (terrainHead + 1) % SIGNAL_TERRAIN_ROWS;
 		terrainRows.set(pendingRow, terrainHead * SIGNAL_TERRAIN_BINS * 2);
@@ -459,6 +578,7 @@
 		variation = signalVariationFor(shared.seed, shared.sourceEpoch);
 		variation.setOverride(lookOverride);
 		roamFor(shared.seed);
+		bandFor(shared.seed);
 		if (mounting) {
 			// Audio envelopes always start from what is playing now.
 			const levels = shared.spectrum.levels;
@@ -644,6 +764,7 @@
 		let terrainBuffer: GPUBuffer | null = null;
 		let figureBuffer: GPUBuffer | null = null;
 		let scopeBuffer: GPUBuffer | null = null;
+		let voiceBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
 			if (!context) throw new Error('The WebGPU canvas context could not be created.');
@@ -750,6 +871,11 @@
 				size: SIGNAL_SCOPE_WINDOW * 2 * 4,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 			});
+			voiceBuffer = device.createBuffer({
+				label: 'Signal voice lanes',
+				size: SIGNAL_VOICE_FLOATS * 4,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
 			const sceneBindGroup = device.createBindGroup({
 				label: 'Signal strokes',
 				layout: scenePipeline.getBindGroupLayout(0),
@@ -758,7 +884,8 @@
 					{ binding: 1, resource: { buffer: detailBuffer } },
 					{ binding: 2, resource: { buffer: terrainBuffer } },
 					{ binding: 3, resource: { buffer: figureBuffer } },
-					{ binding: 4, resource: { buffer: scopeBuffer } }
+					{ binding: 4, resource: { buffer: scopeBuffer } },
+					{ binding: 5, resource: { buffer: voiceBuffer } }
 				]
 			});
 			const beamBindGroup = device.createBindGroup({
@@ -785,6 +912,7 @@
 				terrainBuffer,
 				figureBuffer,
 				scopeBuffer,
+				voiceBuffer,
 				uniforms: new Float32Array(SIGNAL_UNIFORM_FLOATS),
 				scenePipeline,
 				beamPipeline,
@@ -816,6 +944,7 @@
 			terrainBuffer?.destroy();
 			figureBuffer?.destroy();
 			scopeBuffer?.destroy();
+			voiceBuffer?.destroy();
 			try {
 				context?.unconfigure();
 			} catch {
@@ -834,6 +963,7 @@
 		state.terrainBuffer.destroy();
 		state.figureBuffer.destroy();
 		state.scopeBuffer.destroy();
+		state.voiceBuffer.destroy();
 		if (timer) {
 			timer.querySet.destroy();
 			timer.resolve.destroy();
@@ -854,6 +984,30 @@
 		gpu = null;
 		ready = false;
 		destroyGpuState(state);
+	}
+
+	/** Drum lane geometry (traces 4..7) as uniform values. */
+	function laneFrames(layout: SignalLayout) {
+		const out: Record<string, number> = {};
+		for (let k = 4; k < 8; k += 1) {
+			for (const key of ['ox', 'oy', 'tx', 'ty', 'vx', 'vy', 'scroll', 'vis'] as const) {
+				out[`t${k}${key}`] = layout[`t${k}${key}` as keyof SignalLayout];
+			}
+		}
+		return out as Pick<SignalUniformValues, `t${4 | 5 | 6 | 7}${'ox' | 'oy' | 'tx' | 'ty' | 'vx' | 'vy' | 'scroll' | 'vis'}`>;
+	}
+
+	/** Each lane's phosphor and light as uniform values. */
+	function laneColours(light: Float32Array) {
+		const out: Record<string, number> = {};
+		for (let lane = 0; lane < SIGNAL_VOICE_LANES; lane += 1) {
+			const k = lane + 2;
+			out[`v${k}r`] = laneRgb[lane][0];
+			out[`v${k}g`] = laneRgb[lane][1];
+			out[`v${k}b`] = laneRgb[lane][2];
+			out[`v${k}light`] = light[lane];
+		}
+		return out as Pick<SignalUniformValues, `v${2 | 3 | 4 | 5 | 6 | 7}${'r' | 'g' | 'b' | 'light'}`>;
 	}
 
 	function renderFrame(state: SignalGpu, dt: number) {
@@ -884,6 +1038,7 @@
 
 		const directed = shared.director;
 		const spectrum = shared.spectrum;
+		const clock = directed.clock;
 		const response = VISUALIZER_TUNING.signal;
 		// Conductor rails, carried across a new source so a song change glides.
 		// Transients (impact, ring-out, section pulse) pass through untouched.
@@ -937,7 +1092,7 @@
 		rms = approach(rms, rmsTarget, rmsTarget > rms ? 18 : 7, dt);
 		if (!feature || rmsTarget < 0.009) quietFor += dt;
 		else quietFor = 0;
-		silence = approach(silence, quietFor > 0.45 ? 1 : 0, quietFor > 0.45 ? 4 : 12, dt);
+		silence = approach(silence, quietFor > 0.45 ? 1 : 0, quietFor > 0.45 ? 4 : 7, dt);
 		const bandMix = 1 - Math.exp(-dt / 0.05);
 		for (const key of BAND_KEYS) {
 			const target = feature ? spectrum.levels[key] : 0;
@@ -951,8 +1106,18 @@
 		// Hero placement glides over bars, never per beat, so it cannot smear.
 		asymmetry = approach(asymmetry, journey.signedAsymmetry, 0.3, dt);
 
+		// ---- The band: every part of the bench answers its own instrument. ----
+		const ensemble = shared.ensemble;
+		const band = bandFor(shared.seed);
+		const voices = band.update(ensemble, dt, {
+			fallbackBpm: clamp(clock.tempoBpm || 120, 40, 220),
+			silent: !feature || silence > 0.6,
+			restless: clamp(0.25 + ensemble.texture.density * 0.5 + ensemble.texture.build * 0.3, 0, 1),
+			reroute: shiftEvent ? shiftEvent.strength : 0,
+			chordCycles
+		});
+
 		// Song clock: beats phase-locked to the director's phrase anchor.
-		const clock = directed.clock;
 		const bpmTarget = clamp(clock.tempoBpm || 0, 0, 220);
 		renderBpm = approach(renderBpm, bpmTarget >= 30 ? bpmTarget : 120, 2, dt);
 		const beatsPerSecond = renderBpm / 60;
@@ -973,7 +1138,11 @@
 
 		// Channel sweep: one pass per sweepBeats, locked to the bar when the
 		// section's sweep length settles on a whole number of beats.
-		const sweepBeats = clamp(journey.sweepBeats, 0.5, 4);
+		// Each part takes a new section's pace on its own time: the X/Y sweep
+		// over several seconds, the horizon's scroll more slowly still, so a
+		// section change is not every part speeding up in the same instant.
+		sweepGlide = sweepGlide > 0 ? approach(sweepGlide, journey.sweepBeats, 1 / 5, dt) : journey.sweepBeats;
+		const sweepBeats = clamp(sweepGlide, 0.5, 4);
 		const sweepStep = (dt * beatsPerSecond) / sweepBeats;
 		sweepPhase += sweepStep;
 		const wholeBeats = Math.max(1, Math.round(sweepBeats));
@@ -987,17 +1156,29 @@
 		// Hero rotation integrates the conductor's monotonic trace phase so
 		// remounts and response changes never jump the figure.
 		// Tempo sets how fast the beam writes; a club lock trades the smooth
-		// drift for one stride per beat.
+		// drift for one stride per heard kick (never the predicted beat): each
+		// kick pushes the figure on by its velocity, eased over a breath.
 		const traceDelta = clamp(journey.tracePhase - lastTracePhase, 0, 0.5);
 		lastTracePhase = journey.tracePhase;
-		const stepped = steppedBeats(renderBeats);
-		// A clock resync (a jump of many beats) is not a stride: skip it.
-		const lockRaw = stepped - lockStep;
-		const lockDelta = lockRaw > 0 && lockRaw < 0.5 ? lockRaw : 0;
-		lockStep = stepped;
+		const kickLayer = ensemble.drums.kick;
+		if (kickLayer.serial !== kickStrideSerial) {
+			if (kickStrideSerial >= 0 && feature && silence < 0.5) kickStrideTarget += 0.5 + kickLayer.velocity * 0.5;
+			kickStrideSerial = kickLayer.serial;
+		}
+		const strideBefore = kickStride;
+		kickStride += (kickStrideTarget - kickStride) * (1 - Math.exp(-dt / 0.09));
+		const lockDelta = clamp(kickStride - strideBefore, 0, 0.5);
+		// The lock only holds while a kick is there to step on; without one the
+		// figure drifts on at its own pace instead of stopping with the drums.
+		const lock = voice.lock * clamp(kickLayer.present * 1.3, 0, 1);
+		// The hero keeps its own pace through a section change: the conductor's
+		// rate reaches it over several seconds, so the whole bench does not
+		// speed up or calm down in one instant.
+		const tracePace = dt > 0 ? traceDelta / dt : 0;
+		heroPace = heroPace > 0 ? approach(heroPace, tracePace, 1 / 6, dt) : tracePace;
 		figurePhase +=
-			traceDelta * 1.6 * responseMotion * voice.speed * (1 - voice.lock * 0.8) +
-			lockDelta * 0.32 * voice.lock * responseMotion;
+			heroPace * dt * 1.6 * responseMotion * voice.speed * (1 - lock * 0.8) +
+			lockDelta * 0.22 * lock * responseMotion;
 		breathPhase += dt * 0.75;
 		grainClock += dt * voice.speed;
 		fracturePhase += dt * (0.8 + voice.speed * 2.2);
@@ -1008,6 +1189,10 @@
 			1
 		);
 		const impact = clamp(journey.impact * responseImpact, 0, 1);
+		// Parts take the section's energy on their own time: the hero now, the
+		// X/Y traces over a few seconds, the beam head's pool on the bench later.
+		traceEnergy = approach(traceEnergy, energy, 1 / 4, dt);
+		headEnergy = approach(headEnergy, energy, 1 / 7, dt);
 		const ringOut = journey.ringOut;
 		const modeTarget =
 			(directed.context.keyMode === 'major' ? 1 : directed.context.keyMode === 'minor' ? -1 : 0) *
@@ -1032,28 +1217,46 @@
 		// moves that rearrange the bench (layout, camera) keep at least about
 		// three seconds so the composition travels instead of cutting.
 		const morphDt = directed.silence || !feature ? 0 : dt;
-		const structural = 1 + (reactBoost - 1) * 0.3;
+		const structural = 1 + (reactBoost - 1) * 0.75;
 		const layoutChoice = morphs.layout.update(genome.choice('layout').to, morphDt, structural);
 		const familyChoice = morphs.family.update(genome.choice('family').to, morphDt, 1 + (reactBoost - 1) * 0.8);
-		const paletteChoice = morphs.palette.update(genome.choice('palette').to, morphDt, reactBoost * 1.15);
+		const paletteChoice = morphs.palette.update(genome.choice('palette').to, morphDt, reactBoost * 1.7);
+		partSpan = PART_SPAN + (1 - PART_SPAN) * clamp((reactBoost - 1) / 2, 0, 1);
 		const cameraChoice = morphs.camera.update(genome.choice('camera').to, morphDt, structural);
 		const displayChoice = morphs.display.update(genome.choice('display').to, morphDt, reactBoost);
+		// The trace map now styles the chord lane: how many root cycles its
+		// standing wave spans (glided, so the wave re-spaces as it is written).
 		const traceMapChoice = morphs.traceMap.update(genome.choice('traceMap').to, morphDt, reactBoost);
+		chordCycles =
+			CHORD_CYCLES[traceMapChoice.from] +
+			(CHORD_CYCLES[traceMapChoice.to] - CHORD_CYCLES[traceMapChoice.from]) * traceMapChoice.mix;
 		const mirrorChoice = morphs.mirror.update(genome.choice('mirror').to, morphDt, structural);
-		const mirror = mirrorChoice.from + (mirrorChoice.to - mirrorChoice.from) * mirrorChoice.mix;
 		// The roam travels through each bench's room of arrangements while the
 		// genome picks which bench: tempo sets its pace, energy its restlessness,
 		// and it holds still in silence with the morphs.
-		roam.update(morphDt, { tempo: journey.tempo, energy: journey.energy, ringOut: journey.ringOut });
+		roam.update(morphDt, {
+			tempo: journey.tempo,
+			// The roam's restlessness is its own drifting voice, not the
+			// section's energy: a drop does not set every part moving at once.
+			energy: 0.35 + voices.restless * 0.35,
+			ringOut: journey.ringOut
+		});
 		signalCompose(roam.compose.value, compose);
 		for (const key of Object.keys(compose) as (keyof SignalCompose)[]) {
 			if (roamPin[key] !== undefined) compose[key] = roamPin[key];
 		}
-		const layoutFrom = layoutFor(layoutChoice.from, aspect, mirror);
+		const layoutFrom = layoutFor(layoutChoice.from, aspect, mirrorChoice, roam);
 		const layoutTo =
-			layoutChoice.to === layoutChoice.from ? layoutFrom : layoutFor(layoutChoice.to, aspect, mirror);
-		// Panels, traces and faces travel to their new places.
+			layoutChoice.to === layoutChoice.from ? layoutFrom : layoutFor(layoutChoice.to, aspect, mirrorChoice, roam);
+		// Panels, traces and faces travel to their new places, each in its own
+		// window of the move: the cubies turn one after another.
 		const layout = lerpSignalLayout(layoutFrom, layoutTo, layoutChoice.mix, layoutMix);
+		if (layoutChoice.from !== layoutChoice.to) {
+			for (let part = 0; part < SIGNAL_LAYOUT_PARTS.length; part += 1) {
+				const delay = signalPartDelay(layoutChoice.from, layoutChoice.to, part, partSpan);
+				lerpSignalLayoutPart(layoutFrom, layoutTo, part, signalPartMix(layoutChoice.progress, delay, partSpan), layout);
+			}
+		}
 		const camera = lerpPreset(
 			SIGNAL_CAMERAS[cameraChoice.from],
 			SIGNAL_CAMERAS[cameraChoice.to],
@@ -1112,7 +1315,7 @@
 			voice.scale *
 			// The breath swells on a path that never repeats its rhythm.
 			(1 + voice.breathe * 0.07 * roam.noise(SIGNAL_NOISE_LANE.breath, breathPhase * 0.16)) *
-			(1 + voice.lock * (transient * 0.05 + bands.kick * 0.03));
+			(1 + voice.lock * transient * 0.02);
 		const figAScale = layout.figAScale * scaleFactor;
 		// The hero drifts slowly about its place on the face, the way a real
 		// trace wanders with the tube's warm-up; its own size sets how far.
@@ -1130,8 +1333,14 @@
 		// ---- Figure polyline: the one signal everything else reads. -----------
 		const spin = gene('spin');
 		spinAngle += dt * spin * 0.18 * (0.4 + journey.motion) * voice.speed;
+		// The stereo ghost opens with the stereo image and its own drifting voice.
 		const spread =
-			0.02 + bands.air * 0.1 + journey.release * 0.07 + ringOut * 0.25 + spectrum.flatness * 0.05;
+			0.02 +
+			bands.air * 0.06 +
+			journey.release * 0.05 +
+			ringOut * 0.2 +
+			ensemble.texture.width * 0.05 +
+			(voices.ghost - 0.4) * 0.08;
 		const figureInput: SignalFigureInput = {
 			familyFrom: familyChoice.from,
 			familyTo: familyChoice.to,
@@ -1160,7 +1369,7 @@
 			yaw:
 				asymmetry * 0.55 +
 				// Wobble on the figure's own music-driven phase, never periodic.
-				roam.noise(SIGNAL_NOISE_LANE.yaw, figurePhase * 0.037) * 0.36 +
+				roam.noise(SIGNAL_NOISE_LANE.yaw, figurePhase * 0.037) * (0.18 + voices.wobble * 0.36) +
 				spinAngle +
 				voice.organic * 0.22 * roam.noise(SIGNAL_NOISE_LANE.organic, grainClock * 0.046),
 			tilt:
@@ -1175,7 +1384,10 @@
 			pace: (beatsPerSecond / 2) * (0.5 + journey.motion),
 			jitter: voice.jitter,
 			wander: voice.organic,
-			grainTime: grainClock
+			grainTime: grainClock,
+			harmonyIndex: voices.heroIndex,
+			harmonyMinor: voices.heroMinor,
+			harmonyLead: voices.heroLead
 		};
 		const figurePoints = figureEngine.evaluate(figureInput);
 		const headU = sweepPhase;
@@ -1190,6 +1402,25 @@
 			beam.live *
 			(0.2 + 0.8 * beam.structure);
 		const beamTurn = smoothstep(0.58, 0.78, gene('tilt')) * (Math.PI / 4);
+		// X and Y are written where the sweep head passes (see band.ts).
+		// With the XY beam up they carry the real left and right waveforms,
+		// triggered, but repainted by the head as it passes rather than all at
+		// once every frame: the traces change where they are written.
+		const waveMix = beamMix;
+		const scopeWindow = scopeBeam.window;
+		band.writeDeflection(lastSweepWritten, sweepPhase, (u, out) => {
+			figureEngine.sample(0, u, out);
+			if (waveMix > 0.001) {
+				const position = clamp(beam.traceStart + u * beam.traceSpan, 0, SIGNAL_SCOPE_WINDOW - 2);
+				const i0 = Math.floor(position);
+				const f = position - i0;
+				const l = scopeWindow[i0 * 2] + (scopeWindow[i0 * 2 + 2] - scopeWindow[i0 * 2]) * f;
+				const r = scopeWindow[i0 * 2 + 1] + (scopeWindow[i0 * 2 + 3] - scopeWindow[i0 * 2 + 1]) * f;
+				out[0] += (0.95 * Math.tanh((l * beam.agc) / 0.95) - out[0]) * waveMix;
+				out[1] += (0.95 * Math.tanh((r * beam.agc) / 0.95) - out[1]) * waveMix;
+			}
+		});
+		lastSweepWritten = sweepPhase;
 		if (beamMix > 0) {
 			const c = Math.cos(beamTurn);
 			const s = Math.sin(beamTurn);
@@ -1204,23 +1435,27 @@
 
 		// ---- Horizon: the figure's history, written on beat ticks. ------------
 		const coupling = clamp(0.5 + gene('coupling') * 0.42, 0, 1);
-		const stamp = clamp(transient * 1.3 + impact * 0.4 - 0.25, 0, 1.6);
-		accumulateTerrainRow(coupling, headTurn, stamp, beamMix, beamTurn);
-		const tickRate = clamp(journey.tickRate, 0.125, 3);
-		tickPhase += dt * beatsPerSecond * tickRate * (feature ? 1 : 0.25);
+		accumulateTerrainRow(coupling, headTurn, 0, beamMix, beamTurn);
+		// Who played while this row was written, each at its own place.
+		band.stamps(ensemble, stampRow);
+		// Rows are written on the band's own tempo, never the director's clock.
+		// The newest row no longer flashes across its whole width: the kick
+		// lights its own stamp under the figure instead.
+		tickGlide = tickGlide > 0 ? approach(tickGlide, journey.tickRate, 1 / 11, dt) : journey.tickRate;
+		const tickRate = clamp(tickGlide, 0.125, 3);
+		tickPhase += dt * (voices.bpm / 60) * tickRate * (feature ? 1 : 0.25);
 		if (tickPhase >= 1) {
 			tickPhase -= Math.floor(tickPhase);
 			commitTerrainRow();
-			tickFlash = 0.6 + bands.kick * 0.8;
 		}
-		tickFlash *= Math.exp(-dt * 7);
+		tickFlash = 0.5;
 
 		// Surface rigs. Each bench projects its own horizon with its own camera;
 		// a bench change blends the two projections on screen (rows nearest
 		// the figure first), so the horizon re-forms instead of the camera
 		// swinging through poses where it falls behind the lens.
 		const driftBase = clamp(asymmetry * 0.62, -0.4, 0.4) * aspect;
-		const reliefDrive = (0.75 + gene('relief') * 0.5) * (0.8 + energy * 0.35);
+		const reliefDrive = (0.75 + gene('relief') * 0.5) * 0.95;
 		const surfaceRig = (bench: SignalLayout, cam: ReturnType<typeof benchCamera>) => {
 			// Put the surface's anchor (vanishing point, ring centre, waterfall
 			// origin) where the bench wants it.
@@ -1250,13 +1485,62 @@
 		const surfaceB = layoutTo.surface;
 
 		// ---- Phosphor ------------------------------------------------------------
-		resolveSignalPalette(
-			paletteChoice.from,
-			paletteChoice.to,
-			paletteChoice.mix,
-			{ hueLean: gene('hueLean'), mode, energy, warmth: gene('warmth'), temperature: voice.temperature },
-			paletteOut
-		);
+		const paletteContext = {
+			hueLean: gene('hueLean'),
+			mode,
+			energy: 0.5,
+			warmth: gene('warmth'),
+			temperature: voice.temperature
+		};
+		resolveSignalPalette(paletteChoice.from, paletteChoice.to, paletteChoice.mix, paletteContext, paletteOut);
+		if (paletteChoice.from !== paletteChoice.to) {
+			// A new phosphor reaches the tube's roles one after another.
+			PALETTE_ROLES.forEach((role, index) => {
+				const delay = signalPartDelay(paletteChoice.from + 31, paletteChoice.to + 31, index, partSpan);
+				resolveSignalPalette(
+					paletteChoice.from,
+					paletteChoice.to,
+					signalPartMix(paletteChoice.progress, delay, partSpan),
+					paletteContext,
+					paletteScratch
+				);
+				paletteOut[role][0] = paletteScratch[role][0];
+				paletteOut[role][1] = paletteScratch[role][1];
+				paletteOut[role][2] = paletteScratch[role][2];
+			});
+		}
+		// Each tube role leans on its own: the hero by the chord (major warm,
+		// minor cool, diminished twisted), the traces and the horizon by their
+		// own drifting voices.
+		leanColour(paletteOut.hero, voices.heroWarmth * 0.45 + (voices.heroLean - 0.5) * 0.4, voices.heroTwist * 0.4, leanScratch);
+		paletteOut.hero[0] = leanScratch[0];
+		paletteOut.hero[1] = leanScratch[1];
+		paletteOut.hero[2] = leanScratch[2];
+		leanColour(paletteOut.trace, (voices.traceLean - 0.5) * 1.2, 0, leanScratch);
+		paletteOut.trace[0] = leanScratch[0];
+		paletteOut.trace[1] = leanScratch[1];
+		paletteOut.trace[2] = leanScratch[2];
+		leanColour(paletteOut.horizon, (voices.horizonLean - 0.5) * 1.2, 0, leanScratch);
+		paletteOut.horizon[0] = leanScratch[0];
+		paletteOut.horizon[1] = leanScratch[1];
+		paletteOut.horizon[2] = leanScratch[2];
+		// The lanes: bass in the horizon's phosphor, the chord in the hero's,
+		// each drum its own mix of the tube's roles.
+		const blendRgb = (a: ArrayLike<number>, b: ArrayLike<number>, t: number, out: [number, number, number]) => {
+			out[0] = a[0] + (b[0] - a[0]) * t;
+			out[1] = a[1] + (b[1] - a[1]) * t;
+			out[2] = a[2] + (b[2] - a[2]) * t;
+			return out;
+		};
+		blendRgb(paletteOut.horizon, paletteOut.hero, 0.35, laneRgb[0]);
+		blendRgb(paletteOut.hero, paletteOut.trace, 0.2, laneRgb[1]);
+		blendRgb(paletteOut.horizon, paletteOut.hot, 0.3, laneRgb[2]);
+		blendRgb(paletteOut.trace, paletteOut.hot, 0.55, laneRgb[3]);
+		blendRgb(paletteOut.trace, paletteOut.hero, 0.15, laneRgb[4]);
+		blendRgb(paletteOut.trace, paletteOut.horizon, 0.5, laneRgb[5]);
+		for (let lane = 0; lane < SIGNAL_VOICE_LANES; lane += 1) {
+			leanColour(laneRgb[lane], voices.warmth[lane], voices.twist[lane], laneRgb[lane]);
+		}
 
 		// Phosphor persistence per 60 Hz frame, converted to this frame's dt.
 		const persistence = clamp(
@@ -1268,7 +1552,9 @@
 				response.persistenceOffset +
 				display.persist +
 				(gene('persistence') - 0.5) * 0.04 +
-				voice.persistence,
+				voice.persistence +
+				// Legato lingers on the tube, staccato is wiped quickly.
+				voices.legato * 0.018,
 			0.78,
 			0.972
 		);
@@ -1305,16 +1591,6 @@
 		const sizeEnergy = (meanLength: number, scale: number) =>
 			Math.pow(Math.max((meanLength * scale * halfHeight) / 7, 0.05), -0.4);
 
-		// Band traces follow the genome's trace map on the shared time base.
-		const mapA = TRACE_MAPS[traceMapChoice.from];
-		const mapB = TRACE_MAPS[traceMapChoice.to];
-		const mapMix = traceMapChoice.mix;
-		const bandParam = (slot: 0 | 1, field: 1 | 2 | 3) =>
-			(mapA[slot][field] as number) +
-			((mapB[slot][field] as number) - (mapA[slot][field] as number)) * mapMix;
-		const bandLevel = (slot: 0 | 1) =>
-			bands[mapA[slot][0]] + (bands[mapB[slot][0]] - bands[mapA[slot][0]]) * mapMix;
-
 		const scanAxis = gene('scan');
 		const values: SignalUniformValues = {
 			width: size.width,
@@ -1337,7 +1613,6 @@
 			silence,
 			stroke:
 				response.stroke *
-				(1 + bands.presence * 0.08) *
 				display.stroke *
 				(0.86 + gene('stroke') * 0.28) *
 				voice.weight,
@@ -1373,11 +1648,11 @@
 			headU,
 			headX,
 			headY,
-			lightLevel: (0.55 + energy * 0.35 + transient * 0.25) * (1 - silence * 0.6),
+			lightLevel: (0.55 + headEnergy * 0.3) * (1 - silence * 0.6),
 			sweepPhase,
 			channels: clamp(journey.channels * (0.85 + responseMotion * 0.15), 0, 4),
 			feed: layout.feed,
-			feedPhase: clamp(clock.beatPhase, 0, 1),
+			traceLevel: traceEnergy,
 			t0ox: layout.t0ox,
 			t0oy: layout.t0oy,
 			t0tx: layout.t0tx,
@@ -1410,14 +1685,44 @@
 			t3vy: layout.t3vy,
 			t3scroll: layout.t3scroll,
 			t3vis: layout.t3vis,
-			band2Level: bandLevel(0),
-			band2Lo: bandParam(0, 1),
-			band2Hi: bandParam(0, 2),
-			band2Cycles: bandParam(0, 3),
-			band3Level: bandLevel(1),
-			band3Lo: bandParam(1, 1),
-			band3Hi: bandParam(1, 2),
-			band3Cycles: bandParam(1, 3),
+			...laneFrames(layout),
+			vis2: voices.vis[0],
+			vis3: voices.vis[1],
+			vis4: voices.vis[2],
+			vis5: voices.vis[3],
+			vis6: voices.vis[4],
+			vis7: voices.vis[5],
+			fillTravel: voices.fillTravel,
+			fillAmount: voices.fillAmount,
+			head2: voices.head[0],
+			head3: voices.head[1],
+			head4: voices.head[2],
+			head5: voices.head[3],
+			head6: voices.head[4],
+			head7: voices.head[5],
+			withdraw: voices.withdraw,
+			gather: voices.gather,
+			...laneColours(voices.light),
+			rail0: voices.rails[0],
+			rail1: voices.rails[1],
+			rail2: voices.rails[2],
+			rail3: voices.rails[3],
+			rail4: voices.rails[4],
+			rail5: voices.rails[5],
+			rail6: voices.rails[6],
+			graticule: voices.graticule,
+			feedX: voices.feeds[0],
+			feedY: voices.feeds[1],
+			feedDrip: voices.feeds[2],
+			feedLight: voices.feedLight,
+			floorKick: voices.zones[0],
+			floorSnare: voices.zones[1],
+			floorHat: voices.zones[2],
+			floorPerc: voices.zones[3],
+			chordTurn: voices.chordTurn,
+			chordLight: voices.zones[4],
+			bassTurn: voices.bassTurn,
+			bassLight: voices.zones[5],
 			surfaceA,
 			surfaceB,
 			surfaceMix: layoutChoice.mix,
@@ -1508,7 +1813,9 @@
 			// step with how much glass the display shows.
 			tubeRadius: 0.05 + display.curvature * 0.7,
 			glassReflect: 0.35 + display.glass * 0.9,
-			roomSpill: 1,
+			// The room is lit by the instrument, but softly: a strong spill would
+			// carry any one part's flash across the whole glass.
+			roomSpill: 0.7,
 			glassGhost: 0.03 + display.glass * 0.09,
 			figALen: figureEngine.meanLength[0],
 			figBLen: figureEngine.meanLength[1],
@@ -1530,11 +1837,13 @@
 			traceStart: beam.traceStart,
 			traceSpan: beam.traceSpan,
 			traceGain: beam.agc,
-			traceMix: beamMix,
+			// The waveforms are written into the X/Y records at the head (above).
+			traceMix: 0,
 			glowTight: 0.26,
 			glowWide: 0.17,
-			reflection: 0.1,
-			exposure: 1.15 + energy * 0.1,
+			reflection: 0.06,
+			// Fixed exposure: loudness never brightens the whole face at once.
+			exposure: 1.2,
 			overexposure: 0.8,
 			reflectSpread: 0.05,
 			saturation: 1.06,
@@ -1571,6 +1880,7 @@
 			figurePoints.byteOffset,
 			figurePoints.byteLength
 		);
+		queue.writeBuffer(state.voiceBuffer, 0, band.lanes.buffer, band.lanes.byteOffset, band.lanes.byteLength);
 		queue.writeBuffer(
 			state.scopeBuffer,
 			0,

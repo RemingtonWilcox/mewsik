@@ -1,5 +1,7 @@
 import type { AudioFeatureFrame } from '$lib/visualizer/director/types';
 import type { TrackScore } from '$lib/visualizer/director/score';
+import { stereoImage } from '$lib/audio/ensemble-features';
+import { LAB_ENSEMBLE_SPECS, LabEnsembleScore, type LabEnsembleEvent } from './ensemble-score';
 
 export const SOMA_LAB_PROFILE_IDS = [
 	'club128',
@@ -66,6 +68,11 @@ export type SomaLabProfile = {
 	frameAt(positionMs: number, seed?: string, fromMs?: number): AudioFeatureFrame;
 	/** The deterministic synthetic stereo signal between two positions. */
 	scopeBetween(fromMs: number, toMs: number, seed?: string): Float32Array;
+	/**
+	 * The ensemble the raw ensemble features are synthesised from: chords,
+	 * bass line, per-layer drum patterns, fills and breakdowns.
+	 */
+	ensemble: LabEnsembleScore;
 };
 
 const SAMPLE_RATE = 44_100;
@@ -509,12 +516,56 @@ function makeScope(spec: ProfileSpec, score: TrackScore, fromMs: number, toMs: n
 	return out;
 }
 
+const ensembleEvents = new Map<LabEnsembleEvent['layer'], number>();
+
+/**
+ * The raw ensemble features of a frame: pitch from the chord and bass line,
+ * onset strengths of the hits since the previous frame (or one 60 Hz frame),
+ * the stereo image of the frame's scope. Additive: no older field changes.
+ */
+function ensembleFields(
+	ensemble: LabEnsembleScore,
+	energy: number,
+	fromMs: number,
+	toMs: number,
+	seed: string,
+	scope: Float32Array
+): Partial<AudioFeatureFrame> {
+	const chroma = new Array<number>(12);
+	const bassChroma = new Array<number>(12);
+	ensemble.pitchAt(toMs / 1000, chroma, bassChroma, stringHash(`${seed}:ensemble`) & 0xffff);
+	ensemble.eventsBetween(fromMs / 1000, toMs / 1000, ensembleEvents);
+	const gain = 0.7 + 0.3 * energy;
+	const onset = (layer: LabEnsembleEvent['layer']) => Math.round(clamp01((ensembleEvents.get(layer) ?? 0) * gain) * 1000) / 1000;
+	let ll = 0;
+	let rr = 0;
+	let lr = 0;
+	for (let i = 0; i + 1 < scope.length; i += 2) {
+		ll += scope[i] * scope[i];
+		rr += scope[i + 1] * scope[i + 1];
+		lr += scope[i] * scope[i + 1];
+	}
+	const image = stereoImage({ ll, rr, lr, count: scope.length >> 1 });
+	return {
+		chroma,
+		bass_chroma: bassChroma,
+		onset_kick: onset('kick'),
+		onset_snare: onset('snare'),
+		onset_hat: onset('hat'),
+		onset_perc: onset('perc'),
+		onset_tonal: onset('tonal'),
+		stereo_width: image.width,
+		stereo_corr: image.corr
+	};
+}
+
 function makeFrame(
 	spec: ProfileSpec,
 	score: TrackScore,
 	positionMs: number,
 	seed: string,
-	fromMs?: number
+	fromMs: number | undefined,
+	ensemble: LabEnsembleScore
 ): AudioFeatureFrame {
 	const boundedMs = Math.min(score.duration_ms, Math.max(0, positionMs));
 	const positionSeconds = boundedMs / 1_000;
@@ -559,6 +610,11 @@ function makeFrame(
 	const activityGain = 0.42 + energy * 0.58;
 	const rms = clamp01(spec.rms * activityGain + pulses.activity * energy * 0.065);
 	const peak = clamp01(rms * spec.crest + pulses.activity * 0.08);
+	const windowFromMs =
+		fromMs !== undefined && fromMs < boundedMs && boundedMs - fromMs <= SCOPE_MAX_WINDOW_MS
+			? fromMs
+			: boundedMs - 1000 / 60;
+	const scope = makeScope(spec, score, windowFromMs, boundedMs, seed);
 
 	return {
 		bins: magnitudes.map(encodeAnalyzerMagnitude),
@@ -577,15 +633,8 @@ function makeFrame(
 		chroma_key: spec.keyPitchClass / 12,
 		chroma_strength: spec.keyConfidence,
 		scope_rate: SAMPLE_RATE,
-		scope_pcm: makeScope(
-			spec,
-			score,
-			fromMs !== undefined && fromMs < boundedMs && boundedMs - fromMs <= SCOPE_MAX_WINDOW_MS
-				? fromMs
-				: boundedMs - 1000 / 60,
-			boundedMs,
-			seed
-		)
+		scope_pcm: scope,
+		...ensembleFields(ensemble, energy, windowFromMs, boundedMs, seed, scope)
 	};
 }
 
@@ -630,6 +679,16 @@ function buildProfile(spec: ProfileSpec): SomaLabProfile {
 		energy_hz: ENERGY_HZ,
 		energy_curve: energyCurve
 	};
+	const ensemble = new LabEnsembleScore(
+		LAB_ENSEMBLE_SPECS[spec.id],
+		spec.bpm,
+		spec.keyPitchClass,
+		scoreSections.map((section) => ({
+			label: section.label,
+			startS: section.start_ms / 1000,
+			endS: section.end_ms / 1000
+		}))
+	);
 	const labelCounts = new Map<string, number>();
 	const stages = scoreSections.map((section): SomaLabStage => {
 		const count = (labelCounts.get(section.label) ?? 0) + 1;
@@ -653,8 +712,9 @@ function buildProfile(spec: ProfileSpec): SomaLabProfile {
 		score,
 		stages,
 		defaultStage: stages.find((stage) => stage.id === 'verse')?.id ?? stages[0].id,
+		ensemble,
 		frameAt(positionMs: number, seed = 'soma-qa', fromMs?: number) {
-			return makeFrame(spec, score, positionMs, seed, fromMs);
+			return makeFrame(spec, score, positionMs, seed, fromMs, ensemble);
 		},
 		scopeBetween(fromMs: number, toMs: number, seed = 'soma-qa') {
 			return makeScope(spec, score, fromMs, toMs, seed);

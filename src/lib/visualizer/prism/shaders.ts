@@ -19,8 +19,8 @@
 
 export const PRISM_BIN_COUNT = 64;
 
-/** Uniform floats: 24 legacy scalars + 39 vec4 groups. */
-export const PRISM_UNIFORM_FLOATS = 180;
+/** Uniform floats: 24 legacy scalars + 60 vec4 groups. */
+export const PRISM_UNIFORM_FLOATS = 264;
 export const PRISM_UNIFORM_BYTES = PRISM_UNIFORM_FLOATS * 4;
 
 /** Float offsets of each vec4 group, mirrored by the WGSL Uniforms struct. */
@@ -63,7 +63,28 @@ export const PRISM_UNIFORM_OFFSETS = {
 	arcade: 164,
 	side: 168,
 	feel: 172,
-	rig: 176
+	rig: 176,
+	ringIn: 180,
+	ringMid: 184,
+	ringOut: 188,
+	ringLight: 192,
+	chromaA: 196,
+	chromaB: 200,
+	chromaC: 204,
+	snarePk: 208,
+	hatPk: 212,
+	fillPk: 216,
+	low: 220,
+	parts: 224,
+	parts2: 228,
+	arcs: 232,
+	notePk: 236,
+	bayPk: 240,
+	ringPrevIn: 244,
+	ringPrevMid: 248,
+	ringPrevOut: 252,
+	ringSweep: 256,
+	ringStart: 260
 } as const;
 
 /** The window's light map: transmitted light in wall coordinates. */
@@ -172,6 +193,44 @@ struct Uniforms {
 	feel: vec4<f32>,
 	// camera anchor x, frame seconds, beat push, unused
 	rig: vec4<f32>,
+	// The ensemble's voices (voices.ts). Each ring of glass is voiced by a
+	// chord: hue turn (radians), temperature -1..1, saturation, value.
+	ringIn: vec4<f32>,
+	ringMid: vec4<f32>,
+	ringOut: vec4<f32>,
+	// light of the inner, middle and outer ring, petal chroma contrast
+	ringLight: vec4<f32>,
+	// pitch-class weights C..B, four per group
+	chromaA: vec4<f32>,
+	chromaB: vec4<f32>,
+	chromaC: vec4<f32>,
+	// snare crack in the middle ring: strength, progress 0..1, serial, angle
+	snarePk: vec4<f32>,
+	// hat glints on the outer panes: strength, progress 0..1, serial, density
+	hatPk: vec4<f32>,
+	// fill cascading round the rose: strength, progress 0..1, start angle, direction
+	fillPk: vec4<f32>,
+	// low light the bass walks: floor pool shift x, shift z, power, low haze
+	low: vec4<f32>,
+	// left bays, right bays, high haze, floor caustics
+	parts: vec4<f32>,
+	// dust glint, candles, tracery glow, swing lean
+	parts2: vec4<f32>,
+	// kick arc centre and half-width, hat arc centre and half-width (radians)
+	arcs: vec4<f32>,
+	// a heard note in its petal: strength, progress 0..1, circle-of-fifths index,
+	// seconds into a breakdown (the petals withdraw one by one)
+	notePk: vec4<f32>,
+	// flares in the neighbouring bays: left pulse, right pulse, left angle, right angle
+	bayPk: vec4<f32>,
+	// the chord each ring is leaving (same layout as ringIn, ringMid, ringOut)
+	ringPrevIn: vec4<f32>,
+	ringPrevMid: vec4<f32>,
+	ringPrevOut: vec4<f32>,
+	// how far round each ring its new chord has travelled (0..1), unused
+	ringSweep: vec4<f32>,
+	// where round each ring the new chord set out (radians), unused
+	ringStart: vec4<f32>,
 };
 
 const TAU: f32 = 6.28318530718;
@@ -285,6 +344,14 @@ fn toUv(p: vec2<f32>, aspect: f32) -> vec2<f32> {
 fn envWeight(e: f32) -> f32 {
 	return select(0.0, 1.0 - u.world.z, abs(u.world.x - e) < 0.5)
 		+ select(0.0, u.world.z, abs(u.world.y - e) < 0.5);
+}
+
+// The neighbouring bays on each side of the hero answer their own voices
+// (voices.ts: bayLeft, bayRight); the hero bay is always fully lit.
+fn baySide(bay: f32, anchorBay: f32) -> f32 {
+	let off = bay - anchorBay;
+	let side = select(u.parts.y, u.parts.x, off < 0.0);
+	return mix(1.0, side, smoothstep(0.3, 0.8, abs(off)));
 }
 
 // Value noise in 3D for the nave's haze (integer hashed, no sine).
@@ -474,7 +541,7 @@ fn windowGlow(X: vec3<f32>) -> vec3<f32> {
 	let spacing = u.camRight.w;
 	let bay = floor(X.x / spacing + 0.5);
 	let anchorBay = u.rig.x / spacing;
-	let lit = mix(0.06, 1.0, clamp(u.detail.w - abs(bay - anchorBay) + 1.0, 0.0, 1.0));
+	let lit = mix(0.06, 1.0, clamp(u.detail.w - abs(bay - anchorBay) + 1.0, 0.0, 1.0)) * baySide(bay, anchorBay);
 	let C = vec3<f32>(bay * spacing, ROSE_Y, 0.0);
 	let d = X - C;
 	let falloff = (ROSE_R * ROSE_R) / (dot(d, d) * 2.5 + ROSE_R * ROSE_R);
@@ -496,6 +563,9 @@ var<private> gOpen: f32;
 // the shafts and onto the floor, so a beat glows in the glass without
 // strobing the whole nave.
 var<private> gLightPass: f32;
+// Which petal (wedge / fold count) the mosaic is being cut for: re-drafts and
+// divisions travel round the rose petal by petal instead of all at once.
+var<private> gWedge: f32;
 
 struct Sym {
 	q: vec2<f32>,
@@ -925,11 +995,17 @@ fn mosaicSeed(g: vec2<f32>, which: u32, salt: u32, jitter: f32) -> vec3<f32> {
 	let phrase = u32(max(u.organism.y, 0.0));
 	let jNow = hcell(g, salt ^ (phrase * 0x9e3779b1u));
 	let jNext = hcell(g, salt ^ ((phrase + 1u) * 0x9e3779b1u));
-	let redraft = clamp(u.organism.z, 0.0, 1.0);
+	// The re-draft and the divisions travel round the window instead of
+	// moving every piece at once: each cell waits by where it sits (its angle
+	// round the centre), plus a little of its own.
+	let dv = hcell(g, salt ^ 0x51ed270bu);
+	let around = fract(gWedge + atan2(g.y + 0.5, g.x + 0.5) / TAU * 0.25 + f32(salt & 1023u) * 0.000977);
+	let wait = around * 0.8 + dv.y * 0.2;
+	let redraft = clamp((clamp(u.organism.z, 0.0, 1.0) * 1.6 - wait) / 0.6, 0.0, 1.0);
 	let j = mix(jNow, jNext, redraft);
 	let base = g + 0.5 + (j - 0.5) * jitter;
-	let dv = hcell(g, salt ^ 0x51ed270bu);
-	let split = smoothstep(dv.x * 0.8, dv.x * 0.8 + 0.2, u.organism.x);
+	let threshold = mix(dv.x, around, 0.6) * 0.8;
+	let split = smoothstep(threshold, threshold + 0.2, u.organism.x);
 	let axis = dv.y * TAU + j.x * 1.7;
 	let off = vec2<f32>(cos(axis), sin(axis)) * split * 0.21;
 	let sgn = select(-1.0, 1.0, which == 1u);
@@ -1049,9 +1125,67 @@ fn backlightFlat(rel: vec2<f32>) -> f32 {
 	hot = hot + exp(-dot(d2, d2) * 14.0) * smoothstep(0.34, 0.6, count) * 0.7;
 	let d3 = rel - vec2<f32>(u.sun.y * 0.6 + 0.14, -u.sun.x * 0.5 + 0.12);
 	hot = hot + exp(-dot(d3, d3) * 18.0) * smoothstep(0.67, 0.9, count) * 0.55;
-	let drift = vec2<f32>(u.time * 0.031, -u.time * 0.019) + vec2<f32>(u.organism.w * 0.0007, 0.0);
+	let drift = vec2<f32>(u.time * 0.013, -u.time * 0.008) + vec2<f32>(u.organism.w * 0.0007, 0.0);
 	let cloud = 0.62 + 0.62 * vnoise(rel * 3.1 + drift) * (0.6 + 0.4 * vnoise(rel * 7.3 - drift * 1.7));
 	return u.light.x * (0.42 + hot * u.sun.z) * cloud;
+}
+
+// ── The ensemble's voices in the glass (voices.ts) ──────────────────────────
+// Which ring a piece of glass belongs to: inner, middle, outer (weights).
+fn ringWeights(rn: f32) -> vec3<f32> {
+	let wIn = 1.0 - smoothstep(0.31, 0.37, rn);
+	let wOut = smoothstep(0.64, 0.7, rn);
+	return vec3<f32>(wIn, max(1.0 - wIn - wOut, 0.0), wOut);
+}
+
+// How far a ring's new chord has reached this piece (0 still the old chord,
+// 1 the new): a re-voicing flows round the ring from where it set out.
+fn ringReach(angle: f32) -> vec3<f32> {
+	let rel = fract((vec3<f32>(angle) - u.ringStart.xyz) / TAU);
+	return clamp((u.ringSweep.xyz * 1.2 - rel) / 0.2, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The light at the front of a re-voicing as it travels round its ring.
+fn ringFront(angle: f32, w: vec3<f32>) -> f32 {
+	let rel = fract((vec3<f32>(angle) - u.ringStart.xyz) / TAU);
+	let d = (u.ringSweep.xyz * 1.2 - 0.1 - rel) / 0.07;
+	let live = select(vec3<f32>(0.0), vec3<f32>(1.0), u.ringSweep.xyz < vec3<f32>(0.999));
+	return dot(w, exp(-d * d) * live);
+}
+
+// The chord voicing of the piece's ring: a hue turn about the grey axis
+// (luminance kept, the family's relations kept), a white balance toward warm
+// or cold, saturation and value. Mirrors rotateHue and prismTemper.
+fn voiceGlass(c: vec3<f32>, w: vec3<f32>, reach: vec3<f32>) -> vec3<f32> {
+	let v = mix(u.ringPrevIn, u.ringIn, reach.x) * w.x
+		+ mix(u.ringPrevMid, u.ringMid, reach.y) * w.y
+		+ mix(u.ringPrevOut, u.ringOut, reach.z) * w.z;
+	// A lean inside the family, never a new family: the turn and the
+	// temperature stay a fraction of the voicing's full swing.
+	let cs = cos(v.x * 0.65);
+	let sn = sin(v.x * 0.65) * 0.57735;
+	let grey = (1.0 - cs) / 3.0 * (c.r + c.g + c.b);
+	var r = max(vec3<f32>(
+		cs * c.r + grey + sn * (c.b - c.g),
+		cs * c.g + grey + sn * (c.r - c.b),
+		cs * c.b + grey + sn * (c.g - c.r)
+	), vec3<f32>(0.0));
+	let t = clamp(v.y, -1.0, 1.0) * 0.45;
+	let gain = select(
+		vec3<f32>(1.0 + 0.5 * t, 1.0 + 0.04 * t, 1.0 - 0.45 * t),
+		vec3<f32>(1.0 + 0.35 * t, 1.0 + 0.04 * t, 1.0 - 0.6 * t),
+		t >= 0.0
+	);
+	let l = dot(r, vec3<f32>(0.2126, 0.7152, 0.0722));
+	r = (vec3<f32>(l) + (r - vec3<f32>(l)) * v.z) * gain * v.w;
+	return max(r, vec3<f32>(0.0));
+}
+
+fn chromaAt(pc: i32) -> f32 {
+	let k = clamp(pc, 0, 11);
+	var g = u.chromaC;
+	if (k < 4) { g = u.chromaA; } else if (k < 8) { g = u.chromaB; }
+	return g[k % 4];
 }
 
 // Beat light travelling through the window in one of six forms. Glass forms
@@ -1223,7 +1357,7 @@ fn wallCrypt(w: WallIn) -> vec3<f32> {
 	for (var i = 0; i < 2; i = i + 1) {
 		let side = select(-1.0, 1.0, i == 1);
 		let cp = vec2<f32>(w.P.x - w.lx + side * 0.43, FLOOR_Y + 0.075);
-		let flick = 0.82 + 0.18 * vnoise(vec2<f32>(u.time * 7.0, f32(i) * 13.0));
+		let flick = 0.92 + 0.08 * vnoise(vec2<f32>(u.time * 7.0, f32(i) * 13.0));
 		let dd = w.P - cp;
 		lightSum = lightSum + exp(-dot(dd, dd) * 14.0) * flick;
 		flames = flames + exp(-(pow(dd.x * 120.0, 2.0) + pow((dd.y - 0.012) * 50.0, 2.0))) * flick;
@@ -1232,9 +1366,11 @@ fn wallCrypt(w: WallIn) -> vec3<f32> {
 	let ring = exp(-pow((w.od - 0.03) * 70.0, 2.0)) * 0.6;
 	let spill = w.back * exp(-max(w.od, 0.0) * 3.0);
 	let stone = mix(stoneTint(), candle * 0.3, 0.35) * (0.5 + tone * 0.5) * mortar;
-	return stone * (0.035 + lightSum * 0.45 * vault + spill * 0.75)
+	// The candles answer their own voice (voices.ts: candles).
+	let flameGain = u.parts2.y;
+	return stone * (0.035 + lightSum * 0.45 * vault * flameGain + spill * 0.75)
 		+ mix(accent, u.heroCol.rgb, 0.4) * ring * spill * 0.25
-		+ candle * flames * 1.0
+		+ candle * flames * flameGain
 		+ accent * w.seam * ring * 0.2;
 }
 
@@ -1281,7 +1417,7 @@ fn wallApse(w: WallIn) -> vec3<f32> {
 	let cx = (cell + 0.5) * 0.085;
 	let ch = hcell(vec2<f32>(cell, 3.0), 0xca4du);
 	let cy = FLOOR_Y + 0.045 + ch.x * 0.06;
-	let flick = 0.78 + 0.22 * vnoise(vec2<f32>(u.time * 8.0, cell));
+	let flick = 0.92 + 0.08 * vnoise(vec2<f32>(u.time * 8.0, cell));
 	let dd = w.P - vec2<f32>(cx, cy);
 	let lit = step(0.62, ch.y) * step(abs(w.lx), 0.5);
 	let flame = exp(-(pow(dd.x * 130.0, 2.0) + pow((dd.y - 0.01) * 52.0, 2.0))) * flick * lit * (0.6 + 0.4 * ch.x);
@@ -1294,7 +1430,7 @@ fn wallApse(w: WallIn) -> vec3<f32> {
 		+ marble * vein * (0.02 + spill * 0.2)
 		+ accent * frieze * (0.05 + spill * 0.6)
 		+ mix(accent, u.heroCol.rgb, 0.5) * ring * spill * 0.2
-		+ candle * flame * 0.85
+		+ candle * flame * 0.85 * u.parts2.y
 		+ accent * w.seam * ring * 0.15;
 }
 
@@ -1391,8 +1527,8 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 		let ridge = exp(-pow(ts.sd * 260.0, 2.0));
 		let frame = exp(-pow((od + 0.02) * 120.0, 2.0));
 		col = stoneTint() * (0.02 + back * 0.1)
-			+ mix(hero, accent, 0.35) * spill * 0.12
-			+ accent * (bevel * 0.14 + frame * 0.08) * back
+			+ mix(hero, accent, 0.35) * spill * 0.12 * u.parts2.z
+			+ accent * (bevel * 0.14 * u.parts2.z + frame * 0.08) * back
 			+ support * ridge * back * 0.05;
 
 		let inner = od < -0.012;
@@ -1406,6 +1542,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 			let fg = symmetry(glassP, n, grammar);
 			let cellScale = shape.z;
 			let style = gram.y;
+			gWedge = select(0.0, fg.wedge / n, radial);
 			let cell = mosaic(mosaicDomain(fg.q, style, cellScale), salt, mosaicJitter(style));
 			let kind = ts.kind;
 
@@ -1429,22 +1566,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 				c1 = field * 1.9 + support * 0.35; c2 = support; c3 = accent;
 				tierLit = mix(0.45, 0.9, shape.w);
 			}
-			// Mosaic: mostly the role colour in varied density, with sparse pieces of
-			// the neighbouring roles and the odd deep variant of the main one.
-			let sprinkle = u.detail.z;
-			var glass = c1 * mix(1.0, 0.55, smoothstep(0.32, 0.36, cell.id.x) * (1.0 - smoothstep(0.44, 0.48, cell.id.x)));
-			let t2 = mix(0.86, 0.66, sprinkle);
-			let t3 = mix(0.975, 0.9, sprinkle);
-			glass = mix(glass, c2 * 0.75, smoothstep(t2, t2 + 0.04, cell.id.x));
-			glass = mix(glass, c3, smoothstep(t3, t3 + 0.03, cell.id.x));
-			glass = glass * lightCol;
-
-			let slab = select(1.0, 2.2, gram.y > 3.5);
-			let density = 0.3 + 0.95 * cell.id.y * cell.id.y;
-			let interior = mix(0.75, smoothstep(0.0, 0.42, cell.edge), 1.0 - smoothstep(0.18, 0.5, footprint * cellScale));
-			let grainDir = vec2<f32>(cos(cell.id.y * 9.0), sin(cell.id.y * 9.0));
-			let mx = mosaicDomain(fg.q, style, cellScale);
-			let streak = 1.0 - 0.12 * slab + 0.12 * slab * sin(dot(mx, grainDir) * 17.0 / slab + cell.id.x * 40.0);
+			// Where the piece sits: its ring, its petal, its angle.
 			let cq = mosaicInverse(cell.center, style, cellScale);
 			let cellRn = length(cq);
 			var cellAngle = atan2(cq.y, cq.x);
@@ -1453,19 +1575,113 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 			} else if (grammar < 6.5) {
 				cellAngle = atan2(cq.x * fs.side, cq.y);
 			}
+			let ringW = ringWeights(cellRn);
+			// Petals round the rose stand for the pitch classes on the circle of
+			// fifths; each glows with its tone in the chord.
+			let nSec = select(12.0, n, radial);
+			let sec = floor(fract(cellAngle / TAU + 0.5 / nSec) * nSec);
+			let secAngle = sec / nSec * TAU;
+			let pcf = floor(sec * 12.0 / nSec);
+			let pc = i32(pcf * 7.0 - 12.0 * floor(pcf * 7.0 / 12.0));
+			// A breakdown puts the petals out one by one (prismPetalWithdraw).
+			let rank = hnum(sec + 17.0, seedSalt() ^ 0x5e1u);
+			let wStart = vec3<f32>(2.2, 1.3, 0.4) + rank * 5.0;
+			let wOut = smoothstep(wStart, wStart + 1.2, vec3<f32>(u.notePk.w)) * vec3<f32>(0.45, 0.6, 0.75);
+			let petalTone = mix(1.0, 0.72 + 0.75 * chromaAt(pc), u.ringLight.w) * (1.0 - dot(ringW, wOut));
+
+			// Mosaic: mostly the role colour in varied density, with sparse pieces of
+			// the neighbouring roles and the odd deep variant of the main one.
+			let sprinkle = u.detail.z;
+			var glass = c1 * mix(1.0, 0.55, smoothstep(0.32, 0.36, cell.id.x) * (1.0 - smoothstep(0.44, 0.48, cell.id.x)));
+			let t2 = mix(0.86, 0.66, sprinkle);
+			let t3 = mix(0.975, 0.9, sprinkle);
+			glass = mix(glass, c2 * 0.75, smoothstep(t2, t2 + 0.04, cell.id.x));
+			glass = mix(glass, c3, smoothstep(t3, t3 + 0.03, cell.id.x));
+			// Each ring sings its own chord.
+			glass = voiceGlass(glass, ringW, ringReach(cellAngle)) * lightCol;
+
+			let slab = select(1.0, 2.2, gram.y > 3.5);
+			let density = 0.3 + 0.95 * cell.id.y * cell.id.y;
+			let interior = mix(0.75, smoothstep(0.0, 0.42, cell.edge), 1.0 - smoothstep(0.18, 0.5, footprint * cellScale));
+			let grainDir = vec2<f32>(cos(cell.id.y * 9.0), sin(cell.id.y * 9.0));
+			let mx = mosaicDomain(fg.q, style, cellScale);
+			let streak = 1.0 - 0.12 * slab + 0.12 * slab * sin(dot(mx, grainDir) * 17.0 / slab + cell.id.x * 40.0);
 			let pixRn = length(glassP);
 			let pixAngle = atan2(glassP.y, glassP.x);
 			let spectral = bins[clamp(i32(cellRn * 46.0), 0, ${PRISM_BIN_COUNT - 1})];
 
-			let transmitted = back * density * tierLit * (0.5 + 0.5 * interior) * streak * (0.82 + spectral * 0.45);
+			let transmitted = back * density * tierLit * (0.5 + 0.5 * interior) * streak * (0.9 + spectral * 0.2)
+				// The shafts carry the window's light, not every flicker of it: the
+				// light map takes the voices' ring light and petal tones damped.
+				* mix(dot(ringW, u.ringLight.xyz) * petalTone, 1.0, gLightPass * 0.6);
+			// Heard kicks: a packet in the look's beat form, travelling the inner
+			// ring only (the form's radius is the inner ring's), leaning with the
+			// swing to one side.
 			let nForm = select(8.0, n, radial);
-			var pkv = packetForm(u.modes.y, cellRn, cellAngle, nForm, cell.id.x, pixRn, pixAngle);
+			let kickR = 0.5;
+			let lean = 1.0 + u.parts2.w * 0.22 * fs.side;
+			let kRn = cellRn / kickR * lean;
+			let kPix = pixRn / kickR * lean;
+			var pkv = packetForm(u.modes.y, kRn, cellAngle, nForm, cell.id.x, kPix, pixAngle);
 			if (u.modes.z < 0.995) {
-				pkv = mix(packetForm(u.modes.x, cellRn, cellAngle, nForm, cell.id.x, pixRn, pixAngle), pkv, u.modes.z);
+				pkv = mix(packetForm(u.modes.x, kRn, cellAngle, nForm, cell.id.x, kPix, pixAngle), pkv, u.modes.z);
 			}
+			// Each kick lights one arc of the inner ring, a new side each time.
+			let kArc = smoothstep(u.arcs.y, u.arcs.y * 0.45, abs(wrapAngle(cellAngle - u.arcs.x)));
+			let innerMask = (1.0 - smoothstep(0.42, 0.56, cellRn)) * mix(kArc, 1.0, smoothstep(0.16, 0.0, cellRn));
 			let tail = pow(1.0 - clamp(u.light.z, 0.0, 1.0), 1.3) * u.light.y * lit;
-			let pk = pkv.x * tail * (0.35 + 0.65 * tierLit) * (1.0 - gLightPass * 0.7);
-			var g = glass * (transmitted + pk * 2.4) * 3.0
+			let pk = pkv.x * tail * innerMask * (0.35 + 0.65 * tierLit) * (1.0 - gLightPass * 0.9);
+			// Snare: a crack down one spoke of the middle ring, widening as it fades.
+			let sAge = clamp(u.snarePk.y, 0.0, 1.0);
+			let sTail = pow(1.0 - sAge, 2.0) * u.snarePk.x * lit;
+			let midMask = smoothstep(0.28, 0.36, cellRn) * (1.0 - smoothstep(0.7, 0.8, cellRn));
+			let sDist = abs(wrapAngle(cellAngle - u.snarePk.w)) * max(cellRn, 0.2);
+			let crack = exp(-pow(sDist / (0.06 + sAge * 0.12), 2.0)) * midMask * sTail;
+			let sWob = (vnoise(vec2<f32>(pixRn * 9.0, u.snarePk.z * 3.7)) - 0.5) * 0.35;
+			let sPix = abs(wrapAngle(pixAngle - u.snarePk.w - sWob)) * pixRn;
+			let pixMid = smoothstep(0.28, 0.36, pixRn) * (1.0 - smoothstep(0.72, 0.8, pixRn));
+			let crackLead = exp(-pow(sPix * 34.0, 2.0)) * pixMid * sTail;
+			// Hats: single panes of the outer ring glint, a new handful per hit.
+			let hArc = smoothstep(u.arcs.w, u.arcs.w * 0.4, abs(wrapAngle(cellAngle - u.arcs.z)));
+			let outerMask = smoothstep(0.6, 0.7, cellRn) * hArc;
+			let hSel = hnum(floor(cell.id.x * 8191.0) + u.hatPk.z * 37.0, seedSalt() ^ 0x4a7u);
+			let glint = select(0.0, 1.0, hSel < u.hatPk.w) * outerMask * pow(1.0 - clamp(u.hatPk.y, 0.0, 1.0), 2.5) * u.hatPk.x * lit;
+			// A fill cascades round the rose petal by petal from where it began.
+			let fAge = clamp(u.fillPk.y, 0.0, 1.0);
+			let fRel = (secAngle - u.fillPk.z) * u.fillPk.w;
+			let fBehind = fRel - TAU * floor(fRel / TAU);
+			// It runs half way round, through the middle and outer rings.
+			let fPassed = fAge * PI * 1.05 - fBehind;
+			let cascade = select(0.0, exp(-fPassed * 2.4), fPassed > 0.0 && fBehind < PI) * u.fillPk.x * (1.0 - fAge * 0.6) * lit
+				* smoothstep(0.3, 0.4, cellRn);
+			// A heard note lights the petal of its pitch class in the middle and
+			// outer rings (the melody walking round the rose).
+			let noteSec = floor(u.notePk.z * nSec / 12.0 + 0.001);
+			let noteOn = select(0.0, 1.0, abs(sec - noteSec) < 0.5) * smoothstep(0.12, 0.3, cellRn);
+			let noteGlow = noteOn * pow(1.0 - clamp(u.notePk.y, 0.0, 1.0), 1.6) * u.notePk.x * lit;
+			// The heard voices play in the hero window only; the neighbouring bays
+			// answer instruments of their own (baySide).
+			let bayOff = pi.bay - u.rig.x / pi.spacing;
+			let heroBay = 1.0 - smoothstep(0.3, 0.7, abs(bayOff));
+			// A neighbouring bay's own event flares one part of its glass.
+			let flareL = bayOff < 0.0;
+			let flareA = select(u.bayPk.w, u.bayPk.z, flareL);
+			let flareP = select(u.bayPk.y, u.bayPk.x, flareL);
+			let flare = (1.0 - heroBay) * flareP * exp(-pow(abs(wrapAngle(cellAngle - flareA)) / 0.55, 2.0))
+				* smoothstep(0.2, 0.35, cellRn);
+			let seen = heroBay * (pk * 4.2
+				+ ringFront(cellAngle, ringW) * 0.9
+				+ noteGlow * 2.2
+				+ crack * 3.0
+				+ glint * 5.0
+				+ cascade * 1.8)
+				+ flare * 4.5;
+			// The shafts carry the window's steady light, and only the voices that
+			// sit in one arc of it (hat glints, snare cracks), so their beams fall
+			// on one part of the nave; a kick or a sweep never floods the air.
+			let thrown = heroBay * (glint * 2.5 + crack * 1.5);
+			let voices = mix(seen, thrown, gLightPass);
+			var g = glass * (transmitted + voices) * 3.0
 				+ mix(glass, accent, 0.5) * cell.birth * (0.5 + back * 1.4);
 
 			// Ruins have lost pieces: the night shows through.
@@ -1485,7 +1701,7 @@ fn windowPane(pi: PaneIn, n: f32, shape: vec4<f32>, gram: vec4<f32>, baseSalt: u
 			let cameW = mix(0.17, 0.115, u.feel.x);
 			let came = (1.0 - smoothstep(cameW * 0.45 - aa, cameW + aa, cell.edge)) * mix(0.35, 1.0, detail);
 			let leadGlint = accent * back * 0.03 * exp(-pow((cell.edge - 0.02) * 60.0, 2.0));
-			let bolt = mix(accent, vec3<f32>(1.0), 0.25) * pkv.y * tail * 1.5;
+			let bolt = mix(accent, vec3<f32>(1.0), 0.25) * (pkv.y * tail * innerMask * 1.5 + crackLead * 1.3) * heroBay;
 			g = mix(g, lead + leadGlint + bolt, came);
 			let rimLead = smoothstep(-0.026, -0.01, ts.sd);
 			g = mix(g, lead + bolt * 0.5, rimLead);
@@ -1550,7 +1766,7 @@ fn makePane(rd: vec3<f32>, wall: vec3<f32>, stoneW: vec2<f32>, glassW: vec2<f32>
 	pi.footprint = footprint;
 	let anchorBay = u.rig.x / spacing;
 	let bayLit = clamp(u.detail.w - abs(bay - anchorBay) + 1.0, 0.0, 1.0);
-	pi.lit = mix(0.06, 1.0, bayLit);
+	pi.lit = mix(0.06, 1.0, bayLit) * baySide(bay, anchorBay);
 	pi.back = backlight(pi.glassRel, rd) * pi.lit;
 	return pi;
 }
@@ -1607,7 +1823,7 @@ fn composeWindow(pi: PaneIn) -> vec3<f32> {
 	gOpen = mix(openA, openB, wB);
 	// Light leads the reveal: a glass piece glows while it is being set.
 	let seam = u.comp.w * 4.0 * spatial * (1.0 - spatial) * openB;
-	return mix(colA, colB, wB) + colB * seam * 1.1;
+	return mix(colA, colB, wB) + colB * seam * 0.55;
 }
 `;
 
@@ -2049,8 +2265,9 @@ fn ign(pixel: vec2<f32>, frame: f32) -> f32 {
 
 fn hazeDensity(X: vec3<f32>) -> f32 {
 	let h = max(X.y - FLOOR_Y, 0.0);
-	let pool = 0.45 + 0.55 * exp(-h * 1.8);
-	let flow = vec3<f32>(u.time * 0.035, u.time * 0.011, -u.time * 0.02);
+	// Two layers: the pool near the floor (the bass's) and the high air.
+	let pool = 0.45 * u.parts.z + 0.55 * exp(-h * 1.8) * u.low.w;
+	let flow = vec3<f32>(u.time * 0.02, u.time * 0.007, -u.time * 0.012);
 	let q = X * 2.6 + flow;
 	let n = vnoise3(q) * 0.65 + vnoise3(q * 2.4 + vec3<f32>(5.3, 1.7, 3.1)) * 0.35;
 	return u.vol.x * pool * (0.25 + 1.5 * n * n);
@@ -2180,7 +2397,7 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let key = 0.2;
 	let aim = clamp(pow(key / max(litMean, 1e-3), 0.65) * mix(1.2, 1.0, smoothstep(0.02, 0.2, coverage)), 0.7, 2.6);
 	let prev = textureSampleLevel(exposurePrev, samp, vec2<f32>(0.5), 0.0).r;
-	let k = 1.0 - exp(-max(u.rig.y, 0.0) * 0.9);
+	let k = 1.0 - exp(-max(u.rig.y, 0.0) * 0.3);
 	let e = select(aim, mix(prev, aim, k), u.prevPos.w > 0.5 && prev > 0.1);
 	return vec4<f32>(e, litMean, coverage, 1.0);
 }
@@ -2245,7 +2462,11 @@ fn dustMotes(ro: vec3<f32>, rd: vec3<f32>, tEnd: f32, pix: f32) -> vec3<f32> {
 		let off = (fract(g) - 0.5 - (h - vec2<f32>(0.5)) * 0.6) * cell;
 		let m = smoothstep(r, r * 0.2, length(off)) * min(1.0, (size * size) / (r * r) * 1.6);
 		if (m <= 0.001) { continue; }
-		acc = acc + (shaftLight(P) * ph + sideLight(P) * ph2) * m * (0.6 + h.y);
+		// Hats are the fine sparkle in the beams: each hit catches a new few motes.
+		// The sparkle sits on the side of the nave under the hats' arc of glass.
+		let sparkX = u.rig.x + cos(u.arcs.z) * 0.35;
+		let spark = 1.0 + u.parts2.x * 2.5 * step(0.72, fract(h.y * 37.0 + u.hatPk.z * 0.618)) * exp(-pow((P.x - sparkX) / 0.22, 2.0));
+		acc = acc + (shaftLight(P) * ph + sideLight(P) * ph2) * m * (0.6 + h.y) * spark;
 	}
 	return acc;
 }
@@ -2325,9 +2546,10 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		// arcade, rippled into caustic veins; the clerestory beams; the
 		// windows' own glow.
 		let L = sunL();
-		let caustic = 1.0 + u.atmos.z * (pow(1.0 - abs(vnoise(F.xz * 8.0 + vec2<f32>(u.time * 0.15, 0.0)) * 2.0 - 1.0), 6.0) * 2.4 - 0.45);
+			let caustic = 1.0 + u.atmos.z * u.parts.w * (pow(1.0 - abs(vnoise(F.xz * 8.0 + vec2<f32>(u.time * 0.15, 0.0)) * 2.0 - 1.0), 6.0) * 2.4 - 0.45);
 		let Fl = F + vec3<f32>(0.0, 0.001, 0.0);
-		let irradiance = shaftLight(Fl) * L.y * 7.0 * caustic
+		// The bass line walks the pools of glass light across the floor.
+		let irradiance = shaftLight(Fl + vec3<f32>(u.low.x, 0.0, u.low.y)) * L.y * 7.0 * caustic * u.low.z
 			+ sideLight(Fl) * max(sideL().y, 0.0) * 1.8
 			+ windowGlow(Fl) * 0.7;
 		// Dry floors show stone flags.

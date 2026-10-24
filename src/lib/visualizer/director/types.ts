@@ -35,6 +35,22 @@ export type AudioFeatureFrame = {
 	scope_rate?: number;
 	/** Browser analyzers and lab profiles: the same pairs as -1..1 floats. */
 	scope_pcm?: Float32Array;
+	// ---- Raw ensemble features (read by EnsembleTracker, ensemble.ts) ----
+	// Optional so older frames and hand-built test frames stay valid; the
+	// tracker falls back to the spectrum when they are absent.
+	/** 12 pitch classes from C, 100 Hz–5 kHz, max-normalised 0..1. */
+	chroma?: number[];
+	/** 12 pitch classes from C over the bass register (40–250 Hz), 0..1. */
+	bass_chroma?: number[];
+	/** Onset strength in this frame per layer, 0..1 (0 = none). */
+	onset_kick?: number;
+	onset_snare?: number;
+	onset_hat?: number;
+	onset_perc?: number;
+	onset_tonal?: number;
+	/** Stereo image of the samples since the previous frame. */
+	stereo_width?: number;
+	stereo_corr?: number;
 };
 
 export type VisualizerSection =

@@ -13,9 +13,17 @@
 // shafts and caustics. In the abyss and the void the water is black except
 // where something living lights it.
 //
+// The music reaches the picture organ by organ (parts.ts): each arm group,
+// the rim, the photophore clusters, comb rows, organs, colony members, the
+// snow's wake and glinting cloud, the far animals, the shafts and the plankton
+// read their own lanes, so different parts of the frame answer different
+// instruments. Nothing here pulses the whole frame.
+//
 // WGSL notes for whoever edits this: with layout 'auto' every declared binding
 // must be used from the entry point; never put a backtick in a comment inside
 // these template literals (it ends the string and breaks the shader silently).
+
+import { SOMA_PART_SLOTS } from './parts';
 
 /** Uniform vec4 slots, in order. The WGSL struct is generated from this list. */
 export const SOMA_UNIFORM_FIELDS = [
@@ -67,7 +75,9 @@ export const SOMA_UNIFORM_FIELDS = [
 	'comp', // companion xyz, relative scale
 	'drag', // swim velocity in body space (appendages trail it), iridescent film phase
 	'seeds', // seed, layout seed, reflection plane y, reflection mode (0 floor, 1 surface)
-	'debug' // dev-only profiling mask (1 no animal, 2 no world, 4 no particles, 8 no shadow/interior, 16 part ids)
+	'debug', // dev-only profiling mask (1 no animal, 2 no world, 4 no water parts, 8 no shadow/interior, 16 part ids, 32/64/128/256 see fs_main)
+	// The organs' own lanes, one vec4 each (see parts.ts SOMA_PART_SLOTS).
+	...SOMA_PART_SLOTS
 ] as const;
 
 export type SomaUniformField = (typeof SOMA_UNIFORM_FIELDS)[number];
@@ -127,6 +137,11 @@ fn gauss(x: f32, width: f32) -> f32 {
 	return exp(-z * z);
 }
 
+/** One lane of a vec4 by a runtime index, as arithmetic (dynamic vector indexing compiles slowly on some backends). */
+fn lane(v: vec4<f32>, i: i32) -> f32 {
+	return dot(v, vec4<f32>(f32(i == 0), f32(i == 1), f32(i == 2), f32(i == 3)));
+}
+
 fn camRay(p: vec2<f32>) -> vec3<f32> {
 	return normalize(u.camFwd.xyz * u.camPos.w + u.camRight.xyz * (p.x - u.lens.x) + u.camUp.xyz * (p.y - u.lens.y));
 }
@@ -171,6 +186,9 @@ ${FULLSCREEN_WGSL}
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var<storage, read> bins: array<f32, 128>;
+
+// 1 while the map evaluates the juvenile: it pulses on its own instruments.
+var<private> gYoung: f32 = 0.0;
 
 struct Sample {
 	d: f32,
@@ -228,12 +246,22 @@ fn absorb(t: f32) -> vec3<f32> {
 
 // A ring of n appendages in the body's own frame: tentacles, arms, axopodia,
 // oral arms, a lure. Polar repetition keeps the cost of one.
-fn appendage(q: vec3<f32>, n: f32, rootR: f32, rootY: f32, dirA: f32, len: f32, thick: f32, curl: f32, wave: f32, phase: f32, frill: f32, bulbR: f32) -> App {
+fn ph0(idx: f32) -> f32 {
+	return idx * 0.61;
+}
+
+/** The ripple a hit sends down an arm: a travelling wave, skewed by the swing. */
+fn ripple(k: f32, wl: f32, rph: f32) -> f32 {
+	let w = sin(k * 5.5 * wl - rph);
+	return w + u.armMod.z * 0.35 * (w * w - 0.5);
+}
+
+fn appendage(q: vec3<f32>, n: f32, rootR: f32, rootY: f32, dirA: f32, len0: f32, thick: f32, curl: f32, wave: f32, phase: f32, frill: f32, bulbR: f32) -> App {
 	var o: App;
 	o.d = 1e5;
 	o.k = 0.0;
 	o.bulb = 0.0;
-	if (n < 0.5 || len < 0.01) {
+	if (n < 0.5 || len0 < 0.01) {
 		return o;
 	}
 	let stepA = TAU / n;
@@ -241,6 +269,15 @@ fn appendage(q: vec3<f32>, n: f32, rootR: f32, rootY: f32, dirA: f32, len: f32, 
 	let idx = round(phi / stepA);
 	let a = idx * stepA;
 	let qs = rotY(q, a);
+	// Tentacles come in four contiguous groups, each rippling to its own drum
+	// layer (armHit, armPhase) and drawn in on its own in a breakdown (armReach).
+	let isArm = frill <= 0.001;
+	let ii = idx - floor(idx / n) * n;
+	let gi = clamp(i32(floor(ii * 4.0 / n)), 0, 3);
+	let rip = select(0.0, lane(u.armHit, gi) * (1.0 - gYoung * 0.6), isArm);
+	let rph = lane(u.armPhase, gi) + ph0(idx);
+	let len = len0 * select(1.0, lane(u.armReach, gi), isArm);
+	let wl = u.armMod.y;
 	let dir = vec3<f32>(sin(dirA), cos(dirA), 0.0);
 	let nrm = vec3<f32>(cos(dirA), -sin(dirA), 0.0);
 	let v = qs - vec3<f32>(rootR, rootY, 0.0);
@@ -249,12 +286,14 @@ fn appendage(q: vec3<f32>, n: f32, rootR: f32, rootY: f32, dirA: f32, len: f32, 
 	let ph = idx * 2.39996 + phase;
 	let tw = u.orgX.w;
 	let halfW = sin(min(stepA * 0.5, 1.2)) * 0.8;
-	let w1 = sin(k * 4.6 - tw * 1.35 + ph);
-	let w2 = sin(k * 3.2 - tw * 0.95 + ph * 1.7);
+	let w1 = sin(k * 4.6 * wl - tw * 1.35 + ph);
+	let w2 = sin(k * 3.2 * wl - tw * 0.95 + ph * 1.7);
+	let rw = ripple(k, wl, rph);
 	let radial = abs(rootR + dir.x * s);
 	let zmax = max(0.015, radial * halfW);
-	let zoff = clamp(wave * 0.13 * len * k * w2, -zmax, zmax);
-	let nOff = curl * k * k * len * 0.32 + wave * 0.09 * len * k * w1;
+	let zoff = clamp(wave * 0.13 * len * k * w2 + rip * 0.04 * len * k * rw, -zmax, zmax);
+	let curlA = curl + select(0.0, u.armMod.x * 0.4, isArm);
+	let nOff = curlA * k * k * len * 0.32 + wave * 0.09 * len * k * w1 + rip * 0.09 * len * k * rw;
 	// Appendages stream behind the swim: drag bends them away from the travel.
 	let dragS = rotY(u.drag.xyz, a);
 	var rel = v - dir * s - nrm * nOff - vec3<f32>(0.0, 0.0, zoff) + dragS * (k * k * len * 1.4);
@@ -266,11 +305,12 @@ fn appendage(q: vec3<f32>, n: f32, rootR: f32, rootY: f32, dirA: f32, len: f32, 
 	o.d = (length(rel) - th) * 0.7;
 	o.k = k;
 	if (bulbR > 0.001) {
-		let e1 = sin(4.6 - tw * 1.35 + ph);
-		let e2 = sin(3.2 - tw * 0.95 + ph * 1.7);
+		let e1 = sin(4.6 * wl - tw * 1.35 + ph);
+		let e2 = sin(3.2 * wl - tw * 0.95 + ph * 1.7);
+		let r1 = ripple(1.0, wl, rph);
 		let zt = max(0.015, abs(rootR + dir.x * len) * halfW);
-		let tip = dir * len + nrm * (curl * len * 0.32 + wave * 0.09 * len * e1) + vec3<f32>(0.0, 0.0, clamp(wave * 0.13 * len * e2, -zt, zt)) - dragS * len * 1.4;
-		let bd = length(v - tip) - bulbR * (0.9 + 0.2 * u.beat2.x);
+		let tip = dir * len + nrm * (curlA * len * 0.32 + wave * 0.09 * len * e1 + rip * 0.09 * len * r1) + vec3<f32>(0.0, 0.0, clamp(wave * 0.13 * len * e2 + rip * 0.04 * len * r1, -zt, zt)) - dragS * len * 1.4;
+		let bd = length(v - tip) - bulbR * (0.9 + 0.15 * u.organM.z);
 		if (bd < o.d) {
 			o.d = bd;
 			o.k = 1.0;
@@ -291,15 +331,19 @@ fn unit(q: vec3<f32>, seg: f32) -> Sample {
 	let squash = u.body1.y;
 	let fin = u.body1.z;
 	let stalk = u.body1.w;
-	let pulse = u.beat.y * (0.25 + 0.75 * u.posture.z);
+	// The bell squeezes on the bass line; the juvenile on the snare and perc.
+	let pulse = mix(u.beat.y, u.compM.x * 0.8, gYoung) * (0.25 + 0.75 * u.posture.z);
 	let segPhase = seg * 0.9;
 	let phi = atan2(q.z, q.x);
 	let yN = clamp(q.y / max(H, 0.05), -1.3, 1.3);
 	let marginW = smoothstep(0.55, -0.9, yN);
 	let lobe = 1.0 - lobeAmp * (0.5 - 0.5 * cos(u.counts.x * phi)) * marginW;
 	let breath = 1.0 + 0.02 * sin(u.orgX.w * 0.7 + segPhase);
-	let rr = R * lobe * (1.0 - pulse * 0.2 * marginW) * breath;
-	let hh = H * (1.0 + pulse * 0.07);
+	// The snare cracks the margin: a flare of the rim, not of the whole bell.
+	let flare = u.rimM.z * 0.08 * marginW * (1.0 - gYoung);
+	// The whole bell squeezes a little on each bass note, the margin most.
+	let rr = R * lobe * (1.0 - pulse * (0.07 + 0.2 * marginW) + flare) * breath;
+	let hh = H * (1.0 + pulse * 0.1);
 	var d = sdEllipsoid(q, vec3<f32>(rr * squash, hh, rr));
 	if (neck > 0.01) {
 		d = mix(d, sdRoundCylY(q, rr * 0.86, hh * 0.92, rr * 0.25), neck);
@@ -347,7 +391,7 @@ fn unit(q: vec3<f32>, seg: f32) -> Sample {
 		let g = abs(dot(sin(qq), cos(qq.yzx))) / f * 0.7 - 0.035;
 		let shell = abs(s.d + 0.03) - 0.032;
 		let lat = max(shell, g);
-		let cap = length(q) - R * 0.42 * (1.0 + 0.08 * u.beat2.x);
+		let cap = length(q) - R * 0.42 * (1.0 + 0.05 * u.organM.x);
 		let ld = min(lat, cap);
 		if (u.skin0.x > 0.5) {
 			s.part = select(4.0, 5.0, cap < lat);
@@ -393,7 +437,7 @@ fn unit(q: vec3<f32>, seg: f32) -> Sample {
 			select(u.tent0.x * armF, u.tent0.x * 0.42 * u.app.x, oral),
 			select(u.tent0.y * (0.4 + 0.6 * armF), 0.05 * R * (0.6 + 0.4 * u.app.x) + 0.02, oral),
 			select(u.tent1.y, 0.25, oral),
-			select(u.tent1.z, u.tent1.z * 0.7, oral),
+			select(u.tent1.z, u.tent1.z * 0.7 * u.armMod.w, oral),
 			select(segPhase + u.seeds.x * 6.0, segPhase + 1.3, oral),
 			select(0.0, 1.0, oral),
 			bulb
@@ -516,7 +560,9 @@ fn mapS(p: vec3<f32>) -> Sample {
 			s.d = bd;
 			continue;
 		}
+		gYoung = select(0.0, 1.0, young);
 		var c = organism(p, select(u.orgPos.xyz, u.comp.xyz, young), select(u.orgBound.w, u.orgBound.w * u.comp.w, young));
+		gYoung = 0.0;
 		if (young) {
 			c.seg = c.seg + 100.0;
 		}
@@ -653,15 +699,19 @@ fn organField(qi: vec3<f32>, seg: f32, hb: f32) -> vec4<f32> {
 	var e = vec3<f32>(0.0);
 	var dens = 0.05;
 	let phi = atan2(qi.z, qi.x);
-	// Organs pulse with the kick, but as a pulse: at most about 1.7x, never a strobe.
-	let throb = 0.65 + 0.4 * u.beat2.x + hb * 0.6;
+	// Organs throb with the bass line (organM.x), as a pulse, never a strobe.
+	let throb = 0.3 + 0.6 * u.organM.x + hb * 0.5;
 	if (u.organs.x > 0.01) {
 		let a = round(phi / (TAU / 4.0)) * (TAU / 4.0);
 		let qs = rotY(qi, a);
-		let gd = length(vec3<f32>(qs.x - R * 0.42, (qs.y - H * 0.12) * 1.8, qs.z * 0.6)) - R * 0.17;
+		// Each gonad sits at its own height and size: two level ovals side by side
+		// read as a pair of eyes, and Soma never has a face.
+		let gk = round(phi / (TAU / 4.0));
+		let gy = H * (0.02 + 0.2 * fract(gk * 0.618 + 0.3));
+		let gd = length(vec3<f32>(qs.x - R * 0.42, (qs.y - gy) * 1.8, qs.z * 0.6)) - R * (0.12 + 0.07 * fract(gk * 0.371 + 0.5));
 		let g = smoothstep(0.035, -0.035, gd) * u.organs.x;
 		let man = smoothstep(0.03, -0.03, length(qi.xz) - R * 0.09) * smoothstep(-0.6, -0.2, qi.y / H) * smoothstep(0.35, 0.1, qi.y / H) * u.organs.x * 0.6;
-		e = e + u.organ.rgb * (g + man) * throb;
+		e = e + u.colOrgan.rgb * (g + man) * throb;
 		dens = dens + (g + man) * 2.0;
 	}
 	if (u.organs.y > 0.01) {
@@ -674,9 +724,9 @@ fn organField(qi: vec3<f32>, seg: f32, hb: f32) -> vec4<f32> {
 		e = e + u.glow.rgb * line * u.organs.y * (0.12 + travel * 1.6 + note(along) * 0.6);
 	}
 	if (u.organs.z > 0.01) {
-		let nd = length(qi - vec3<f32>(0.0, H * 0.05, 0.0)) - R * (0.24 + 0.05 * u.beat2.x);
+		let nd = length(qi - vec3<f32>(0.0, H * 0.05, 0.0)) - R * (0.24 + 0.04 * u.organM.x);
 		let nn = smoothstep(0.04, -0.04, nd) * u.organs.z;
-		e = e + mix(u.organ.rgb, u.glow.rgb, 0.3) * nn * (0.55 + 0.35 * u.audio.x + hb * 0.6);
+		e = e + mix(u.colOrgan.rgb, u.glow.rgb, 0.3) * nn * (0.35 + 0.5 * u.organM.x + hb * 0.5);
 		dens = dens + nn * 3.0;
 	}
 	if (u.organs.w > 0.01) {
@@ -736,12 +786,14 @@ fn plankton(rd: vec3<f32>) -> vec3<f32> {
 		let slab = exp(-pow((p.y - yL) / 1.3, 2.0));
 		let q = p.xz * 0.11 + vec2<f32>(u.app.z * 0.35, -u.app.z * 0.2);
 		let clump = smoothstep(0.35, 0.85, vnoise(vec3<f32>(q, p.y * 0.25 + u.app.z * 0.05)));
+		// A chord change flares one or two rare patches, never the whole layer.
+		let flareAt = smoothstep(0.8, 0.95, vnoise(vec3<f32>(q * 2.3, 7.0)));
 		let fade = exp(-dot(u.medium.xyz, vec3<f32>(0.33)) * t * 0.8);
-		acc = acc + slab * (0.25 + 0.75 * clump) * fade * (t - prev);
+		acc = acc + slab * (0.25 + 0.75 * clump + flareAt * u.shaftM.w * 1.5) * fade * (t - prev);
 		prev = t;
 	}
 	let tint = mix(u.accent.rgb, u.glow.rgb, 0.35);
-	return tint * acc * density * 0.012 * (1.0 + 0.35 * u.beat2.y);
+	return tint * acc * density * 0.012;
 }
 
 fn waterBg(rd: vec3<f32>) -> vec3<f32> {
@@ -759,13 +811,6 @@ fn waterBg(rd: vec3<f32>) -> vec3<f32> {
 	return u.water.rgb * 0.45 + scatter + plankton(rd);
 }
 
-// The beat light as the water sees it: the body fires on the beat, the water
-// around it swells over the first part of the beat instead of stepping, so a
-// dark world never strobes as a whole on every beat.
-fn waterPulse() -> f32 {
-	let ph = u.beat.x;
-	return u.beat.z * smoothstep(0.0, 0.4, ph) * (1.0 - ph) * 1.35;
-}
 
 // The water lit by the animal itself: single scattering of a point light at
 // the animal's centre along the view ray up to depth tMax, attenuated on both
@@ -777,7 +822,9 @@ fn livingScatter(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> vec3<f32> {
 	let h = length(ro + rd * tc - c);
 	let soft = max(h, u.orgPos.w * 0.45 + 0.2);
 	let span = atan2(tMax - tc, soft) - atan2(-tc, soft);
-	let flash = 0.7 + 0.5 * u.mood.z + (waterPulse() * (0.6 + 0.8 * u.mood.y) + u.beat2.x * 0.5) * (1.0 - 0.6 * u.mood.z);
+	// Steady: lighting all the water at once on a beat would turn the frame as
+	// one face. The music shows in the organs and the plankton patches instead.
+	let flash = 0.8 + 0.5 * u.mood.z;
 	return u.glow.rgb * span / soft * absorb(tc + h) * u.flow.y * flash * 0.03 * (1.0 - u.beat2.z * 0.7);
 }
 
@@ -792,7 +839,7 @@ fn ember() -> vec3<f32> {
 }
 
 fn orgLight() -> vec3<f32> {
-	return u.glow.rgb * (0.12 + u.skin1.z * 0.15 + waterPulse() * 0.5 + u.audio.w * 0.15);
+	return u.glow.rgb * (0.2 + u.skin1.z * 0.15);
 }
 
 fn floorShade(p: vec3<f32>, rd: vec3<f32>, wVent: f32, wIce: f32, wKelp: f32) -> vec3<f32> {
@@ -815,7 +862,7 @@ fn floorShade(p: vec3<f32>, rd: vec3<f32>, wVent: f32, wIce: f32, wKelp: f32) ->
 	if (wVent > 0.001) {
 		let crack = smoothstep(0.05, 0.0, abs(vnoise(vec3<f32>(p.xz * 0.7, 9.0)) - 0.5));
 		let basalt = vec3<f32>(0.012, 0.01, 0.009) * (0.5 + n2);
-		let glowC = ember() * crack * (0.35 + 0.65 * u.audio.x) * 0.6;
+		let glowC = ember() * crack * (0.35 + 0.5 * u.organM.x) * 0.6;
 		col = mix(col, basalt + glowC, wVent);
 	}
 	// Ice: pale blue glaze with glints.
@@ -864,7 +911,7 @@ fn ventEnv(ro: vec3<f32>, rd: vec3<f32>, w: f32, floorY: f32, fog: f32) -> EnvHi
 				let rough = vnoise(p * 3.0);
 				let crack = smoothstep(0.06, 0.0, abs(vnoise(p * vec3<f32>(1.5, 0.6, 1.5)) - 0.5));
 				let heat = smoothstep(top - 1.4, top, y);
-				e.col = vec3<f32>(0.013, 0.011, 0.01) * (0.4 + rough) + em * (crack * 0.35 + heat * heat * 0.7) * (0.45 + 0.55 * u.audio.x);
+				e.col = vec3<f32>(0.013, 0.011, 0.01) * (0.4 + rough) + em * (crack * 0.35 + heat * heat * 0.7) * (0.45 + 0.45 * u.organM.x);
 			}
 		}
 		// A shimmering plume rising out of the mouth.
@@ -926,7 +973,7 @@ fn kelpEnv(ro: vec3<f32>, rd: vec3<f32>, w: f32, floorY: f32) -> EnvHit {
 				let height = smoothstep(floorY, top, p.y);
 				let lit = key * (max(dot(n, l), 0.0) * 0.16 + back * 0.7 + edge * 0.25) * vec3<f32>(0.6, 0.9, 0.32) * (0.45 + 0.9 * vein);
 				let bead = smoothstep(0.86, 0.98, sin(p.y * 3.1 + h.x * 20.0)) * smoothstep(0.3, 0.7, vein);
-				e.col = frond + lit * (0.35 + 0.9 * height) + mix(u.accent.rgb, u.glow.rgb, 0.5) * bead * (0.06 + 0.25 * u.beat2.y);
+				e.col = frond + lit * (0.35 + 0.9 * height) + mix(u.accent.rgb, u.glow.rgb, 0.5) * bead * (0.06 + 0.25 * lane(u.farM, i % 4));
 			}
 		}
 	}
@@ -971,7 +1018,8 @@ fn iceEnv(ro: vec3<f32>, rd: vec3<f32>, w: f32) -> EnvHit {
 	col = col + key * pow(max(dot(n, l), 0.0), 2.0) * 0.05 * vec3<f32>(0.6, 0.85, 1.0);
 	let crackLight = smoothstep(0.82, 0.95, (p.y - center.y) / radii.y) * smoothstep(0.022, 0.0, abs(vnoise(p * 0.4) - 0.5));
 	col = col + key * crackLight * 1.2 * u.medium.w;
-	let glint = step(0.985, hash33(floor(p * 3.0)).x) * (0.3 + u.beat2.y);
+	let gh = hash33(floor(p * 3.0));
+	let glint = step(0.985, gh.x) * (0.3 + 0.5 * lane(u.farM, clamp(i32(gh.y * 4.0), 0, 3)));
 	col = col + vec3<f32>(0.6, 0.85, 1.0) * glint * 0.12;
 	e.col = col * w + waterBg(rd) * (1.0 - w);
 	return e;
@@ -991,7 +1039,7 @@ fn surfaceShade(p: vec3<f32>, rd: vec3<f32>, wBay: f32) -> vec3<f32> {
 	let cell = floor(g);
 	let hh = hash33(vec3<f32>(cell, 5.0));
 	let f = fract(g) - 0.5 - (hh.xy - 0.5) * 0.6;
-	let flash = step(0.72, hh.z) * (0.15 + 2.4 * u.beat2.y + u.beat.z * (1.0 - u.beat.x) * 1.5 + note(hh.x) * 1.2);
+	let flash = step(0.72, hh.z) * (0.15 + 1.2 * lane(u.farM, clamp(i32(hh.y * 4.0), 0, 3)) + note(hh.x) * 1.2);
 	let spark = exp(-dot(f, f) * 140.0) * flash;
 	return (mix(tir, sky, window) + u.glow.rgb * spark * 0.6) * wBay + waterBg(rd) * (1.0 - wBay);
 }
@@ -1006,13 +1054,13 @@ fn volumeShafts(ro: vec3<f32>, rd: vec3<f32>, tMax: f32, jitter: f32) -> vec3<f3
 	for (var i = 0; i < 6; i = i + 1) {
 		let t = (f32(i) + jitter) / 6.0 * span;
 		let p = ro + rd * t;
-		let q = p.xz - l.xz / ly * p.y;
+		let q = p.xz - l.xz / ly * p.y + vec2<f32>(u.shaftM.y * p.y * 0.35 + u.shaftM.z * 1.7, u.shaftM.z * 0.6);
 		let n = vnoise(vec3<f32>(q * 0.33, u.frame.z * 0.04)) * 0.65 + vnoise(vec3<f32>(q * 0.9, u.frame.z * 0.07 + 5.0)) * 0.35;
 		let shaft = smoothstep(0.5, 0.82, n);
 		acc = acc + absorb(t * 0.8) * shaft;
 	}
 	let toward = 0.35 + 0.65 * pow(max(dot(rd, l), 0.0), 2.0);
-	return u.keyCol.rgb * mix(u.haze.rgb * 6.0, vec3<f32>(0.05), 0.15) * u.keyDir.w * u.envB.w * acc / 6.0 * span * 0.06 * toward;
+	return u.keyCol.rgb * mix(u.haze.rgb * 6.0, vec3<f32>(0.05), 0.15) * u.keyDir.w * u.envB.w * u.shaftM.x * acc / 6.0 * span * 0.06 * toward;
 }
 
 /** The world behind the animal: colour with fog, and the distance of the first opaque surface. */
@@ -1100,7 +1148,10 @@ fn particles(ro: vec3<f32>, rd: vec3<f32>, tMax: f32, cells: i32, cs: f32, salt:
 		let r2 = dot(toOrg, toOrg);
 		let nearOrg = 1.0 / (1.0 + r2 * 0.6);
 		let spore = shed * nearOrg * 0.6;
-		if (h.x < density + spore) {
+		// The hats' cloud: a drifting patch of flakes beside the animal that glint.
+		let dc = length(pc - u.snowCloud.xyz) / max(u.snowM.w, 0.3);
+		let inCloud = exp(-dc * dc);
+		if (h.x < density + spore + inCloud * 0.35) {
 			let tp = dot(pc - ro, rd);
 			if (tp > 0.08 && tp < tMax) {
 				let dp = length(ro + rd * tp - pc);
@@ -1108,9 +1159,20 @@ fn particles(ro: vec3<f32>, rd: vec3<f32>, tMax: f32, cells: i32, cs: f32, salt:
 				let coc = u.camUp.w * abs(tp - u.camRight.w) * 0.6 + size;
 				let disc = 1.0 - smoothstep(coc * 0.65, coc, dp);
 				let energy = (size * size) / (coc * coc);
-				let living = orgLight() * u.flow.y * (2.4 + 3.0 * u.beat2.y) / (0.25 + r2 * 0.55) * absorb(sqrt(r2));
+				let living = orgLight() * u.flow.y * 2.6 / (0.25 + r2 * 0.55) * absorb(sqrt(r2));
 				let sun = u.keyCol.rgb * u.keyDir.w * u.medium.w * 0.1;
-				let lit = living + sun + u.glow.rgb * spore * 1.2;
+				// The bell's jet lights a wake behind it: a shell running out from the
+				// body on each squeeze, only on the side away from the apex.
+				let rr = sqrt(r2);
+				let away = smoothstep(-0.1, 0.7, dot(toOrg / max(rr, 1e-3), -u.orgY.xyz));
+				let wake = exp(-pow((rr - u.snowM.x) / 0.7, 2.0)) * u.snowM.y * away / (1.0 + rr * 0.15);
+				let glint = inCloud * u.snowM.z * step(0.4, h.z) * (0.5 + h.y);
+				// Luminous plankton among the snow, in patches a few body lengths
+				// across: each patch flashes on its own instrument (zoneM), so
+				// different parts of the water answer different drums.
+				let zc = hash33(floor(pc / 2.6) + vec3<f32>(41.0, salt, u.seeds.y * 11.0));
+				let spark = step(0.5, h.y) * lane(u.zoneM, clamp(i32(zc.x * 4.0), 0, 3));
+				let lit = living + sun + u.glow.rgb * spore * 1.2 + u.glow.rgb * wake * 1.6 + u.accent.rgb * glint * 2.2 + mix(u.glow.rgb, u.accent.rgb, zc.y) * spark * 1.6;
 				// Flakes brushing the lens fade out instead of flashing across the frame.
 				acc = acc + lit * disc * energy * absorb(tp) * (0.4 + h.y) * smoothstep(0.3, 1.4, tp);
 			}
@@ -1148,15 +1210,19 @@ fn farLights(ro: vec3<f32>, rd: vec3<f32>, tMax: f32) -> vec3<f32> {
 		let h = hash33(cell * 1.31 + vec3<f32>(5.0, u.seeds.y * 13.0, 2.0));
 		// How many distant animals share the water wanders (flow.z): some
 		// stretches are empty black, others a scatter of far lights.
-		if (h.x < 0.06 + 0.3 * u.flow.z) {
+		if (h.x < 0.06 + 0.3 * u.flow.z + 0.1 * u.colOrgan.w) {
 			let pc = (cell + 0.25 + 0.5 * h.zxy - vec3<f32>(t * 0.004, 0.0, -t * 0.003)) * cs;
 			let tp = dot(pc - ro, rd);
 			if (tp > 3.0 && tp < tMax) {
 				let dp = length(ro + rd * tp - pc);
 				// Each far light flickers on its own noise, never on a fixed cycle.
-				let blink = smoothstep(0.6, 0.85, vnoise(vec3<f32>(h.z * 40.0, h.x * 17.0, t * (0.3 + 0.5 * h.y)))) * select(1.0, u.beat.z * (1.0 - u.beat.x) * 2.0, h.y > 0.7);
+				// Each group of far animals answers its own instrument (farM).
+				let gi = clamp(i32(h.y * 4.0), 0, 3);
+				let idle = smoothstep(0.6, 0.85, vnoise(vec3<f32>(h.z * 40.0, h.x * 17.0, t * (0.3 + 0.5 * h.y))));
+				let blink = idle * 0.35 + lane(u.farM, gi) * (0.4 + 0.6 * fract(h.x * 13.0));
 				// A small hot core and a wide soft body: a far animal out of focus.
-				let core = exp(-dp * dp / (0.0004 * tp)) + exp(-dp * dp / (0.012 * tp)) * 0.12 + exp(-dp * dp / (0.05 * tp)) * 0.05 * u.flow.z;
+				let sz = u.colRim.w;
+				let core = exp(-dp * dp / (0.0004 * tp * sz)) + exp(-dp * dp / (0.012 * tp * sz)) * 0.18 + exp(-dp * dp / (0.05 * tp * sz)) * 0.06;
 				let tint = select(u.glow.rgb, u.accent.rgb, h.z > 0.5);
 				acc = acc + tint * core * blink * absorb(tp * 0.7) * 0.5;
 			}
@@ -1195,6 +1261,11 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	let key = u.keyCol.rgb * u.keyDir.w;
 	let energy = u.audio.w;
 	let hb = heartbeat() * formWeight(3.0);
+	// Colony members each carry their own light (the light hops between them);
+	// the juvenile its own pulse.
+	let colonyW = smoothstep(1.05, 2.0, u.chain0.x);
+	let member = mix(1.0, lane(u.colonyM, clamp(i32(seg + 0.5) % 4, 0, 3)), colonyW);
+	let own = select(member, u.compM.y, isComp);
 
 	// Opacity per tissue: thin tissues read denser.
 	var opac = u.skin0.w;
@@ -1218,7 +1289,7 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	if (u.skin0.z > 0.01 && (part < 0.5 || part > 8.5)) {
 		let vc = voro(qi * 9.0);
 		let wave = 0.5 + 0.5 * sin(dot(qi, vec3<f32>(0.4, 3.2, 0.9)) * 2.2 - u.orgY.w * 0.6 + vc.y * 2.0);
-		let open = clamp(wave * 0.75 + u.beat2.x * 0.2 + u.beat.z * gauss(fract(qi.y * 0.4 - u.beat.x) - 0.5, 0.2) * 0.35, 0.0, 1.0);
+		let open = clamp(wave * 0.75 + u.organM.x * 0.15 + u.beat.z * gauss(fract(qi.y * 0.4 - u.beat.x) - 0.5, 0.2) * 0.35, 0.0, 1.0);
 		let spot = smoothstep(0.08 + 0.32 * open, 0.04 + 0.28 * open, vc.x);
 		let pigment = mix(u.accent.rgb * 0.35, u.organ.rgb * 0.4, step(0.5, vc.y));
 		let cloud = smoothstep(0.35, 0.95, sin(qi.y * 3.5 - u.orgY.w * 0.45 + qi.z * 1.2));
@@ -1251,8 +1322,11 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 
 	// Rim glow: the membrane's edge catching its own bioluminescence.
 	let pulse = u.beat.y;
-	let rimTint = mix(u.bodyCol.rgb, u.glow.rgb, 0.6);
-	col = col + rimTint * (fres * 1.3 + pow(1.0 - ndv, 8.0) * 1.2) * u.skin1.z * (0.45 + 0.55 * energy + 0.3 * pulse);
+	// The chord sets the rim's light relation (colRim).
+	let rimTint = mix(u.bodyCol.rgb, u.colRim.rgb, 0.6);
+	// Lures are lit by their own photophore (below), not by the rim's glow.
+	let rimPart = select(1.0, 0.25, part > 7.5 && part < 8.5);
+	col = col + rimTint * (fres * 1.3 + pow(1.0 - ndv, 8.0) * 1.2) * u.skin1.z * (0.45 + 0.4 * energy + 0.3 * pulse) * (0.7 + 0.3 * own) * rimPart;
 
 	// Iridescence and comb rows.
 	let phi = atan2(qi.z, qi.x);
@@ -1262,8 +1336,9 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	if (u.skin0.y > 0.01 && part < 0.5) {
 		let row = smoothstep(0.88, 0.99, cos(8.0 * phi));
 		let yN = qi.y / max(u.body0.y, 0.05);
-		let beat = 0.5 + 0.5 * sin(yN * 14.0 - u.app.w + phi);
-		col = col + film(yN * 0.8 + u.drag.w + phi * 0.2) * row * (1.0 - abs(yN)) * u.skin0.y * (0.12 + beat * (0.25 + 1.4 * u.beat2.y + u.audio.z * 0.6));
+		// The running light steps down the rows with every hat (colArm.w).
+		let beat = 0.5 + 0.5 * sin(yN * 14.0 - u.colArm.w * 6.0 + phi);
+		col = col + film(yN * 0.8 + u.drag.w + phi * 0.2) * row * (1.0 - abs(yN)) * u.skin0.y * (0.08 + beat * beat * u.photoM.w * 0.9);
 	}
 
 	// Photophores: rim ring, body spots, along the appendages, bulbs; notes light them.
@@ -1276,33 +1351,64 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 		let dp = vec2<f32>((phi - k * TAU / np) * u.body0.x, (s.u - 0.93) * u.body0.y * 2.0);
 		let spot = exp(-dot(dp, dp) / 0.0014);
 		let x = fract(k / np + 0.5);
-		photo = photo + mix(u.glow.rgb, u.accent.rgb, step(0.5, fract(k * 0.5))) * spot * u.photo.y * (0.1 + note(x) * gain * 2.4 + onset(x) * 2.5 * strike);
+		// The snare cracks the ring (rimM.x); a light chases round it (rimM.y).
+		let chase = 0.3 + 0.7 * gauss(fract(k / np - u.rimM.y) - 0.5, 0.1 * u.rimM.w);
+		photo = photo + mix(u.colRim.rgb, u.glow.rgb, step(0.5, fract(k * 0.5)) * 0.4) * spot * u.photo.y * (0.06 + u.rimM.x * chase + note(x) * gain * 0.6 + onset(x) * 0.5 * strike) * own;
 	}
 	if (u.photo.x > 0.01 && (part < 0.5 || part > 8.5)) {
 		let cq = qi * 6.5 + vec3<f32>(seg * 2.3);
 		let h = hash33(floor(cq));
 		let f = fract(cq) - 0.5 - (h - 0.5) * 0.5;
 		let spot = exp(-dot(f, f) * mix(70.0, 34.0, u.photo.x)) * step(1.0 - u.photo.x * 0.7, h.x);
-		let wave = gauss(fract(qi.y * 0.35 + seg * 0.2 - u.beat.x) - 0.5, 0.1) * u.beat.z;
-		photo = photo + mix(u.glow.rgb, u.accent.rgb, step(0.6, h.y)) * spot * (0.08 + note(h.z) * gain * 2.0 + onset(h.z) * 2.2 * strike + wave * 2.0 + u.beat2.y * 0.5);
+		// Three clusters, three sides of the body, each firing on its own voice.
+		let cl = clamp(i32(floor((phi / TAU + 0.5) * 3.0)), 0, 2);
+		photo = photo + mix(u.colRim.rgb, u.colArm.rgb, step(0.6, h.y)) * spot * (0.04 + note(h.z) * gain * 0.6 + onset(h.z) * 0.5 * strike + lane(u.photoM, cl) * 1.5) * own;
 	}
 	if ((part > 0.5 && part < 2.5) || (part > 6.5 && part < 7.5)) {
 		let nA = max(u.counts.z, 1.0);
 		let idx = round(phi / (TAU / nA));
+		// Each arm group lights on its own drum layer; oral arms and cerata on the notes.
+		let ii = idx - floor(idx / nA) * nA;
+		let gi = clamp(i32(floor(ii * 4.0 / nA)), 0, 3);
+		let armL = select(u.organM.y, lane(u.armLight, gi), part < 1.5);
 		let beads = gauss(fract(s.u * 10.0 + idx * 0.37) - 0.5, 0.16);
 		let x = fract(s.u * 0.7 + idx / nA);
-		photo = photo + u.glow.rgb * beads * u.photo.z * (0.06 + note(x) * gain * 1.6 + onset(x) * 2.0) * (1.0 - s.u * 0.4);
+		photo = photo + u.colArm.rgb * beads * u.photo.z * (0.04 + armL * 1.2 + note(x) * gain * 0.6 + onset(x) * 0.6) * (1.0 - s.u * 0.4) * own;
 		if (part > 6.5) {
-			photo = photo + u.accent.rgb * smoothstep(0.6, 1.0, s.u) * (0.3 + u.beat2.y);
+			photo = photo + u.colOrgan.rgb * smoothstep(0.6, 1.0, s.u) * (0.15 + 0.6 * u.organM.y);
 		}
 	}
 	if (part > 7.5 && part < 8.5) {
-		photo = photo + mix(u.glow.rgb, u.accent.rgb, 0.3) * (0.9 + (note(0.15) * 1.5 * gain + u.beat2.x * 1.2 + u.beat.z * (1.0 - u.beat.x)) * (1.0 - 0.65 * u.mood.z));
+		// Lures belong to their arm group: they flash with its drum, and all of
+		// them warm a little on a chord change. Dim between hits, so a flash reads.
+		let nA = max(u.counts.z, 1.0);
+		let idx = round(phi / (TAU / nA));
+		let ii = idx - floor(idx / nA) * nA;
+		let gi = clamp(i32(floor(ii * 4.0 / nA)), 0, 3);
+		photo = photo + mix(u.colArm.rgb, u.colOrgan.rgb, 0.35) * (0.1 + (lane(u.armLight, gi) * 0.55 + note(0.15) * 0.3 * gain + u.organM.z * 0.3) * (1.0 - 0.4 * u.mood.z)) * own;
 	}
 	if (part > 4.5 && part < 5.5) {
-		photo = photo + u.organ.rgb * (0.3 + 0.35 * u.audio.x + hb * 0.6) * u.skin1.w;
+		photo = photo + u.colOrgan.rgb * (0.2 + 0.4 * u.organM.x + hb * 0.5) * u.skin1.w;
 	}
-	col = col + photo;
+	// Living light in the tissue itself, by organ: each third of the bell
+	// (around its axis) glows with its own photophore cluster's voice, and each
+	// tentacle group glows along its length with its own drum. Soft and broad,
+	// so a part of the animal brightens, never the whole frame.
+	var tissue = vec3<f32>(0.0);
+	let edgeW = 0.25 + 0.75 * fres;
+	if (part < 0.5 || part > 8.5) {
+		let sector = (phi / TAU + 0.5) * 3.0;
+		let cl = clamp(i32(floor(sector)), 0, 2);
+		let inner = smoothstep(0.0, 0.25, fract(sector)) * smoothstep(1.0, 0.75, fract(sector));
+		tissue = u.colRim.rgb * lane(u.photoM, cl) * (0.35 + 0.65 * inner) * edgeW * 0.16;
+	} else if (part > 0.5 && part < 1.5) {
+		let nA = max(u.counts.z, 1.0);
+		let idx = round(phi / (TAU / nA));
+		let ii = idx - floor(idx / nA) * nA;
+		let gi = clamp(i32(floor(ii * 4.0 / nA)), 0, 3);
+		tissue = u.colArm.rgb * lane(u.armLight, gi) * (1.0 - 0.5 * s.u) * edgeW * 0.22;
+	}
+	col = col + photo + tissue * own;
 
 	// Beat light packets travelling through the body.
 	var arc = s.u;
@@ -1323,7 +1429,7 @@ fn shadeAnimal(p: vec3<f32>, rd: vec3<f32>, t: f32, behind: vec3<f32>, s: Sample
 	// The packet is a travelling ring of light: strongest at the rim and in the
 	// photophores, a faint wash across the tissue in between.
 	let packetMask = 0.12 + 0.7 * fres + min(1.0, length(photo) * 2.0);
-	col = col + mix(u.glow.rgb, rimTint, 0.3) * band * u.beat.z * (1.0 - u.beat.x * 0.5) * packetMask * 0.9;
+	col = col + mix(u.glow.rgb, rimTint, 0.3) * band * u.beat.z * (1.0 - u.beat.x * 0.5) * packetMask * 1.3;
 
 	// Through the membrane: organs, then the world behind.
 	var inner = vec3<f32>(0.0);
@@ -1421,17 +1527,24 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 		} else {
 			// Filaments thinner than a pixel still glow: a halo from the near miss.
 			let halo = exp(-minD * 260.0) * 0.18;
-			col = col + mix(u.glow.rgb, u.bodyCol.rgb, 0.4) * halo * (0.4 + 0.6 * u.audio.w + u.beat.z * 0.3) * absorb(minT);
+			col = col + mix(u.colArm.rgb, u.bodyCol.rgb, 0.4) * halo * (0.4 + 0.6 * u.audio.w) * absorb(minT);
 		}
 	}
 	if ((dbg & 4u) == 0u) {
-		col = col + livingScatter(ro, rd, min(depth, 60.0));
-		col = col + particles(ro, rd, depth, i32(u.march.w + 0.5), 0.55, 0.0);
-		col = col + particles(ro, rd, depth, i32(u.march.w * 0.6 + 0.5), 1.7, 17.0) * 2.2;
-		if (u.envB.w > 0.01) {
+		// Dev bits for QA: 32 no living scatter, 64 no snow, 128 no shafts, 256 no far life.
+		if ((dbg & 32u) == 0u) {
+			col = col + livingScatter(ro, rd, min(depth, 60.0));
+		}
+		if ((dbg & 64u) == 0u) {
+			col = col + particles(ro, rd, depth, i32(u.march.w + 0.5), 0.55, 0.0);
+			col = col + particles(ro, rd, depth, i32(u.march.w * 0.6 + 0.5), 1.7, 17.0) * 2.2;
+		}
+		if (u.envB.w > 0.01 && (dbg & 128u) == 0u) {
 			col = col + volumeShafts(ro, rd, depth, hash33(vec3<f32>(in.position.xy, 7.0)).x);
 		}
-		col = col + farLights(ro, rd, depth);
+		if ((dbg & 256u) == 0u) {
+			col = col + farLights(ro, rd, depth);
+		}
 	}
 	// Never let a NaN reach the feedback history, where it would spread.
 	col = max(select(col, vec3<f32>(0.0), col != col), vec3<f32>(0.0));
@@ -1461,7 +1574,7 @@ ${POST_COMMON_WGSL}
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4<f32> {
 	let center = clamp(u.orgScreen.xy, vec2<f32>(0.1), vec2<f32>(0.9));
-	let prevUv = center + (in.uv - center) * (1.0 - 0.0035 * (1.0 + u.audio.x));
+	let prevUv = center + (in.uv - center) * (1.0 - 0.0035 * (1.0 + 0.5 * u.mood.w));
 	let edge = min(min(prevUv.x, prevUv.y), min(1.0 - prevUv.x, 1.0 - prevUv.y));
 	let border = smoothstep(0.0, 0.03, edge);
 	let prev = textureSampleLevel(feedbackPrev, samp, prevUv, 0.0).rgb;

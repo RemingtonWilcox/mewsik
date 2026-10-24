@@ -38,6 +38,7 @@
 	} from '$lib/visualizer/mandala/look';
 	import { FoldSpring, JuliaTrack, MandalaVoyage } from '$lib/visualizer/mandala/flight';
 	import { HeardPulse } from '$lib/visualizer/mandala/pulse';
+	import { MandalaRose, ROSE_FLOATS, ROSE_PARTS } from '$lib/visualizer/mandala/rose';
 	import { VariationGenome, type ContinuousAxis } from '$lib/visualizer/variation';
 	import { Wander } from '$lib/visualizer/motion';
 	import type { MusicCharacter } from '$lib/visualizer/character';
@@ -143,11 +144,21 @@
 		spring: FoldSpring;
 		pulse: HeardPulse;
 		julia: JuliaTrack[];
+		/**
+		 * The picture's parts: a rose of panes (rings x petals), each lit and
+		 * drawn by its own part of the ensemble (see rose.ts).
+		 */
+		rose: MandalaRose;
+		/** Bass notes answered (they flex the folds a little). */
+		lastBassNote: number;
 		env: ReturnType<typeof freshEnv>;
 		/** World x variant x fold, morphed on the GPU. */
 		scene: MandalaFollower;
 		palette: MandalaFollower;
+		/** The palette arriving (all panes show it once the morph is done). */
 		colours: Palette;
+		/** The palette being left, shown by the panes the new one has not reached yet. */
+		leaving: [Rgb, Rgb, Rgb, Rgb];
 		lastShiftSerial: number;
 		lastHits: number;
 		/** Seconds until the character weights are refreshed. */
@@ -357,10 +368,13 @@
 			spring: new FoldSpring(),
 			pulse: new HeardPulse(),
 			julia: [2, 3, 4, 5].map((power) => new JuliaTrack(power)),
+			rose: new MandalaRose(seed),
+			lastBassNote: -1,
 			env,
 			scene: new MandalaFollower(sceneTarget()),
 			palette,
 			colours: paletteFrom(palette.to),
+			leaving: paletteFrom(palette.to).stops,
 			lastShiftSerial: shiftSerial,
 			lastHits: 0,
 			weightsIn: 0,
@@ -434,6 +448,7 @@
 		sampler: GPUSampler;
 		uniformBuffer: GPUBuffer;
 		binsBuffer: GPUBuffer;
+		roseBuffer: GPUBuffer;
 		uniforms: Float32Array;
 		pipelines: {
 			scene: GPURenderPipeline;
@@ -530,7 +545,11 @@
 			scene: device.createBindGroup({
 				label: 'Mandala scene',
 				layout: pipelines.scene.getBindGroupLayout(0),
-				entries: [uniform, { binding: 1, resource: { buffer: g.binsBuffer } }]
+				entries: [
+					uniform,
+					{ binding: 1, resource: { buffer: g.binsBuffer } },
+					{ binding: 2, resource: { buffer: g.roseBuffer } }
+				]
 			}),
 			feedback: [
 				bind(pipelines.feedback, 'Mandala feedback reads A', [t.sceneView, t.feedbackView[0]]),
@@ -563,6 +582,7 @@
 		let context: GPUCanvasContext | null = null;
 		let uniformBuffer: GPUBuffer | null = null;
 		let binsBuffer: GPUBuffer | null = null;
+		let roseBuffer: GPUBuffer | null = null;
 		try {
 			context = targetCanvas.getContext('webgpu') as unknown as GPUCanvasContext | null;
 			if (!context) throw new Error('The WebGPU canvas context could not be created.');
@@ -616,6 +636,10 @@
 				size: MANDALA_BIN_COUNT * 4,
 				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
 			});
+			roseBuffer = device.createBuffer({
+				size: ROSE_FLOATS * 4,
+				usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+			});
 			const state: MandalaGpu = {
 				device,
 				context,
@@ -628,6 +652,7 @@
 				}),
 				uniformBuffer,
 				binsBuffer,
+				roseBuffer,
 				uniforms: new Float32Array(MANDALA_UNIFORM_FLOATS),
 				pipelines: {
 					scene: built[0],
@@ -653,6 +678,7 @@
 		} catch (error) {
 			uniformBuffer?.destroy();
 			binsBuffer?.destroy();
+			roseBuffer?.destroy();
 			try {
 				context?.unconfigure();
 			} catch {
@@ -669,6 +695,7 @@
 		disposeTargets(state.retired);
 		state.uniformBuffer.destroy();
 		state.binsBuffer.destroy();
+		state.roseBuffer.destroy();
 		try {
 			state.context.unconfigure();
 		} catch {
@@ -795,14 +822,18 @@
 		}
 		const run = lookState.run;
 		if (!run) return;
+		run.rose ??= new MandalaRose(journey.seed);
+		run.leaving ??= paletteFrom(run.palette.to).stops;
+		run.lastBassNote ??= -1;
 		const env = run.env;
 
 		// ── Envelopes. The spectrum is held as timbre (which bands are alive),
-		// slow enough that a kick does not flash the scales it lights.
+		// slow enough that no drum flashes the scales it lights: the drums
+		// speak through the rose's panes, each in its own place.
 		const incoming = feat?.bins ?? [];
 		for (let i = 0; i < MANDALA_BIN_COUNT; i++) {
 			const target = clamp(finite(incoming[i] ?? 0), 0, 1);
-			bins[i] = approach(bins[i], target, target > bins[i] ? 1 / 0.3 : 1 / 0.7, dt);
+			bins[i] = approach(bins[i], target, target > bins[i] ? 1 / 1.5 : 1 / 3, dt);
 		}
 		const rmsTarget = clamp(finite(feat?.rms ?? 0), 0, 1);
 		env.rms = approach(env.rms, rmsTarget, rmsTarget > env.rms ? 6 : 3, dt);
@@ -816,7 +847,7 @@
 		env.treble = approach(env.treble, feat ? spectrum.treble : 0, 1.5, dt);
 		const sectionEnergy = clamp(finite(directed.context.sectionEnergy), 0, 1);
 		// Light follows the song's arc over seconds, never the beat.
-		env.energy = approach(env.energy, clamp(character.energy * 0.65 + sectionEnergy * 0.35, 0, 1), 0.8, dt);
+		env.energy = approach(env.energy, clamp(character.energy * 0.65 + sectionEnergy * 0.35, 0, 1), 0.3, dt);
 
 		// ── Character: Mandala hears tilt (bright vs dark spectrum) and hiss
 		// (bright, sub-less, fast) itself, then answers each shift exactly once.
@@ -910,8 +941,10 @@
 			run.answers.world = { option: answerFor(run, 'world', keptWorld, heard, changed), boundary: boundaryCount('world') };
 			run.answers.palette = { option: answerFor(run, 'palette', keptPalette, heard, changed), boundary: boundaryCount('palette') };
 			mandalaPullCharacter(genome, heard, 0.75 * shiftStrength);
-			// New music: the camera heads somewhere new now.
+			// New music: the camera heads somewhere new now, and the rose
+			// re-voices and re-routes its panes.
 			run.voyage.redirect();
+			run.rose.shift(shiftStrength, journey.ensemble.harmony.root);
 			run.weightsIn = 0.5;
 		}
 		run.weightsIn -= dt;
@@ -920,7 +953,9 @@
 			mandalaApplyCharacter(genome, heard, 6, run.recent);
 		}
 		if (feat) mandalaPullCharacter(genome, heard, Math.min(1, dt * 0.12));
-		const glide = 1.4 * genome.glideSpeed;
+		// The character rails glide over a second or two (faster right after a
+		// shift): they reshape the whole frame, so they must never pump.
+		const glide = 0.7 * genome.glideSpeed;
 		env.tempo = approach(env.tempo, character.tempo, glide, dt);
 		env.harsh = approach(env.harsh, env.hiss, glide, dt);
 		env.punch = approach(env.punch, character.punch, glide, dt);
@@ -943,7 +978,9 @@
 		if (nextScene !== run.scene.to || run.scene.mix >= 1) {
 			const worldMove = mandalaSlotParts(nextScene).world !== mandalaSlotParts(run.scene.to).world;
 			// Never quicker than two seconds for a new world: faster reads as a cut.
-			run.sceneTau = Math.max(worldMove ? 2.0 : 1.2, (worldMove ? 6.5 : 4.5) / leap);
+			// The reveal sweeps the frame as a front, so each pixel turns over in
+			// under half the morph: the morph itself must not be too quick.
+			run.sceneTau = Math.max(worldMove ? 2.2 : 1.8, (worldMove ? 6.5 : 4.5) / leap);
 		}
 		// A new world brings its own light: another palette that fits the
 		// music nearly as well, so a change of world never wears the last
@@ -978,10 +1015,15 @@
 		const colours = run.colours;
 		// The family's stops turn slowly round the wheel: a palette is a
 		// continuum the look drifts through, never the same colouring twice.
+		// The new family reaches the window pane by pane (see rose.ts): the
+		// shader mixes the stops being left with the arriving ones per pane.
 		const tint = run.voyage.tint;
+		const settled = run.palette.mix >= 1;
 		for (let i = 0; i < 4; i++) {
-			const c = turnHue(mixRgb(pa.stops[i], pb.stops[i], pw), tint);
-			approachRgb(colours.stops[i], [c[0] * warmTint[0], c[1] * warmTint[1], c[2] * warmTint[2]], colourRate, dt);
+			const to = turnHue(pb.stops[i], tint);
+			const from = settled ? to : turnHue(pa.stops[i], tint);
+			approachRgb(colours.stops[i], [to[0] * warmTint[0], to[1] * warmTint[1], to[2] * warmTint[2]], colourRate, dt);
+			approachRgb(run.leaving[i], [from[0] * warmTint[0], from[1] * warmTint[1], from[2] * warmTint[2]], colourRate, dt);
 		}
 		approachRgb(colours.spark, turnHue(mixRgb(pa.spark, pb.spark, pw), tint), colourRate, dt);
 		colours.sheen = approach(colours.sheen, pa.sheen + (pb.sheen - pa.sheen) * pw, colourRate, dt);
@@ -1001,22 +1043,21 @@
 			loudness,
 			tempo: env.tempo
 		});
-		const punchiness = clamp(0.35 + env.punch * 0.5 + env.weight * 0.35, 0, 1.2);
-		if (run.pulse.hits !== run.lastHits) {
-			run.lastHits = run.pulse.hits;
-			const strength = run.pulse.lastStrength * response.impact;
-			// The spring rings to about +-0.5 on a strong kick; each world turns
-			// that into a flex of its folds (see the shaders' motion.x).
-			if (!forced()?.nosnap) run.spring.kick(strength * punchiness);
-			if (!forced()?.nosurge) run.surge = Math.max(run.surge, strength * punchiness);
-			// The roaming camera leans in on a heard kick.
-			run.voyage.kick(strength * punchiness * 0.6);
-		}
-		run.surge *= Math.exp(-dt / 0.16);
+		// The kick no longer moves the whole frame (no travel surge, no camera
+		// lean, no frame-wide fold flex): it pushes the rose's core, in its own
+		// place. The heard pulse is still counted for QA.
+		if (run.pulse.hits !== run.lastHits) run.lastHits = run.pulse.hits;
+		const ensemble = journey.ensemble;
+		// Nothing flexes the whole structure on a hit any more: the fold spring
+		// rests (the bass line turns the rose's core instead, see rose.ts).
+		run.lastBassNote = ensemble.bass.noteSerial;
+		run.surge = 0;
 		run.spring.update(dt, 2.6 + env.tempo * 1.6, 0.45);
 
 		// ── Travel: tempo sets the pace continuously; the clock never flashes.
-		const speed = (0.06 + Math.pow(env.tempo, 1.4) * 0.5 + env.drive * 0.12) * response.motion * (forced()?.speed ?? 1);
+		// Energy barely moves the pace: a breakdown slowing every part of the
+		// frame at once would be a whole face turning.
+		const speed = (0.06 + Math.pow(env.tempo, 1.4) * 0.36 + env.drive * 0.03) * response.motion * (forced()?.speed ?? 1);
 		const morph = run.scene.mix < 1 ? Math.sin(Math.PI * run.scene.mix) * 0.25 : 0;
 		const sceneTo = mandalaSlotParts(run.scene.to);
 		const spiralTrack = run.julia[sceneTo.world === WORLD_INDEX.spiral ? sceneTo.variant : 0];
@@ -1029,11 +1070,12 @@
 			speed: speed + morph,
 			rates,
 			spin: val('spin') * (0.05 + env.tempo * 0.12),
-			surge: run.surge * (0.35 + env.tempo * 0.4),
+			surge: 0,
 			restless: clamp(env.tempo * 0.7 + finite(directed.motion) * 0.3 + env.harsh * 0.2, 0, 1),
 			drift: clamp(val('drift'), 0, 1) * (0.5 + env.harsh * 0.3),
 			tempo: env.tempo,
-			silence: env.silence
+			silence: env.silence,
+			roam: forced()?.roam ?? 1
 		});
 
 		// Julia dives are chosen by their spiral: the multiplier rests near a
@@ -1155,7 +1197,7 @@
 		values.feedbackZoom = Math.exp(-run.voyage.stepLog * zoomWeight);
 		values.feedbackRoll = -run.voyage.stepTurn * (1 - marchWeight);
 		values.bloomThreshold = 0.9 - env.energy * 0.2;
-		values.aberration = 0.8 + env.harsh * 1.4 + run.surge * 0.5;
+		values.aberration = 0.8 + env.harsh * 1.4;
 		// The planes zoom about their own centre, wherever the camera has
 		// drifted it; the flights stream from the middle of the frame.
 		const planeWeight = 1 - marchWeight;
@@ -1167,17 +1209,33 @@
 		values.vignette = 1;
 		values.grain = forced()?.debug ? -1 : 1.4;
 		values.exposureCeil = 2.6;
-		values.meterRate = feedbackResetFrames > 0 ? 1 : 0.06;
+		// The meter eases over a second or two: a pane's flash must not dim
+		// the rest of the frame.
+		values.meterRate = feedbackResetFrames > 0 ? 1 : 0.012;
 		values.debug = forced()?.debug ?? 0;
 		// A wall the camera passes close to fills the frame: the meter brings it
 		// down rather than letting the whole picture swell.
 		values.meanCeil = 0.22;
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
+		// ── The rose: every pane answers its own part of the ensemble.
+		const roseData = run.rose.update(ensemble, {
+			dt,
+			silence: env.silence,
+			restless: clamp(env.energy * 0.6 + ensemble.texture.density * 0.4, 0, 1),
+			reroute: shiftStrength,
+			centreX: voyage.panX * planeWeight,
+			centreY: voyage.panY * planeWeight,
+			paletteWeight: settled ? 1 : run.palette.weight,
+			leaving: run.leaving,
+			mute: forced()?.mute
+		});
+		if (import.meta.env.DEV) Object.assign(globalThis, { __MANDALA_ROSE__: run.rose, __MANDALA_RUN__: run, __MANDALA_VALUES__: values });
 		packMandalaUniforms(g.uniforms, values);
 		frameIndex += 1;
 
 		g.device.queue.writeBuffer(g.uniformBuffer, 0, g.uniforms.buffer, g.uniforms.byteOffset, g.uniforms.byteLength);
 		g.device.queue.writeBuffer(g.binsBuffer, 0, bins.buffer, bins.byteOffset, bins.byteLength);
+		g.device.queue.writeBuffer(g.roseBuffer, 0, roseData.buffer, roseData.byteOffset, roseData.byteLength);
 
 		const shown = mandalaSlotParts(sceneB);
 		const worldName = MANDALA_WORLDS[shown.world];
@@ -1424,6 +1482,7 @@
 			data-mandala-governor={hudScale}
 			data-mandala-render-passes={RENDER_PASSES}
 			data-mandala-uniform-bytes={MANDALA_UNIFORM_BYTES}
+			data-mandala-parts={ROSE_PARTS}
 			data-mandala-frame-stride={activeFrameStride}
 			data-mandala-internal-pixels={internalPixels}
 			data-mandala-ready={String(ready)}

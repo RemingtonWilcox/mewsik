@@ -37,6 +37,8 @@ import type { VisualDirectorFrame } from '../director/types';
 import type { SignalSpectrumProfile } from '../signal/spectrum';
 import type { Mk2ConductorFrame } from './conductor';
 import type { MusicCharacter } from '../character';
+import type { EnsembleFrame } from '../ensemble';
+import { SOMA_PART_SLOTS, SomaParts } from './parts';
 import {
 	SOMA_ANATOMY_KEYS,
 	SOMA_ANATOMY_SIZE,
@@ -182,6 +184,8 @@ export type SomaFrame = {
 	};
 	lifecycle: number[];
 	names: { species: string; environment: string; palette: string; camera: string; form: SomaLifecycleForm };
+	/** The organs' own lanes (parts.ts SOMA_PART_SLOTS), one vec4 each. */
+	parts: Float32Array;
 };
 
 export type SomaLookInput = {
@@ -199,6 +203,8 @@ export type SomaLookInput = {
 	impactScale?: number;
 	/** What kind of music is playing (journey.character); a new shiftSerial means it just changed. */
 	character?: Readonly<MusicCharacter> | null;
+	/** What each part of the band is doing (journey.ensemble): the organs answer it one by one. */
+	ensemble?: Readonly<EnsembleFrame> | null;
 };
 
 /** Soma's reading of the music character. */
@@ -504,6 +510,16 @@ export class SomaLook {
 	private readonly dr = new Float32Array(DRIFT_PERIODS.length);
 	private readonly frame: SomaFrame;
 	private readonly colorScratch: Rgb = [0, 0, 0];
+	/** The organs as an ensemble: each answers its own part of the music (parts.ts). */
+	private parts = new SomaParts('soma');
+	/** Character shift strength answered this tick (re-routes the modulation matrix). */
+	private rerouteNow = 0;
+	/** Seconds since the last heard bass note: the bell falls back to the kick without a bass line. */
+	private sinceBassNote = 1e3;
+	private lastBassSerial = -1;
+	private sinceFillNudge = 1e3;
+	private sectionGlow = 0.5;
+	private lastFillSerial = -1;
 
 	constructor(seed: number | string = 0.5) {
 		this.genome = new VariationGenome(SOMA_AXES, seed);
@@ -537,7 +553,8 @@ export class SomaLook {
 			camera3: { pos: [0, 0, 4], right: [1, 0, 0], up: [0, 1, 0], fwd: [0, 0, -1], focal: 1.55, focusDist: 4, aperture: 0.03, shiftX: 0, shiftY: 0 },
 			motion: { contraction: 0, sway: 0, fin: 0, growth: 0, shed: 0, packet: 0, packetPhase: 0, beatCount: 0, energy: 0, silence: 1, kick: 0, sparkle: 0, impact: 0, bass: 0, mid: 0, treble: 0 },
 			lifecycle: [0, 0, 0, 0, 0, 1],
-			names: { species: 'medusa', environment: 'abyss', palette: 'abyssal-cyan', camera: 'companion', form: 'dormancy' }
+			names: { species: 'medusa', environment: 'abyss', palette: 'abyssal-cyan', camera: 'companion', form: 'dormancy' },
+			parts: this.parts.lanes
 		};
 		this.reset(seed);
 	}
@@ -590,6 +607,10 @@ export class SomaLook {
 		this.combPhase = 0;
 		this.filmPhase = this.seed * 7;
 		this.lastImpact = 0;
+		this.parts = new SomaParts(word);
+		this.sinceBassNote = 1e3;
+		this.lastBassSerial = -1;
+		this.lastFillSerial = -1;
 		this.applyWeights();
 	}
 
@@ -613,12 +634,18 @@ export class SomaLook {
 			Array.from(this.rig.value, r).join(','),
 			Array.from(this.kin.value, r).join(','),
 			String(this.answeredShift),
-			Object.values(this.mood).map(r).join(',')
+			Object.values(this.mood).map(r).join(','),
+			this.parts.fingerprint()
 		].join('|');
 	}
 
 	get time(): number {
 		return this.clock;
+	}
+
+	/** 0 staccato .. 1 legato, glided: the trails' length. */
+	get partsArticulation(): number {
+		return this.parts.articulation;
 	}
 
 	/** Compact live state for QA logs. */
@@ -639,7 +666,8 @@ export class SomaLook {
 			anatomy: SOMA_ANATOMY_KEYS.map((key, i) => `${key}=${this.anatomy[i].toFixed(2)}`).join(' '),
 			uniforms: `fold ${this.lobes}/${this.lobeFade.toFixed(2)} arms ${this.arms}/${this.armFade.toFixed(2)} pos ${this.pos.map((v) => v.toFixed(2)).join(',')} pitch ${this.pitch.toFixed(2)} eye ${this.camEye.map((v) => v.toFixed(2)).join(',')}`,
 			body: `arms ${this.arms}@${this.armFade.toFixed(2)} lobes ${this.lobes}@${this.lobeFade.toFixed(2)} bulb ${this.anatomy[A.tipBulb].toFixed(2)} len ${this.anatomy[A.tentLen].toFixed(2)} e ${this.energy.toFixed(2)} grow ${this.growth.toFixed(2)} y ${this.pos[1].toFixed(2)} floor ${this.envFloor.toFixed(2)} life ${this.lifecycle.map((v) => v.toFixed(1)).join('/')} pk ${this.packet.toFixed(2)} kick ${this.kick.toFixed(2)} imp ${this.impact.toFixed(2)} spk ${this.sparkle.toFixed(2)} con ${this.contraction.toFixed(2)} beat ${this.lastBeat} reach ${this.genome.value('reach').toFixed(2)} cam ${this.camDistance.toFixed(2)} el ${this.camElevation.toFixed(2)} eyeY ${this.camEye[1].toFixed(2)} az ${this.camAzimuth.toFixed(2)} hd ${this.heading.toFixed(2)}`,
-			mood: `calm ${m.calm.toFixed(2)} ag ${m.agitation.toFixed(2)} pulse ${m.pulse.toFixed(2)} warm ${m.warmth.toFixed(2)} mass ${m.mass.toFixed(2)}`
+			mood: `calm ${m.calm.toFixed(2)} ag ${m.agitation.toFixed(2)} pulse ${m.pulse.toFixed(2)} warm ${m.warmth.toFixed(2)} mass ${m.mass.toFixed(2)}`,
+			...this.parts.voicing()
 		};
 	}
 
@@ -799,6 +827,8 @@ export class SomaLook {
 		g.shift(strength, Math.max(this.energy, m.energy));
 		// The diver heads for a new viewpoint now, not when its hold runs out.
 		this.rig.redirect();
+		// New music: the organs re-route which instruments they answer.
+		this.rerouteNow = strength;
 		return true;
 	}
 
@@ -1165,6 +1195,9 @@ export class SomaLook {
 		const quiet = this.quietFor > 0.5;
 		this.silence = approach(this.silence, quiet ? 1 : 0, quiet ? 0.6 : 0.15, dt);
 		const sectionEnergy = clamp(finite(director.context.sectionEnergy), 0, 1);
+		// The section's weight, glided over seconds: a drop lights the water more
+		// than a verse, but as a slow swell between sections, never a pulse.
+		this.sectionGlow = approach(this.sectionGlow, live ? sectionEnergy : 0, 3, dt);
 		const energyTarget = live ? clamp(director.energy * 0.6 + sectionEnergy * 0.25 + rms * 0.25, 0, 1) : 0;
 		this.energy = approach(this.energy, energyTarget, 0.35, dt);
 		this.bass = approach(this.bass, live ? spectrum.bass : 0, 0.09, dt);
@@ -1252,6 +1285,23 @@ export class SomaLook {
 		this.resolvePalette(dt, director, 0.7 / quick);
 		this.resolveEnvironment(dt, 1.4 / quick);
 
+		// The organs: each answers its own part of the ensemble.
+		const colors = this.frame.colors;
+		const organism = this.frame.organism;
+		this.parts.update({
+			ensemble: input.ensemble,
+			dt,
+			silence: this.silence,
+			glow: colors.glow,
+			accent: colors.accent,
+			organ: colors.organ,
+			reroute: this.rerouteNow,
+			restless: clamp(0.25 + this.energy * 0.5 + this.mood.agitation * 0.4, 0, 1),
+			center: organism.boundCenter,
+			radius: organism.boundRadius
+		});
+		this.rerouteNow = 0;
+
 		this.live(dt, input, live, motionScale);
 		return this.publish(input.aspect);
 	}
@@ -1337,6 +1387,11 @@ export class SomaLook {
 		const near = 0.72 + 0.2 * md.calm - 0.08 * md.agitation;
 		const far = 1.9 + 0.2 * md.calm - 0.65 * md.agitation;
 		const roam = lerp(near, far, 0.5 + 0.5 * r[RIG.distance]);
+		// The ensemble moves the diver too, slowly: a build gathers it in, a
+		// breakdown (the animal drawing in) lets it drift back, and the matrix
+		// leans the distance on whatever it is listening to.
+		const parts = this.parts;
+		const gather = (1 - 0.12 * parts.build) * (1 + 0.16 * parts.drawIn01()) * lerp(0.92, 1.1, parts.mod('camera', 'distance'));
 		// Far, but never so far the body shrinks to a speck: the core's
 		// projected radius stays at least a third of the frame height (the
 		// core estimate is generous, so the visible body reads smaller). A
@@ -1344,7 +1399,7 @@ export class SomaLook {
 		// the animal is.
 		const furthest = Math.max(3, (core * spec.focal) / 0.34);
 		const distance = Math.max(
-			Math.min(spec.distance * roam * moodDistance * (0.9 + extent * 0.85), furthest),
+			Math.min(spec.distance * roam * moodDistance * gather * (0.9 + extent * 0.85), furthest),
 			this.frame.organism.boundRadius * 1.2 + 0.4
 		);
 		// Calm music holds a deeper focus, so the long slow animal stays readable.
@@ -1362,8 +1417,10 @@ export class SomaLook {
 		const clock = director.clock;
 		const t = this.anatomy;
 		const b = this.bounds();
-		const tempo = clamp(finite(clock.tempoBpm, 110), 50, 190);
-		const beatPhase = clamp(finite(clock.beatPhase), 0, 1);
+		// Musical time from the ensemble's own grid (heard), not the director's
+		// clock, which often locks to half time.
+		const ens = input.ensemble;
+		const tempo = clamp(ens && ens.grid.known ? finite(ens.grid.bpm, 110) : finite(clock.tempoBpm, 110), 50, 190);
 		const awake = 1 - this.silence * 0.85;
 		const md = this.mood;
 		const ag = md.agitation;
@@ -1379,15 +1436,22 @@ export class SomaLook {
 		this.combPhase = (this.combPhase + dt * 9 * (0.4 + this.treble)) % 6283.1853;
 		this.filmPhase += dt * 0.35 * (0.5 + 0.5 * (1 + d[DRIFT.hue])) * motionScale;
 
-		// Muscle: a jet contraction locked to the beat (fast squeeze, slow
-		// refill). Fast tempos contract every other beat, like a real bell.
-		const halfTime = tempo > 132;
-		const beatIndex = Math.floor(finite(clock.beatIndex));
-		const phase = halfTime ? (((beatIndex % 2) + 2) % 2 + beatPhase) / 2 : beatPhase;
-		const squeeze = phase < 0.14 ? smoothstep(0, 0.14, phase) : 1 - smoothstep(0.14, 0.92, phase);
-		// A groove squeezes hard on every beat; calm music barely flexes; agitation
-		// adds a fine tremor on top, the bell shivering.
-		const strength = (0.4 + 0.45 * this.energy + 0.5 * this.kick) * (0.75 + pulse * 0.7 - calm * 0.2);
+		// Muscle: the bell squeezes on each heard bass note (a fast squeeze, then
+		// a refill as long as the articulation: staccato short and sharp, legato
+		// long and slow). Without a bass line it follows the kick instead. It
+		// never runs on the predicted beat clock.
+		if (ens) {
+			if (ens.bass.noteSerial !== this.lastBassSerial) {
+				if (this.lastBassSerial >= 0) this.sinceBassNote = 0;
+				this.lastBassSerial = ens.bass.noteSerial;
+			}
+			this.sinceBassNote += dt;
+		}
+		const kickFallback = ens ? smoothstep(1.5, 3, this.sinceBassNote) * this.parts.voice('kick') : this.kick;
+		const squeeze = this.parts.squeezeUpdate(dt, kickFallback);
+		// A groove squeezes hard; calm music barely flexes; agitation adds a fine
+		// tremor on top, the bell shivering.
+		const strength = (0.55 + 0.5 * this.energy) * (0.75 + pulse * 0.7 - calm * 0.2);
 		this.breathe += dt * (0.28 + this.energy * 0.1) * (1 - calm * 0.35) * (0.75 + 0.3 * (1 + d[DRIFT.breath]));
 		const idle = (0.5 + 0.5 * Math.sin(this.breathe * Math.PI * 2)) * 0.22;
 		const tremor = ag * 0.07 * (0.5 + 0.5 * Math.sin(this.shiverPhase)) * awake;
@@ -1396,19 +1460,19 @@ export class SomaLook {
 		this.contraction = approach(this.contraction, contractionTarget, 0.035, dt);
 		const squeezing = Math.max(0, this.contraction - previous) / Math.max(dt, 1e-3);
 
-		// Beat light: latched as each beat starts, carried by the shader over the beat.
-		const beatCount = Math.max(0, Math.floor(finite(clock.barIndex)) * 4 + beatIndex);
-		if (beatCount !== this.lastBeat) {
-			const downbeat = beatIndex === 0;
-			this.packet = live
-				? clamp((0.3 + director.bassPunch * 0.6 + this.energy * 0.35 + (downbeat ? 0.25 : 0)) * awake * (1 - 0.5 * this.mood.calm), 0, 1.4)
-				: 0;
-			this.lastBeat = beatCount;
-		}
-		this.packetPhase = beatPhase;
+		// Beat light: a packet set off by each heard kick (parts.ts), running at
+		// the ensemble's tempo through the body.
+		const lanes = this.parts.lanes;
+		const packetAt = SOMA_PART_SLOTS.indexOf('compM') * 4;
+		this.packet = live ? clamp(lanes[packetAt + 2] * (0.5 + this.energy * 0.6) * (1 - 0.5 * this.mood.calm), 0, 1.4) : 0;
+		this.packetPhase = lanes[packetAt + 3];
+		if (ens) this.lastBeat = ens.drums.kick.serial;
 
 		const energyRate = 0.55 + this.energy * 0.9;
-		this.sway += dt * energyRate * (0.55 + md.tempo * 0.9) * motionScale;
+		// Legato music undulates the tentacles continuously; staccato music holds
+		// them nearly still between the strokes each hit sends down an arm group.
+		const flowing = ens ? lerp(0.35, 1.15, this.parts.articulation) : 1;
+		this.sway += dt * energyRate * (0.55 + md.tempo * 0.9) * motionScale * flowing;
 		this.fin += dt * Math.PI * 2 * (tempo / 60) * 0.5 * (0.4 + this.energy * 0.7) * motionScale * awake + dt * 0.6;
 
 		// ── Locomotion: waypoint steering inside the shot's volume, jet thrust
@@ -1447,7 +1511,7 @@ export class SomaLook {
 		const gl = Math.hypot(gx, gy, gz) || 1;
 		const arrive = Math.min(1, gl / 0.8);
 		const axisY = this.frame.organism.axisY;
-		const thrust = t[A.jet] * squeezing * 0.05 * (1 + pulse * 1.5) * motionScale;
+		const thrust = t[A.jet] * squeezing * 0.025 * (1 + pulse * 1.5) * motionScale;
 		const steer = lerp(1.6, 0.25, ag) * (1 + calm * 0.6);
 		const desired: Vec3 = [(gx / gl) * speed * arrive, (gy / gl) * speed * arrive, (gz / gl) * speed * arrive];
 		// A dweller settles onto the seabed promptly rather than crawling down to it.
@@ -1490,7 +1554,18 @@ export class SomaLook {
 			this.sinceNudge = 0;
 		}
 		this.lastImpact = impact;
-		this.rig.update(dt, (0.75 + md.tempo * 0.45 + ag * 0.3) * motionScale * awake, clamp(0.25 + this.energy * 0.5 + ag * 0.4, 0, 1));
+		// A fill turns the diver's head a little, once in a while.
+		this.sinceFillNudge += dt;
+		if (ens && ens.groove.fillSerial !== this.lastFillSerial) {
+			const first = this.lastFillSerial < 0;
+			this.lastFillSerial = ens.groove.fillSerial;
+			if (!first && this.sinceFillNudge > 8 && live) {
+				this.rig.impulse(RIG.azimuth, (hash01(this.seed, ens.groove.fillSerial, 14) - 0.5) * 0.35);
+				this.sinceFillNudge = 0;
+			}
+		}
+		const restless = lerp(0.8, 1.2, this.parts.mod('camera', 'restless'));
+		this.rig.update(dt, (0.75 + md.tempo * 0.45 + ag * 0.3) * motionScale * awake, clamp((0.25 + this.energy * 0.5 + ag * 0.4) * restless, 0, 1));
 		// The orbit is no longer a constant spin: its rate wanders through zero,
 		// so the diver drifts round one way, slows, and comes back.
 		this.orbit +=
@@ -1608,7 +1683,12 @@ export class SomaLook {
 		// A juvenile keeps station some of the time, at a distance that wanders.
 		const companionAmount = smoothstep(0.4, 0.7, g.value('companion') * 0.7 + (0.5 + 0.5 * this.dr[DRIFT.companion]) * 0.45);
 		const cAngle = this.companionPhase;
-		const cDist = (o.extent * 2.1 + 1) * (0.75 + 0.5 * (0.5 + 0.5 * this.tr[TRAIT.spacing]));
+		// A wide stereo image spreads the pair apart.
+		const cDist =
+			(o.extent * 2.1 + 1) *
+			(0.75 + 0.5 * (0.5 + 0.5 * this.tr[TRAIT.spacing])) *
+			(0.85 + 0.45 * this.parts.spread) *
+			lerp(0.9, 1.15, this.parts.mod('companion', 'distance'));
 		f.companion.pos[0] = o.pos[0] + Math.cos(cAngle) * cDist;
 		f.companion.pos[1] = o.pos[1] + 0.6 + noise1(this.noiseSeed, 31, this.clock / 23) * 0.8;
 		f.companion.pos[2] = o.pos[2] + Math.sin(cAngle) * cDist - 1.2;
@@ -1629,7 +1709,8 @@ export class SomaLook {
 		const fwd = normalize([this.camTarget[0] - eye[0], this.camTarget[1] - eye[1], this.camTarget[2] - eye[2]]);
 		const right = normalize(cross(fwd, [0, 1, 0], [0, 0, 0]));
 		const up = cross(right, fwd, [0, 0, 0]);
-		const rollAngle = d[DRIFT.roll] * 0.03 + this.rig.value[RIG.roll] * 0.06;
+		// The matrix rolls the diver's horizon a touch, on its own listening.
+		const rollAngle = d[DRIFT.roll] * 0.03 + this.rig.value[RIG.roll] * 0.06 + (this.parts.mod('camera', 'roll') - 0.5) * 0.06;
 		const crl = Math.cos(rollAngle);
 		const srl = Math.sin(rollAngle);
 		for (let i = 0; i < 3; i += 1) {
@@ -1673,7 +1754,9 @@ export class SomaLook {
 		f.flow.film = this.filmPhase;
 		// Far life: how many distant animals glow in the water, on its own lane.
 		f.flow.life = smoothstep(-0.8, 0.8, this.dr[DRIFT.life]);
-		f.flow.light = 0.8 + this.mood.mass * 0.3 + this.mood.pulse * 0.3 + this.energy * 0.2;
+		// The animal's light power in the water: from the kind of music, never its
+		// loudness from moment to moment (that would brighten all the water at once).
+		f.flow.light = 0.8 + this.mood.mass * 0.3 + this.mood.pulse * 0.3 + this.sectionGlow * 0.35;
 		let form = 0;
 		for (let i = 1; i < 6; i += 1) if (this.lifecycle[i] > this.lifecycle[form]) form = i;
 		f.names.species = SOMA_SPECIES[f.species.mix >= 0.5 ? f.species.to : f.species.from].name;
@@ -1681,6 +1764,7 @@ export class SomaLook {
 		f.names.palette = SOMA_PALETTES[f.palette.mix >= 0.5 ? f.palette.to : f.palette.from].name;
 		f.names.camera = SOMA_CAMERAS[f.camera.mix >= 0.5 ? f.camera.to : f.camera.from];
 		f.names.form = SOMA_LIFECYCLE[form];
+		f.parts = this.parts.lanes;
 		return f;
 	}
 }

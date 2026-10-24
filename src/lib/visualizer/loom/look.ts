@@ -333,9 +333,14 @@ export const LOOM_COMPOSITIONS: readonly LoomComposition[] = [
 // ---------------------------------------------------------------------------
 // The genome.
 
+// Tone relights the whole room, so it is era-scale: the slow container, picked
+// for the music on a change of genre and every few sections. The palette
+// family may move at a section, but less often than it used to and as a slow
+// glide; within it the parts carry the music (ensemble.ts): each strand
+// group's colour follows its own chord relation.
 export const LOOM_LOOK_AXES: readonly VariationAxis[] = [
 	{ kind: 'choice', name: 'grammar', options: LOOM_GRAMMARS.length, scale: 'section', chance: 0.85, memory: 6, maxHold: 2, tau: 3.6 },
-	{ kind: 'choice', name: 'palette', options: LOOM_PALETTES.length, scale: 'section', chance: 0.8, memory: 12, maxHold: 2, tau: 4.5 },
+	{ kind: 'choice', name: 'palette', options: LOOM_PALETTES.length, scale: 'section', chance: 0.5, memory: 12, maxHold: 3, tau: 4.5 },
 	{ kind: 'choice', name: 'roles', options: LOOM_ROLE_ORDERS.length, scale: 'phrase', chance: 0.2, memory: 2, tau: 3.5 },
 	{ kind: 'choice', name: 'camera', options: LOOM_CAMERAS.length, scale: 'phrase', chance: 0.5, memory: 3, maxHold: 3, tau: 4.5 },
 	{ kind: 'choice', name: 'material', options: LOOM_MATERIALS.length, scale: 'section', chance: 0.55, memory: 3, maxHold: 2, tau: 3.5 },
@@ -358,7 +363,7 @@ export const LOOM_LOOK_AXES: readonly VariationAxis[] = [
 	{ kind: 'continuous', name: 'drift', min: -1, max: 1, scale: 'section', step: 0.4, chance: 0.5, tau: 5 },
 	{ kind: 'continuous', name: 'vivid', min: 0, max: 1, scale: 'era', step: 0.35, tau: 6 },
 	// Appended axes keep every earlier axis's seeded walk unchanged.
-	{ kind: 'choice', name: 'tone', options: LOOM_TONES.length, scale: 'section', chance: 0.5, memory: 1, maxHold: 3, tau: 10 },
+	{ kind: 'choice', name: 'tone', options: LOOM_TONES.length, scale: 'era', chance: 0.5, memory: 1, maxHold: 3, tau: 10 },
 	{ kind: 'choice', name: 'composition', options: LOOM_COMPOSITIONS.length, scale: 'phrase', chance: 0.3, memory: 2, maxHold: 5, tau: 5 }
 ];
 
@@ -603,6 +608,11 @@ export type LoomLookContext = {
 	phraseIndex: number;
 	sectionKey: string;
 	energy: number;
+	/**
+	 * The song's slow energy (conductor songEnergy). Tone and dark palettes
+	 * follow it, so a quiet verse is not a different light from its drop.
+	 */
+	songEnergy?: number;
 	/** -1 minor .. +1 major. */
 	mode: number;
 	/** 0..1 circle-of-fifths position. */
@@ -612,8 +622,10 @@ export type LoomLookContext = {
 	character?: Readonly<MusicCharacter> | null;
 	/** Raw spectrum cues Loom calibrates its own hearing from (see LoomLook.hear). */
 	listen?: LoomListenCues | null;
-	/** Heard kick/novelty impulse 0..1 (conductor); strong transients nudge the camera. */
+	/** Heard kick/novelty impulse 0..1 (conductor); diagnostics only. */
 	impact?: number;
+	/** 0..1 how busy the band is (conductor motion): the slow container moves against it. */
+	busy?: number;
 };
 
 /** Per-frame spectrum cues (SignalSpectrumProfile values). */
@@ -917,6 +929,15 @@ function neutralWeave(): LoomWeaveCharacter {
 	return { flow: 1, fray: 0, grain: 0.15, turbulence: 0.15, weight: 0.45, edge: 0.4, warmth: 0, value: 1 };
 }
 
+/**
+ * Pace of a glide at a given speed-up: `slow` (a fraction) in steady state,
+ * full speed once a shift speeds things up by half again or more; continuous
+ * in between.
+ */
+function naturalPace(speed: number, slow: number): number {
+	return lerp(slow, 1, clamp01((speed - 1) / 0.5));
+}
+
 function smoothstep(edge0: number, edge1: number, x: number): number {
 	const t = clamp01((x - edge0) / (edge1 - edge0));
 	return t * t * (3 - 2 * t);
@@ -966,6 +987,19 @@ function createHeard(): Heard {
 /** Look numbers that scale the figure on screen, and their top speed (log units per second). */
 const SCALE_KEYS = new Set<string>(['frameScale', 'camDistance', 'focal']);
 const SCALE_RATE = 0.42;
+/**
+ * Steady-state speed limits (per second) of the camera's angles and lens
+ * shifts: a camera regime change is a slow drift of the whole frame, never a
+ * swing, so the music shows through the parts. After a shift they lift
+ * (see smooth), so new music is still seen from a new place at once.
+ */
+const ANGLE_RATE: Partial<Record<string, number>> = {
+	camYaw: 0.07,
+	camPitch: 0.05,
+	camRoll: 0.04,
+	lensShiftX: 0.03,
+	lensShiftY: 0.02
+};
 
 /** Weave numbers that move the geometry glide slower after a shift than colour does. */
 const WEAVE_GEOMETRY = new Set<string>(['flow', 'fray', 'turbulence', 'weight', 'edge', 'grain']);
@@ -1213,9 +1247,11 @@ export class LoomLook {
 	private hybridGrammar = 0;
 	private hybridPicks = 0;
 	private hybridWasOn = false;
-	/** Strong-transient detector for camera nudges (rising edge, refractory). */
-	private impactArmed = true;
-	private impactRest = 0;
+	/** Pace of the slow container (camera, figure): faster when the band is sparse. */
+	private containerPace = 1;
+	/** Pace of a new choice morph now, and the pace each morph in flight started at. */
+	private pace = 1;
+	private readonly morphPace: Partial<Record<LoomChoiceAxis, number>> = {};
 	/** Floor margin under the deformed figure, smoothed. */
 	private floorMargin = 0.1;
 	private readonly roamView = new Float32Array(CAM_DIMS);
@@ -1298,8 +1334,6 @@ export class LoomLook {
 		this.hybridGrammar = Math.floor(this.identity * LOOM_GRAMMARS.length) % LOOM_GRAMMARS.length;
 		this.hybridPicks = 0;
 		this.hybridWasOn = false;
-		this.impactArmed = true;
-		this.impactRest = 0;
 		this.floorMargin = 0.1;
 	}
 
@@ -1334,10 +1368,11 @@ export class LoomLook {
 			this.genome.settle();
 		}
 		const character = this.hear(context.character ?? null, context.listen ?? null, context.dt);
-		// Quiet passages lean toward drawn tones, loud ones toward glow, and
+		// Quiet songs lean toward drawn tones, loud ones toward glow, and
 		// every big axis leans toward options that fit the music. Weights only
-		// bias the next pick, so they never move the current scene.
-		this.fit(character, energy, 3);
+		// bias the next pick, so they never move the current scene. The song's
+		// slow energy decides, not the section's.
+		this.fit(character, clamp01(context.songEnergy ?? energy), 3);
 		this.answerShift(character, energy, context.dt, context);
 		// A scene just re-picked for new music establishes itself before it
 		// evolves: phrase and section boundaries during the hold are skipped,
@@ -1379,7 +1414,9 @@ export class LoomLook {
 		const speed = this.genome.glideSpeed;
 		this.followAxes(context.dt, speed, first, energy);
 		this.followCharacter(character, context.dt, speed);
-		this.roam(context, character, energy);
+		// The camera's pace and the figure's wander follow the song, not the
+		// section: sections show through the ensemble's parts.
+		this.roam(context, character, clamp01(context.songEnergy ?? energy));
 		this.resolve(this.target, context, override ?? globalOverride, first, speed);
 		this.smooth(context.dt, speed);
 		this.shapeFigure();
@@ -1598,7 +1635,8 @@ export class LoomLook {
 		const dt = Math.max(0, Math.min(0.25, Number.isFinite(dtSeconds) ? dtSeconds : 0));
 		// Fast for two seconds after a shift, back to the authored glide by six.
 		const landing = 1 + 4 * Math.max(0, Math.min(1, (6 - this.sinceAnyShift) / 4));
-		const rate = Math.max(speed, landing);
+		const fast = Math.max(speed, landing);
+		const rate = fast * naturalPace(fast, 0.5);
 		const snap = first || !this.axesReady;
 		// Loom glides the genome's targets itself, so it adds the continuous
 		// wander the genome gives its own eased values: no axis ever parks
@@ -1656,20 +1694,15 @@ export class LoomLook {
 		const dt = Math.max(0, Math.min(0.25, Number.isFinite(context.dt) ? context.dt : 0));
 		const tempo = character ? character.tempo : 0.5;
 		const restless = clamp01(energy * 0.7 + (character ? character.motion * 0.3 : 0.15));
-		// Strong transients only (rising edge, refractory), and small: a nudge
-		// of the dolly, never a pulse on every kick.
-		const impact = clamp01(context.impact ?? 0);
-		this.impactRest = Math.max(0, this.impactRest - dt);
-		if (impact < 0.5) this.impactArmed = true;
-		if (this.impactArmed && impact > 0.85 && this.impactRest <= 0) {
-			this.impactArmed = false;
-			this.impactRest = 3.5;
-			this.camRoam.impulse(CAM_FILL, 0.12 * impact);
-			this.camRoam.impulse(CAM_DOLLY, -0.1 * impact);
-		}
-		this.camRoam.update(dt, 0.7 + tempo * 0.6, restless);
+		// The slow container breathes against the band: when the ensemble thins
+		// out (a breakdown, an intro) the camera and the figure drift a little
+		// more; when it is busy they hold and let the parts play. Transients no
+		// longer nudge the camera: a hit belongs to its own part (ensemble.ts).
+		const pace = lerp(1.45, 0.75, clamp01(context.busy ?? 0.5));
+		this.containerPace = pace;
+		this.camRoam.update(dt, (0.7 + tempo * 0.6) * pace, restless);
 		const flow = this.frame.weave.flow;
-		const fig = this.figureWander.update(dt, 0.6 + flow * 0.35 + energy * 0.2);
+		const fig = this.figureWander.update(dt, (0.6 + flow * 0.35 + energy * 0.2) * pace);
 		this.envWander.update(dt, 0.8 + energy * 0.4);
 		for (let i = 0; i < 3; i += 1) {
 			const rate = (0.07 + 0.13 * (fig[FIG_WARP_RATE + i] * 0.5 + 0.5)) * (0.5 + flow * 0.6);
@@ -1779,18 +1812,24 @@ export class LoomLook {
 		const morph = this.morphs[name];
 		if (first) return morph.snap(goal);
 		morph.realDt = this.realDt;
-		return morph.update(goal, dt, MORPH_MAX_RATE[name] ?? Infinity);
+		// A morph keeps the pace it started at: one begun by a shift lands at
+		// shift speed even as the glide eases back; a natural one stays slow.
+		if (!morph.moving && goal !== morph.to) this.morphPace[name] = this.pace;
+		// A shift arriving mid-morph hurries the morph in flight too.
+		else if (morph.moving) this.morphPace[name] = Math.max(this.morphPace[name] ?? 1, this.pace);
+		return morph.update(goal, dt * (this.morphPace[name] ?? 1), MORPH_MAX_RATE[name] ?? Infinity);
 	}
 
 	private mapPalette(raw: number, context: LoomLookContext): number {
 		const vivid = this.axis('vivid');
 		const family = LOOM_PALETTES[raw];
 		const gate = hashUnit(raw * 31 + 7, this.genome.boundaries.sections);
+		const energy = context.songEnergy ?? context.energy;
 		if (family?.dark) {
 			// Dark families only hold in low-vivid eras; bright major music lifts them.
-			const keepDark = vivid < 0.38 && !(context.mode > 0.3 && context.energy > 0.62);
+			const keepDark = vivid < 0.38 && !(context.mode > 0.3 && energy > 0.62);
 			if (!keepDark) return VIVID_PALETTES[(raw * 7 + this.genome.boundaries.eras) % VIVID_PALETTES.length];
-		} else if (vivid < 0.25 && context.mode < -0.25 && context.energy < 0.45 && gate < 0.45) {
+		} else if (vivid < 0.25 && context.mode < -0.25 && energy < 0.45 && gate < 0.45) {
 			return DARK_PALETTES[raw % DARK_PALETTES.length];
 		}
 		return raw;
@@ -1804,6 +1843,11 @@ export class LoomLook {
 		speed = 1
 	): void {
 		const g = this.genome;
+		// Natural boundaries (no change of music) morph the scene slowly, so a
+		// section change never turns the whole frame at once; the music shows
+		// through the ensemble's parts instead. After a shift the glide speed
+		// takes over and new music still lands within a couple of seconds.
+		this.pace = naturalPace(speed, 0.55);
 		const dt = context.dt * speed;
 		this.realDt = Math.max(0, Math.min(0.5, Number.isFinite(context.dt) ? context.dt : 0));
 		// Palette families are re-mapped once, at the moment a raw option becomes
@@ -2050,13 +2094,23 @@ export class LoomLook {
 		const ready = this.smoothedReady;
 		const k = ready ? 1 - Math.exp((-dt * Math.min(2, Math.max(1, speed))) / 0.35) : 1;
 		this.smoothedReady = true;
+		// Steady state: slow camera; for a few seconds after a shift: free.
+		const landing = 1 + 4 * Math.max(0, Math.min(1, (6 - this.sinceAnyShift) / 4));
+		// The camera keeps its freedom a little longer than the glides, so a
+		// move begun for new music finishes at speed.
+		const lift = Math.max(speed, landing) > 1.2 || this.sinceAnyShift < 10 ? 10 : this.containerPace;
 		for (const key of NUMERIC_KEYS) {
 			const previous = out[key];
 			out[key] = lerp(previous, src[key], k);
+			const angle = ANGLE_RATE[key];
+			if (ready && angle !== undefined) {
+				const limit = angle * lift * dt;
+				out[key] = previous + Math.max(-limit, Math.min(limit, out[key] - previous));
+			}
 			// Scale travels at a bounded speed (log space), so a small figure
 			// never balloons to fill the frame in a second: a zoom, not a cut.
 			if (ready && SCALE_KEYS.has(key) && previous > 0 && out[key] > 0) {
-				const limit = SCALE_RATE * dt;
+				const limit = SCALE_RATE * (lift > 1 ? 1 : 0.35) * dt;
 				const step = Math.log(out[key] / previous);
 				if (Math.abs(step) > limit) out[key] = previous * Math.exp(Math.sign(step) * limit);
 			}
