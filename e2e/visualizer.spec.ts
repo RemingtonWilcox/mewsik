@@ -211,10 +211,10 @@ test.describe('visualizer engine roster', () => {
 			'data-mk2-render-passes',
 			'8'
 		);
-		// 49 vec4 slots in the rebuilt organism renderer.
+		// 67 vec4 slots: the organism renderer plus 18 lanes for its organs (parts.ts).
 		await expect(page.getByLabel('Soma audio visualizer')).toHaveAttribute(
 			'data-mk2-uniform-bytes',
-			'784'
+			'1072'
 		);
 		// The species is reported once the GPU renderer is running.
 		if (await hasUsableWebGpu(page)) {
@@ -235,7 +235,7 @@ test.describe('visualizer engine roster', () => {
 		// Beams, phosphor, glow prefilter, tight H/V, wide prefilter, wide H/V, present.
 		await expect(signalCanvas).toHaveAttribute('data-signal-render-passes', '9');
 		// 53 vec4 slots: the instrument plus beam physics and the XY beam.
-		await expect(signalCanvas).toHaveAttribute('data-signal-uniform-bytes', '848');
+		await expect(signalCanvas).toHaveAttribute('data-signal-uniform-bytes', '1184');
 		if (await hasUsableWebGpu(page)) {
 			await expect(signalCanvas).toHaveAttribute('data-signal-ready', 'true', { timeout: 15_000 });
 			await expect(page.getByText('Signal unavailable', { exact: true })).toHaveCount(0);

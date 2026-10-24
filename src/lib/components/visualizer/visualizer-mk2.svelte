@@ -34,6 +34,7 @@
 	} from '$lib/visualizer/mk2/shaders';
 	import { createSomaLookState, somaSyncLook, type SomaFrame } from '$lib/visualizer/mk2/look';
 	import { SOMA_ANATOMY_INDEX, SOMA_ANATOMY_SLOTS } from '$lib/visualizer/mk2/species';
+	import { SOMA_PART_SLOTS } from '$lib/visualizer/mk2/parts';
 
 	const vis = useVisualizer();
 
@@ -76,6 +77,8 @@
 
 	let feedbackResetFrames = 2;
 	let frameIndex = 0;
+	/** 0..1 after a fresh GPU start: the picture fades up instead of popping in. */
+	let fadeIn = 0;
 
 	type Targets = {
 		scene: GPUTexture;
@@ -468,7 +471,8 @@
 			aspect,
 			motionScale: tuning.motion,
 			impactScale: tuning.impact,
-			character: journey.character
+			character: journey.character,
+			ensemble: journey.ensemble
 		});
 
 		// Notes: levels with a fast attack, onsets from positive spectral detail.
@@ -487,13 +491,24 @@
 
 		const m = f.motion;
 		const env = f.env;
+		// The whole frame is no longer a dial the music turns: bloom, aberration
+		// and exposure stay with the world (and silence), and only the trails
+		// follow the articulation (legato long, staccato short). The music shows
+		// in the organs and the water's parts instead.
+		const legato = look.partsArticulation;
+		const slowEnergy = f.mood.energy;
 		const feedbackFade =
-			feedbackResetFrames > 0 ? 0 : clamp((0.8 + m.energy * 0.07 - m.impact * 0.08) * (1 - m.silence * 0.25), 0.35, 0.92);
+			feedbackResetFrames > 0 ? 0 : clamp((0.76 + legato * 0.14) * (1 - m.silence * 0.25), 0.35, 0.92);
 		if (feedbackResetFrames > 0) feedbackResetFrames -= 1;
-		const bloomThreshold = 0.72 - m.energy * 0.16;
-		const bloomGain = 0.5 + m.impact * 0.25;
-		const aberration = 1 + m.impact * 1.2;
-		const exposure = env.exposure * (1.05 + 0.15 * (1 - m.energy)) * (1 - m.silence * 0.2);
+		// The kind of music (glided, fast after a genre change) still sets the
+		// container: calm music opens the exposure, a pulsing groove lowers the
+		// bloom knee, agitation sharpens the lens. Never the moment's loudness.
+		const md = f.mood;
+		const bloomThreshold = 0.7 - md.pulse * 0.1 - md.agitation * 0.06;
+		const bloomGain = 0.5 + md.pulse * 0.12;
+		const aberration = 1 + md.agitation * 0.8;
+		fadeIn = Math.min(1, fadeIn + dt / 1.2);
+		const exposure = env.exposure * (1.08 + 0.16 * md.calm - 0.06 * md.agitation) * (1 - m.silence * 0.2) * smooth01(fadeIn, 0, 1);
 
 		const u = g.uniformData;
 		const c = f.camera3;
@@ -501,7 +516,7 @@
 		const a = f.anatomy;
 		put(u, 'frame', sceneSize.width, sceneSize.height, f.time, frameIndex % 1024);
 		put(u, 'outp', backing.width, backing.height, aspect, TIER_INDEX[profile.tier]);
-		put(u, 'audio', m.bass, m.mid, m.treble, m.energy);
+		put(u, 'audio', m.bass, m.mid, m.treble, slowEnergy);
 		put(u, 'beat', m.packetPhase, m.contraction, m.packet, m.impact);
 		put(u, 'beat2', m.kick, m.sparkle, m.silence, m.beatCount % 4096);
 		put3(u, 'camPos', c.pos, c.focal);
@@ -546,7 +561,6 @@
 		put(u, 'post', feedbackFade, bloomThreshold, aberration, bloomGain);
 		const orgUv = projectUv(f, aspect, o.boundCenter);
 		put(u, 'orgScreen', orgUv[0], orgUv[1], env.layerY, env.layer);
-		const md = f.mood;
 		put(u, 'mood', md.agitation, md.punch, md.calm, md.pulse);
 		// The water as a medium: per-channel extinction, and how much daylight reaches this depth.
 		const fog = env.fog * tuning.fog;
@@ -557,6 +571,9 @@
 		put3(u, 'drag', f.drag, f.flow.film);
 		put(u, 'seeds', look.layoutSeed, look.layoutSeed, mirrorSurface ? env.surfaceY : env.floorY, mirrorSurface ? 1 : 0);
 		put(u, 'debug', import.meta.env.DEV ? ((globalThis as { __SOMA_DEBUG__?: number }).__SOMA_DEBUG__ ?? 0) : 0);
+		// The organs' own lanes: each part of the animal and its water answers its own instrument.
+		const parts = f.parts;
+		SOMA_PART_SLOTS.forEach((name, i) => put(u, name, parts[i * 4], parts[i * 4 + 1], parts[i * 4 + 2], parts[i * 4 + 3]));
 		frameIndex += 1;
 
 		g.device.queue.writeBuffer(g.uniformBuf, 0, u.buffer, u.byteOffset, u.byteLength);
@@ -676,6 +693,7 @@
 				gpu = state;
 				resetFrameScheduler();
 				feedbackResetFrames = 2;
+				fadeIn = 0;
 				ready = true;
 			})
 			.catch((error) => {
