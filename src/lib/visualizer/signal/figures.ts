@@ -98,6 +98,14 @@ export type SignalFigureInput = {
 	wander?: number;
 	/** Seconds-like clock the jitter and wander move on. */
 	grainTime?: number;
+	/**
+	 * The chord's own place in the ratio table (band.ts): 0..7, continuous,
+	 * its minor-table weight, and how far it leads the conductor's
+	 * complexity (0 none .. 1 all). Absent means the conductor alone.
+	 */
+	harmonyIndex?: number;
+	harmonyMinor?: number;
+	harmonyLead?: number;
 };
 
 type Vec3 = [number, number, number];
@@ -395,9 +403,14 @@ export class SignalFigureEngine {
 		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
 		// Lissajous-like families use the conductor complexity directly; table
 		// families shift two entries darker in minor keys.
-		const index = clamp(input.complexity, 0, 1) * 5 + (family === 0 || family === 1 || family === 4 ? 0 : (1 - majorWeight) * 2);
+		const conductorIndex = clamp(input.complexity, 0, 1) * 5 + (family === 0 || family === 1 || family === 4 ? 0 : (1 - majorWeight) * 2);
+		// The chord leads the ratio: major consonant, diminished tense.
+		const lead = clamp(input.harmonyLead ?? 0, 0, 1);
+		const index = clamp(conductorIndex + ((input.harmonyIndex ?? conductorIndex) - conductorIndex) * lead, 0, 6.999);
 		const i0 = Math.floor(index);
-		const f = smooth(index - i0);
+		// A detent: the figure rests on whole ratios and crosses between them
+		// quickly, so it is a blend of two figures only in passing.
+		const f = smooth(smooth(index - i0));
 		this.raw(family, u, i0, input, phase, this.a, major);
 		if (f > 0.001 && family !== 5 && family !== 6) {
 			this.raw(family, u, i0 + 1, input, phase, this.b, major);
@@ -420,7 +433,10 @@ export class SignalFigureEngine {
 	private familyPoint(family: number, u: number, input: SignalFigureInput, phase: number, out: Vec3) {
 		const usesTable = family === 0 || family === 1 || family === 4;
 		const majorWeight = clamp(input.mode * 0.5 + 0.5, 0, 1);
-		const toMajor = usesTable ? smooth(clamp((majorWeight - 0.3) / 0.4, 0, 1)) : 1;
+		const lead = clamp(input.harmonyLead ?? 0, 0, 1);
+		const keyMajor = smooth(clamp((majorWeight - 0.3) / 0.4, 0, 1));
+		const chordMajor = 1 - clamp(input.harmonyMinor ?? 0, 0, 1);
+		const toMajor = usesTable ? keyMajor + (chordMajor - keyMajor) * lead : 1;
 		this.indexedPoint(family, u, input, phase, toMajor > 0.001, out);
 		if (toMajor <= 0.001 || toMajor >= 0.999) return;
 		const majorX = out[0];
@@ -560,6 +576,16 @@ export class SignalFigureEngine {
 		}
 		this.advanceAttractor(input);
 		this.evaluateRaw(input, input.phase, this.rawA);
+		// Blending two different curves point for point can pull the figure
+		// in on itself halfway (two ratios averaging toward the centre). A
+		// shrunken figure would burn into a bright knot, so a sudden shrink is
+		// held at the size the figure has had lately; a real change of size
+		// still arrives, over a second or so.
+		const radius = this.rmsRadius(this.rawA);
+		if (!(this.heldRadius > 0)) this.heldRadius = radius;
+		this.heldRadius += (radius - this.heldRadius) * (1 - Math.exp(-Math.max(0, input.dt) / 1.2));
+		const lift = clamp(this.heldRadius / Math.max(radius, 1e-4), 1, 2.2);
+		if (lift > 1.0001) for (let i = 0; i < this.rawA.length; i += 1) this.rawA[i] *= lift;
 		this.project(this.rawA, input, input.yaw, 1, 0, 1, null, input.yaw);
 		const partner = clamp(input.partner, 0, 1);
 		let ghost: Float32Array | null = null;
@@ -571,6 +597,16 @@ export class SignalFigureEngine {
 		// of a dual bench showing the figure's side elevation.
 		this.project(this.rawA, input, input.yaw + Math.PI * 0.5, 1, 1, partner, ghost, input.yaw);
 		return this.points;
+	}
+
+	private heldRadius = 0;
+
+	private rmsRadius(raw: Float32Array): number {
+		let sum = 0;
+		for (let i = 0; i < SIGNAL_FIGURE_POINTS; i += 1) {
+			sum += raw[i * 3] * raw[i * 3] + raw[i * 3 + 1] * raw[i * 3 + 1];
+		}
+		return Math.sqrt(sum / SIGNAL_FIGURE_POINTS);
 	}
 
 	/** Interpolated local xy of figure 0 or 1 at u in 0..1. */

@@ -4,8 +4,9 @@
 // type is categorical and the shader blends the two surfaces it is given.
 //
 // Every layout keeps the same instrument: figure A is drawn by channel traces
-// 0 (X deflection) and 1 (Y deflection); traces 2 and 3 carry bands on the
-// same time base; the horizon is born under (or around) the figure.
+// 0 (X deflection) and 1 (Y deflection); traces 2 and 3 carry the bass line
+// and the chord, traces 4..7 the drum rack (kick, snare, hat, perc; see
+// band.ts); the horizon is born under (or around) the figure.
 
 export const SIGNAL_LAYOUT_NAMES = [
 	'bench',
@@ -40,7 +41,7 @@ const TRACE_KEYS = ['ox', 'oy', 'tx', 'ty', 'vx', 'vy', 'scroll', 'vis'] as cons
 const LAYOUT_KEYS = [
 	'figAX', 'figAY', 'figAScale',
 	'figBX', 'figBY', 'figBScale', 'figBScreen', 'partner', 'drift',
-	...[0, 1, 2, 3].flatMap((k) => TRACE_KEYS.map((key) => `t${k}${key}`)),
+	...[0, 1, 2, 3, 4, 5, 6, 7].flatMap((k) => TRACE_KEYS.map((key) => `t${k}${key}`)),
 	'feed',
 	'surface', 'anchorX', 'anchorY', 'anchorFollow', 'span', 'near', 'far', 'camHeight', 'pitch', 'yaw', 'focal',
 	'ringInner', 'ringOuter', 'ringZ', 'relief', 'terrainVis', 'wfDx', 'wfDy', 'rails', 'radarArm',
@@ -85,6 +86,31 @@ function setTrace(layout: SignalLayout, k: number, trace: Trace) {
 /** A horizontal sweep trace from x0 to x1 at height y. */
 function sweep(x0: number, x1: number, y: number, amplitude: number, vis = 1): Trace {
 	return { o: [x0, y], t: [x1 - x0, 0], v: [0, amplitude], vis };
+}
+
+/** Drum lanes (traces 4..7: kick, snare, hat, perc) side by side in one row. */
+function drumRow(l: SignalLayout, x0: number, x1: number, y: number, amplitude: number) {
+	const gap = Math.abs(x1 - x0) * 0.035;
+	const width = (x1 - x0 - gap * 3) / 4;
+	for (let i = 0; i < 4; i += 1) {
+		const start = x0 + i * (width + gap);
+		setTrace(l, 4 + i, sweep(start, start + width, clampY(y), amplitude));
+	}
+}
+
+/** Drum lanes as a two by two block: kick and snare above, hat and perc below. */
+function drumGrid(l: SignalLayout, x0: number, x1: number, yTop: number, yBottom: number, amplitude: number) {
+	const gap = Math.abs(x1 - x0) * 0.06;
+	const width = (x1 - x0 - gap) / 2;
+	for (let i = 0; i < 4; i += 1) {
+		const start = x0 + (i % 2) * (width + gap);
+		setTrace(l, 4 + i, sweep(start, start + width, clampY(i < 2 ? yTop : yBottom), amplitude));
+	}
+}
+
+/** Drum lanes stacked, each the full span. */
+function drumStack(l: SignalLayout, x0: number, x1: number, yTop: number, step: number, amplitude: number) {
+	for (let i = 0; i < 4; i += 1) setTrace(l, 4 + i, sweep(x0, x1, clampY(yTop - i * step), amplitude));
 }
 
 /**
@@ -168,6 +194,8 @@ function bench(A: number, k: Compose): SignalLayout {
 	setTrace(l, 1, sweep(x0, x1, level(-0.24), 0.075));
 	setTrace(l, 2, sweep(x0, x1, level(0.86), 0.06));
 	setTrace(l, 3, sweep(x0, x1, level(0.45), 0.06));
+	// The drum rack: one small lane per drum under the Y trace.
+	drumRow(l, x0, x1, level(-0.24) - 0.17, 0.07);
 	l.feed = 0.85;
 	l.surface = SURFACE_FLOOR;
 	l.anchorX = 0;
@@ -208,6 +236,8 @@ function construction(A: number, k: Compose): SignalLayout {
 	setTrace(l, 1, { o: [fx - s - gap, fy], t: [-(fx - s - gap + 0.95 * A), 0], v: [0, s] });
 	setTrace(l, 2, sweep(-0.95 * A, 0.95 * A, 0.93, 0.035, 0.55));
 	setTrace(l, 3, sweep(fx + s + 0.12, 0.95 * A, clampY(-0.2 + k.spread * 0.12 - k.lift * 0.05), 0.05, 0.7));
+	// The drum rack sits in the open corner above the Y deflection.
+	drumGrid(l, -0.93 * A, fx - s - gap - 0.12, 0.76 + k.lift * 0.03, 0.54 + k.lift * 0.05, 0.065);
 	l.feed = 1;
 	l.surface = SURFACE_WATERFALL;
 	// The waterfall fills the lower-left quadrant, newest row nearest the figure.
@@ -232,7 +262,7 @@ function dual(A: number, k: Compose): SignalLayout {
 	const l = blank();
 	const cx = (0.48 + k.spread * 0.05) * A;
 	const shift = k.pan * 0.03 * A;
-	const fy = 0.3 + k.lift * 0.07;
+	const fy = 0.26 + k.lift * 0.06;
 	// One screen can grow while the other shrinks: the pair is never a
 	// mirror image of itself for long.
 	const lean = k.reach * 0.1;
@@ -251,6 +281,7 @@ function dual(A: number, k: Compose): SignalLayout {
 	setTrace(l, 1, sweep(-0.93 * A, 0.93 * A, clampY(below - 0.14 - k.spread * 0.06), 0.06));
 	setTrace(l, 2, sweep(-0.93 * A, -0.04 * A, 0.93, 0.03, 0.6));
 	setTrace(l, 3, sweep(0.04 * A, 0.93 * A, 0.93, 0.03, 0.6));
+	drumRow(l, -0.93 * A, 0.93 * A, 0.8, 0.05);
 	l.feed = 0.8;
 	l.surface = SURFACE_FLOOR;
 	l.anchorX = 0;
@@ -260,7 +291,7 @@ function dual(A: number, k: Compose): SignalLayout {
 	l.relief = 0.22;
 	l.rails = 0.7;
 	const halfW = 0.91 * A - cx - Math.abs(shift);
-	const halfH = 0.52 * (1 + k.size * 0.08);
+	const halfH = 0.44 * (1 + k.size * 0.07);
 	l.faceAX = -cx + shift;
 	l.faceAY = fy;
 	l.faceAW = halfW * (1 - lean * 0.5);
@@ -298,6 +329,7 @@ function monitor(A: number, k: Compose): SignalLayout {
 	for (let i = 0; i < 4; i += 1) {
 		setTrace(l, i, sweep(x0, x1, clampY(centre + (1.5 - i) * step), i < 2 ? 0.07 : 0.055));
 	}
+	drumRow(l, -0.93 * A, 0.93 * A, 0.88, 0.06);
 	l.feed = 1;
 	l.surface = SURFACE_FLOOR;
 	l.anchorX = mx;
@@ -344,6 +376,9 @@ function bank(A: number, k: Compose): SignalLayout {
 		const y = top - stripH - i * (stripH * 2 + gapH);
 		setTrace(l, i, sweep(cx - half * 0.96, cx + half * 0.96, y, 0.085 * (1 + k.spread * 0.12)));
 	}
+	// The drum rack under the screen.
+	const rackTop = fy - 0.4 * grow - 0.1;
+	drumGrid(l, fx - 0.4 * grow, Math.min(fx + 0.4 * grow, 0.95 * A), rackTop, rackTop - 0.17, 0.06);
 	l.feed = 1;
 	l.surface = SURFACE_FLOOR;
 	l.anchorX = fx;
@@ -391,6 +426,7 @@ function tunnel(A: number, k: Compose): SignalLayout {
 	setTrace(l, 1, sweep(-0.93 * A, 0.93 * A, -edge, 0.05));
 	setTrace(l, 2, sweep(-0.93 * A, reach, inner, 0.035, 0.6));
 	setTrace(l, 3, sweep(-0.93 * A, reach, -inner, 0.035, 0.6));
+	drumStack(l, -0.93 * A, Math.min(reach, vx - 0.5), 0.45, 0.3, 0.065);
 	l.feed = 0.9;
 	l.surface = SURFACE_TUNNEL;
 	l.anchorX = vx;
@@ -424,6 +460,7 @@ function ring(A: number, k: Compose): SignalLayout {
 	setTrace(l, 1, { o: [-0.88 * A, -0.82], t: [0, 1.62], v: [0.07, 0] });
 	setTrace(l, 2, { o: [right, -0.82], t: [0, 1.4], v: [0.05, 0], vis: 0.8 });
 	setTrace(l, 3, { o: [right - (0.1 + k.spread * 0.04) * A, -0.82], t: [0, 1.4], v: [0.05, 0], vis: 0.8 });
+	drumRow(l, -0.78 * A, right - (0.18 + k.spread * 0.04) * A, -0.88, 0.06);
 	l.feed = 0.9;
 	l.surface = SURFACE_RING;
 	l.anchorX = fx;
@@ -458,6 +495,7 @@ function radar(A: number, k: Compose): SignalLayout {
 	for (let i = 0; i < 4; i += 1) {
 		setTrace(l, i, sweep(x0, x1, clampY(centre + (1.5 - i) * step), i < 2 ? 0.07 : 0.055));
 	}
+	drumGrid(l, x0, x1, 0.88, -0.84, 0.06);
 	l.feed = 1;
 	l.surface = SURFACE_RING;
 	l.anchorX = rx;
@@ -665,13 +703,32 @@ export function mirrorSignalLayout(layout: SignalLayout, amount: number): Signal
 	for (const key of ['figAX', 'figBX', 'anchorX', 'faceAX', 'faceBX', 'wfDx'] as const) {
 		layout[key] -= 2 * layout[key] * t;
 	}
-	for (let k = 0; k < 4; k += 1) {
+	for (let k = 0; k < 8; k += 1) {
 		const ox = `t${k}ox` as SignalLayoutKey;
 		const tx = `t${k}tx` as SignalLayoutKey;
 		// Mirrored span: -(ox + tx) .. -ox, same direction of travel.
 		layout[ox] += (-(layout[ox] + layout[tx]) - layout[ox]) * t;
 	}
 	return layout;
+}
+
+/**
+ * The bench's movable parts for a staggered rearrangement: the hero, each
+ * trace, the screens. Everything else (the horizon and its camera) moves on
+ * the bench's own mix, because the shader blends the two horizons by it.
+ */
+export const SIGNAL_LAYOUT_PARTS: readonly (readonly SignalLayoutKey[])[] = [
+	['figAX', 'figAY', 'figAScale', 'figBX', 'figBY', 'figBScale', 'figBScreen', 'partner', 'drift'],
+	...[0, 1, 2, 3, 4, 5, 6, 7].map((k) => TRACE_KEYS.map((key) => `t${k}${key}` as SignalLayoutKey)),
+	[
+		'faceAX', 'faceAY', 'faceAW', 'faceAH', 'faceARadius', 'faceARepeat', 'faceAGap', 'faceAVis', 'faceABezel',
+		'faceBX', 'faceBY', 'faceBW', 'faceBH', 'faceBRadius', 'faceBVis', 'faceBBezel', 'feed'
+	]
+];
+
+/** Re-blend one part of `out` between a and b by its own mix. */
+export function lerpSignalLayoutPart(a: SignalLayout, b: SignalLayout, part: number, t: number, out: SignalLayout): void {
+	for (const key of SIGNAL_LAYOUT_PARTS[part]) out[key] = a[key] + (b[key] - a[key]) * t;
 }
 
 export function lerpSignalLayout(a: SignalLayout, b: SignalLayout, t: number, out: SignalLayout): SignalLayout {

@@ -129,7 +129,8 @@ test.describe('Signal uniform contract', () => {
 		expect(result.passes).toBe(9);
 		expect(result.terrainArray).toBe(true);
 		expect(result.terrainFloats).toBe(result.expectedTerrain);
-		expect(result.instances).toBe(2 + 4 + 3 + 7 + 22);
+		// Hero A and B, X/Y plus six voice lanes, three feeds, seven rails, 22 rows.
+		expect(result.instances).toBe(2 + 8 + 3 + 7 + 22);
 		expect(result.segments).toBe(result.figureSegments);
 		expect(result.backticks).toBe(false);
 	});

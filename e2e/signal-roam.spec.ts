@@ -32,7 +32,7 @@ test.describe('Signal roam', () => {
 							if (Math.abs(l.figAX) + reach > aspect * 1.02 || Math.abs(l.figAY) + reach > 1.08) {
 								problems.push(`${name} ${bits} m${mirror} hero off frame`);
 							}
-							for (let t = 0; t < 4; t += 1) {
+							for (let t = 0; t < 8; t += 1) {
 								const ox = l[`t${t}ox` as keyof typeof l];
 								const oy = l[`t${t}oy` as keyof typeof l];
 								const tx = l[`t${t}tx` as keyof typeof l];
