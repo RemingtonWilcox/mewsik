@@ -13,7 +13,9 @@ export default defineConfig({
 		command: 'pnpm dev --host 127.0.0.1',
 		url: 'http://127.0.0.1:5173',
 		reuseExistingServer: !isCi,
-		timeout: 60_000
+		// The first cold SSR compile of the app now takes over a minute on a
+		// busy machine; a 60 s limit failed before the server ever answered.
+		timeout: 180_000
 	},
 	projects: [
 		{

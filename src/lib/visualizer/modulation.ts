@@ -36,6 +36,12 @@ export type ModParam = {
 	prefers?: readonly string[];
 	/** Sources this parameter must never listen to. */
 	avoid?: readonly string[];
+	/**
+	 * Allow-list: only sources of these families (or with these exact names)
+	 * may drive this parameter. Use for bindings with intent (a comb row that
+	 * only ever answers percussion). Overrides `prefers` for eligibility.
+	 */
+	only?: readonly string[];
 	/** Resting value 0..1 the parameter returns to when its sources are quiet. */
 	rest?: number;
 	/** How far the music may move it from rest, 0..1. */
@@ -194,6 +200,9 @@ export class ModMatrix {
 					route.to = this.pickSource(param, index, r, route.from);
 					route.mix = 0;
 					route.hold = this.nextHold(index, r);
+					// An inverted impulse glows constantly and dips on each hit; only
+					// continuous sources may invert.
+					if (this.sources[route.to].impulse || this.sources[route.from].impulse) route.invert = false;
 				}
 				if (route.mix < 1) route.mix = Math.min(1, route.mix + step / Math.max(0.2, this.opts.crossfade));
 				const m = route.mix * route.mix * (3 - 2 * route.mix);
@@ -261,7 +270,8 @@ export class ModMatrix {
 			// Impulse sources snap; continuous ones may be tides.
 			attack: impulse ? 0.02 + u * 0.06 : 0.08 + u * 0.9,
 			release: impulse ? 0.15 + u * 0.9 : 0.3 + hash(this.seed, index, r, 0x34) * 3.2,
-			invert: hash(this.seed, index, r, 0x35) < 0.22,
+			// An inverted impulse would glow constantly and dip on each hit.
+			invert: !impulse && hash(this.seed, index, r, 0x35) < 0.22,
 			// Neutral drive: the parameter starts exactly at rest.
 			envelope: 0.5
 		};
@@ -270,11 +280,17 @@ export class ModMatrix {
 	private pickSource(param: ModParam, index: number, r: number, current: number): number {
 		const prefers = param.prefers ?? [];
 		const avoid = new Set(param.avoid ?? []);
+		const only = param.only ? new Set(param.only) : null;
+		// With many sources, an unpreferred source must weigh little or the
+		// preference drowns: a parameter that prefers families gives others a
+		// small residual chance only.
+		const residual = prefers.length ? 0.04 : 0.35;
 		let total = 0;
 		const weights = this.sources.map((source, i) => {
 			if (i === current || avoid.has(source.name)) return 0;
+			if (only && !only.has(source.name) && !(source.family && only.has(source.family))) return 0;
 			const rank = source.family ? prefers.indexOf(source.family) : -1;
-			const w = rank < 0 ? 0.35 : 1.6 / (1 + rank * 0.5);
+			const w = rank < 0 ? residual : 1.6 / (1 + rank * 0.5);
 			total += w;
 			return w;
 		});

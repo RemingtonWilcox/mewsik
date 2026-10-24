@@ -147,6 +147,21 @@ async function regionChunk(samples) {
 	);
 }
 
+// Remove slow trends (a 4 s moving average) so correlation measures who
+// follows whom moment to moment, not who drifts the same way.
+function detrend(series, window = 32) {
+	const out = new Array(series.length);
+	let sum = 0;
+	const q = [];
+	for (let i = 0; i < series.length; i += 1) {
+		q.push(series[i]);
+		sum += series[i];
+		if (q.length > window) sum -= q.shift();
+		out[i] = series[i] - sum / q.length;
+	}
+	return out;
+}
+
 function pearson(a, b) {
 	const n = Math.min(a.length, b.length);
 	let ma = 0;
@@ -170,6 +185,8 @@ const results = [];
 try {
 	const recordings = await Promise.all(engines.map((engine) => record(engine)));
 	for (const { engine, samples } of recordings) {
+		// Skip the first 10 frames of load-in.
+		samples.splice(0, Math.min(10, samples.length - 2));
 		const cells = await regions(samples);
 		const n = cells.length;
 		const R = GRID * GRID;
@@ -187,23 +204,28 @@ try {
 		}
 		let corrSum = 0;
 		let pairs = 0;
+		const detrended = change.map((series) => detrend(series));
 		for (let a = 0; a < R; a += 1) for (let b = a + 1; b < R; b += 1) {
-			corrSum += Math.abs(pearson(change[a], change[b]));
+			corrSum += Math.abs(pearson(detrended[a], detrended[b]));
 			pairs += 1;
 		}
 		const faceness = corrSum / Math.max(1, pairs);
 		// Share of region change explained by the global mean (R^2 averaged).
 		let explained = 0;
-		for (let r = 0; r < R; r += 1) explained += pearson(change[r], globalChange) ** 2 / R;
+		const globalDetrended = detrend(globalChange);
+		for (let r = 0; r < R; r += 1) explained += pearson(detrended[r], globalDetrended) ** 2 / R;
 		// Musical drivers: each region's best-matching channel (activity of the
 		// channel = |delta| for continuous channels), lag 0..2 samples.
-		const names = Object.keys(samples[0]?.channels ?? {});
+		// Counters and clocks (serials, bar counts, time-since) are not music
+		// a region can follow; they win correlations through slow trends.
+		const isCounter = (name) => /serial|sinceHit|sinceFill|since[A-Z]|\.bar$|barIndex|beatIndex|count/i.test(name);
+		const names = Object.keys(samples[0]?.channels ?? {}).filter((name) => !isCounter(name));
 		const channelActivity = {};
 		for (const name of names) {
 			const series = samples.map((s) => s.channels[name] ?? 0);
 			const act = [];
 			for (let t = 1; t < n; t += 1) act.push(Math.abs(series[t] - series[t - 1]) + Math.max(0, series[t]) * 0.25);
-			channelActivity[name] = act;
+			channelActivity[name] = detrend(act);
 		}
 		const drivers = [];
 		for (let r = 0; r < R; r += 1) {
@@ -211,7 +233,7 @@ try {
 			for (const name of names) {
 				const act = channelActivity[name];
 				for (let lag = 0; lag <= 2; lag += 1) {
-					const c = pearson(change[r].slice(lag), act.slice(0, act.length - lag));
+					const c = pearson(detrended[r].slice(lag), act.slice(0, act.length - lag));
 					if (c > best.corr) best = { name, corr: c };
 				}
 			}
