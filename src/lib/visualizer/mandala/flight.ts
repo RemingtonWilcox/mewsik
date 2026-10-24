@@ -23,6 +23,13 @@ import { Roamer, Wander } from '../motion';
 const WORLD_COUNT = MANDALA_WORLDS.length;
 /** Phases wrap here: a multiple of every period a shader takes them modulo. */
 const PHASE_WRAP = 840;
+/**
+ * Turns wrap here: the shaders roll by turn x 1, 0.5, 0.4 and 0.25 (bloom
+ * and the flights, the cavern, the foam, the spiral), so the wrap must be
+ * 2 pi times a multiple of 2, 2.5 and 4 or one of those rolls would jump by
+ * a fraction of a turn when it wraps (it did: the foam snapped by 0.8 pi).
+ */
+const TURN_WRAP = Math.PI * 2 * 20;
 
 function wrap(value: number, period: number): number {
 	return ((value % period) + period) % period;
@@ -45,6 +52,8 @@ export type VoyageInput = {
 	/** 0..1 the music's tempo: the pace the camera roams at. */
 	tempo: number;
 	silence: number;
+	/** Dev/QA: scales the camera's roaming pace (default 1). */
+	roam?: number;
 };
 
 /** Roamer axes, each -1..1. */
@@ -103,7 +112,9 @@ export class MandalaVoyage {
 			this.phase[i] = (s * 7.31 * (i + 1)) % 1;
 			this.turn[i] = (s * 6.283 * (i + 3)) % 6.283;
 		}
-		this.roamer = new Roamer(13, s + 0.137, { meanHold: 13, minHold: 4, response: 5, wander: 0.25, wanderPeriod: 23 });
+		// Slow, gliding moves: a fast sweep of the whole view would move every
+		// part of the picture at once (the music speaks through the parts).
+		this.roamer = new Roamer(13, s + 0.137, { meanHold: 14, minHold: 5, response: 8, wander: 0.3, wanderPeriod: 23 });
 		// Incommensurate periods, long enough that a lane reads as drift, not motion.
 		this.lanes = new Wander(8, s + 0.613, [31, 43, 57, 71, 37, 53, 47, 64]);
 		this.orbitBase = s * 6.283;
@@ -141,14 +152,14 @@ export class MandalaVoyage {
 		this.stepTurn = turnStep;
 		for (let i = 0; i < WORLD_COUNT; i += 1) {
 			this.phase[i] = wrap(this.phase[i] + log * (input.rates[i] ?? 1), PHASE_WRAP);
-			this.turn[i] = wrap(this.turn[i] + turnStep, Math.PI * 2);
+			this.turn[i] = wrap(this.turn[i] + turnStep, TURN_WRAP);
 		}
 		// Tempo sets the camera's pace, energy and motion its restlessness;
 		// silence slows it to a drift without stopping it.
 		const hush = 1 - input.silence * 0.65;
 		const tempo = Number.isFinite(input.tempo) ? Math.min(1, Math.max(0, input.tempo)) : 0.5;
 		const pace = (0.75 + tempo * 0.75) * hush;
-		this.roamer.update(dt, pace, input.restless);
+		this.roamer.update(dt, pace * (input.roam ?? 1), input.restless);
 		this.lanes.update(dt, (0.7 + tempo * 0.6) * hush);
 		const lane = this.lanes.value;
 		// The orbit always moves on, at a pace that wanders (never a loop),
@@ -169,7 +180,7 @@ export class MandalaVoyage {
 		this.roll = to(this.roll, r[ROAM.roll] * 0.45 * amp);
 		this.panX = to(this.panX, r[ROAM.panX] * 0.34 * amp);
 		this.panY = to(this.panY, r[ROAM.panY] * 0.17 * amp);
-		this.zoom = to(this.zoom, r[ROAM.zoom] * 0.38);
+		this.zoom = to(this.zoom, r[ROAM.zoom] * 0.3);
 		this.focal = to(this.focal, Math.exp(r[ROAM.focal] * 0.2));
 		this.dolly = to(this.dolly, Math.max(-1, Math.min(1, r[ROAM.dolly])));
 		this.orbit = this.orbitBase + r[ROAM.swing] * 0.9;
