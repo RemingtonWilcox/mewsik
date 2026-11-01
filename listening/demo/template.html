@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mewsik Listening Engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Plan: a mixing-desk readout. Cool slate neutrals, one signal-orange playhead,
+   section colours as the only categorical palette. Layout: summary strip on top,
+   two timelines (whole song + scrolling close-up), then narration beside events. */
+:root {
+  --bg: #eef1f4;
+  --panel: #ffffff;
+  --ink: #17202b;
+  --muted: #5b6876;
+  --rule: #d5dbe2;
+  --accent: #e0522a;
+  --lane: #f3f5f8;
+  --display: "Familjen Grotesk", "Helvetica Neue", Arial, sans-serif;
+  --body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  --s-intro: #8a9bb0; --s-verse: #4f86c6; --s-build: #e3a33b; --s-chorus: #3fa37a;
+  --s-drop: #d9483b; --s-breakdown: #7d6bc2; --s-bridge: #2aa5b8; --s-outro: #6f7d8c;
+  --st-drums: #d9483b; --st-bass: #7d6bc2; --st-other: #3fa37a; --st-vocals: #e3a33b;
+  --energy: #2f6fb5; --tension: #e3a33b;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #11161c; --panel: #19212a; --ink: #e6ebf0; --muted: #93a1b0; --rule: #2b3642;
+    --accent: #ff6a3d; --lane: #141b22; --energy: #6aa6ec; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #11161c; --panel: #19212a; --ink: #e6ebf0; --muted: #93a1b0; --rule: #2b3642;
+  --accent: #ff6a3d; --lane: #141b22; --energy: #6aa6ec; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--body); }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; display: grid; gap: 18px; }
+h1, h2 { font-family: var(--display); text-wrap: balance; margin: 0; }
+h1 { font-size: 30px; letter-spacing: -0.01em; }
+h2 { font-size: 18px; }
+p { margin: 0; max-width: 72ch; }
+.muted { color: var(--muted); }
+.mono, .num { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+header { display: grid; gap: 6px; }
+.panel { background: var(--panel); border: 1px solid var(--rule); border-radius: 10px; padding: 16px; }
+.tracks { display: flex; flex-wrap: wrap; gap: 8px; }
+.tracks button { font: 500 14px var(--body); color: var(--ink); background: var(--panel);
+  border: 1px solid var(--rule); border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+.tracks button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tracks button .tag { font: 11px var(--mono); color: var(--muted); margin-left: 6px; }
+button:focus-visible, canvas:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.transport { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.play { font: 600 14px var(--body); background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+  padding: 9px 18px; cursor: pointer; min-width: 92px; }
+.clock { font: 500 20px var(--mono); }
+.credit { font-size: 13px; color: var(--muted); }
+.credit a { color: inherit; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+.stat { border: 1px solid var(--rule); border-radius: 8px; padding: 10px 12px; background: var(--panel); display: grid; gap: 2px; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.stat .v { font: 600 20px var(--mono); }
+.stat .d { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.now { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.now .stat .v { font-size: 18px; }
+.pill { display: inline-block; padding: 1px 9px; border-radius: 999px; color: #fff; font: 600 13px var(--body); }
+.beatlights { display: flex; gap: 6px; padding-top: 4px; }
+.beatlights span { width: 18px; height: 18px; border-radius: 4px; background: var(--lane); border: 1px solid var(--rule); }
+.beatlights span.on { background: var(--accent); border-color: var(--accent); }
+.beatlights span.on.down { box-shadow: 0 0 0 2px var(--ink) inset; }
+.canvas-wrap { position: relative; }
+canvas { display: block; width: 100%; cursor: pointer; border-radius: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.cols { display: grid; grid-template-columns: 1.2fr 1fr; gap: 18px; }
+@media (max-width: 820px) { .cols { grid-template-columns: 1fr; } }
+ol.narr, ul.events { list-style: none; margin: 10px 0 0; padding: 0; display: grid; gap: 4px; max-height: 360px; overflow-y: auto; }
+ol.narr li, ul.events li { padding: 6px 8px; border-radius: 6px; font-size: 14px; cursor: pointer; border-left: 3px solid transparent; }
+ol.narr li.cur, ul.events li.cur { background: var(--lane); border-left-color: var(--accent); }
+ul.events li .t { font-family: var(--mono); color: var(--muted); margin-right: 8px; }
+ul.events li .kind { font: 11px var(--mono); color: var(--muted); margin-left: 6px; }
+table { border-collapse: collapse; font-size: 13px; width: 100%; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--rule); font-variant-numeric: tabular-nums; font-family: var(--mono); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; font-family: var(--body); }
+th { font-family: var(--body); font-weight: 600; color: var(--muted); }
+tr.mean td { font-weight: 600; }
+.scroll { overflow-x: auto; }
+.note { font-size: 13px; color: var(--muted); }
+.honest { display: grid; gap: 8px; }
+.honest ul { margin: 0; padding-left: 18px; display: grid; gap: 4px; max-width: 90ch; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>mewsik listening engine</h1>
+    <p class="muted">Offline analysis of a whole track: beats and downbeats, tempo, key and chords, sections, energy and mood, and which parts of the band are playing. Press play and the timelines follow the music. Click anywhere on a timeline, a section or an event to jump there.</p>
+  </header>
+
+  <section class="panel" aria-label="Track">
+    <div class="tracks" id="tracks" role="group" aria-label="Choose a track"></div>
+    <div class="transport" style="margin-top:14px">
+      <button class="play" id="play" type="button">Play</button>
+      <span class="clock" id="clock">0:00.0</span>
+      <span class="credit" id="credit"></span>
+    </div>
+    <audio id="audio" preload="auto"></audio>
+  </section>
+
+  <section class="stats" id="stats" aria-label="Track summary"></section>
+
+  <section class="now" aria-label="Right now">
+    <div class="stat"><span class="k">Section</span><span class="v" id="n-sec">–</span><span class="d" id="n-sec-d"></span></div>
+    <div class="stat"><span class="k">Chord</span><span class="v" id="n-chord">–</span><span class="d" id="n-chord-d"></span></div>
+    <div class="stat"><span class="k">Beat in bar</span><div class="beatlights" id="n-beat"></div><span class="d" id="n-bar"></span></div>
+    <div class="stat"><span class="k">Energy · tension</span><span class="v" id="n-energy">–</span><span class="d" id="n-loud"></span></div>
+    <div class="stat"><span class="k">Mood (heuristic)</span><span class="v" id="n-mood">–</span><span class="d" id="n-va"></span></div>
+    <div class="stat"><span class="k">Playing now</span><span class="v" id="n-stems" style="font-size:15px">–</span><span class="d" id="n-stems-d"></span></div>
+  </section>
+
+  <section class="panel" aria-label="Whole-song timeline">
+    <h2>Whole song</h2>
+    <div class="canvas-wrap" style="margin-top:10px"><canvas id="ov" height="236" tabindex="0" aria-label="Whole-song timeline, click to seek"></canvas></div>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section class="panel" aria-label="Close-up timeline">
+    <h2>Close-up, 12 seconds around the playhead</h2>
+    <div class="canvas-wrap" style="margin-top:10px"><canvas id="lens" height="250" aria-label="Close-up of beats, chords and drum hits"></canvas></div>
+    <p class="note" style="margin-top:8px">Rows: section, chords, beats (tall ticks are downbeats), detected kick, snare and hat hits, energy. On the synthetic tracks a second row under sections and chords shows the ground truth.</p>
+  </section>
+
+  <div class="cols">
+    <section class="panel" aria-label="What's happening">
+      <h2>What's happening</h2>
+      <ol class="narr" id="narr"></ol>
+    </section>
+    <section class="panel" aria-label="Events">
+      <h2>Events</h2>
+      <ul class="events" id="events"></ul>
+    </section>
+  </div>
+
+  <section class="panel honest" aria-label="Accuracy">
+    <h2>How accurate is it?</h2>
+    <p class="note" id="acc-intro"></p>
+    <div class="scroll" id="acc-synth"></div>
+    <div class="scroll" id="acc-real"></div>
+    <ul class="note" id="acc-notes"></ul>
+  </section>
+</main>
+
+<script>
+const DATA = /*__DATA__*/null;
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const fmt = (t) => { t = Math.max(0, t); const m = Math.floor(t / 60); const s = t - m * 60; return `${m}:${s.toFixed(1).padStart(4, "0")}`; };
+const SEC_KEYS = ["intro", "verse", "build", "chorus", "drop", "breakdown", "bridge", "outro"];
+const secColor = (l) => css(`--s-${SEC_KEYS.includes(l) ? l : "verse"}`);
+const STEMS = ["drums", "bass", "other", "vocals"];
+const STEM_LABEL = { drums: "Drums", bass: "Bass", other: "Instruments", vocals: "Vocals" };
+
+let T = null; // current track
+const audio = $("audio");
+
+function bisect(arr, t, key = (x) => x) { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (key(arr[m]) <= t) lo = m + 1; else hi = m; } return lo - 1; }
+const at = (list, t) => { const i = bisect(list, t, (x) => x.s); return i >= 0 && t < list[i].e ? list[i] : null; };
+const curveAt = (c, t) => c[Math.min(c.length - 1, Math.max(0, Math.round(t * DATA.rate)))] ?? 0;
+
+function buildPicker() {
+  const box = $("tracks");
+  DATA.tracks.forEach((tr, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.innerHTML = `${tr.title}<span class="tag">${tr.synthetic ? "synthetic · truth" : "real"}</span>`;
+    b.addEventListener("click", () => select(i));
+    box.appendChild(b);
+  });
+}
+
+function select(i) {
+  audio.pause();
+  T = DATA.tracks[i];
+  [...$("tracks").children].forEach((b, j) => b.setAttribute("aria-pressed", String(i === j)));
+  audio.src = T.audio;
+  $("credit").innerHTML = T.credit;
+  const s = T.summary;
+  const tiles = [
+    ["Tempo", `${s.bpm.toFixed(1)} BPM`, `${s.meter}/4 · grid confidence ${s.conf.toFixed(2)}` + (s.octave ? " · octave corrected" : "")],
+    ["Key", `${s.key}`, `Camelot ${s.camelot} · confidence ${s.keyconf.toFixed(2)}`],
+    ["Loudness", `${s.lufs.toFixed(1)} LUFS`, `range ${s.lra == null ? "–" : s.lra.toFixed(1) + " LU"}`],
+    ["Form", `${T.sections.length} sections`, `${s.style} vocabulary`],
+    ["Stems", s.stems_method.startsWith("demucs") ? "Demucs" : "DSP split", s.stems_method.startsWith("demucs") ? "htdemucs, 4 stems" : "HPSS + low-pass, no vocal stem"],
+  ];
+  if (T.truth) tiles.push(["Ground truth", `${T.truth.bpm} BPM`, `${T.truth.key}`]);
+  $("stats").innerHTML = tiles.map(([k, v, d]) => `<div class="stat"><span class="k">${k}</span><span class="v">${v}</span><span class="d">${d}</span></div>`).join("");
+  $("narr").innerHTML = T.narration.map((n, j) => `<li data-t="${n.s}" id="nr${j}"><span class="pill" style="background:${secColor(n.l)}">${n.l}</span> ${n.x.replace(/^[^ ]+ [^ ]+ /, "")}<br><span class="muted mono" style="font-size:12px">${fmt(n.s)}–${fmt(n.e)}</span></li>`).join("");
+  $("events").innerHTML = T.events.map((e, j) => `<li data-t="${e.t}" id="ev${j}"><span class="t">${fmt(e.t)}</span>${e.x}<span class="kind">${e.k}</span></li>`).join("");
+  document.querySelectorAll("#narr li, #events li").forEach((li) => li.addEventListener("click", () => seek(+li.dataset.t)));
+  $("legend").innerHTML = SEC_KEYS.map((k) => `<span><i style="background:${secColor(k)}"></i>${k}</span>`).join("") +
+    `<span><i style="background:${css("--energy")}"></i>energy</span><span><i style="background:${css("--tension")}"></i>tension</span>`;
+  $("n-beat").innerHTML = Array.from({ length: s.meter }, () => "<span></span>").join("");
+  $("play").textContent = "Play";
+  draw(0);
+}
+
+function seek(t) { audio.currentTime = Math.max(0, Math.min(T.duration - 0.05, t)); draw(audio.currentTime); }
+
+$("play").addEventListener("click", async () => {
+  if (audio.paused) { try { await audio.play(); } catch (e) { $("play").textContent = "Blocked"; return; } }
+  else audio.pause();
+});
+audio.addEventListener("play", () => { $("play").textContent = "Pause"; loop(); });
+audio.addEventListener("pause", () => { $("play").textContent = "Play"; });
+audio.addEventListener("seeked", () => draw(audio.currentTime));
+function loop() { draw(audio.currentTime); if (!audio.paused) requestAnimationFrame(loop); }
+
+function setup(cv) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = +cv.getAttribute("height");
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); cv.style.height = h + "px"; }
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  return [g, w, h];
+}
+
+function lanes(rows, top, gap = 4) { const out = {}; let y = top; for (const [k, h] of rows) { out[k] = [y, h]; y += h + gap; } return out; }
+
+function drawCurve(g, c, x0, x1, t0, t1, y, h, color, fill) {
+  g.beginPath();
+  const n = c.length; const i0 = Math.max(0, Math.floor(t0 * DATA.rate)), i1 = Math.min(n - 1, Math.ceil(t1 * DATA.rate));
+  for (let i = i0; i <= i1; i++) { const x = x0 + ((i / DATA.rate - t0) / (t1 - t0)) * (x1 - x0); const yy = y + h - c[i] * h; i === i0 ? g.moveTo(x, yy) : g.lineTo(x, yy); }
+  g.strokeStyle = color; g.lineWidth = 1.5; g.stroke();
+  if (fill) { g.lineTo(x0 + ((i1 / DATA.rate - t0) / (t1 - t0)) * (x1 - x0), y + h); g.lineTo(x0 + ((i0 / DATA.rate - t0) / (t1 - t0)) * (x1 - x0), y + h); g.closePath(); g.globalAlpha = 0.16; g.fillStyle = color; g.fill(); g.globalAlpha = 1; }
+}
+
+function blocks(g, list, X, y, h, colorOf, labelOf, minLabel = 30) {
+  for (const b of list) {
+    const xa = X(b.s), xb = X(b.e); if (xb < 0 || xa > g.canvas.clientWidth) continue;
+    g.fillStyle = colorOf(b); g.fillRect(xa + 0.5, y, Math.max(1, xb - xa - 1), h);
+    const lab = labelOf(b);
+    if (lab && xb - xa > minLabel) { g.save(); g.beginPath(); g.rect(xa, y, xb - xa - 2, h); g.clip(); g.fillStyle = "#fff"; g.font = `600 12px ${css("--body")}`; g.textBaseline = "middle"; g.fillText(lab, Math.max(xa, 0) + 5, y + h / 2); g.restore(); }
+  }
+}
+
+function rowLabel(g, text, y, h) { g.fillStyle = css("--muted"); g.font = `11px ${css("--mono")}`; g.textBaseline = "middle"; g.fillText(text, 0, y + h / 2); }
+
+function drawOverview(t) {
+  const [g, w, h] = setup($("ov"));
+  const L = 78, R = w - 4, D = T.duration;
+  const X = (s) => L + (s / D) * (R - L);
+  const rows = [["sec", 26]]; if (T.truth) rows.push(["tsec", 12]);
+  rows.push(["energy", 70], ...STEMS.filter((k) => T.stems[k]).map((k) => [k, 16]), ["ev", 14]);
+  const Y = lanes(rows, 4);
+  g.fillStyle = css("--lane"); for (const k in Y) g.fillRect(L, Y[k][0], R - L, Y[k][1]);
+  rowLabel(g, "sections", ...Y.sec);
+  blocks(g, T.sections, X, ...Y.sec, (b) => secColor(b.l), (b) => `${b.l} ${b.L}`);
+  if (T.truth) { rowLabel(g, "truth", ...Y.tsec); blocks(g, T.truth.sections, X, ...Y.tsec, (b) => secColor(b.l), () => ""); }
+  rowLabel(g, "energy", ...Y.energy);
+  drawCurve(g, T.tension, L, R, 0, D, ...Y.energy, css("--tension"), false);
+  drawCurve(g, T.energy, L, R, 0, D, ...Y.energy, css("--energy"), true);
+  for (const k of STEMS) {
+    if (!Y[k]) continue; const [y, hh] = Y[k]; rowLabel(g, STEM_LABEL[k].toLowerCase(), y, hh);
+    const c = T.stems[k]; const col = css(`--st-${k}`);
+    for (let i = 0; i < c.length; i++) { const a = c[i]; if (a <= 0.02) continue; g.globalAlpha = a; g.fillStyle = col; g.fillRect(X(i / DATA.rate), y, Math.max(1, (R - L) / D / DATA.rate + 0.5), hh); }
+    g.globalAlpha = 1;
+  }
+  rowLabel(g, "events", ...Y.ev);
+  for (const e of T.events) { g.fillStyle = e.k === "drop" ? css("--s-drop") : css("--muted"); g.fillRect(X(e.t) - 1, Y.ev[0], 2, Y.ev[1]); }
+  // downbeat grid every 4 bars
+  g.strokeStyle = css("--rule"); g.lineWidth = 1;
+  T.down.forEach((d, i) => { if (i % 8 === 0) { g.beginPath(); g.moveTo(X(d), Y.energy[0]); g.lineTo(X(d), Y.energy[0] + Y.energy[1]); g.stroke(); } });
+  // playhead
+  g.fillStyle = css("--accent"); g.fillRect(X(t) - 1, 0, 2, h);
+}
+
+function drawLens(t) {
+  const [g, w, h] = setup($("lens"));
+  const L = 78, R = w - 4, span = 12, t0 = t - span / 2, t1 = t + span / 2;
+  const X = (s) => L + ((s - t0) / span) * (R - L);
+  const rows = [["sec", 22]]; if (T.truth) rows.push(["tsec", 10]);
+  rows.push(["ch", 30]); if (T.truth) rows.push(["tch", 18]);
+  rows.push(["beat", 26], ["kick", 14], ["snare", 14], ["hat", 14], ["energy", 40]);
+  const Y = lanes(rows, 4);
+  g.fillStyle = css("--lane"); for (const k in Y) g.fillRect(L, Y[k][0], R - L, Y[k][1]);
+  g.save(); g.beginPath(); g.rect(L, 0, R - L, h); g.clip();
+  blocks(g, T.sections, X, ...Y.sec, (b) => secColor(b.l), (b) => `${b.l} ${b.L}`);
+  if (T.truth) blocks(g, T.truth.sections, X, ...Y.tsec, (b) => secColor(b.l), () => "");
+  const chordCol = (b) => b.n === "N.C." ? css("--muted") : (b.n.endsWith("m") ? css("--s-breakdown") : css("--s-verse"));
+  blocks(g, T.chords, X, ...Y.ch, chordCol, (b) => b.n, 18);
+  if (T.truth) blocks(g, T.truth.chords, X, ...Y.tch, chordCol, (b) => b.n, 18);
+  const [by, bh] = Y.beat;
+  const downSet = new Set(T.down.map((d) => d.toFixed(3)));
+  for (let i = Math.max(0, bisect(T.beats, t0)); i < T.beats.length && T.beats[i] <= t1; i++) {
+    const b = T.beats[i]; const isD = downSet.has(b.toFixed(3));
+    g.fillStyle = b <= t ? css("--ink") : css("--muted");
+    g.fillRect(X(b) - (isD ? 1.5 : 0.75), isD ? by : by + bh * 0.45, isD ? 3 : 1.5, isD ? bh : bh * 0.55);
+  }
+  if (T.truth) { g.fillStyle = css("--accent"); for (const b of T.truth.down) if (b >= t0 && b <= t1) g.fillRect(X(b) - 4, by, 8, 3); }
+  for (const k of ["kick", "snare", "hat"]) {
+    const [y, hh] = Y[k]; const col = k === "kick" ? css("--st-drums") : k === "snare" ? css("--st-vocals") : css("--st-other");
+    g.fillStyle = col;
+    const arr = T.hits[k];
+    for (let i = Math.max(0, bisect(arr, t0)); i < arr.length && arr[i] <= t1; i++) { g.beginPath(); g.arc(X(arr[i]), y + hh / 2, 3.2, 0, Math.PI * 2); g.fill(); }
+  }
+  drawCurve(g, T.energy, L, R, t0, t1, ...Y.energy, css("--energy"), true);
+  g.restore();
+  rowLabel(g, "section", ...Y.sec); if (T.truth) rowLabel(g, "truth", ...Y.tsec);
+  rowLabel(g, "chords", ...Y.ch); if (T.truth) rowLabel(g, "truth", ...Y.tch);
+  rowLabel(g, "beats", ...Y.beat); rowLabel(g, "kick", ...Y.kick); rowLabel(g, "snare", ...Y.snare); rowLabel(g, "hat", ...Y.hat); rowLabel(g, "energy", ...Y.energy);
+  g.fillStyle = css("--accent"); g.fillRect(X(t) - 1, 0, 2, h);
+}
+
+let lastSec = -1, lastEv = -1;
+function drawNow(t) {
+  $("clock").textContent = fmt(t);
+  const sec = at(T.sections, t);
+  $("n-sec").innerHTML = sec ? `<span class="pill" style="background:${secColor(sec.l)}">${sec.l} ${sec.L}</span>` : "–";
+  $("n-sec-d").textContent = sec ? `${fmt(sec.s)}–${fmt(sec.e)} · ${sec.bars} bars` : "";
+  const ch = at(T.chords, t);
+  $("n-chord").textContent = ch ? ch.n : "–";
+  const nx = T.chords[bisect(T.chords, t, (x) => x.s) + 1];
+  $("n-chord-d").textContent = nx ? `next ${nx.n} in ${(nx.s - t).toFixed(1)} s` : "";
+  const bi = bisect(T.beats, t);
+  const pos = bi >= 0 ? T.pos[bi] : 0;
+  [...$("n-beat").children].forEach((el, j) => { el.className = j + 1 === pos ? (pos === 1 ? "on down" : "on") : ""; });
+  const bar = bisect(T.down, t) + 1;
+  $("n-bar").textContent = bar > 0 ? `bar ${bar}` : "pickup";
+  $("n-energy").textContent = `${Math.round(curveAt(T.energy, t) * 100)} · ${Math.round(curveAt(T.tension, t) * 100)}`;
+  $("n-loud").textContent = `${curveAt(T.loud, t).toFixed(0)} LUFS short-term`;
+  const v = curveAt(T.valence, t), a = curveAt(T.arousal, t);
+  $("n-mood").textContent = a >= 0.55 ? (v >= 0.5 ? "euphoric" : "tense") : (v >= 0.5 ? "warm" : "melancholic");
+  $("n-va").textContent = `valence ${v.toFixed(2)} · arousal ${a.toFixed(2)}`;
+  const playing = STEMS.filter((k) => T.stems[k] && curveAt(T.stems[k], t) > 0.35).map((k) => STEM_LABEL[k]);
+  $("n-stems").textContent = playing.length ? playing.join(", ") : "near silence";
+  $("n-stems-d").textContent = T.summary.stems_method.startsWith("demucs") ? "from Demucs stems" : "from the DSP split";
+  const si = bisect(T.narration, t, (x) => x.s);
+  if (si !== lastSec) { document.querySelectorAll("#narr li.cur").forEach((e) => e.classList.remove("cur")); const el = $(`nr${si}`); if (el) { el.classList.add("cur"); } lastSec = si; }
+  const ei = bisect(T.events, t, (x) => x.t);
+  if (ei !== lastEv) { document.querySelectorAll("#events li.cur").forEach((e) => e.classList.remove("cur")); const el = $(`ev${ei}`); if (el) { el.classList.add("cur"); const box = $("events"); box.scrollTop = Math.max(0, el.offsetTop - box.offsetTop - 60); } lastEv = ei; }
+}
+
+function draw(t) { if (!T) return; drawOverview(t); drawLens(t); drawNow(t); }
+
+$("ov").addEventListener("click", (ev) => { const r = ev.currentTarget.getBoundingClientRect(); const L = 78; const x = ev.clientX - r.left; if (x < L) return; seek(((x - L) / (r.width - L - 4)) * T.duration); });
+$("ov").addEventListener("keydown", (ev) => { if (ev.key === "ArrowRight") seek(audio.currentTime + 5); if (ev.key === "ArrowLeft") seek(audio.currentTime - 5); if (ev.key === " ") { ev.preventDefault(); $("play").click(); } });
+window.addEventListener("resize", () => draw(audio.currentTime));
+matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", () => draw(audio.currentTime));
+
+function accTable(rows, cols, title) {
+  if (!rows || !rows.length) return "";
+  const head = cols.map((c) => `<th>${c[1]}</th>`).join("");
+  const fmtv = (v) => typeof v === "number" ? (Number.isInteger(v) && v > 2 ? v : v.toFixed(2)) : (v ?? "");
+  const body = rows.map((r) => `<tr>${cols.map((c) => `<td>${fmtv(r[c[0]])}</td>`).join("")}</tr>`).join("");
+  const mean = cols.map((c, i) => { if (i === 0) return "<td>mean</td>"; const vs = rows.map((r) => r[c[0]]).filter((v) => typeof v === "number"); return `<td>${vs.length && c[2] !== false ? (vs.reduce((a, b) => a + b, 0) / vs.length).toFixed(2) : ""}</td>`; }).join("");
+  return `<h2 style="font-size:15px;margin:10px 0 6px">${title}</h2><table><thead><tr>${head}</tr></thead><tbody>${body}<tr class="mean">${mean}</tr></tbody></table>`;
+}
+
+function buildAccuracy() {
+  const A = DATA.accuracy;
+  $("acc-intro").textContent = A.intro;
+  $("acc-synth").innerHTML = accTable(A.synthetic, [["name", "Synthetic song"], ["bpm_ref", "BPM truth", false], ["bpm_est", "BPM est", false], ["tempo_acc1", "Tempo Acc1"], ["tempo_acc2", "Acc2"], ["beat_f", "Beat F"], ["downbeat_f", "Downbeat F"], ["key_score", "Key"], ["chord_majmin", "Chords"], ["boundary_f3", "Bounds F@3s"], ["label_function", "Labels"], ["stem_drums", "Drums on/off"], ["stem_bass", "Bass on/off"]], "Synthetic set: exact ground truth (7 songs)");
+  $("acc-real").innerHTML = accTable(A.real, [["name", "Real recording"], ["bpm_est", "BPM est", false], ["key_ref", "Published key"], ["key_est", "Engine key"], ["key_score", "Key"], ["key_score_alt", "Key (alt)"], ["meter_ok", "Meter"], ["stem_drums", "Drums on/off"], ["stem_bass", "Bass on/off"], ["stem_other", "Other on/off"]], "Real recordings: only the truth that is actually published");
+  $("acc-notes").innerHTML = A.notes.map((n) => `<li>${n}</li>`).join("");
+}
+
+buildPicker();
+buildAccuracy();
+select(0);
+</script>
+</body>
+</html>

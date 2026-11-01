@@ -1,0 +1,11 @@
+{
+ "intro": "Scored with the standard MIR metrics (mir_eval). The synthetic songs come with exact truth, but the engine was tuned while looking at them, so read those numbers as an upper bound. Real recordings are scored only where truth is actually published.",
+ "notes": [
+  "The synthetic and real sets were both used during tuning (key disambiguation, octave correction, section rules). There is no held-out set yet, so expect lower numbers on new music.",
+  "Tempo: the pop ballad is truth 76 BPM with half-time drums; the engine says 152. Acc2 (which accepts the octave) counts it, Acc1 does not.",
+  "Key on real recordings: Sugar Plum Fairy is E minor (correct). The Brahms is titled F# minor after the piano original. The engine and essentia both hear G minor, the key orchestral arrangements are normally played in; we could not verify which this recording uses, so both are shown.",
+  "Chords are major/minor triads only. Seventh chords (lofi) and fast chord rhythms (waltz) are where they slip.",
+  "Stems use a DSP split here, because the Demucs weights host is blocked in this sandbox. On a normal machine the engine uses Demucs automatically. The real multitrack's parts play almost throughout, so its stem scores are weak evidence.",
+  "Mood is a heuristic on mode, chord quality, brightness, tempo and energy. It is not a trained model and has not been evaluated."
+ ]
+}

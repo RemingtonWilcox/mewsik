@@ -1,0 +1,21 @@
+{
+  "note": "Only truth that is actually published for each recording. Paths are relative to the --real root. Audio comes from github.com/librosa/data (licence file per recording) and github.com/mdn/webaudio-examples.",
+  "tracks": [
+    {"name": "brahms_hungarian5", "path": "librosa/Hungarian_Dance_number_5_-_Allegro_in_F_sharp_minor_(string_orchestra).hq.ogg",
+     "licence": "Public Domain Mark 1.0 (Musopen, US Army Strings)",
+     "truth": {"key": {"tonic": "F#", "mode": "minor", "source": "title (the piano original's key)",
+                       "alt": {"tonic": "G", "mode": "minor", "source": "the key orchestral arrangements are usually played in; unverified for this recording"}}}},
+    {"name": "sugar_plum_fairy", "path": "librosa/Kevin_MacLeod_-_P_I_Tchaikovsky_Dance_of_the_Sugar_Plum_Fairy.hq.ogg",
+     "licence": "CC BY 4.0 (Kevin MacLeod)",
+     "truth": {"key": {"tonic": "E", "mode": "minor", "source": "Tchaikovsky's score (E minor); arrangement assumed untransposed"}}},
+    {"name": "sweet_waltz", "path": "librosa/147793__setuniman__sweet-waltz-0i-22mi.hq.ogg",
+     "licence": "CC BY-NC 4.0 (Setuniman)",
+     "truth": {"meter": 3, "meter_source": "a waltz (title)"}},
+    {"name": "vibe_ace", "path": "librosa/Kevin_MacLeod_-_Vibe_Ace.hq.ogg", "licence": "CC BY 4.0 (Kevin MacLeod)", "truth": {}},
+    {"name": "choice_drum_bass", "path": "librosa/admiralbob77_-_Choice_-_Drum-bass.hq.ogg", "licence": "CC BY-NC 4.0 (Admiral Bob)", "truth": {}},
+    {"name": "pistachio_rag", "path": "librosa/442789__lena-orsa__happy-music-pistachio-ice-cream-ragtime.hq.ogg", "licence": "CC BY-NC 4.0 (Lena Orsa)", "truth": {}},
+    {"name": "outfoxing_the_fox", "path": "mdn/audio-basics_outfoxing.mp3", "licence": "CC BY (Kevin MacLeod, via MDN webaudio-examples)", "truth": {}},
+    {"name": "mdn_multitrack", "path": "mdn/multitrack_mix.wav", "truth_file": "mdn/multitrack_mix.truth.json",
+     "licence": "unstated (jPlayer demo stems by Mark Boas); evaluation only, never bundled", "truth": {}}
+  ]
+}

@@ -1,0 +1,13 @@
+# Core engine
+numpy>=2.0
+scipy>=1.13
+librosa>=0.11
+soundfile>=0.12
+essentia>=2.1b6.dev1389   # multi-feature beat tracker, EBU R128 loudness, key second opinion
+mido>=1.3                 # MIDI export
+# Evaluation
+mir_eval>=0.8
+pytest>=8
+# Optional: real 4-stem separation (weights download once from dl.fbaipublicfiles.com)
+# torch>=2.4
+# demucs>=4.0

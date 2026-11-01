@@ -41,6 +41,17 @@ Every frame is generated on the GPU from the audio. Nothing is prerendered, samp
 | **Signal** | A phosphor oscilloscope that draws the music as living traces |
 | **Loom** | Woven ribbons of light that are the only light in the room |
 
+## Listening engine (prototype)
+
+`listening/` holds an offline engine that hears a whole track. It finds beats,
+downbeats and tempo, key and chords, sections (intro/build/drop/breakdown or
+verse/chorus), energy, loudness and mood curves, and stem activity, and
+writes a "what's happening" timeline. It can also emit the app's `TrackScore`.
+On a synthetic test set with exact truth it scores beat F 0.92, key 1.00,
+chords 0.86 and section boundaries F 0.85. See
+[listening/README.md](listening/README.md) for real-recording results,
+caveats and next steps.
+
 ## Screenshot
 
 <img src="docs/screenshot.png" alt="mewsik screenshot" width="800">
