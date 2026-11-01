@@ -49,6 +49,13 @@ def r(v, d=3):
     return [round(float(x), d) for x in v]
 
 
+LITE = False  # --lite: no audio, 1 Hz curves, no drum hits (small enough to publish inline)
+
+
+def _ds(c, d=2):
+    return [round(float(x), d) for x in (c[::2] if LITE else c)]
+
+
 def pack(res: dict, audio_path: str, title: str, credit: str, truth: dict | None) -> dict:
     rh, hm, en, st, sx, tl = (res[k] for k in ("rhythm", "harmony", "energy", "stems", "structure", "timeline"))
     k = hm["key"]
@@ -56,20 +63,23 @@ def pack(res: dict, audio_path: str, title: str, credit: str, truth: dict | None
     ref = max(np.percentile(v, 95) for v in acts.values())
     stems = {n: (r(np.clip((acts[n] - (ref - 40)) / 40, 0, 1), 2) if n in acts else None)
              for n in ("drums", "bass", "other", "vocals")}
+    if LITE:
+        stems = {n: ([round(x, 1) for x in v[::2]] if v else None) for n, v in stems.items()}
     out = {
         "title": title, "credit": credit, "synthetic": truth is not None, "duration": res["duration"],
-        "audio": encode(audio_path),
+        "audio": None if LITE else encode(audio_path),
         "summary": {"bpm": rh["bpm"], "meter": rh["meter"], "conf": rh["confidence"], "octave": rh["octave_note"],
                     "key": k["name"], "camelot": k["camelot"], "keyconf": k["confidence"],
                     "lufs": en["integrated_lufs"], "lra": en["loudness_range_lu"], "style": sx["style"],
                     "stems_method": st["method"]},
-        "beats": r(rh["beats"]), "pos": rh["beat_positions"], "down": r(rh["downbeats"]),
+        "beats": None if LITE else r(rh["beats"]), "pos": None if LITE else rh["beat_positions"],
+        "down": r(rh["downbeats"], 2 if LITE else 3),
         "sections": [{"s": s["start"], "e": s["end"], "l": s["label"], "L": s["letter"], "bars": s["bars"]}
                      for s in sx["sections"]],
-        "chords": [{"s": c["start"], "e": c["end"], "n": c["name"]} for c in hm["chords"]],
-        "energy": en["energy"], "tension": en["tension"], "valence": en["valence"], "arousal": en["arousal"],
-        "loud": en["loudness_short_term"], "stems": stems,
-        "hits": st["drum_hits"],
+        "chords": [{"s": round(c["start"], 2), "e": round(c["end"], 2), "n": c["name"]} for c in hm["chords"]],
+        "energy": _ds(en["energy"]), "tension": _ds(en["tension"], 1 if LITE else 2), "valence": _ds(en["valence"], 1 if LITE else 2),
+        "arousal": _ds(en["arousal"], 1 if LITE else 2), "loud": _ds(en["loudness_short_term"], 0), "stems": stems,
+        "hits": {k: [] for k in st["drum_hits"]} if LITE else st["drum_hits"],
         "events": [{"t": e["t"], "k": e["kind"], "x": e["text"]} for e in tl["events"]],
         "narration": [{"s": n["start"], "e": n["end"], "l": n["label"], "x": n["text"]} for n in tl["narration"]],
     }
@@ -79,8 +89,9 @@ def pack(res: dict, audio_path: str, title: str, credit: str, truth: dict | None
         out["truth"] = {
             "bpm": truth["bpm"], "key": f"{truth['key']['tonic']} {truth['key']['mode']}",
             "sections": [{"s": s["start"], "e": s["end"], "l": s["label"]} for s in truth["sections"]],
-            "chords": [{"s": c["start"], "e": c["end"], "n": pretty_chord(c["label"])} for c in truth["chords"]],
-            "down": truth["downbeats"],
+            "chords": [] if LITE else [{"s": round(c["start"], 2), "e": round(c["end"], 2), "n": pretty_chord(c["label"])}
+                       for c in truth["chords"]],
+            "down": [round(x, 2) for x in truth["downbeats"]],
         }
     return out
 
@@ -96,11 +107,17 @@ def main():
     ap.add_argument("--results", required=True)
     ap.add_argument("--notes", default=os.path.join(HERE, "accuracy_notes.json"))
     ap.add_argument("--out", default=os.path.join(HERE, "dist", "index.html"))
+    ap.add_argument("--lite", action="store_true", help="no audio, light data: for inline publishing")
+    ap.add_argument("--only", nargs="*", help="track names to include")
     args = ap.parse_args()
+    global LITE
+    LITE = args.lite
 
     refs = {t["name"]: t for t in json.load(open(os.path.join(HERE, "..", "eval", "references.json")))["tracks"]}
     tracks = []
     for name, title, credit, synthetic in TRACKS:
+        if args.only and name not in args.only:
+            continue
         res = json.load(open(os.path.join(args.cache, name + ".json")))
         if synthetic:
             ap_ = os.path.join(args.synth, name + ".wav")
@@ -112,10 +129,21 @@ def main():
         print("packed", name)
     results = json.load(open(args.results))
     notes = json.load(open(args.notes))
-    data = {"rate": 2.0, "tracks": tracks,
+    data = {"rate": 1.0 if LITE else 2.0, "tracks": tracks,
             "accuracy": {"intro": notes["intro"], "notes": notes["notes"],
                          "synthetic": results.get("synthetic", []), "real": results.get("real", [])}}
+    if LITE:
+        for rows in data["accuracy"].values():
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict):
+                        row.pop("seconds", None)
+                        for k, v in row.items():
+                            if isinstance(v, float):
+                                row[k] = round(v, 2)
     html = open(os.path.join(HERE, "template.html")).read().replace("/*__DATA__*/null", json.dumps(data, separators=(",", ":")))
+    if LITE:  # strip indentation to keep the inline page small
+        html = "\n".join(line.strip() for line in html.splitlines() if line.strip())
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     open(args.out, "w").write(html)
     print(f"wrote {args.out} ({len(html) / 1e6:.1f} MB)")

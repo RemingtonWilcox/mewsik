@@ -40,7 +40,8 @@
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 var(--body); }
-main { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; display: grid; gap: 18px; }
+main { max-width: 1180px; margin: 0 auto; padding-block: 24px 48px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); display: grid; gap: 18px; }
+.cols > *, .stats > *, .now > * { min-width: 0; }
 h1, h2 { font-family: var(--display); text-wrap: balance; margin: 0; }
 h1 { font-size: 30px; letter-spacing: -0.01em; }
 h2 { font-size: 18px; }
@@ -167,7 +168,22 @@ const STEMS = ["drums", "bass", "other", "vocals"];
 const STEM_LABEL = { drums: "Drums", bass: "Bass", other: "Instruments", vocals: "Vocals" };
 
 let T = null; // current track
-const audio = $("audio");
+// Playback clock: the real <audio> element when the track carries audio,
+// otherwise a silent clock so the timelines still play (lite builds).
+const audio = (() => {
+  const el = $("audio"); const hs = {}; let silent = false, base = 0, start = 0, paused = true;
+  const emit = (n) => (hs[n] || []).forEach((f) => f());
+  ["play", "pause", "seeked"].forEach((n) => el.addEventListener(n, () => { if (!silent) emit(n); }));
+  return {
+    addEventListener(n, f) { (hs[n] ||= []).push(f); },
+    set src(v) { silent = !v; paused = true; base = 0; if (v) el.src = v; else el.removeAttribute("src"); },
+    get paused() { return silent ? paused : el.paused; },
+    get currentTime() { if (!silent) return el.currentTime; const t = paused ? base : base + (performance.now() - start) / 1000; if (T && t >= T.duration) { base = T.duration; paused = true; emit("pause"); } return Math.min(t, T ? T.duration : t); },
+    set currentTime(v) { if (!silent) { el.currentTime = v; return; } base = v; start = performance.now(); emit("seeked"); },
+    async play() { if (!silent) return el.play(); base = base >= T.duration - 0.1 ? 0 : base; start = performance.now(); paused = false; emit("play"); },
+    pause() { if (!silent) return el.pause(); if (!paused) { base = this.currentTime; paused = true; emit("pause"); } },
+  };
+})();
 
 function bisect(arr, t, key = (x) => x) { let lo = 0, hi = arr.length; while (lo < hi) { const m = (lo + hi) >> 1; if (key(arr[m]) <= t) lo = m + 1; else hi = m; } return lo - 1; }
 const at = (list, t) => { const i = bisect(list, t, (x) => x.s); return i >= 0 && t < list[i].e ? list[i] : null; };
@@ -187,9 +203,15 @@ function buildPicker() {
 function select(i) {
   audio.pause();
   T = DATA.tracks[i];
+  if (!T.beats) { // lite builds: rebuild the beat grid from the downbeats
+    const m = T.summary.meter, d = T.down, b = [];
+    for (let i = 0; i < d.length; i++) { const step = ((i + 1 < d.length ? d[i + 1] : d[i] + (d[i] - d[i - 1])) - d[i]) / m; for (let k = 0; k < m; k++) { const x = d[i] + k * step; if (x < T.duration) b.push(x); } }
+    T.beats = b.map((x) => Math.round(x * 100) / 100);
+  }
+  if (!T.pos) { const D = new Set(T.down.map((d) => d.toFixed(2))); let k = 0; T.pos = T.beats.map((b) => (D.has(b.toFixed(2)) ? (k = 1) : ++k)); }
   [...$("tracks").children].forEach((b, j) => b.setAttribute("aria-pressed", String(i === j)));
   audio.src = T.audio;
-  $("credit").innerHTML = T.credit;
+  $("credit").innerHTML = T.credit + (T.audio ? "" : " <b>Audio not bundled in this build: the playhead runs silently.</b>");
   const s = T.summary;
   const tiles = [
     ["Tempo", `${s.bpm.toFixed(1)} BPM`, `${s.meter}/4 · grid confidence ${s.conf.toFixed(2)}` + (s.octave ? " · octave corrected" : "")],
