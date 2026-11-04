@@ -732,4 +732,114 @@ mod tests {
         let output = resample_peaks(&[], 5);
         assert_eq!(output, vec![0.0; 5]);
     }
+
+    #[test]
+    #[ignore]
+    fn symphonia_m4a_probe() {
+        use super::*;
+        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
+        for p in files.split(';') {
+            let file = File::open(p).unwrap();
+            let mss = MediaSourceStream::new(Box::new(file), Default::default());
+            let mut hint = Hint::new();
+            hint.with_extension("m4a");
+            match symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()) {
+                Err(e) => println!("{p}: probe error {e:?}"),
+                Ok(mut probed) => {
+                    for t in probed.format.tracks() {
+                        println!("{p}: track {} codec {:?} rate {:?}", t.id, t.codec_params.codec, t.codec_params.sample_rate);
+                    }
+                    let mut n = 0;
+                    loop {
+                        match probed.format.next_packet() {
+                            Ok(pk) => { n += 1; if n < 3 { println!("  packet track {} ts {}", pk.track_id(), pk.ts()); } if n > 200 { break; } }
+                            Err(e) => { println!("  next_packet error after {n}: {e:?}"); break; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Opens every library file the way the engine does and reports failures.
+    #[test]
+    #[ignore]
+    fn real_library_decode_probe() {
+        use super::*;
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let db = crate::db::init_db(Path::new(&path)).expect("open db");
+        let tracks = queries::get_library_tracks(&db).expect("tracks");
+        let mut failures = std::collections::BTreeMap::<String, usize>::new();
+        let mut first = std::collections::BTreeMap::<String, String>::new();
+        std::panic::set_hook(Box::new(|_| {}));
+        for t in &tracks {
+            let Some(p) = t.local_file_path.clone() else { continue };
+            let result = std::panic::catch_unwind(|| {
+                let mut d = crate::audio::decoder::AudioDecoder::open_path(Path::new(&p))?;
+                // pull a second of audio and seek, like playback does
+                for _ in 0..88_200 { if d.next().is_none() { break; } }
+                rodio::Source::try_seek(&mut d, std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+                d.next().map(|_| ()).ok_or_else(|| "no audio after seek".to_string())
+            });
+            let err = match result {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(_) => "panic".to_string(),
+            };
+            let dir = Path::new(&p).components().rev().nth(2)
+                .map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
+            let key = format!("{dir} | {err}");
+            *failures.entry(key.clone()).or_default() += 1;
+            first.entry(key).or_insert(p);
+        }
+        let _ = std::panic::take_hook();
+        println!("checked {} tracks", tracks.len());
+        for (k, n) in &failures {
+            println!("{n:5}  {k}  e.g. {}", first[k]);
+        }
+    }
+
+    /// Plays from a copy of a real library through the real engine and output.
+    /// `MEWSIK_PROBE_DB=<copy of library.db> cargo test real_library_play_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_library_play_probe() {
+        use super::*;
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let db = crate::db::init_db(Path::new(&path)).expect("open db");
+        let tracks = queries::get_library_tracks(&db).expect("tracks");
+        let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        println!("library tracks: {}", ids.len());
+        let sidecar = SidecarManager::new();
+        let cache: StreamCache = Default::default();
+
+        let started = std::time::Instant::now();
+        let mut entries = Vec::new();
+        for id in &ids {
+            match build_queue_entry(&db, &sidecar, id, Some(&cache)) {
+                Ok(entry) => entries.push(entry),
+                Err(error) => println!("build_queue_entry({id}) failed: {error}"),
+            }
+        }
+        println!("built {} entries in {:?}", entries.len(), started.elapsed());
+
+        let engine = AudioEngine::new(db.clone());
+        let start = 5.min(entries.len().saturating_sub(1));
+        println!("starting at {:?}", entries.get(start).map(|e| (&e.title, &e.file_path)));
+        engine.start_queue(entries, start);
+        for step in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let s = engine.get_state();
+            if step % 5 == 0 || s.is_playing {
+                println!(
+                    "t={}ms playing={} buffering={} pos={} title={:?} stage={:?}",
+                    (step + 1) * 100, s.is_playing, s.is_buffering, s.position_ms, s.current_title, s.connection_stage
+                );
+            }
+        }
+        while let Some(event) = engine.try_recv_event() {
+            println!("event: {event:?}");
+        }
+        engine.shutdown();
+    }
 }

@@ -1,4 +1,5 @@
 pub mod analyzer;
+pub mod decoder;
 pub mod engine;
 pub mod ensemble;
 pub mod http_stream;
