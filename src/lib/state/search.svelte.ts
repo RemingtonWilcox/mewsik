@@ -1,15 +1,30 @@
-// Persistent search state — survives navigation between pages
-let _query = $state('');
-let _results: any[] = $state([]);
-let _sourcePreference = $state<string>('all');
+import type { ExternalSearchResult } from '$lib/api/tauri';
+
+// Kept across page changes so going back to Search shows the last results.
+let query = $state('');
+let online = $state<ExternalSearchResult[]>([]);
+let onlineQuery = $state('');
 
 export function useSearchState() {
 	return {
-		get query() { return _query; },
-		set query(v: string) { _query = v; },
-		get results() { return _results; },
-		set results(v: any[]) { _results = v; },
-		get sourcePreference() { return _sourcePreference; },
-		set sourcePreference(v: string) { _sourcePreference = v; },
+		get query() {
+			return query;
+		},
+		set query(value: string) {
+			query = value;
+		},
+		get online() {
+			return online;
+		},
+		set online(value: ExternalSearchResult[]) {
+			online = value;
+		},
+		/** The query `online` belongs to. */
+		get onlineQuery() {
+			return onlineQuery;
+		},
+		set onlineQuery(value: string) {
+			onlineQuery = value;
+		}
 	};
 }

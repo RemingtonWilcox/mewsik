@@ -223,6 +223,38 @@ export function usePlayer() {
 			scheduleRefresh();
 		},
 
+		/** Play button on a collection: in order, shuffle off. */
+		async playOrdered(ids: string[]) {
+			if (ids.length === 0) return;
+			clearPendingSeek();
+			clearVisualizerAudio();
+			await api.playTracksFrom(ids, 0);
+			scheduleRefresh();
+			if (state.is_shuffle) {
+				await api.setShuffle(false);
+				scheduleRefresh([0, 50]);
+			}
+		},
+
+		/** An album in disc and track order. */
+		async playAlbum(albumId: string) {
+			const tracks = await api.getAlbumTracks(albumId);
+			await this.playOrdered(tracks.map((t) => t.id));
+		},
+
+		/** Shuffle button on a collection: random first song, shuffle on. */
+		async playShuffled(ids: string[]) {
+			if (ids.length === 0) return;
+			clearPendingSeek();
+			clearVisualizerAudio();
+			await api.playTracksFrom(ids, Math.floor(Math.random() * ids.length));
+			scheduleRefresh();
+			if (!state.is_shuffle) {
+				await api.setShuffle(true);
+				scheduleRefresh([0, 50]);
+			}
+		},
+
 		async pause() {
 			clearPendingSeek();
 			clearVisualizerAudio();

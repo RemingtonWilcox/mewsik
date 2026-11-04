@@ -180,15 +180,12 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 						return [playlist];
 					case 'get_playlist_tracks':
 						return tracks;
-					case 'get_daily_mix':
-						return tracks.map((track, index) => ({
-							...track,
-							title: `Quick ${['One', 'Two', 'Three'][index]}`
-						}));
-					case 'get_recently_played':
-						return [];
-					case 'get_play_stats':
-						return { total_plays: 0, total_time_ms: 0, unique_tracks: 0 };
+					case 'get_album_tracks':
+						return tracks;
+					case 'search_all_sources':
+						return { items: [], failed_sources: [] };
+					case 'is_library_scanning':
+						return false;
 					case 'search_library':
 						return searchResults;
 					case 'set_shuffle':
@@ -235,11 +232,29 @@ async function playbackInvocations(page: Page) {
 	});
 }
 
-test('Quick Picks starts the selected song inside the whole visible recommendation context', async ({ page }) => {
+test('double-clicking a library song plays it inside the whole visible list', async ({ page }) => {
 	await installPlaybackMock(page);
-	await page.goto('/');
+	await page.goto('/library');
 
-	await page.getByRole('button', { name: /Quick Two/ }).click();
+	// Recently added first: newest ids lead.
+	await page.getByText('Context Two', { exact: true }).dblclick();
+
+	await expect
+		.poll(() => playbackInvocations(page))
+		.toEqual([
+			{
+				command: 'play_tracks_from',
+				args: { recordingIds: ['track-3', 'track-2', 'track-1'], startIndex: 1 }
+			}
+		]);
+});
+
+test('search plays the chosen song inside the matching library songs', async ({ page }) => {
+	await installPlaybackMock(page);
+	await page.goto('/search');
+
+	await page.locator('[data-search-input]').fill('Context');
+	await page.locator('main').getByText('Context Two', { exact: true }).dblclick();
 
 	await expect
 		.poll(() => playbackInvocations(page))
@@ -251,51 +266,26 @@ test('Quick Picks starts the selected song inside the whole visible recommendati
 		]);
 });
 
-test('command search starts the selected song inside the whole visible result context', async ({ page }) => {
+test('artist Shuffle plays the artist songs with backend shuffle on', async ({ page }) => {
 	await installPlaybackMock(page);
-	await page.goto('/');
-	await expect(page.getByRole('heading', { name: 'mewsik' })).toBeVisible();
-	await page.evaluate(() => window.dispatchEvent(new CustomEvent('toggle-command')));
+	await page.goto('/artists/artist-1');
 
-	const dialog = page.getByRole('dialog', { name: 'Command Palette' });
-	await expect(dialog).toBeVisible();
-	await dialog.getByPlaceholder('Search songs, artists, albums...').fill('Context');
-	await dialog.getByText('Context Two', { exact: true }).click();
-
-	await expect
-		.poll(() => playbackInvocations(page))
-		.toEqual([
-			{
-				command: 'play_tracks_from',
-				args: { recordingIds: ['track-1', 'track-2', 'track-3'], startIndex: 1 }
-			}
-		]);
-});
-
-test('artist shuffle submits ordered context and enables backend shuffle', async ({ page }) => {
-	await installPlaybackMock(page);
-	await page.goto('/library?artist=artist-1');
-
-	await expect(page.getByRole('heading', { name: 'Continuity Artist' })).toBeVisible();
+	await expect(page.getByRole('heading', { name: 'Artist One' })).toBeVisible();
 	await page.locator('main').getByRole('button', { name: 'Shuffle', exact: true }).click();
 
-	await expect
-		.poll(() => playbackInvocations(page))
-		.toEqual([
-			{
-				command: 'play_tracks_from',
-				args: { recordingIds: ['track-1', 'track-2', 'track-3'], startIndex: 0 }
-			},
-			{ command: 'set_shuffle', args: { enabled: true } }
-		]);
+	await expect.poll(() => playbackInvocations(page)).toHaveLength(2);
+	const [play, shuffle] = await playbackInvocations(page);
+	expect(play.command).toBe('play_tracks_from');
+	expect([...(play.args.recordingIds as string[])].sort()).toEqual(['track-1', 'track-2', 'track-3']);
+	expect(shuffle).toEqual({ command: 'set_shuffle', args: { enabled: true } });
 });
 
-test('playlist Play submits ordered context and disables backend shuffle', async ({ page }) => {
+test('playlist Play submits ordered context and turns backend shuffle off', async ({ page }) => {
 	await installPlaybackMock(page, { initialShuffle: true });
 	await page.goto('/playlists/playlist-1');
 
-	await expect(page.locator('main input').first()).toHaveValue('Continuity Playlist');
-	await page.locator('main').getByRole('button', { name: 'Play', exact: true }).click();
+	await expect(page.getByRole('button', { name: 'Continuity Playlist' })).toBeVisible();
+	await page.locator('main').getByRole('button', { name: 'Play', exact: true }).first().click();
 
 	await expect
 		.poll(() => playbackInvocations(page))
@@ -308,17 +298,17 @@ test('playlist Play submits ordered context and disables backend shuffle', async
 		]);
 });
 
-test('Up Next renders the native snapshot and mutates by stable session and entry IDs', async ({ page }) => {
+test('the queue renders the native snapshot and mutates by stable session and entry IDs', async ({ page }) => {
 	await installPlaybackMock(page);
-	await page.goto('/');
+	await page.goto('/library');
 
-	await page.getByRole('button', { name: 'Up Next queue' }).click();
-	await expect(page.getByRole('heading', { name: 'Queue' })).toBeVisible();
-	await expect(page.getByText('Context Two', { exact: true })).toBeVisible();
-	await expect(page.getByText('Context Three', { exact: true })).toBeVisible();
+	await page.locator('[data-player-bar]').getByRole('button', { name: 'Queue' }).click();
+	const queue = page.locator('aside').filter({ has: page.getByRole('heading', { name: 'Queue' }) });
+	await expect(queue.getByText('Context Two', { exact: true })).toBeVisible();
+	await expect(queue.getByText('Context Three', { exact: true })).toBeVisible();
 
-	await page.getByRole('button', { name: 'Play Context Two' }).click();
-	await page.getByRole('button', { name: 'Remove Context Three from Up Next' }).click();
+	await queue.getByText('Context Two', { exact: true }).dblclick();
+	await queue.getByRole('button', { name: 'Remove Context Three from queue' }).click();
 
 	await expect
 		.poll(() =>

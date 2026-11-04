@@ -16,8 +16,8 @@ test.describe('app smoke', () => {
 
 		await page.goto('/');
 		await page.waitForLoadState('networkidle');
-		await expect(page.getByRole('heading', { name: 'mewsik' })).toBeVisible();
-		await expect(page.getByText('Library, search, radio, and recommendations in one player.')).toBeVisible();
+		await expect(page).toHaveURL(/\/library$/);
+		await expect(page.getByRole('heading', { name: 'Library' })).toBeVisible();
 		expect(consoleErrors).toEqual([]);
 		expect(pageErrors).toEqual([]);
 	});
@@ -34,9 +34,6 @@ test.describe('app smoke', () => {
 		await page.locator('a[href="/stations"]').first().click();
 		await expect(page.getByRole('heading', { name: 'Stations' })).toBeVisible();
 
-		await page.locator('a[href="/discover"]').first().click();
-		await expect(page.getByRole('heading', { name: 'Discover', exact: true })).toBeVisible();
-
 		await page.locator('a[href="/downloads"]').first().click();
 		await expect(page.locator('h1').filter({ hasText: 'Downloads' })).toBeVisible();
 
@@ -44,13 +41,12 @@ test.describe('app smoke', () => {
 		await expect(page.locator('h1').filter({ hasText: 'Settings' })).toBeVisible();
 	});
 
-	test('command palette opens from app event wiring', async ({ page }) => {
-		await page.goto('/');
+	test('Ctrl+K jumps to search with the box focused', async ({ page }) => {
+		await page.goto('/library');
 		await page.waitForLoadState('networkidle');
 		await page.keyboard.press('Control+k');
-		const dialog = page.getByRole('dialog', { name: 'Command Palette' });
-		await expect(dialog).toBeVisible();
-		await expect(dialog.getByPlaceholder('Search songs, artists, albums...')).toBeVisible();
+		await expect(page).toHaveURL(/\/search/);
+		await expect(page.locator('[data-search-input]')).toBeFocused();
 	});
 
 	test('space on an interactive control does not toggle playback', async ({ page }) => {

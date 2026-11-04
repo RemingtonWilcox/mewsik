@@ -1,794 +1,374 @@
 <script lang="ts">
-	import { Input } from '$lib/components/ui/input';
-	import * as Table from '$lib/components/ui/table';
-	import { Button } from '$lib/components/ui/button';
-	import { Badge } from '$lib/components/ui/badge';
-	import SourceIcon from '$lib/components/source-icon.svelte';
-	import SearchDiscoveryFeedView from '$lib/components/search/search-discovery-feed.svelte';
-	import * as api from '$lib/api/tauri';
-	import type {
-		ExternalSearchResult,
-		SearchDiscoveryFeed,
-		SearchDiscoveryItem
-	} from '$lib/api/tauri';
-	import { usePlayer, formatTime } from '$lib/state/player.svelte';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { toast } from 'svelte-sonner';
-	import { Search, Play, Pause, Heart, Download, LoaderCircle, X, CheckCircle2 } from '@lucide/svelte';
-
-	const player = usePlayer();
+	import * as api from '$lib/api/tauri';
+	import type { ExternalSearchResult } from '$lib/api/tauri';
+	import { useLibrary } from '$lib/state/library.svelte';
+	import { usePlayer } from '$lib/state/player.svelte';
 	import { useSearchState } from '$lib/state/search.svelte';
+	import TrackList from '$lib/components/tracks/track-list.svelte';
+	import Tile from '$lib/components/tracks/tile.svelte';
+	import Cover from '$lib/components/tracks/cover.svelte';
+	import SourceIcon from '$lib/components/source-icon.svelte';
+	import { fold, formatDuration, plural } from '$lib/media';
+	import { Search, X, Play, Pause, Plus, Check, Download, LoaderCircle } from '@lucide/svelte';
 
-	type SearchSourcePreference = 'all' | 'youtube' | 'soundcloud' | 'bandcamp';
-	type ProviderSource = Exclude<SearchSourcePreference, 'all'>;
+	const library = useLibrary();
+	const player = usePlayer();
+	const saved = useSearchState();
 
-	const SEARCH_SOURCES: ProviderSource[] = ['youtube', 'soundcloud', 'bandcamp'];
-	const SOURCE_LABELS: Record<SearchSourcePreference, string> = {
-		all: 'Best',
+	const SOURCES: Record<string, string> = {
 		youtube: 'YouTube',
 		soundcloud: 'SoundCloud',
 		bandcamp: 'Bandcamp'
 	};
 
-	const searchState = useSearchState();
-	let query = $state(searchState.query);
-	let externalResults = $state<ExternalSearchResult[]>(searchState.results as ExternalSearchResult[]);
-	let searchingExternal = $state(false);
-	let loadingMore = $state(false);
-	let externalSearchRequest = 0;
-	let pendingExternalActions = $state<Record<string, 'play' | 'save' | 'download'>>({});
-	let savedIds = $state<Set<string>>(new Set());
-	let externalError = $state('');
-	let sidecarReady = $state(false);
-	let sidecarStartPromise: Promise<void> | null = null;
-	let activeExternalQuery = '';
-	let handledUrlQuery = '';
-	let completedExternalQuery = $state(
-		searchState.results.length > 0 ? searchState.query.trim() : ''
+	let input = $state<HTMLInputElement | null>(null);
+	let query = $state(saved.query || page.url.searchParams.get('q') || '');
+	let online = $state<ExternalSearchResult[]>(saved.online);
+	let onlineQuery = $state(saved.onlineQuery);
+	let searching = $state(false);
+	let failed = $state<string[]>([]);
+	let onlineError = $state('');
+	let busy = $state<Record<string, 'play' | 'save' | 'download'>>({});
+	let savedKeys = $state(new Set<string>());
+	let downloadedKeys = $state(new Set<string>());
+	let request = 0;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+
+	const clean = $derived(query.trim().replace(/\s+/g, ' '));
+	const words = $derived(fold(clean).split(' ').filter(Boolean));
+	const has = (text: string) => words.every((w) => text.includes(w));
+
+	// Library matches update on every keystroke.
+	const songs = $derived(
+		words.length
+			? library.tracks
+					.filter((t) => has(fold(`${t.title} ${t.artist_name} ${t.album_title ?? ''}`)))
+					.slice(0, 50)
+			: []
 	);
-	let sourcePreference = $state<SearchSourcePreference>(searchState.sourcePreference as SearchSourcePreference || 'all');
-	let loadMoreSentinel = $state<HTMLDivElement | null>(null);
-	let nextPageBySource = $state<Record<ProviderSource, number>>({
-		youtube: 1,
-		soundcloud: 1,
-		bandcamp: 1
-	});
-	let sourceHasMore = $state<Record<ProviderSource, boolean>>({
-		youtube: true,
-		soundcloud: true,
-		bandcamp: true
-	});
-	let discoveryFeed = $state<SearchDiscoveryFeed | null>(null);
-	let loadingDiscoveryFeed = $state(true);
-	let activeQueueSelection:
-		| {
-			recordingId: string | null;
-				source: string;
-				title: string;
-				artist: string;
-				previous: {
-					recordingId: string | null;
-					source: string | null;
-					title: string | null;
-					artist: string | null;
-				};
-			  }
-		| null = null;
+	const albums = $derived(
+		words.length ? library.albums.filter((a) => has(fold(`${a.title} ${a.artist}`))).slice(0, 12) : []
+	);
+	const artists = $derived(
+		words.length ? library.artists.filter((a) => has(fold(a.name))).slice(0, 12) : []
+	);
 
-	const MIN_QUERY_LENGTH = 2;
+	$effect(() => {
+		saved.query = query;
+	});
+
 	onMount(() => {
-		let disposed = false;
-		const cleanups: Array<() => void> = [];
-
-		void api.getSearchDiscoveryFeed()
-			.then((feed) => {
-				if (!disposed) discoveryFeed = feed;
-			})
-			.catch(() => {
-				if (!disposed) discoveryFeed = null;
-			})
-			.finally(() => {
-				if (!disposed) loadingDiscoveryFeed = false;
-			});
-
-		void ensureSidecarReady().catch(() => {
-			sidecarReady = false;
+		input?.focus();
+		const offPartial = api.listenExternalSearchPartial((event) => {
+			if (event.request_id !== String(request)) return;
+			online = merge(online, event.results);
 		});
-
-		void api.listenExternalSearchPartial((payload) => {
-			if (
-				disposed ||
-				payload.request_id !== String(externalSearchRequest) ||
-				payload.query !== query.trim()
-			) return;
-			externalResults = mergeExternalResults(externalResults, payload.results);
-		}).then((unlisten) => {
-			if (disposed) {
-				unlisten();
-				return;
-			}
-			cleanups.push(unlisten);
+		const offComplete = api.listenExternalSearchComplete((event) => {
+			if (event.request_id !== String(request)) return;
+			online = event.results ?? online;
 		});
-
-		void api.listenExternalSearchComplete((payload) => {
-			if (
-				disposed ||
-				payload.request_id !== String(externalSearchRequest) ||
-				payload.query !== query.trim()
-			) return;
-			externalResults = payload.results;
-			completedExternalQuery = payload.query;
-		}).then((unlisten) => {
-			if (disposed) {
-				unlisten();
-				return;
-			}
-			cleanups.push(unlisten);
-		});
-
+		if (clean.length >= 2 && clean !== onlineQuery) void searchOnline(clean);
 		return () => {
-			disposed = true;
-			activeQueueSelection = null;
-			for (const cleanup of cleanups) {
-				cleanup();
-			}
+			clearTimeout(timer);
+			void offPartial.then((off) => off());
+			void offComplete.then((off) => off());
 		};
 	});
 
-	let currentPage = $state(1);
+	const key = (r: ExternalSearchResult) => `${r.source}:${r.source_id}`;
 
-	// Sync state to persistent store
-	$effect(() => { searchState.query = query; });
-	$effect(() => { searchState.results = externalResults; });
-	$effect(() => { searchState.sourcePreference = sourcePreference; });
-	$effect(() => {
-		const urlQuery = (page.url.searchParams.get('q') ?? '').trim().replace(/\s+/g, ' ');
-		if (urlQuery.length < MIN_QUERY_LENGTH || urlQuery === handledUrlQuery) return;
-		handledUrlQuery = urlQuery;
-		if (query.trim() === urlQuery && completedExternalQuery === urlQuery && externalResults.length > 0) {
-			return;
+	function merge(current: ExternalSearchResult[], incoming: ExternalSearchResult[]) {
+		const seen = new Map(current.map((r, i) => [key(r), i]));
+		const out = [...current];
+		for (const r of incoming) {
+			const at = seen.get(key(r));
+			if (at === undefined) {
+				seen.set(key(r), out.length);
+				out.push(r);
+			} else out[at] = r;
 		}
-		startNewSearch(urlQuery, false);
-	});
-	$effect(() => {
-		const selection = {
-			recordingId: player.state.current_recording_id,
-			source: player.state.source,
-			title: player.state.current_title,
-			artist: player.state.current_artist
-		};
-
-		if (!activeQueueSelection) return;
-
-		const isActiveSearchSelection = activeQueueSelection.recordingId !== null
-			? selection.recordingId === activeQueueSelection.recordingId
-			: selection.source === activeQueueSelection.source &&
-				selection.title === activeQueueSelection.title &&
-				selection.artist === activeQueueSelection.artist;
-		const isPreviousSelectionWhileResolving = activeQueueSelection.recordingId === null &&
-			selection.recordingId === activeQueueSelection.previous.recordingId &&
-			selection.source === activeQueueSelection.previous.source &&
-			selection.title === activeQueueSelection.previous.title &&
-			selection.artist === activeQueueSelection.previous.artist;
-
-		if (!isActiveSearchSelection && !isPreviousSelectionWhileResolving) {
-			activeQueueSelection = null;
-		}
-	});
-
-
-	function resetPaginationState() {
-		nextPageBySource = {
-			youtube: 1,
-			soundcloud: 1,
-			bandcamp: 1
-		};
-		sourceHasMore = {
-			youtube: true,
-			soundcloud: true,
-			bandcamp: true
-		};
+		return out;
 	}
 
-	function mergeExternalResults(
-		current: ExternalSearchResult[],
-		incoming: ExternalSearchResult[]
-	): ExternalSearchResult[] {
-		if (incoming.length === 0) {
-			return current;
-		}
-
-		const merged = [...current];
-		const positions = new Map(
-			merged.map((result, index) => [externalResultKey(result), index] as const)
-		);
-
-		for (const result of incoming) {
-			const key = externalResultKey(result);
-			const existingIndex = positions.get(key);
-			if (existingIndex === undefined) {
-				positions.set(key, merged.length);
-				merged.push(result);
-				continue;
-			}
-
-			merged[existingIndex] = result;
-		}
-
-		return merged;
+	function typed() {
+		clearTimeout(timer);
+		if (clean.length < 3) return;
+		timer = setTimeout(() => void searchOnline(clean), 700);
 	}
 
-	function preferredSourceOrder(): ProviderSource[] {
-		if (sourcePreference === 'all') {
-			return SEARCH_SOURCES;
-		}
-
-		return [sourcePreference, ...SEARCH_SOURCES.filter((source) => source !== sourcePreference)];
-	}
-
-	function displayedResults(): ExternalSearchResult[] {
-		if (sourcePreference === 'all') {
-			return externalResults;
-		}
-
-		const order = preferredSourceOrder();
-		const positions = new Map(order.map((source, index) => [source, index] as const));
-
-		return [...externalResults].sort((left, right) => {
-			return (positions.get(left.source as ProviderSource) ?? 99)
-				- (positions.get(right.source as ProviderSource) ?? 99);
-		});
-	}
-
-	function sourceResultCount(source: ProviderSource): number {
-		return externalResults.filter((result) => result.source === source).length;
-	}
-
-	function sourcePreferenceLabel(source: SearchSourcePreference): string {
-		const label = SOURCE_LABELS[source];
-		if (source === 'all') {
-			return label;
-		}
-		return `${label} ${sourceResultCount(source)}`;
-	}
-
-	function canLoadMore(): boolean {
-		return SEARCH_SOURCES.some((source) => sourceHasMore[source]);
-	}
-
-	async function ensureSidecarReady() {
-		if (sidecarReady) return;
-		if (!sidecarStartPromise) {
-			sidecarStartPromise = api
-				.startSidecar()
-				.then(() => { sidecarReady = true; })
-				.finally(() => { sidecarStartPromise = null; });
-		}
-		await sidecarStartPromise;
-	}
-
-	function formatExternalSearchError(error: unknown, hasResults: boolean): string {
-		const detail = error instanceof Error ? error.message : String(error ?? '').trim();
-		if (hasResults) {
-			return `Some music sources could not finish. Showing the results that did arrive${detail ? `: ${detail}` : '.'}`;
-		}
-		return `Search is unavailable${detail ? `: ${detail}` : ''}`;
-	}
-
-	function formatProviderWarning(failedSources: string[]): string {
-		const labels = [...new Set(failedSources)]
-			.map((source) => SOURCE_LABELS[source as ProviderSource] ?? source)
-			.sort();
-		const joined = labels.length > 2
-			? `${labels.slice(0, -1).join(', ')}, and ${labels.at(-1)}`
-			: labels.join(' and ');
-		const verb = labels.length === 1 ? 'is' : 'are';
-		return `Some music sources could not finish. Showing the results that did arrive: ${joined || 'another provider'} ${verb} temporarily unavailable.`;
-	}
-
-	async function searchExternal(searchQuery = query.trim()) {
-		searchQuery = searchQuery.trim().replace(/\s+/g, ' ');
-		if (!searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return;
-		if (activeExternalQuery === searchQuery) return;
-
-		const requestId = ++externalSearchRequest;
-		activeExternalQuery = searchQuery;
-		searchingExternal = true;
-		externalError = '';
-		completedExternalQuery = '';
-		resetPaginationState();
-		try {
-			await ensureSidecarReady();
-			const response = await api.searchAllSources(searchQuery, String(requestId));
-			if (requestId === externalSearchRequest) {
-				externalResults = response.items;
-				externalError = response.failed_sources.length > 0 && response.items.length > 0
-					? formatProviderWarning(response.failed_sources)
-					: '';
-				completedExternalQuery = searchQuery;
-			}
-		} catch (e) {
-			if (requestId === externalSearchRequest) {
-				// The managed provider process may have exited after it was first
-				// started. Force the next attempt to health-check it, and never erase
-				// useful partial results that arrived before another provider failed.
-				sidecarReady = false;
-				externalError = formatExternalSearchError(e, externalResults.length > 0);
-				completedExternalQuery = externalResults.length > 0 ? searchQuery : '';
-			}
-		} finally {
-			if (requestId === externalSearchRequest) {
-				activeExternalQuery = '';
-				searchingExternal = false;
-			}
-		}
-	}
-
-	const RESULTS_PER_PAGE = 40;
-	let totalPages = $derived(Math.max(1, Math.ceil(displayedResults().length / RESULTS_PER_PAGE)));
-	let pagedResults = $derived(displayedResults().slice((currentPage - 1) * RESULTS_PER_PAGE, currentPage * RESULTS_PER_PAGE));
-
-	function goToPage(page: number) {
-		const requestedPage = Number.isFinite(page) ? Math.trunc(page) : 1;
-		currentPage = Math.min(Math.max(1, requestedPage), totalPages);
-		// Scroll to top of results
-		document.querySelector('[data-slot="search-results"]')?.scrollIntoView({ behavior: 'smooth' });
-	}
-
-	async function loadMoreResults(): Promise<number | null> {
-		const searchQuery = query.trim();
-		if (loadingMore || !searchQuery || searchQuery.length < MIN_QUERY_LENGTH) return null;
-
-		const sourcesToLoad = SEARCH_SOURCES.filter((source) => sourceHasMore[source]);
-		if (sourcesToLoad.length === 0) return null;
-
-		const previousTotalPages = totalPages;
-		loadingMore = true;
-		try {
-			await ensureSidecarReady();
-			let addedCount = 0;
-
-			// Load each source independently — merge results as each arrives
-			await Promise.all(
-				sourcesToLoad.map(async (source) => {
-					try {
-						const page = nextPageBySource[source];
-						const response = await api.searchExternal(searchQuery, source, page);
-						if (query.trim() !== searchQuery) return;
-
-						const beforeKeys = new Set(externalResults.map((r) => externalResultKey(r)));
-						externalResults = mergeExternalResults(externalResults, response.items);
-						addedCount += response.items.filter((r) => !beforeKeys.has(externalResultKey(r))).length;
-						sourceHasMore = { ...sourceHasMore, [source]: response.has_more && response.items.length > 0 };
-						nextPageBySource = { ...nextPageBySource, [source]: page + 1 };
-					} catch {
-						// Individual source failure — don't block others
-						sourceHasMore = { ...sourceHasMore, [source]: false };
-					}
-				})
-			);
-
-			if (addedCount === 0) {
-				toast.info('No more results available');
-				return null;
-			}
-
-			const nextTotalPages = Math.max(1, Math.ceil(displayedResults().length / RESULTS_PER_PAGE));
-			return nextTotalPages > previousTotalPages ? previousTotalPages + 1 : null;
-		} catch (error) {
-			toast.error(`Failed to load more: ${error}`);
-			return null;
-		} finally {
-			loadingMore = false;
-		}
-	}
-
-	function handleSearchKeydown(event: KeyboardEvent) {
-		if (event.key !== 'Enter') return;
-		const trimmedQuery = query.trim();
-		if (trimmedQuery.length < MIN_QUERY_LENGTH) return;
-		startNewSearch(trimmedQuery, true);
-	}
-
-	function syncSearchUrl(searchQuery: string) {
-		handledUrlQuery = searchQuery;
-		void goto(`/search?q=${encodeURIComponent(searchQuery)}`, {
+	async function searchOnline(text: string) {
+		clearTimeout(timer);
+		if (text.length < 2 || (text === onlineQuery && (searching || online.length))) return;
+		const id = ++request;
+		online = [];
+		onlineQuery = text;
+		failed = [];
+		onlineError = '';
+		searching = true;
+		void goto(`/search?q=${encodeURIComponent(text)}`, {
 			replaceState: true,
 			noScroll: true,
 			keepFocus: true
 		});
-	}
-
-	function startNewSearch(searchQuery: string, updateUrl: boolean) {
-		const nextQuery = searchQuery.trim().replace(/\s+/g, ' ');
-		if (nextQuery.length < MIN_QUERY_LENGTH) return;
-		query = nextQuery;
-		sourcePreference = 'all';
-		externalResults = [];
-		externalError = '';
-		completedExternalQuery = '';
-		currentPage = 1;
-		resetPaginationState();
-		if (updateUrl) syncSearchUrl(nextQuery);
-		void searchExternal(nextQuery);
-	}
-
-	function clearSearch() {
-		query = '';
-		externalResults = [];
-		externalError = '';
-		searchingExternal = false;
-		completedExternalQuery = '';
-		activeExternalQuery = '';
-		currentPage = 1;
-		resetPaginationState();
-		externalSearchRequest += 1;
-		handledUrlQuery = '';
-		void goto('/search', { replaceState: true, noScroll: true, keepFocus: true });
-	}
-
-	function searchDiscoveryItem(item: SearchDiscoveryItem) {
-		const nextQuery = item.search_query.trim();
-		if (nextQuery.length < MIN_QUERY_LENGTH) return;
-
-		startNewSearch(nextQuery, true);
-	}
-
-	async function playExternalTrack(result: ExternalSearchResult) {
-		activeQueueSelection = null;
-		activeQueueSelection = {
-			recordingId: null,
-			source: result.source,
-			title: result.title,
-			artist: result.artist,
-			previous: {
-				recordingId: player.state.current_recording_id,
-				source: player.state.source,
-				title: player.state.current_title,
-				artist: player.state.current_artist
+		try {
+			await api.startSidecar();
+			const response = await api.searchAllSources(text, String(id));
+			if (id !== request) return;
+			online = response.items ?? [];
+			failed = response.failed_sources ?? [];
+		} catch (error) {
+			if (id === request && online.length === 0) onlineError = String(error);
+		} finally {
+			if (id === request) {
+				searching = false;
+				saved.online = online;
+				saved.onlineQuery = text;
 			}
-		};
+		}
+	}
 
-		await runExternalAction(result, 'play', async () => {
-			const currentResults = pagedResults;
-			const clickedIndex = currentResults.findIndex(
-				(candidate) => externalResultKey(candidate) === externalResultKey(result)
-			);
-			const context = clickedIndex >= 0 ? currentResults : [result];
-			const contextIndex = clickedIndex >= 0 ? clickedIndex : 0;
-			const recordingId = await api.playExternalContext(context, contextIndex);
-			if (activeQueueSelection) activeQueueSelection.recordingId = recordingId;
-			toast.success(`Playing: ${result.title}`);
+	function clear() {
+		query = '';
+		online = [];
+		onlineQuery = '';
+		saved.online = [];
+		saved.onlineQuery = '';
+		request++;
+		searching = false;
+		void goto('/search', { replaceState: true, noScroll: true, keepFocus: true });
+		input?.focus();
+	}
+
+	async function task(r: ExternalSearchResult, kind: 'play' | 'save' | 'download', run: () => Promise<void>) {
+		const k = key(r);
+		if (busy[k]) return;
+		busy = { ...busy, [k]: kind };
+		try {
+			await run();
+		} catch (error) {
+			toast.error(`Couldn't ${kind === 'save' ? 'add' : kind} “${r.title}”: ${error}`);
+		} finally {
+			const { [k]: _, ...rest } = busy;
+			busy = rest;
+		}
+	}
+
+	const recordingFor = (r: ExternalSearchResult) =>
+		r.recording_id
+			? Promise.resolve(r.recording_id)
+			: api.ensureExternalRecording(
+					r.source,
+					r.source_id,
+					r.title,
+					r.artist,
+					r.duration_ms ?? undefined,
+					r.cover_art_url ?? undefined
+				);
+
+	function isCurrent(r: ExternalSearchResult) {
+		const id = player.state.current_recording_id;
+		return Boolean(id && r.recording_id === id) ||
+			(player.state.current_title === r.title && player.state.current_artist === r.artist);
+	}
+
+	function playOnline(index: number) {
+		const r = online[index];
+		if (isCurrent(r)) return void player.togglePlay();
+		void task(r, 'play', async () => {
+			// The rest of the results queue up behind it.
+			await api.playExternalContext(online, index);
 		});
 	}
 
-	async function saveExternal(result: ExternalSearchResult) {
-		const key = externalResultKey(result);
-		// Optimistic: immediately show as saved
-		savedIds = new Set([...savedIds, key]);
-		try {
-			const recordingId = await api.ensureExternalRecording(
-				result.source,
-				result.source_id,
-				result.title,
-				result.artist,
-				result.duration_ms ?? undefined,
-				result.cover_art_url ?? undefined
-			);
-			await api.saveToLibrary(recordingId);
-			toast.success(`Saved "${result.title}" to library`);
-		} catch (e) {
-			// Rollback on failure
-			savedIds = new Set([...savedIds].filter(id => id !== key));
-			toast.error(`Failed to save: ${e}`);
-		}
+	function save(r: ExternalSearchResult) {
+		void task(r, 'save', async () => {
+			await api.saveToLibrary(await recordingFor(r));
+			savedKeys = new Set(savedKeys).add(key(r));
+			toast.success(`Added “${r.title}” to your library`);
+			void library.refresh();
+		});
 	}
 
-	let downloadedIds = $state<Set<string>>(new Set());
-
-	async function downloadExternal(result: ExternalSearchResult) {
-		const key = externalResultKey(result);
-		// Optimistic: immediately show as downloaded + saved
-		downloadedIds = new Set([...downloadedIds, key]);
-		savedIds = new Set([...savedIds, key]);
-		try {
-			const recordingId = await api.ensureExternalRecording(
-				result.source,
-				result.source_id,
-				result.title,
-				result.artist,
-				result.duration_ms ?? undefined,
-				result.cover_art_url ?? undefined
-			);
-			const started = await api.downloadRecording(recordingId);
-			if (started.already_active || !started.directory) {
-				toast.message(`Download already queued: ${result.title}`);
-			} else {
-				toast.success(`Download queued: ${result.title} · Saving to ${started.directory}`);
-			}
-		} catch (e) {
-			downloadedIds = new Set([...downloadedIds].filter(id => id !== key));
-			toast.error(`Failed to download: ${e}`);
-		}
-	}
-
-	function isDownloadedLocal(result: ExternalSearchResult): boolean {
-		return downloadedIds.has(externalResultKey(result));
-	}
-
-	function externalResultKey(result: ExternalSearchResult): string {
-		return `${result.source}:${result.source_id}`;
-	}
-
-	function isExternalActionPending(result: ExternalSearchResult): boolean {
-		return Boolean(pendingExternalActions[externalResultKey(result)]);
-	}
-
-	function isSaved(result: ExternalSearchResult): boolean {
-		return result.is_saved || savedIds.has(externalResultKey(result));
-	}
-
-	function isDownloaded(result: ExternalSearchResult): boolean {
-		return Boolean(result.is_downloaded);
-	}
-
-	async function runExternalAction(
-		result: ExternalSearchResult,
-		action: 'play' | 'save' | 'download',
-		task: () => Promise<void>
-	) {
-		const key = externalResultKey(result);
-		if (pendingExternalActions[key]) return;
-		pendingExternalActions = { ...pendingExternalActions, [key]: action };
-		try {
-			await task();
-		} catch (e) {
-			const label = action === 'download' ? 'queue download' : action;
-			toast.error(`Failed to ${label}: ${e}`);
-		} finally {
-			const { [key]: _removed, ...rest } = pendingExternalActions;
-			pendingExternalActions = rest;
-		}
+	function download(r: ExternalSearchResult) {
+		void task(r, 'download', async () => {
+			const started = await api.downloadRecording(await recordingFor(r));
+			downloadedKeys = new Set(downloadedKeys).add(key(r));
+			toast.success(started.already_active ? 'Already downloading' : `Downloading “${r.title}”`);
+		});
 	}
 </script>
 
-<style>
-	@keyframes heart-pulse {
-		0% { transform: scale(1); }
-		50% { transform: scale(1.3); }
-		100% { transform: scale(1); }
-	}
-	:global(.heart-saved) {
-		animation: heart-pulse 0.3s ease-out;
-	}
-	@keyframes searchbar {
-		0% { transform: translateX(0); }
-		100% { transform: translateX(150%); }
-	}
-</style>
-
-<div class="flex min-w-0 flex-col gap-4">
-	<h1 class="text-2xl font-bold">Search</h1>
-
-	<div class="relative">
-		<Search class="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-		<Input
-			placeholder="Search songs, artists..."
-			class="pl-10 pr-44"
+<div class="flex flex-col gap-8">
+	<h1 class="-mb-4 text-3xl font-bold tracking-tight">Search</h1>
+	<div class="relative max-w-2xl">
+		<Search class="pointer-events-none absolute left-4 top-1/2 size-5 -translate-y-1/2 text-muted-foreground" />
+		<input
+			bind:this={input}
 			bind:value={query}
-			onkeydown={handleSearchKeydown}
-			autofocus
+			data-search-input
+			placeholder="Songs, artists, albums — your library and online"
+			class="h-12 w-full rounded-full border border-white/10 bg-white/5 pl-12 pr-11 text-base outline-none placeholder:text-muted-foreground focus:border-white/30 focus:bg-white/[0.07]"
+			oninput={typed}
+			onkeydown={(e) => {
+				if (e.key === 'Enter') void searchOnline(clean);
+				if (e.key === 'Escape') clear();
+			}}
 		/>
-		{#if query.length > 0}
+		{#if query}
 			<button
-				class="absolute right-24 top-1/2 -translate-y-1/2 text-muted-foreground transition-colors hover:text-foreground"
-				onclick={clearSearch}
+				class="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
 				aria-label="Clear search"
+				onclick={clear}
 			>
-				<X class="size-4" />
+				<X class="size-5" />
 			</button>
-		{/if}
-		{#if searchingExternal}
-			<span class="absolute right-3 top-1/2 inline-flex -translate-y-1/2 items-center gap-1.5 text-xs text-primary">
-				<LoaderCircle class="size-3.5 animate-spin" />
-				Searching...
-			</span>
-		{:else if query.trim().length >= MIN_QUERY_LENGTH}
-			<span class="absolute right-3 top-1/2 -translate-y-1/2 rounded bg-muted/50 px-2 py-0.5 text-[11px] text-muted-foreground">Enter to search</span>
 		{/if}
 	</div>
 
-	{#if searchingExternal}
-		<div style="height: 3px; border-radius: 9999px; overflow: hidden; background: #2a2a3a;">
-			<div style="height: 100%; width: 40%; background: oklch(0.75 0.18 160); border-radius: 9999px; animation: searchbar 1s ease-in-out infinite alternate;"></div>
-		</div>
-	{/if}
-
-	{#if query.trim().length >= MIN_QUERY_LENGTH && externalResults.length > 0}
-		<div class="flex items-center gap-1.5">
-			{#each (['all', 'youtube', 'soundcloud', 'bandcamp'] as SearchSourcePreference[]) as source}
-				<button
-					class="rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors {sourcePreference === source
-						? 'bg-primary text-primary-foreground'
-						: 'bg-muted/50 text-muted-foreground hover:text-foreground'}"
-					onclick={() => { sourcePreference = source; }}
-				>
-					{#if source === 'all'}
-						All {externalResults.length}
-					{:else}
-						<span class="inline-flex items-center gap-1">
-							<SourceIcon {source} size={12} />
-							{sourceResultCount(source)}
-						</span>
-					{/if}
-				</button>
-			{/each}
-		</div>
-	{/if}
-
-	{#if externalError && externalResults.length > 0}
-		<div class="flex items-center justify-between gap-3 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2" role="status">
-			<p class="text-xs text-muted-foreground">{externalError}</p>
-			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
-				Retry missing sources
-			</Button>
-		</div>
-	{/if}
-
-	{#if externalResults.length > 0}
-		<div data-slot="search-results"></div>
-		<Table.Root class="table-fixed">
-			<Table.Header>
-				<Table.Row>
-					<Table.Head class="w-10"></Table.Head>
-					<Table.Head>Title</Table.Head>
-					<Table.Head class="w-[20%]">Artist</Table.Head>
-					<Table.Head class="w-16 text-right">Duration</Table.Head>
-					<Table.Head class="w-28">Actions</Table.Head>
-				</Table.Row>
-			</Table.Header>
-			<Table.Body>
-				{#each pagedResults as result}
-					{@const isPlaying = player.state.current_title === result.title && player.state.current_artist === result.artist && player.state.is_playing}
-					{@const isCurrent = player.state.current_title === result.title && player.state.current_artist === result.artist}
-					<Table.Row class="cursor-pointer hover:bg-muted/50" ondblclick={() => playExternalTrack(result)}>
-						<Table.Cell>
-							{#if isCurrent}
-								<button
-									class="flex size-7 items-center justify-center rounded-full bg-primary text-primary-foreground"
-									onclick={() => player.togglePlay()}
-								>
-									{#if isPlaying}
-										<Pause class="size-3.5" />
-									{:else}
-										<Play class="size-3.5 pl-0.5" />
-									{/if}
-								</button>
-							{:else}
-								<SourceIcon source={result.source} size={18} />
-							{/if}
-						</Table.Cell>
-						<Table.Cell class="overflow-hidden">
-							<div class="flex min-w-0 items-center gap-2">
-								{#if result.cover_art_url}
-									<img src={result.cover_art_url} alt="" class="size-8 shrink-0 rounded object-cover" loading="lazy" decoding="async" width="32" height="32" />
-								{/if}
-								<span class="block flex-1 truncate font-medium {isCurrent ? 'text-primary' : ''}">{result.title}</span>
-							</div>
-						</Table.Cell>
-						<Table.Cell class="text-muted-foreground">
-							<div class="truncate">{result.artist}</div>
-						</Table.Cell>
-						<Table.Cell class="text-right text-muted-foreground">
-							{result.duration_ms ? formatTime(result.duration_ms) : '--:--'}
-						</Table.Cell>
-						<Table.Cell>
-							<div class="flex gap-1">
-								<Button
-									variant="ghost"
-									size="icon"
-									class="size-7"
-									disabled={isExternalActionPending(result)}
-									onclick={() => playExternalTrack(result)}
-								>
-									<Play class="size-3" />
-								</Button>
-								<Button
-									variant="ghost"
-									size="icon"
-									class="size-7 {isSaved(result) ? 'heart-saved' : ''}"
-									disabled={isExternalActionPending(result)}
-									onclick={() => saveExternal(result)}
-								>
-									<Heart class="size-3 {isSaved(result) ? 'fill-primary text-primary' : ''}" />
-								</Button>
-								<Button
-									variant="ghost"
-									size="icon"
-									class="size-7"
-									disabled={isExternalActionPending(result) || isDownloaded(result) || isDownloadedLocal(result)}
-									onclick={() => downloadExternal(result)}
-									title={isDownloaded(result) || isDownloadedLocal(result) ? 'Downloaded' : 'Download'}
-								>
-									{#if isDownloaded(result) || isDownloadedLocal(result)}
-										<CheckCircle2 class="size-3 text-primary" />
-									{:else}
-										<Download class="size-3" />
-									{/if}
-								</Button>
-							</div>
-						</Table.Cell>
-					</Table.Row>
-				{/each}
-			</Table.Body>
-		</Table.Root>
-		<!-- Pagination -->
-		<div class="flex items-center justify-center gap-3 py-3">
-			<button
-				class="rounded-md px-3 py-1 text-sm transition-colors {currentPage > 1 ? 'text-foreground hover:bg-muted' : 'text-muted-foreground/40 cursor-default'}"
-				disabled={currentPage <= 1}
-				onclick={() => goToPage(currentPage - 1)}
-			>
-				Previous
-			</button>
-			<span class="text-xs text-muted-foreground">Page {currentPage} of {totalPages}</span>
-			{#if currentPage < totalPages}
-				<button
-					class="rounded-md px-3 py-1 text-sm text-foreground transition-colors hover:bg-muted"
-					onclick={() => goToPage(currentPage + 1)}
-				>
-					Next
-				</button>
-			{:else if canLoadMore()}
-				<button
-					class="rounded-md px-3 py-1 text-sm text-primary transition-colors hover:bg-primary/10"
-					disabled={loadingMore}
-					onclick={async () => {
-						const firstNewPage = await loadMoreResults();
-						if (firstNewPage !== null) goToPage(firstNewPage);
-					}}
-				>
-					{#if loadingMore}
-						<span class="inline-flex items-center gap-1"><LoaderCircle class="size-3 animate-spin" /> Loading...</span>
-					{:else}
-						Load more results
-					{/if}
-				</button>
-			{:else}
-				<span class="text-xs text-muted-foreground">End of results</span>
-			{/if}
-		</div>
-	{:else if searchingExternal}
-		<div class="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
-			<LoaderCircle class="size-5 animate-spin text-primary" />
-			<p>Searching YouTube, SoundCloud, and Bandcamp for “{query}”…</p>
-		</div>
-	{:else if externalError}
-		<div class="flex flex-col items-center gap-3 py-8 text-center">
-			<p class="max-w-xl text-sm text-destructive">{externalError}</p>
-			<Button variant="outline" size="sm" onclick={() => void searchExternal(query.trim())}>
-				Retry search
-			</Button>
-		</div>
-	{:else if query.trim().length > 0 && query.trim().length < MIN_QUERY_LENGTH}
-		<p class="py-8 text-center text-muted-foreground">
-			Type at least {MIN_QUERY_LENGTH} characters to search.
-		</p>
-	{:else if query.trim().length >= MIN_QUERY_LENGTH && completedExternalQuery === query.trim()}
-		<p class="py-8 text-center text-muted-foreground">
-			No results for "{query}".
-		</p>
-	{:else if query.trim().length >= MIN_QUERY_LENGTH}
-		<p class="py-8 text-center text-sm text-muted-foreground">
-			Press Enter to search every music source.
+	{#if !clean}
+		<p class="text-sm text-muted-foreground">
+			Type to search your library. Online results from YouTube, SoundCloud and Bandcamp show up
+			below; press Enter to search right away.
 		</p>
 	{:else}
-		<SearchDiscoveryFeedView
-			feed={discoveryFeed}
-			loading={loadingDiscoveryFeed}
-			onselect={searchDiscoveryItem}
-		/>
+		{#if artists.length || albums.length}
+			<section>
+				<h2 class="mb-3 text-lg font-bold">In your library</h2>
+				<div class="tile-grid">
+					{#each artists.slice(0, 6) as artist (artist.id)}
+						<Tile href="/artists/{artist.id}" title={artist.name} subtitle="Artist" cover={artist.cover} round />
+					{/each}
+					{#each albums.slice(0, 12 - Math.min(6, artists.length)) as album (album.id)}
+						<Tile
+							href="/albums/{album.id}"
+							title={album.title}
+							subtitle={`Album · ${album.artist}`}
+							cover={album.cover}
+							onplay={() => void player.playAlbum(album.id)}
+						/>
+					{/each}
+				</div>
+			</section>
+		{/if}
+
+		{#if songs.length}
+			<section>
+				<h2 class="mb-2 text-lg font-bold">
+					Songs <span class="text-sm font-normal text-muted-foreground">{songs.length === 50 ? '50+' : songs.length}</span>
+				</h2>
+				<TrackList tracks={songs} />
+			</section>
+		{/if}
+
+		<section>
+			<div class="mb-2 flex items-center gap-3">
+				<h2 class="text-lg font-bold">Online</h2>
+				{#if searching}
+					<LoaderCircle class="size-4 animate-spin text-muted-foreground" />
+				{:else if onlineQuery !== clean && clean.length >= 2}
+					<button
+						class="rounded-full border border-white/10 px-3 py-1 text-xs hover:bg-white/5"
+						onclick={() => void searchOnline(clean)}>Search online for “{clean}”</button
+					>
+				{/if}
+				{#if failed.length && !searching}
+					<span class="text-xs text-muted-foreground">
+						{failed.map((s) => SOURCES[s] ?? s).join(', ')} didn't answer
+					</span>
+				{/if}
+			</div>
+
+			{#if onlineError}
+				<p class="py-4 text-sm text-destructive">Online search isn't working right now: {onlineError}</p>
+			{:else if online.length === 0}
+				{#if searching}
+					<div class="space-y-1">
+						{#each Array(6) as _, i (i)}
+							<div class="h-[52px] animate-pulse rounded-md bg-white/[0.04]"></div>
+						{/each}
+					</div>
+				{:else if onlineQuery === clean}
+					<p class="py-4 text-sm text-muted-foreground">Nothing found online.</p>
+				{/if}
+			{:else}
+				<div class="flex flex-col">
+					{#each online as r, index (key(r))}
+						{@const current = isCurrent(r)}
+						{@const pending = busy[key(r)]}
+						{@const inLibrary = r.is_saved || savedKeys.has(key(r))}
+						{@const downloaded = r.is_downloaded || downloadedKeys.has(key(r))}
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div
+							class="track-row group grid h-[52px] grid-cols-[2.75rem_minmax(0,1fr)_7rem_4rem_6rem] items-center gap-3 rounded-md px-3"
+							class:is-current={current}
+							ondblclick={() => playOnline(index)}
+						>
+							<button
+								class="flex size-8 items-center justify-center justify-self-center text-muted-foreground hover:text-foreground"
+								aria-label={current && player.state.is_playing ? 'Pause' : 'Play'}
+								onclick={() => playOnline(index)}
+							>
+								{#if pending === 'play'}
+									<LoaderCircle class="size-4 animate-spin" />
+								{:else if current && player.state.is_playing}
+									<Pause class="size-4 fill-current text-primary" />
+								{:else}
+									<Play class="size-4 fill-current" />
+								{/if}
+							</button>
+							<div class="flex min-w-0 items-center gap-3">
+								<Cover src={r.cover_art_url} name={r.title} class="size-9 rounded" />
+								<div class="min-w-0">
+									<p class="track-title truncate text-sm font-medium" title={r.title}>{r.title}</p>
+									<p class="truncate text-xs text-muted-foreground">{r.artist}</p>
+								</div>
+							</div>
+							<span class="flex items-center gap-1.5 text-xs text-muted-foreground">
+								<SourceIcon source={r.source} size={14} />
+								{SOURCES[r.source] ?? r.source}
+							</span>
+							<span class="text-right text-sm tabular-nums text-muted-foreground">{formatDuration(r.duration_ms)}</span>
+							<div class="flex items-center justify-end gap-1">
+								<button
+									class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
+									title={inLibrary ? 'In your library' : 'Add to library'}
+									aria-label={inLibrary ? 'In your library' : 'Add to library'}
+									disabled={inLibrary || Boolean(pending)}
+									onclick={() => save(r)}
+								>
+									{#if pending === 'save'}
+										<LoaderCircle class="size-4 animate-spin" />
+									{:else if inLibrary}
+										<Check class="size-4 text-primary" />
+									{:else}
+										<Plus class="size-4" />
+									{/if}
+								</button>
+								<button
+									class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
+									title={downloaded ? 'Downloaded' : 'Download'}
+									aria-label={downloaded ? 'Downloaded' : 'Download'}
+									disabled={downloaded || Boolean(pending)}
+									onclick={() => download(r)}
+								>
+									{#if pending === 'download'}
+										<LoaderCircle class="size-4 animate-spin" />
+									{:else if downloaded}
+										<Check class="size-4 text-primary" />
+									{:else}
+										<Download class="size-4" />
+									{/if}
+								</button>
+							</div>
+						</div>
+					{/each}
+				</div>
+				<p class="mt-2 px-3 text-xs text-muted-foreground">{plural(online.length, 'result')}</p>
+			{/if}
+		</section>
 	{/if}
 </div>
