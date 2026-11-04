@@ -3,6 +3,7 @@ import * as api from '$lib/api/tauri';
 import { cleanStationName } from '$lib/radio/names';
 import { setActiveScore, setScorePlayback } from '$lib/visualizer/director/score';
 import { useVisualizer } from '$lib/state/visualizer.svelte';
+import { useLibrary } from '$lib/state/library.svelte';
 import { visualizerPerformanceIdentity } from '$lib/visualizer/identity';
 
 const defaultState: PlaybackState = {
@@ -63,6 +64,56 @@ function withPendingStation(next: PlaybackState, pending: PendingStation): Playb
 		connection_error: null
 	};
 }
+/** A library song the listener just picked, shown as playing at once while
+ * the engine opens it; dropped when the engine reports it, or after 2 s. */
+interface PendingPlay {
+	id: string;
+	expiresAt: number;
+}
+let pendingPlay: PendingPlay | null = null;
+
+function withPendingPlay(next: PlaybackState, pending: PendingPlay): PlaybackState {
+	const track = useLibrary().trackById(pending.id);
+	return {
+		...next,
+		is_playing: true,
+		is_buffering: false,
+		can_seek: false,
+		source: 'local',
+		current_recording_id: pending.id,
+		current_station_id: null,
+		current_title: track?.title ?? next.current_title,
+		current_artist: track?.artist_name ?? next.current_artist,
+		current_album_art: track?.cover_art_path || track?.cover_art_url || null,
+		current_source_url: null,
+		position_ms: 0,
+		duration_ms: track?.duration_ms ?? 0,
+		connection_stage: 'playing',
+		connection_error: null
+	};
+}
+
+function showPending(id: string | undefined) {
+	if (!id) return;
+	pendingPlay = { id, expiresAt: Date.now() + 2000 };
+	state = withPendingPlay(state, pendingPlay);
+}
+
+/** Runs a play command with the chosen song shown immediately. */
+async function playing(id: string | undefined, start: () => Promise<unknown>) {
+	clearPending();
+	clearVisualizerAudio();
+	showPending(id);
+	try {
+		await start();
+	} catch (error) {
+		pendingPlay = null;
+		void refreshState();
+		throw error;
+	}
+	scheduleRefresh();
+}
+
 let refreshCycle = 0;
 let pendingSeek:
 	| {
@@ -73,8 +124,10 @@ let pendingSeek:
 	  }
 	| null = null;
 
-function clearPendingSeek() {
+/** Any new command supersedes a seek or song still settling. */
+function clearPending() {
 	pendingSeek = null;
+	pendingPlay = null;
 }
 
 // ---- Visual score lifecycle ----
@@ -131,6 +184,15 @@ function syncVisualScore(next: PlaybackState) {
 function mergePlaybackState(nextState: PlaybackState) {
 	if (pendingStation) {
 		nextState = withPendingStation(nextState, pendingStation);
+	} else if (pendingPlay) {
+		if (
+			nextState.current_recording_id === pendingPlay.id ||
+			Date.now() >= pendingPlay.expiresAt
+		) {
+			pendingPlay = null;
+		} else {
+			nextState = withPendingPlay(nextState, pendingPlay);
+		}
 	}
 	// Clear immediately when playback is no longer producing trustworthy audio.
 	// The store's 250 ms freshness timeout remains a backstop for missed polls or
@@ -210,26 +272,17 @@ export function usePlayer() {
 		},
 
 		async play(recordingId: string) {
-			clearPendingSeek();
-			clearVisualizerAudio();
-			await api.playRecording(recordingId);
-			scheduleRefresh();
+			await playing(recordingId, () => api.playRecording(recordingId));
 		},
 
 		async playAll(ids: string[], startIndex: number) {
-			clearPendingSeek();
-			clearVisualizerAudio();
-			await api.playTracksFrom(ids, startIndex);
-			scheduleRefresh();
+			await playing(ids[startIndex], () => api.playTracksFrom(ids, startIndex));
 		},
 
 		/** Play button on a collection: in order, shuffle off. */
 		async playOrdered(ids: string[]) {
 			if (ids.length === 0) return;
-			clearPendingSeek();
-			clearVisualizerAudio();
-			await api.playTracksFrom(ids, 0);
-			scheduleRefresh();
+			await playing(ids[0], () => api.playTracksFrom(ids, 0));
 			if (state.is_shuffle) {
 				await api.setShuffle(false);
 				scheduleRefresh([0, 50]);
@@ -245,10 +298,8 @@ export function usePlayer() {
 		/** Shuffle button on a collection: random first song, shuffle on. */
 		async playShuffled(ids: string[]) {
 			if (ids.length === 0) return;
-			clearPendingSeek();
-			clearVisualizerAudio();
-			await api.playTracksFrom(ids, Math.floor(Math.random() * ids.length));
-			scheduleRefresh();
+			const start = Math.floor(Math.random() * ids.length);
+			await playing(ids[start], () => api.playTracksFrom(ids, start));
 			if (!state.is_shuffle) {
 				await api.setShuffle(true);
 				scheduleRefresh([0, 50]);
@@ -256,27 +307,27 @@ export function usePlayer() {
 		},
 
 		async pause() {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.pause();
 			scheduleRefresh([0, 50]);
 		},
 
 		async stop() {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.stopPlayback();
 			scheduleRefresh([0, 50]);
 		},
 
 		async resume() {
-			clearPendingSeek();
+			clearPending();
 			await api.resume();
 			scheduleRefresh([0, 50]);
 		},
 
 		async togglePlay() {
-			clearPendingSeek();
+			clearPending();
 			if (state.source === 'radio' && connectionStage(state) === 'failed') {
 				await retryStation();
 				return;
@@ -309,7 +360,7 @@ export function usePlayer() {
 			station: { id?: string | null; name: string; url?: string | null },
 			start: () => Promise<T>
 		): Promise<T> {
-			clearPendingSeek();
+			clearPending();
 			const token = ++pendingStationToken;
 			pendingStation = {
 				token,
@@ -337,7 +388,7 @@ export function usePlayer() {
 			try {
 				await api.seek(ms);
 			} catch (error) {
-				clearPendingSeek();
+				clearPending();
 				void refreshState();
 				throw error;
 			}
@@ -350,14 +401,14 @@ export function usePlayer() {
 		},
 
 		async next() {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.nextTrack();
 			scheduleRefresh();
 		},
 
 		async prev() {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.prevTrack();
 			scheduleRefresh();
@@ -391,14 +442,14 @@ export function usePlayer() {
 		},
 
 		async playQueueIndex(index: number) {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.playQueueIndex(index);
 			scheduleRefresh();
 		},
 
 		async playQueueEntry(sessionId: string, entryId: string) {
-			clearPendingSeek();
+			clearPending();
 			clearVisualizerAudio();
 			await api.playQueueEntry(sessionId, entryId);
 			scheduleRefresh();
@@ -426,7 +477,7 @@ export function usePlayer() {
 }
 
 async function retryStation() {
-	clearPendingSeek();
+	clearPending();
 	const { current_station_id: stationId, current_source_url: url, current_title: name } = state;
 	try {
 		if (stationId && url) {

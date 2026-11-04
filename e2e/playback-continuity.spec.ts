@@ -193,7 +193,15 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 						return null;
 					case 'play_tracks_from':
 					case 'play_station':
+					case 'seek':
 						return null;
+					case 'get_playback_waveform':
+						return {
+							recording_id: args.recordingId,
+							peaks: Array.from({ length: 600 }, (_, i) => 0.4 + 0.4 * Math.abs(Math.sin(i / 9))),
+							rms: Array.from({ length: 600 }, (_, i) => 0.3 + 0.3 * Math.abs(Math.sin(i / 9))),
+							source: 'local'
+						};
 					case 'get_queue':
 						return queueSnapshot;
 					case 'play_queue_entry':
@@ -247,6 +255,53 @@ test('double-clicking a library song plays it inside the whole visible list', as
 				args: { recordingIds: ['track-3', 'track-2', 'track-1'], startIndex: 1 }
 			}
 		]);
+});
+
+test('a picked song shows as playing before the engine reports it', async ({ page }) => {
+	await installPlaybackMock(page);
+	await page.goto('/library');
+
+	await page.getByText('Context Two', { exact: true }).dblclick();
+
+	// The mock engine never reports a current song; the bar answers at once.
+	const bar = page.locator('[data-player-bar]');
+	await expect(bar.getByText('Context Two', { exact: true })).toBeVisible();
+	await expect(bar.getByRole('button', { name: 'Pause' })).toBeVisible();
+});
+
+test('clicking the waveform seeks to that point of a downloaded song', async ({ page }) => {
+	await installPlaybackMock(page, {
+		playback: {
+			is_playing: true,
+			can_seek: true,
+			current_recording_id: 'track-1',
+			current_title: 'Context One',
+			current_artist: 'Artist One',
+			position_ms: 10_000,
+			duration_ms: 180_000,
+			source: 'local'
+		}
+	});
+	await page.goto('/library');
+
+	const seek = page.locator('[data-player-bar]').getByRole('slider', { name: 'Seek' });
+	await expect(seek).toHaveAttribute('data-waveform', 'ready');
+	const box = (await seek.boundingBox())!;
+	await page.mouse.click(box.x + box.width * 0.5, box.y + box.height / 2);
+
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				(
+					(window as Window & {
+						__PLAYBACK_INVOCATIONS__?: Array<{ command: string; args: Record<string, unknown> }>;
+					}).__PLAYBACK_INVOCATIONS__ ?? []
+				)
+					.filter(({ command }) => command === 'seek')
+					.map(({ args }) => Math.round(Number(args.positionMs) / 1000))
+			)
+		)
+		.toEqual([90]);
 });
 
 test('search plays the chosen song inside the matching library songs', async ({ page }) => {

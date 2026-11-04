@@ -8,18 +8,11 @@ use crate::sources::SidecarManager;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::audio::decoder::AudioDecoder;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use std::sync::{Arc, OnceLock};
 use tauri::State;
 
 #[derive(Debug, Default, Deserialize)]
@@ -37,6 +30,7 @@ struct StoredStreamMetadata {
 pub struct PlaybackWaveform {
     pub recording_id: String,
     pub peaks: Vec<f32>,
+    pub rms: Vec<f32>,
     pub source: String,
 }
 
@@ -82,87 +76,80 @@ fn resample_peaks(window_peaks: &[f32], bins: usize) -> Vec<f32> {
     resampled
 }
 
-fn generate_waveform_peaks(path: &Path, bins: usize) -> Result<Vec<f32>, String> {
-    const WINDOW_FRAMES: usize = 2048;
+/// Loudness per short window across the whole file: (peak, rms), 0..1.
+/// Decodes through the playback decoder so it reads exactly what plays,
+/// including MP4s with embedded cover art.
+fn waveform_windows(path: &Path) -> Result<Vec<(f32, f32)>, String> {
+    const WINDOW_FRAMES: usize = 1024;
 
-    let file = File::open(path).map_err(|e| format!("Failed to open audio file: {}", e))?;
-    let media_source = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|value| value.to_str()) {
-        hint.with_extension(ext);
-    }
+    let decoder = AudioDecoder::open_path(path)?;
+    let channels = rodio::Source::channels(&decoder).max(1) as usize;
+    let mut windows = Vec::new();
+    let (mut peak, mut sum_sq, mut count) = (0.0_f32, 0.0_f32, 0usize);
+    let (mut frame_amp, mut in_frame) = (0.0_f32, 0usize);
 
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            media_source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| format!("Failed to probe audio file: {}", e))?;
-
-    let mut format = probed.format;
-    let track = format
-        .default_track()
-        .ok_or_else(|| "No audio track found in file".to_string())?;
-    let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("Failed to create decoder: {}", e))?;
-
-    let mut window_peaks = Vec::new();
-    let mut current_window_peak = 0.0_f32;
-    let mut frames_in_window = 0usize;
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
-            Err(SymphoniaError::ResetRequired) => {
-                return Err("Waveform decoding reset is not supported".to_string());
-            }
-            Err(err) => return Err(format!("Failed to read audio packet: {}", err)),
-        };
-
-        if packet.track_id() != track_id {
+    for sample in decoder {
+        frame_amp = frame_amp.max((sample as f32 / 32768.0).abs());
+        in_frame += 1;
+        if in_frame < channels {
             continue;
         }
-
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
-            Err(SymphoniaError::ResetRequired) => {
-                return Err("Waveform decoding reset is not supported".to_string());
-            }
-            Err(err) => return Err(format!("Failed to decode audio packet: {}", err)),
-        };
-
-        let spec = *decoded.spec();
-        let channel_count = spec.channels.count().max(1);
-        let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        for frame in sample_buf.samples().chunks(channel_count) {
-            let amplitude = frame
-                .iter()
-                .fold(0.0_f32, |max_amp, sample| max_amp.max(sample.abs()));
-            current_window_peak = current_window_peak.max(amplitude);
-            frames_in_window += 1;
-
-            if frames_in_window >= WINDOW_FRAMES {
-                window_peaks.push(current_window_peak);
-                current_window_peak = 0.0;
-                frames_in_window = 0;
-            }
+        peak = peak.max(frame_amp);
+        sum_sq += frame_amp * frame_amp;
+        count += 1;
+        frame_amp = 0.0;
+        in_frame = 0;
+        if count >= WINDOW_FRAMES {
+            windows.push((peak, (sum_sq / count as f32).sqrt()));
+            (peak, sum_sq, count) = (0.0, 0.0, 0);
         }
     }
-
-    if frames_in_window > 0 {
-        window_peaks.push(current_window_peak);
+    if count > 0 {
+        windows.push((peak, (sum_sq / count as f32).sqrt()));
     }
+    Ok(windows)
+}
 
-    Ok(resample_peaks(&window_peaks, bins.clamp(24, 256)))
+/// Bins of (peak, rms), both scaled so the loudest bin's peak is 1.
+fn bin_waveform(windows: &[(f32, f32)], bins: usize) -> (Vec<f32>, Vec<f32>) {
+    let peaks = resample_peaks(&windows.iter().map(|w| w.0).collect::<Vec<_>>(), bins);
+    if windows.is_empty() || bins == 0 {
+        return (peaks, vec![0.0; bins]);
+    }
+    let max_peak = windows.iter().map(|w| w.0).fold(0.0_f32, f32::max).max(1e-6);
+    let rms = (0..bins)
+        .map(|i| {
+            let start = i * windows.len() / bins;
+            let end = ((i + 1) * windows.len() / bins).max(start + 1).min(windows.len());
+            let slice = &windows[start..end];
+            let mean = slice.iter().map(|w| w.1 * w.1).sum::<f32>() / slice.len() as f32;
+            (mean.sqrt() / max_peak).sqrt().clamp(0.0, 1.0)
+        })
+        .collect();
+    (peaks, rms)
+}
+
+type WaveformCache = Mutex<HashMap<(String, usize), Arc<(Vec<f32>, Vec<f32>)>>>;
+
+/// Recently drawn waveforms, so replaying or seeking back never re-decodes.
+fn waveform_cache() -> &'static WaveformCache {
+    static CACHE: OnceLock<WaveformCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn generate_waveform(path: &Path, bins: usize) -> Result<Arc<(Vec<f32>, Vec<f32>)>, String> {
+    let bins = bins.clamp(24, 1024);
+    let key = (path.to_string_lossy().to_string(), bins);
+    if let Some(hit) = waveform_cache().lock().get(&key) {
+        return Ok(Arc::clone(hit));
+    }
+    let shape = Arc::new(bin_waveform(&waveform_windows(path)?, bins));
+    let mut cache = waveform_cache().lock();
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&shape));
+    Ok(shape)
 }
 
 fn resolve_waveform_source_path(
@@ -592,11 +579,17 @@ pub async fn get_playback_waveform(
     bins: Option<usize>,
 ) -> Result<PlaybackWaveform, String> {
     let (file_path, source) = resolve_waveform_source_path(&db, &recording_id)?;
-    let peaks = generate_waveform_peaks(Path::new(&file_path), bins.unwrap_or(144))?;
+    let bins = bins.unwrap_or(600);
+    let shape = tauri::async_runtime::spawn_blocking(move || {
+        generate_waveform(Path::new(&file_path), bins)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     Ok(PlaybackWaveform {
         recording_id,
-        peaks,
+        peaks: shape.0.clone(),
+        rms: shape.1.clone(),
         source,
     })
 }
@@ -621,31 +614,27 @@ mod tests {
         assert_eq!(output, vec![0.0; 5]);
     }
 
+    /// Times opening and drawing real files, as play and the seek bar do.
+    /// `MEWSIK_PROBE_FILES="a.m4a;b.mp3" cargo test waveform_timing_probe -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn symphonia_m4a_probe() {
+    fn waveform_timing_probe() {
         use super::*;
         let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
         for p in files.split(';') {
-            let file = File::open(p).unwrap();
-            let mss = MediaSourceStream::new(Box::new(file), Default::default());
-            let mut hint = Hint::new();
-            hint.with_extension("m4a");
-            match symphonia::default::get_probe().format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()) {
-                Err(e) => println!("{p}: probe error {e:?}"),
-                Ok(mut probed) => {
-                    for t in probed.format.tracks() {
-                        println!("{p}: track {} codec {:?} rate {:?}", t.id, t.codec_params.codec, t.codec_params.sample_rate);
-                    }
-                    let mut n = 0;
-                    loop {
-                        match probed.format.next_packet() {
-                            Ok(pk) => { n += 1; if n < 3 { println!("  packet track {} ts {}", pk.track_id(), pk.ts()); } if n > 200 { break; } }
-                            Err(e) => { println!("  next_packet error after {n}: {e:?}"); break; }
-                        }
-                    }
-                }
-            }
+            let started = std::time::Instant::now();
+            let mut decoder = AudioDecoder::open_path(Path::new(p)).expect("open");
+            let opened = started.elapsed();
+            rodio::Source::try_seek(&mut decoder, std::time::Duration::from_secs(60)).expect("seek");
+            let seeked = started.elapsed() - opened;
+            let started = std::time::Instant::now();
+            let (peaks, rms) = &*generate_waveform(Path::new(p), 600).expect("waveform");
+            println!(
+                "open {opened:?} seek {seeked:?} waveform {:?} bins {} max rms {:.2}  {p}",
+                started.elapsed(),
+                peaks.len(),
+                rms.iter().copied().fold(0.0, f32::max)
+            );
         }
     }
 

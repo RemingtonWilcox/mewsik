@@ -139,7 +139,7 @@
 	</div>
 
 	<!-- Controls -->
-	<div class="flex min-w-0 flex-col items-center gap-1.5">
+	<div class="flex min-w-0 flex-col items-center gap-0.5">
 		<div class="flex items-center gap-2">
 			<button
 				class="ctl"
@@ -204,8 +204,9 @@
 				{/if}
 			</div>
 		{:else}
-			<div class="w-full max-w-xl">
+			<div class="w-full max-w-2xl">
 				<SeekBar
+					recordingId={s.current_recording_id}
 					positionMs={s.position_ms}
 					durationMs={s.duration_ms || track?.duration_ms || 0}
 					playing={s.is_playing && !s.is_buffering}
