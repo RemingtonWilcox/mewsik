@@ -11,7 +11,7 @@ pub struct SmartRule {
 }
 
 #[tauri::command]
-pub fn create_smart_playlist(
+pub async fn create_smart_playlist(
     db: State<'_, DbPool>,
     name: String,
     rules: Vec<SmartRule>,
@@ -33,7 +33,7 @@ pub fn create_smart_playlist(
 }
 
 #[tauri::command]
-pub fn evaluate_smart_playlist(
+pub async fn evaluate_smart_playlist(
     db: State<'_, DbPool>,
     playlist_id: String,
 ) -> Result<Vec<LibraryTrack>, String> {

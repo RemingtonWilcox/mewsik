@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.6", features = [] }
 
 [dependencies]
-tauri = { version = "2.10.3", features = [] }
+tauri = { version = "2.10.3", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 serde = { version = "1.0", features = ["derive"] }
@@ -53,7 +53,7 @@ security-framework = "3"
 # Desktop-only deps. tray-icon pulls in desktop-only crates, and the drag,
 # process and updater plugins have no mobile implementation.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
-tauri = { version = "2.10.3", features = ["tray-icon"] }
+tauri = { version = "2.10.3", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-drag = "2.1.0"
 tauri-plugin-process = "=2.3.1"
 tauri-plugin-updater = "=2.10.1"

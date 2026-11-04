@@ -2,50 +2,89 @@ use crate::db::models::*;
 use crate::db::queries;
 use crate::db::DbPool;
 use crate::metadata::scanner;
+use crate::commands::settings::ConfigState;
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tauri::{AppHandle, Emitter, State};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScanResult {
     pub total_files: u32,
     pub new_tracks: u32,
     pub updated_tracks: u32,
+    pub removed_tracks: u32,
     pub errors: Vec<String>,
 }
 
-#[tauri::command]
-pub fn scan_library(db: State<'_, DbPool>, path: String) -> Result<ScanResult, String> {
-    let result = scanner::scan_directory(&db, &path);
-    Ok(ScanResult {
-        total_files: result.total_files,
-        new_tracks: result.new_tracks,
-        updated_tracks: result.updated_tracks,
-        errors: result.errors,
-    })
+static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Scans every library folder. Only one scan runs at a time; a second call
+/// while one is running returns `None`. Emits `library:changed` when done.
+pub fn scan_all_blocking(db: &DbPool, paths: &[String], app: Option<&AppHandle>) -> Option<ScanResult> {
+    if SCAN_RUNNING.swap(true, Ordering::SeqCst) {
+        return None;
+    }
+    let mut total = ScanResult::default();
+    for path in paths {
+        let result = scanner::scan_directory(db, path);
+        total.total_files += result.total_files;
+        total.new_tracks += result.new_tracks;
+        total.updated_tracks += result.updated_tracks;
+        total.removed_tracks += result.removed_tracks;
+        total.errors.extend(result.errors);
+    }
+    SCAN_RUNNING.store(false, Ordering::SeqCst);
+    if let Some(app) = app {
+        let _ = app.emit("library:changed", &total);
+    }
+    log::info!(
+        "library scan: {} files, {} new, {} moved, {} removed, {} errors",
+        total.total_files, total.new_tracks, total.updated_tracks, total.removed_tracks, total.errors.len()
+    );
+    Some(total)
 }
 
 #[tauri::command]
-pub fn get_library_tracks(db: State<'_, DbPool>) -> Result<Vec<LibraryTrack>, String> {
+pub async fn scan_library(
+    app: AppHandle,
+    db: State<'_, DbPool>,
+    config: State<'_, ConfigState>,
+) -> Result<ScanResult, String> {
+    let db = db.inner().clone();
+    let paths = config.lock().library_paths.clone();
+    tauri::async_runtime::spawn_blocking(move || scan_all_blocking(&db, &paths, Some(&app)))
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "A scan is already running".to_string())
+}
+
+#[tauri::command]
+pub async fn is_library_scanning() -> Result<bool, String> {
+    Ok(SCAN_RUNNING.load(Ordering::SeqCst))
+}
+
+#[tauri::command]
+pub async fn get_library_tracks(db: State<'_, DbPool>) -> Result<Vec<LibraryTrack>, String> {
     queries::get_library_tracks(&db).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_all_artists(db: State<'_, DbPool>) -> Result<Vec<Artist>, String> {
+pub async fn get_all_artists(db: State<'_, DbPool>) -> Result<Vec<Artist>, String> {
     queries::get_all_artists(&db).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_all_albums(db: State<'_, DbPool>) -> Result<Vec<Album>, String> {
+pub async fn get_all_albums(db: State<'_, DbPool>) -> Result<Vec<Album>, String> {
     queries::get_all_albums(&db).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_artist(db: State<'_, DbPool>, artist_id: String) -> Result<Option<Artist>, String> {
+pub async fn get_artist(db: State<'_, DbPool>, artist_id: String) -> Result<Option<Artist>, String> {
     queries::get_artist(&db, &artist_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn get_artist_tracks(
+pub async fn get_artist_tracks(
     db: State<'_, DbPool>,
     artist_id: String,
 ) -> Result<Vec<LibraryTrack>, String> {
@@ -95,7 +134,7 @@ pub fn get_artist_tracks(
 }
 
 #[tauri::command]
-pub fn get_album_tracks(
+pub async fn get_album_tracks(
     db: State<'_, DbPool>,
     album_id: String,
 ) -> Result<Vec<LibraryTrack>, String> {
@@ -143,11 +182,11 @@ pub fn get_album_tracks(
 }
 
 #[tauri::command]
-pub fn save_to_library(db: State<'_, DbPool>, recording_id: String) -> Result<(), String> {
+pub async fn save_to_library(db: State<'_, DbPool>, recording_id: String) -> Result<(), String> {
     queries::set_in_library(&db, &recording_id, true).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn remove_from_library(db: State<'_, DbPool>, recording_id: String) -> Result<(), String> {
+pub async fn remove_from_library(db: State<'_, DbPool>, recording_id: String) -> Result<(), String> {
     queries::set_in_library(&db, &recording_id, false).map_err(|e| e.to_string())
 }
