@@ -169,9 +169,11 @@ impl Iterator for AudioDecoder {
 
 impl Source for AudioDecoder {
     fn current_frame_len(&self) -> Option<usize> {
-        // The current packet's remaining samples; channel count and rate are
-        // only allowed to change at these boundaries.
-        Some(self.samples.len().saturating_sub(self.cursor).max(1))
+        // One track keeps one rate and channel count. Reporting packet-sized
+        // frames made rodio rebuild its resampler every ~23 ms, dropping the
+        // interpolation state each time: an audible crackle on any file
+        // whose rate differs from the output device (44.1 kHz on 48 kHz).
+        None
     }
 
     fn channels(&self) -> u16 {
@@ -237,4 +239,62 @@ pub fn extension_for_mime(mime: Option<&str>) -> Option<&'static str> {
         "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AudioDecoder;
+    use rodio::source::UniformSourceIterator;
+    use rodio::Source;
+    use std::path::Path;
+
+    /// The old framing: a new rodio frame every 1024 stereo samples.
+    struct PacketFramed<S>(S, usize);
+    impl<S: Iterator<Item = i16>> Iterator for PacketFramed<S> {
+        type Item = i16;
+        fn next(&mut self) -> Option<i16> {
+            self.1 = if self.1 <= 1 { 2048 } else { self.1 - 1 };
+            self.0.next()
+        }
+    }
+    impl<S: Source<Item = i16>> Source for PacketFramed<S> {
+        fn current_frame_len(&self) -> Option<usize> {
+            Some(self.1)
+        }
+        fn channels(&self) -> u16 {
+            self.0.channels()
+        }
+        fn sample_rate(&self) -> u32 {
+            self.0.sample_rate()
+        }
+        fn total_duration(&self) -> Option<std::time::Duration> {
+            None
+        }
+    }
+
+    fn spikes(out: Vec<i16>) -> (usize, f32) {
+        let left: Vec<f32> = out.iter().step_by(2).map(|s| *s as f32).collect();
+        // Second difference: smooth audio is small, a click is a spike.
+        let d2: Vec<f32> = left.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).collect();
+        let mean = d2.iter().sum::<f32>() / d2.len() as f32;
+        (d2.iter().filter(|v| **v > mean * 12.0).count(), mean)
+    }
+
+    /// Resamples a file to 48 kHz the way the output does, with the old and
+    /// the current framing, and counts clicks.
+    /// `MEWSIK_PROBE_FILES="a.m4a" cargo test resample_click_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn resample_click_probe() {
+        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
+        for p in files.split(';') {
+            let n = 48_000 * 2 * 15;
+            let open = || AudioDecoder::open_path(Path::new(p)).expect("open");
+            let old: Vec<i16> = UniformSourceIterator::<_, i16>::new(PacketFramed(open(), 2048), 2, 48_000)
+                .take(n)
+                .collect();
+            let new: Vec<i16> = UniformSourceIterator::<_, i16>::new(open(), 2, 48_000).take(n).collect();
+            println!("old {:?}  new {:?}  {p}", spikes(old), spikes(new));
+        }
+    }
 }
