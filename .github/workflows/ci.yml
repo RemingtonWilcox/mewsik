@@ -61,7 +61,6 @@ jobs:
       - name: Verify discovery publisher contract
         run: |
           pnpm test:discovery-snapshot
-          pnpm test:release-policy
 
       - name: Build the production frontend and sidecar
         run: pnpm build

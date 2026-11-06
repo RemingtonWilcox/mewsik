@@ -9,7 +9,6 @@ Normal local builds deliberately have no updater endpoint or public key. They re
 - The installed/local Windows 0.2.0 build is unsigned private-test output. It is current enough for local testing, but it is not the signed public bootstrap installer.
 - The updater UI, native shutdown gate, and draft workflow exist. The protected `release` environment is restricted to `main`, requires owner approval, and contains a cryptographically verified Tauri updater keypair. The encrypted recovery material is stored outside the repository under the current Windows account, but still needs one separate disaster-recovery copy because its local password envelope is DPAPI-bound to this account. Azure Artifact Signing account/profile credentials are still absent, so the public `latest.json` feed is not live.
 - `.github/workflows/ci.yml` runs the version, Svelte/type, discovery publisher, Rust format/test, production build, and four-worker Playwright gates for pull requests and `main`. GitHub secret scanning, push protection, and Dependabot security updates are enabled for the public repository.
-- `release/provider-policy.json` is a checked-in fail-closed distribution gate. It currently blocks the draft workflow because the prototype's unofficial YouTube audio extraction/download, SoundCloud multi-provider playback/download, and Bandcamp scraping paths are not suitable for distribution. Azure credentials or a workflow dispatch cannot bypass this code-reviewed gate.
 - GitHub Pages is enabled and the credential-free discovery snapshot is live. YouTube and Last.fm intentionally remain `unavailable`: keys are absent, activation switches are off, and their data is excluded from mewsik-derived shelves until the policy gates below pass.
 - No distributable Mac build is current. A fresh clean Apple Silicon release checkout now passes dependency, Svelte, sidecar, runtime-resource, and Rust checks with the pinned toolchains. The Mac mini still lacks the Developer ID Application identity/private key and the `mewsik-notary` Keychain profile; the MacBook that may hold the signing identity was unreachable during the audit.
 
@@ -71,13 +70,9 @@ Tauri's uninstall checkbox clears interface/WebView preferences and cache derive
 
 Public Windows drafts use Azure Artifact Signing through Tauri's `bundle.windows.signCommand`. Tauri signs the application executable and installer while bundling, before updater signatures and `latest.json` are produced. The guarded workflow has no unsigned fallback. A deliberately unsigned private build must be built locally, labeled unmistakably, and never published through the stable updater feed.
 
-### Distribution provider gate
+### Provider features
 
-Signing makes an installer attributable and tamper-evident; it does not grant rights to provider content. The current local prototype uses unofficial YouTube InnerTube audio extraction, scraped SoundCloud credentials/streams, and Bandcamp page scraping. Those paths remain available only for local development while product alternatives are built. Do not send the current build to friends or publish it with those features enabled.
-
-The Windows preflight and macOS release script read `release/provider-policy.json` before using any signing identity or secret. A distributable version remains blocked until a reviewed pull request either replaces those paths with approved integrations or disables them server-side for distributed builds, adds real user Terms/Privacy, and binds the approval file to that exact release version and review reference. Do not flip the JSON boolean as a paperwork shortcut.
-
-The provider-by-provider evidence and safe product alternatives are recorded in [Provider distribution strategy](provider-distribution-strategy-2026-07-14.md).
+Releases ship with the YouTube, SoundCloud and Bandcamp search, playback and download features enabled. Those paths use unofficial access, so a published build can draw a terms-of-service complaint or a DMCA takedown of the release. The owner chose to publish anyway on 2026-11-05 and removed the old `release/provider-policy.json` gate.
 
 ## Windows updater behavior
 
@@ -176,4 +171,3 @@ Do not publish if an upgrade changes the Tauri identifier, Windows installer sco
 - Every macOS DMG is signed, notarized, stapled, and tested on clean matching hardware.
 - SHA-256 hashes are published with the release.
 - Release notes list supported OS/architecture, known limitations, and storage behavior.
-- `release/provider-policy.json` approves this exact version after YouTube, SoundCloud, Bandcamp, radio-directory, Node, and FFmpeg obligations have been reviewed and all listed blockers are actually closed.
