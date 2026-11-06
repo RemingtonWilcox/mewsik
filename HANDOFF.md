@@ -165,7 +165,7 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 ### Windows updates and release safety
 
 - Ordinary pull requests and `main` now run a least-privilege Windows CI workflow covering version consistency, Svelte/type checks, the discovery publisher contract, Rust formatting/tests, the production frontend/sidecar build, and four-worker Playwright. GitHub secret scanning, push protection, and Dependabot security updates are enabled.
-- Stable distribution is fail-closed in `release/provider-policy.json` and `scripts/release-policy.mjs`. The current file intentionally blocks every release: unofficial YouTube audio extraction/download, SoundCloud's scraped client/combined playback/download, Bandcamp scraping, and missing final Terms/Privacy must be replaced, licensed, or disabled in a reviewed exact-version change before preflight can reach signing.
+- The provider distribution gate (`release/provider-policy.json`) was removed on 2026-11-05 at the owner's request; releases ship with the YouTube, SoundCloud and Bandcamp features.
 - The official-source evidence and fastest release-safe product shape are in `docs/provider-distribution-strategy-2026-07-14.md`.
 - Version `0.2.0` introduces the updater UI and native shutdown gate. Normal source/local builds deliberately do not register the updater plugin and report updates unavailable; only the protected release build supplies a public key, endpoint, and `MEWSIK_UPDATE_CHANNEL=stable`.
 - Update install is user-confirmed. The package is downloaded and signature-verified first, then native code atomically blocks new music downloads, refuses to proceed while one is active, and shuts down the sidecar, playback, and tracked FFmpeg children before handing control to NSIS.
@@ -190,7 +190,6 @@ Completed on the combined branch and packaged native release:
 - `pnpm build`: pass
 - `pnpm test:e2e -- --workers=4`: 69/69 pass on a clean Vite server, including 11 updater state/race/recovery scenarios and Prism's scheduler/pixel/seed foundation
 - `pnpm test:discovery-snapshot`: 14/14 pass, including explicit activation gates, header-only YouTube credentials, provider-failure retention, credential exclusion, Last.fm live/cached linkback sanitization, and atomic publication
-- `pnpm test:release-policy`: 6/6 pass; the checked-in policy is fail-closed, version-bound, review-referenced, and cannot approve with open blockers
 - `cargo test --all-targets`: 155 pass, 0 fail, 3 intentionally ignored live-provider tests
 - Disposable release-contract test: a real generated Tauri keypair passed sign/verify and credential-exclusion checks; wrong refs, prerelease versions, non-increasing versions, and mismatched keys were rejected. The disposable key and generated config were removed afterward.
 - Local-build startup smoke: the updater plugin remains unregistered when no signed release configuration exists; the fresh debug app stayed responsive and closed through the normal window path.
