@@ -75,7 +75,7 @@ fn download_location_info(config: &AppConfig, db: &DbPool) -> DownloadLocationIn
 }
 
 #[tauri::command]
-pub fn get_downloads(db: State<'_, DbPool>) -> Result<Vec<Download>, String> {
+pub async fn get_downloads(db: State<'_, DbPool>) -> Result<Vec<Download>, String> {
     download::get_all_downloads(&db)
 }
 
@@ -92,7 +92,7 @@ pub async fn refresh_download_files(db: State<'_, DbPool>) -> Result<Vec<Downloa
 }
 
 #[tauri::command]
-pub fn get_download_location(
+pub async fn get_download_location(
     config: State<'_, ConfigState>,
     db: State<'_, DbPool>,
 ) -> Result<DownloadLocationInfo, String> {
@@ -101,7 +101,7 @@ pub fn get_download_location(
 }
 
 #[tauri::command]
-pub fn set_download_location(
+pub async fn set_download_location(
     config: State<'_, ConfigState>,
     directory: String,
 ) -> Result<(), String> {
@@ -125,7 +125,7 @@ pub fn set_download_location(
 }
 
 #[tauri::command]
-pub fn reset_download_location(config: State<'_, ConfigState>) -> Result<(), String> {
+pub async fn reset_download_location(config: State<'_, ConfigState>) -> Result<(), String> {
     download::prepare_download_directory(&AppConfig::default_download_dir())?;
     let mut config = config.lock();
     let previous = config.download_directory.take();
@@ -137,14 +137,14 @@ pub fn reset_download_location(config: State<'_, ConfigState>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn reveal_download_location(config: State<'_, ConfigState>) -> Result<(), String> {
+pub async fn reveal_download_location(config: State<'_, ConfigState>) -> Result<(), String> {
     let directory = config.lock().download_dir();
     download::prepare_download_directory(&directory)?;
     open_folder(&directory)
 }
 
 #[tauri::command]
-pub fn download_recording(
+pub async fn download_recording(
     db: State<'_, DbPool>,
     downloads: State<'_, Arc<DownloadManager>>,
     sidecar: State<'_, Arc<SidecarManager>>,
@@ -182,7 +182,7 @@ pub fn download_recording(
 }
 
 #[tauri::command]
-pub fn cancel_download(
+pub async fn cancel_download(
     db: State<'_, DbPool>,
     downloads: State<'_, Arc<DownloadManager>>,
     download_id: String,
@@ -197,7 +197,7 @@ pub fn cancel_download(
 }
 
 #[tauri::command]
-pub fn delete_download(
+pub async fn delete_download(
     db: State<'_, DbPool>,
     downloads: State<'_, Arc<DownloadManager>>,
     download_id: String,
@@ -207,7 +207,7 @@ pub fn delete_download(
 }
 
 #[tauri::command]
-pub fn reveal_download_path(db: State<'_, DbPool>, download_id: String) -> Result<(), String> {
+pub async fn reveal_download_path(db: State<'_, DbPool>, download_id: String) -> Result<(), String> {
     let file_path = resolve_completed_download_path(&db, &download_id)?;
     let containing_folder = file_path
         .parent()

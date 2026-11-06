@@ -55,12 +55,12 @@ fn validate_library_paths(
 }
 
 #[tauri::command]
-pub fn get_settings(config: State<'_, ConfigState>) -> Result<AppConfig, String> {
+pub async fn get_settings(config: State<'_, ConfigState>) -> Result<AppConfig, String> {
     Ok(config.lock().clone())
 }
 
 #[tauri::command]
-pub fn update_library_paths(
+pub async fn update_library_paths(
     config: State<'_, ConfigState>,
     paths: Vec<String>,
 ) -> Result<(), String> {
@@ -74,7 +74,7 @@ pub fn update_library_paths(
 }
 
 #[tauri::command]
-pub fn get_library_paths(config: State<'_, ConfigState>) -> Result<Vec<String>, String> {
+pub async fn get_library_paths(config: State<'_, ConfigState>) -> Result<Vec<String>, String> {
     Ok(config.lock().library_paths.clone())
 }
 

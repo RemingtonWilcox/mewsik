@@ -16,7 +16,7 @@ fn in_flight() -> &'static Mutex<HashSet<String>> {
 }
 
 #[tauri::command]
-pub fn get_track_analysis(
+pub async fn get_track_analysis(
     db: State<'_, DbPool>,
     recording_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
@@ -33,7 +33,7 @@ pub fn get_track_analysis(
 /// Returns "cached" | "started" | "unavailable" so the frontend knows
 /// whether to wait for an `analysis:complete` event.
 #[tauri::command]
-pub fn request_track_analysis(
+pub async fn request_track_analysis(
     app: AppHandle,
     db: State<'_, DbPool>,
     recording_id: String,

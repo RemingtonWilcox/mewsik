@@ -2,25 +2,17 @@ use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::queue::{QueueEntry, RepeatMode};
 use crate::db::models::{PlaybackState, QueueSnapshot};
 use crate::db::{queries, DbPool};
-use crate::discovery::recommendations::RecommendationEngine;
 use crate::download;
 use crate::sources::stream_cache::StreamCache;
 use crate::sources::SidecarManager;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use crate::audio::decoder::AudioDecoder;
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Arc;
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
+use std::sync::{Arc, OnceLock};
 use tauri::State;
 
 #[derive(Debug, Default, Deserialize)]
@@ -38,6 +30,7 @@ struct StoredStreamMetadata {
 pub struct PlaybackWaveform {
     pub recording_id: String,
     pub peaks: Vec<f32>,
+    pub rms: Vec<f32>,
     pub source: String,
 }
 
@@ -83,87 +76,80 @@ fn resample_peaks(window_peaks: &[f32], bins: usize) -> Vec<f32> {
     resampled
 }
 
-fn generate_waveform_peaks(path: &Path, bins: usize) -> Result<Vec<f32>, String> {
-    const WINDOW_FRAMES: usize = 2048;
+/// Loudness per short window across the whole file: (peak, rms), 0..1.
+/// Decodes through the playback decoder so it reads exactly what plays,
+/// including MP4s with embedded cover art.
+fn waveform_windows(path: &Path) -> Result<Vec<(f32, f32)>, String> {
+    const WINDOW_FRAMES: usize = 1024;
 
-    let file = File::open(path).map_err(|e| format!("Failed to open audio file: {}", e))?;
-    let media_source = MediaSourceStream::new(Box::new(file), Default::default());
-    let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|value| value.to_str()) {
-        hint.with_extension(ext);
-    }
+    let decoder = AudioDecoder::open_path(path)?;
+    let channels = rodio::Source::channels(&decoder).max(1) as usize;
+    let mut windows = Vec::new();
+    let (mut peak, mut sum_sq, mut count) = (0.0_f32, 0.0_f32, 0usize);
+    let (mut frame_amp, mut in_frame) = (0.0_f32, 0usize);
 
-    let probed = symphonia::default::get_probe()
-        .format(
-            &hint,
-            media_source,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )
-        .map_err(|e| format!("Failed to probe audio file: {}", e))?;
-
-    let mut format = probed.format;
-    let track = format
-        .default_track()
-        .ok_or_else(|| "No audio track found in file".to_string())?;
-    let track_id = track.id;
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("Failed to create decoder: {}", e))?;
-
-    let mut window_peaks = Vec::new();
-    let mut current_window_peak = 0.0_f32;
-    let mut frames_in_window = 0usize;
-
-    loop {
-        let packet = match format.next_packet() {
-            Ok(packet) => packet,
-            Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
-            Err(SymphoniaError::ResetRequired) => {
-                return Err("Waveform decoding reset is not supported".to_string());
-            }
-            Err(err) => return Err(format!("Failed to read audio packet: {}", err)),
-        };
-
-        if packet.track_id() != track_id {
+    for sample in decoder {
+        frame_amp = frame_amp.max((sample as f32 / 32768.0).abs());
+        in_frame += 1;
+        if in_frame < channels {
             continue;
         }
-
-        let decoded = match decoder.decode(&packet) {
-            Ok(decoded) => decoded,
-            Err(SymphoniaError::DecodeError(_)) => continue,
-            Err(SymphoniaError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
-            Err(SymphoniaError::ResetRequired) => {
-                return Err("Waveform decoding reset is not supported".to_string());
-            }
-            Err(err) => return Err(format!("Failed to decode audio packet: {}", err)),
-        };
-
-        let spec = *decoded.spec();
-        let channel_count = spec.channels.count().max(1);
-        let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-        sample_buf.copy_interleaved_ref(decoded);
-
-        for frame in sample_buf.samples().chunks(channel_count) {
-            let amplitude = frame
-                .iter()
-                .fold(0.0_f32, |max_amp, sample| max_amp.max(sample.abs()));
-            current_window_peak = current_window_peak.max(amplitude);
-            frames_in_window += 1;
-
-            if frames_in_window >= WINDOW_FRAMES {
-                window_peaks.push(current_window_peak);
-                current_window_peak = 0.0;
-                frames_in_window = 0;
-            }
+        peak = peak.max(frame_amp);
+        sum_sq += frame_amp * frame_amp;
+        count += 1;
+        frame_amp = 0.0;
+        in_frame = 0;
+        if count >= WINDOW_FRAMES {
+            windows.push((peak, (sum_sq / count as f32).sqrt()));
+            (peak, sum_sq, count) = (0.0, 0.0, 0);
         }
     }
-
-    if frames_in_window > 0 {
-        window_peaks.push(current_window_peak);
+    if count > 0 {
+        windows.push((peak, (sum_sq / count as f32).sqrt()));
     }
+    Ok(windows)
+}
 
-    Ok(resample_peaks(&window_peaks, bins.clamp(24, 256)))
+/// Bins of (peak, rms), both scaled so the loudest bin's peak is 1.
+fn bin_waveform(windows: &[(f32, f32)], bins: usize) -> (Vec<f32>, Vec<f32>) {
+    let peaks = resample_peaks(&windows.iter().map(|w| w.0).collect::<Vec<_>>(), bins);
+    if windows.is_empty() || bins == 0 {
+        return (peaks, vec![0.0; bins]);
+    }
+    let max_peak = windows.iter().map(|w| w.0).fold(0.0_f32, f32::max).max(1e-6);
+    let rms = (0..bins)
+        .map(|i| {
+            let start = i * windows.len() / bins;
+            let end = ((i + 1) * windows.len() / bins).max(start + 1).min(windows.len());
+            let slice = &windows[start..end];
+            let mean = slice.iter().map(|w| w.1 * w.1).sum::<f32>() / slice.len() as f32;
+            (mean.sqrt() / max_peak).sqrt().clamp(0.0, 1.0)
+        })
+        .collect();
+    (peaks, rms)
+}
+
+type WaveformCache = Mutex<HashMap<(String, usize), Arc<(Vec<f32>, Vec<f32>)>>>;
+
+/// Recently drawn waveforms, so replaying or seeking back never re-decodes.
+fn waveform_cache() -> &'static WaveformCache {
+    static CACHE: OnceLock<WaveformCache> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn generate_waveform(path: &Path, bins: usize) -> Result<Arc<(Vec<f32>, Vec<f32>)>, String> {
+    let bins = bins.clamp(24, 1024);
+    let key = (path.to_string_lossy().to_string(), bins);
+    if let Some(hit) = waveform_cache().lock().get(&key) {
+        return Ok(Arc::clone(hit));
+    }
+    let shape = Arc::new(bin_waveform(&waveform_windows(path)?, bins));
+    let mut cache = waveform_cache().lock();
+    if cache.len() >= 256 {
+        cache.clear();
+    }
+    cache.insert(key, Arc::clone(&shape));
+    Ok(shape)
 }
 
 fn resolve_waveform_source_path(
@@ -344,143 +330,53 @@ pub(crate) fn build_queue_entry(
     })
 }
 
-const SINGLE_TRACK_CONTINUATION_LIMIT: usize = 8;
-const SINGLE_TRACK_CANDIDATE_SCAN_LIMIT: usize = 24;
-const SINGLE_TRACK_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-const SINGLE_TRACK_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-/// Expands a one-song context without delaying its start. Candidate selection
-/// is deterministic and database-only. Building a queue entry may refresh an
-/// expired provider URL, but this worker never fetches or decodes audio for a
-/// future track; actual media work remains demand-driven in the audio engine.
-pub(crate) fn spawn_deterministic_continuation(
+/// Builds queue entries for a play context. A track whose source cannot be
+/// opened is skipped instead of failing the whole list; `start_index` is
+/// remapped onto the entries that survived.
+fn build_context(
     db: &DbPool,
-    sidecar: &Arc<SidecarManager>,
-    engine: &Arc<AudioEngine>,
+    sidecar: &SidecarManager,
     cache: &StreamCache,
-    session_id: String,
-    anchor_recording_id: String,
-) {
-    let worker_db = db.clone();
-    let worker_sidecar = Arc::clone(sidecar);
-    let worker_engine = Arc::clone(engine);
-    let worker_cache = cache.clone();
-
-    if let Err(error) = std::thread::Builder::new()
-        .name("single-track-continuation".to_string())
-        .spawn(move || {
-            // The app uses one mutex-protected SQLite connection. Let the audio
-            // worker finish its start/history transaction before running the
-            // larger recommendation query, or a fast helper can make pressing
-            // Play feel slower on a large library.
-            let readiness_deadline = std::time::Instant::now() + SINGLE_TRACK_READY_TIMEOUT;
-            loop {
-                if !worker_engine.queue_session_can_still_start_continuation(
-                    &session_id,
-                    &anchor_recording_id,
-                ) || std::time::Instant::now() >= readiness_deadline
-                {
-                    return;
+    recording_ids: &[String],
+    start_index: usize,
+) -> Result<(Vec<QueueEntry>, usize), String> {
+    let mut entries = Vec::with_capacity(recording_ids.len());
+    let mut start = None;
+    let mut first_error = None;
+    for (index, id) in recording_ids.iter().enumerate() {
+        match build_queue_entry(db, sidecar, id, Some(cache)) {
+            Ok(entry) if entry.file_path.is_some() || entry.source_url.is_some() => {
+                if index >= start_index && start.is_none() {
+                    start = Some(entries.len());
                 }
-                if worker_engine
-                    .queue_session_is_ready_for_continuation(&session_id, &anchor_recording_id)
-                {
-                    break;
-                }
-                std::thread::sleep(SINGLE_TRACK_READY_POLL_INTERVAL);
+                entries.push(entry);
             }
-
-            let candidate_ids = match RecommendationEngine::new(worker_db.clone())
-                .continuation_recording_ids(
-                    &anchor_recording_id,
-                    SINGLE_TRACK_CANDIDATE_SCAN_LIMIT,
-                )
-            {
-                Ok(ids) => ids,
-                Err(error) => {
-                    log::debug!(
-                        "Could not build continuation for {anchor_recording_id}: {error}"
-                    );
-                    return;
-                }
-            };
-
-            let mut prepared = Vec::with_capacity(SINGLE_TRACK_CONTINUATION_LIMIT - 1);
-            let mut published = 0usize;
-            for candidate_id in candidate_ids {
-                if published + prepared.len() >= SINGLE_TRACK_CONTINUATION_LIMIT
-                    || !worker_engine.queue_session_is_current(&session_id)
-                {
-                    break;
-                }
-
-                match build_queue_entry(
-                    &worker_db,
-                    &worker_sidecar,
-                    &candidate_id,
-                    Some(&worker_cache),
-                ) {
-                    Ok(entry) if entry.file_path.is_some() || entry.source_url.is_some() => {
-                        if published == 0 {
-                            // Make the first playable successor visible as soon
-                            // as it is ready. A slow provider refresh for a later
-                            // suggestion must never leave the active song with
-                            // an empty Up Next queue.
-                            worker_engine
-                                .append_context_if_session(session_id.clone(), vec![entry]);
-                            published = 1;
-                        } else {
-                            prepared.push(entry);
-                        }
-                    }
-                    Ok(_) => {
-                        log::debug!(
-                            "Skipping continuation candidate without a playable source: {candidate_id}"
-                        );
-                    }
-                    Err(error) => {
-                        log::debug!(
-                            "Skipping continuation candidate {candidate_id}: {error}"
-                        );
-                    }
-                }
+            Ok(_) => {
+                first_error.get_or_insert_with(|| "No playable source for this track".to_string());
             }
-
-            if !prepared.is_empty() && worker_engine.queue_session_is_current(&session_id) {
-                // Append the remaining batch behind anything the listener may
-                // have manually queued while provider URLs were resolving.
-                // Queue V2 shuffles only this new batch when shuffle is active.
-                worker_engine.append_context_if_session(session_id, prepared);
+            Err(error) => {
+                log::warn!("skipping {id} in play context: {error}");
+                first_error.get_or_insert(error);
             }
-        })
-    {
-        // Playback already started. Continuation is intentionally best-effort.
-        log::warn!("Failed to start single-track continuation worker: {error}");
+        }
     }
+    if entries.is_empty() {
+        return Err(first_error.unwrap_or_else(|| "Nothing to play".to_string()));
+    }
+    let start = start.unwrap_or(0);
+    Ok((entries, start))
 }
 
 #[tauri::command]
-pub fn play_recording(
+pub async fn play_recording(
     db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     engine: State<'_, Arc<AudioEngine>>,
     cache: State<'_, StreamCache>,
     recording_id: String,
 ) -> Result<(), String> {
-    let entry = build_queue_entry(&db, &sidecar, &recording_id, Some(&cache))?;
-    if entry.file_path.is_none() && entry.source_url.is_none() {
-        return Err("No playable source for this recording".to_string());
-    }
-
-    let session_id = engine.start_queue(vec![entry], 0);
-    spawn_deterministic_continuation(
-        db.inner(),
-        sidecar.inner(),
-        engine.inner(),
-        cache.inner(),
-        session_id,
-        recording_id,
-    );
+    let (entries, start) = build_context(&db, &sidecar, &cache, &[recording_id], 0)?;
+    engine.start_queue(entries, start);
     Ok(())
 }
 
@@ -549,7 +445,7 @@ pub fn get_playback_state(engine: State<'_, Arc<AudioEngine>>) -> Result<Playbac
 }
 
 #[tauri::command]
-pub fn play_tracks_from(
+pub async fn play_tracks_from(
     db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     engine: State<'_, Arc<AudioEngine>>,
@@ -558,37 +454,16 @@ pub fn play_tracks_from(
     start_index: usize,
 ) -> Result<(), String> {
     if recording_ids.is_empty() {
-        return Err("Playback context is empty".to_string());
+        return Err("Nothing to play".to_string());
     }
-    if start_index >= recording_ids.len() {
-        return Err(format!(
-            "Playback start index {start_index} is outside a {}-track context",
-            recording_ids.len()
-        ));
-    }
-
-    let mut queue_entries = Vec::new();
-    for id in &recording_ids {
-        queue_entries.push(build_queue_entry(&db, &sidecar, id, Some(&cache))?);
-    }
-
-    let single_anchor = (recording_ids.len() == 1).then(|| recording_ids[start_index].clone());
-    let session_id = engine.start_queue(queue_entries, start_index);
-    if let Some(anchor_recording_id) = single_anchor {
-        spawn_deterministic_continuation(
-            db.inner(),
-            sidecar.inner(),
-            engine.inner(),
-            cache.inner(),
-            session_id,
-            anchor_recording_id,
-        );
-    }
+    let start_index = start_index.min(recording_ids.len() - 1);
+    let (entries, start) = build_context(&db, &sidecar, &cache, &recording_ids, start_index)?;
+    engine.start_queue(entries, start);
     Ok(())
 }
 
 #[tauri::command]
-pub fn add_to_queue(
+pub async fn add_to_queue(
     db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     engine: State<'_, Arc<AudioEngine>>,
@@ -605,7 +480,7 @@ pub fn add_to_queue(
 }
 
 #[tauri::command]
-pub fn play_next(
+pub async fn play_next(
     db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
     engine: State<'_, Arc<AudioEngine>>,
@@ -698,17 +573,23 @@ pub fn clear_queue(engine: State<'_, Arc<AudioEngine>>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn get_playback_waveform(
+pub async fn get_playback_waveform(
     db: State<'_, DbPool>,
     recording_id: String,
     bins: Option<usize>,
 ) -> Result<PlaybackWaveform, String> {
     let (file_path, source) = resolve_waveform_source_path(&db, &recording_id)?;
-    let peaks = generate_waveform_peaks(Path::new(&file_path), bins.unwrap_or(144))?;
+    let bins = bins.unwrap_or(600);
+    let shape = tauri::async_runtime::spawn_blocking(move || {
+        generate_waveform(Path::new(&file_path), bins)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     Ok(PlaybackWaveform {
         recording_id,
-        peaks,
+        peaks: shape.0.clone(),
+        rms: shape.1.clone(),
         source,
     })
 }
@@ -731,5 +612,111 @@ mod tests {
     fn resample_peaks_handles_empty_input() {
         let output = resample_peaks(&[], 5);
         assert_eq!(output, vec![0.0; 5]);
+    }
+
+    /// Times opening and drawing real files, as play and the seek bar do.
+    /// `MEWSIK_PROBE_FILES="a.m4a;b.mp3" cargo test waveform_timing_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn waveform_timing_probe() {
+        use super::*;
+        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
+        for p in files.split(';') {
+            let started = std::time::Instant::now();
+            let mut decoder = AudioDecoder::open_path(Path::new(p)).expect("open");
+            let opened = started.elapsed();
+            rodio::Source::try_seek(&mut decoder, std::time::Duration::from_secs(60)).expect("seek");
+            let seeked = started.elapsed() - opened;
+            let started = std::time::Instant::now();
+            let (peaks, rms) = &*generate_waveform(Path::new(p), 600).expect("waveform");
+            println!(
+                "open {opened:?} seek {seeked:?} waveform {:?} bins {} max rms {:.2}  {p}",
+                started.elapsed(),
+                peaks.len(),
+                rms.iter().copied().fold(0.0, f32::max)
+            );
+        }
+    }
+
+    /// Opens every library file the way the engine does and reports failures.
+    #[test]
+    #[ignore]
+    fn real_library_decode_probe() {
+        use super::*;
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let db = crate::db::init_db(Path::new(&path)).expect("open db");
+        let tracks = queries::get_library_tracks(&db).expect("tracks");
+        let mut failures = std::collections::BTreeMap::<String, usize>::new();
+        let mut first = std::collections::BTreeMap::<String, String>::new();
+        std::panic::set_hook(Box::new(|_| {}));
+        for t in &tracks {
+            let Some(p) = t.local_file_path.clone() else { continue };
+            let result = std::panic::catch_unwind(|| {
+                let mut d = crate::audio::decoder::AudioDecoder::open_path(Path::new(&p))?;
+                // pull a second of audio and seek, like playback does
+                for _ in 0..88_200 { if d.next().is_none() { break; } }
+                rodio::Source::try_seek(&mut d, std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
+                d.next().map(|_| ()).ok_or_else(|| "no audio after seek".to_string())
+            });
+            let err = match result {
+                Ok(Ok(())) => continue,
+                Ok(Err(e)) => e,
+                Err(_) => "panic".to_string(),
+            };
+            let dir = Path::new(&p).components().rev().nth(2)
+                .map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
+            let key = format!("{dir} | {err}");
+            *failures.entry(key.clone()).or_default() += 1;
+            first.entry(key).or_insert(p);
+        }
+        let _ = std::panic::take_hook();
+        println!("checked {} tracks", tracks.len());
+        for (k, n) in &failures {
+            println!("{n:5}  {k}  e.g. {}", first[k]);
+        }
+    }
+
+    /// Plays from a copy of a real library through the real engine and output.
+    /// `MEWSIK_PROBE_DB=<copy of library.db> cargo test real_library_play_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn real_library_play_probe() {
+        use super::*;
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let db = crate::db::init_db(Path::new(&path)).expect("open db");
+        let tracks = queries::get_library_tracks(&db).expect("tracks");
+        let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
+        println!("library tracks: {}", ids.len());
+        let sidecar = SidecarManager::new();
+        let cache: StreamCache = Default::default();
+
+        let started = std::time::Instant::now();
+        let mut entries = Vec::new();
+        for id in &ids {
+            match build_queue_entry(&db, &sidecar, id, Some(&cache)) {
+                Ok(entry) => entries.push(entry),
+                Err(error) => println!("build_queue_entry({id}) failed: {error}"),
+            }
+        }
+        println!("built {} entries in {:?}", entries.len(), started.elapsed());
+
+        let engine = AudioEngine::new(db.clone());
+        let start = 5.min(entries.len().saturating_sub(1));
+        println!("starting at {:?}", entries.get(start).map(|e| (&e.title, &e.file_path)));
+        engine.start_queue(entries, start);
+        for step in 0..30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let s = engine.get_state();
+            if step % 5 == 0 || s.is_playing {
+                println!(
+                    "t={}ms playing={} buffering={} pos={} title={:?} stage={:?}",
+                    (step + 1) * 100, s.is_playing, s.is_buffering, s.position_ms, s.current_title, s.connection_stage
+                );
+            }
+        }
+        while let Some(event) = engine.try_recv_event() {
+            println!("event: {event:?}");
+        }
+        engine.shutdown();
     }
 }

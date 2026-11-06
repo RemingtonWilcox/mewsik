@@ -35,6 +35,7 @@
 	style="padding-top: env(safe-area-inset-top);"
 >
 	<main
+		data-scroll-root
 		class="flex-1 overflow-y-auto px-4 pt-2"
 		style="padding-bottom: {hasCurrentItem ? '170px' : '110px'};"
 	>

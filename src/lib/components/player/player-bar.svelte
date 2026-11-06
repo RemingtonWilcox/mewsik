@@ -1,21 +1,18 @@
 <script lang="ts">
-	import * as api from '$lib/api/tauri';
-	import type { PlaybackWaveform } from '$lib/types';
+	import { onMount } from 'svelte';
 	import {
 		usePlayer,
-		formatTime,
 		connectionMessage,
 		connectionStage,
 		displayTitle
 	} from '$lib/state/player.svelte';
+	import { useLibrary } from '$lib/state/library.svelte';
+	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import StationArt from '$lib/components/station-art.svelte';
 	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
-	import { useVisualizer } from '$lib/state/visualizer.svelte';
-	import { Button } from '$lib/components/ui/button';
-	import { Toggle } from '$lib/components/ui/toggle';
-	import { Slider } from '$lib/components/ui/slider';
-	import QueueSheet from '$lib/components/queue/queue-sheet.svelte';
-	import WaveformScrubber from '$lib/components/player/waveform-scrubber.svelte';
+	import Cover from '$lib/components/tracks/cover.svelte';
+	import SeekBar from './seek-bar.svelte';
+	import QueuePanel from './queue-panel.svelte';
 	import {
 		Play,
 		Pause,
@@ -26,284 +23,296 @@
 		Repeat,
 		Repeat1,
 		Volume2,
+		Volume1,
 		VolumeX,
 		ListMusic,
-		Sparkles
+		Sparkles,
+		LoaderCircle
 	} from '@lucide/svelte';
 
+	const player = usePlayer();
+	const library = useLibrary();
 	const visualizer = useVisualizer();
 
-	import { onMount } from 'svelte';
-
-	const player = usePlayer();
-	const waveformCache = new Map<string, PlaybackWaveform | null>();
+	let queueOpen = $state(false);
+	let lastVolume = 1;
+	// Volume follows the slider immediately; the engine catches up.
+	let volume = $state<number | null>(null);
 
 	onMount(() => {
-		const handler = () => player.togglePlay();
-		window.addEventListener('toggle-playback', handler);
-		return () => window.removeEventListener('toggle-playback', handler);
+		const toggle = () => void player.togglePlay();
+		window.addEventListener('toggle-playback', toggle);
+		return () => window.removeEventListener('toggle-playback', toggle);
 	});
 
-	let showQueue = $state(false);
-	let prevVolume = $state(1);
-	let waveform = $state<PlaybackWaveform | null>(null);
-	let waveformLoading = $state(false);
-	let waveformRequest = 0;
-	let hasCurrentItem = $derived(
-		Boolean(
-			player.state.current_title ||
-			player.state.current_source_url ||
-			player.state.current_recording_id
-		)
-	);
-	let canSeek = $derived(
-		!player.state.is_buffering && player.state.can_seek && player.state.duration_ms > 0
-	);
-	let hasTimeline = $derived(hasCurrentItem && player.state.duration_ms > 0);
-	let isRadio = $derived(player.state.source === 'radio');
-	let stage = $derived(connectionStage(player.state));
-	let title = $derived(displayTitle(player.state));
-	let subtitle = $derived(
+	const s = $derived(player.state);
+	const hasItem = $derived(Boolean(s.current_title || s.current_source_url || s.current_recording_id));
+	const isRadio = $derived(s.source === 'radio');
+	const stage = $derived(connectionStage(s));
+	const track = $derived(s.current_recording_id ? library.trackById(s.current_recording_id) : undefined);
+	const title = $derived(displayTitle(s));
+	const artist = $derived(
 		isRadio
-			? (connectionMessage(player.state) ?? (stage === 'playing' ? 'Live radio' : 'Radio'))
-			: (player.state.current_artist ?? '')
+			? (connectionMessage(s) ?? (stage === 'playing' ? 'Live radio' : 'Radio'))
+			: (s.current_artist ?? '')
 	);
-	let wantsWaveform = $derived(player.state.source === 'local' && hasTimeline);
-	let showWaveform = $derived(
-		Boolean(canSeek && wantsWaveform && waveform?.peaks?.length)
-	);
+	const shownVolume = $derived(volume ?? s.volume);
+	const busy = $derived(s.is_buffering && !isRadio);
 
-	$effect(() => {
-		const recordingId = player.state.current_recording_id;
-		const durationMs = player.state.duration_ms;
-		const source = player.state.source;
-		const requestId = ++waveformRequest;
-
-		waveform = null;
-		waveformLoading = false;
-
-		if (!recordingId || durationMs <= 0 || source !== 'local') {
-			return;
-		}
-
-		const cached = waveformCache.get(recordingId);
-		if (cached !== undefined) {
-			waveform = cached;
-			return;
-		}
-
-		waveformLoading = true;
-		void api
-			.getPlaybackWaveform(recordingId, 160)
-			.then((data) => {
-				if (requestId !== waveformRequest) {
-					return;
-				}
-				waveformCache.set(recordingId, data);
-				waveform = data;
-			})
-			.catch(() => {
-				if (requestId !== waveformRequest) {
-					return;
-				}
-				waveformCache.set(recordingId, null);
-				waveform = null;
-			})
-			.finally(() => {
-				if (requestId === waveformRequest) {
-					waveformLoading = false;
-				}
-			});
-	});
+	function setVolume(value: number) {
+		volume = value;
+		void player.setVolume(value).finally(() => {
+			if (volume === value) volume = null;
+		});
+	}
 
 	function toggleMute() {
-		if (player.state.volume > 0) {
-			prevVolume = player.state.volume;
-			player.setVolume(0);
+		if (shownVolume > 0) {
+			lastVolume = shownVolume;
+			setVolume(0);
 		} else {
-			player.setVolume(prevVolume);
+			setVolume(lastVolume || 1);
 		}
 	}
 
-	function handleSeekCommit(positionMs: number) {
-		if (player.state.duration_ms > 0) {
-			player.seek(positionMs);
-		}
-	}
-
-	function handleVolumeChange(values: number[]) {
-		player.setVolume(values[0] / 100);
+	function wheelVolume(event: WheelEvent) {
+		event.preventDefault();
+		setVolume(Math.max(0, Math.min(1, shownVolume - Math.sign(event.deltaY) * 0.05)));
 	}
 </script>
 
-<!-- While the visualizer is open it owns playback (its own now-playing
-     overlay); the bar stays mounted underneath the opaque engine, inert and
-     hidden from assistive tech, so nothing here remounts or refetches when the
-     listener comes back. (No visibility toggle: the buttons' transition-all
-     would animate the inherited visibility and briefly block focus return.) -->
-<div
+<!-- While the visualizer is open it owns playback; the bar stays mounted
+     underneath, inert, so nothing remounts when the listener comes back. -->
+<footer
 	data-player-bar
 	data-visualizer-open={visualizer.active || undefined}
 	aria-hidden={visualizer.active ? 'true' : undefined}
 	inert={visualizer.active}
-	class={`fixed inset-x-0 bottom-0 z-50 grid h-[88px] grid-cols-[1fr_auto_1fr] items-center gap-4 border-t border-border bg-[oklch(0.18_0.005_285/0.97)] px-5 shadow-[0_-4px_24px_rgba(0,0,0,0.3)] backdrop-blur-sm max-[640px]:h-[72px] max-[640px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[640px]:gap-1 max-[640px]:px-2`}
+	class="relative z-50 grid h-[88px] shrink-0 grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_minmax(0,1fr)] items-center gap-6 border-t border-white/5 bg-[oklch(0.16_0.004_285)] px-4"
 >
-	<!-- Left: track info -->
-	<div class="flex min-w-0 flex-1 items-center gap-3">
-		{#if player.state.current_album_art}
-			<img
-				src={player.state.current_album_art}
-				alt="Album art"
-				class="size-14 shrink-0 rounded-md object-cover max-[640px]:size-10"
-			/>
-		{:else if hasCurrentItem}
+	<!-- Now playing -->
+	<div class="flex min-w-0 items-center gap-3">
+		{#if isRadio}
 			<StationArt
 				name={title}
-				src={null}
-				class="size-14 rounded-md max-[640px]:size-10"
-				monogramClass="text-base max-[640px]:text-xs"
+				src={s.current_album_art}
+				class="size-14 rounded-md"
+				monogramClass="text-base"
+			/>
+		{:else if hasItem}
+			<Cover
+				src={track?.cover_art_path || track?.cover_art_url || s.current_album_art}
+				name={track?.album_title || title}
+				class="size-14 rounded-md shadow-lg"
+				textClass="text-base"
+				eager
 			/>
 		{:else}
-			<div class="flex size-14 shrink-0 items-center justify-center rounded-md bg-muted max-[640px]:size-10">
-				<ListMusic class="size-6 text-muted-foreground max-[640px]:size-4" />
+			<div class="flex size-14 shrink-0 items-center justify-center rounded-md bg-white/5">
+				<ListMusic class="size-5 text-muted-foreground" />
 			</div>
 		{/if}
-		<div class="flex min-w-0 flex-col gap-0.5">
-			<p class="truncate text-sm font-medium" title={player.state.current_title ?? undefined}>
-				{title ?? 'Not playing'}
-			</p>
-			<p class="truncate text-xs text-muted-foreground" data-player-subtitle>
-				{subtitle}
-			</p>
+		<div class="min-w-0">
+			{#if hasItem}
+				{#if track?.album_id}
+					<a
+						href="/albums/{track.album_id}"
+						class="block truncate text-sm font-medium hover:underline"
+						title={title ?? undefined}>{title}</a
+					>
+				{:else}
+					<p class="truncate text-sm font-medium" title={title ?? undefined}>{title}</p>
+				{/if}
+				{#if track?.artist_id}
+					<a
+						href="/artists/{track.artist_id}"
+						class="block truncate text-xs text-muted-foreground hover:text-foreground hover:underline"
+						>{artist}</a
+					>
+				{:else}
+					<p class="truncate text-xs text-muted-foreground" data-player-subtitle>{artist}</p>
+				{/if}
+			{:else}
+				<p class="text-sm text-muted-foreground">Nothing playing</p>
+			{/if}
 		</div>
 	</div>
 
-	<!-- Center: controls + progress -->
-	<div class="flex min-w-0 flex-col items-center gap-1">
-		<div class="flex items-center gap-1">
-			<Toggle
-				size="sm"
-				pressed={player.state.is_shuffle}
-				disabled={!hasCurrentItem}
-				onPressedChange={() => player.toggleShuffle()}
+	<!-- Controls -->
+	<div class="flex min-w-0 flex-col items-center gap-0.5">
+		<div class="flex items-center gap-2">
+			<button
+				class="ctl"
+				class:on={s.is_shuffle}
+				disabled={!hasItem || isRadio}
 				aria-label="Shuffle"
-				class="size-8 max-[640px]:hidden {player.state.is_shuffle ? 'text-primary' : ''}"
+				aria-pressed={s.is_shuffle}
+				title="Shuffle"
+				onclick={() => player.toggleShuffle()}
 			>
 				<Shuffle class="size-4" />
-			</Toggle>
-			<Button variant="ghost" size="icon" class="size-8 max-[640px]:hidden" disabled={!hasCurrentItem} onclick={() => player.prev()}>
-				<SkipBack class="size-4" />
-			</Button>
-			<Button
-				size="icon"
-				class="size-9 rounded-full"
-				disabled={!hasCurrentItem}
+			</button>
+			<button class="ctl" disabled={!hasItem || isRadio} aria-label="Previous" onclick={() => player.prev()}>
+				<SkipBack class="size-[18px] fill-current" />
+			</button>
+			<button
+				class="flex size-10 items-center justify-center rounded-full bg-foreground text-background transition-transform hover:scale-105 active:scale-95 disabled:opacity-40 disabled:hover:scale-100"
+				disabled={!hasItem}
+				aria-label={s.is_playing ? 'Pause' : 'Play'}
 				onclick={() => player.togglePlay()}
 			>
-				{#if player.state.is_buffering}
-					<Square class="size-4" />
-				{:else if player.state.is_playing}
-					<Pause class="size-4" />
+				{#if busy}
+					<LoaderCircle class="size-5 animate-spin" />
+				{:else if isRadio && s.is_buffering}
+					<Square class="size-4 fill-current" />
+				{:else if s.is_playing}
+					<Pause class="size-5 fill-current" />
 				{:else}
-					<Play class="size-4 pl-0.5" />
+					<Play class="ml-0.5 size-5 fill-current" />
 				{/if}
-			</Button>
-			<Button variant="ghost" size="icon" class="size-8 max-[640px]:hidden" disabled={!hasCurrentItem} onclick={() => player.next()}>
-				<SkipForward class="size-4" />
-			</Button>
-			<Toggle
-				size="sm"
-				pressed={player.state.repeat_mode !== 'off'}
-				disabled={!hasCurrentItem}
-				onPressedChange={() => player.cycleRepeat()}
-				aria-label="Repeat"
-				class="size-8 max-[640px]:hidden {player.state.repeat_mode !== 'off' ? 'text-primary' : ''}"
+			</button>
+			<button class="ctl" disabled={!hasItem || isRadio} aria-label="Next" onclick={() => player.next()}>
+				<SkipForward class="size-[18px] fill-current" />
+			</button>
+			<button
+				class="ctl"
+				class:on={s.repeat_mode !== 'off'}
+				disabled={!hasItem || isRadio}
+				aria-label="Repeat: {s.repeat_mode}"
+				title={s.repeat_mode === 'one' ? 'Repeat one' : s.repeat_mode === 'all' ? 'Repeat all' : 'Repeat'}
+				onclick={() => player.cycleRepeat()}
 			>
-				{#if player.state.repeat_mode === 'one'}
+				{#if s.repeat_mode === 'one'}
 					<Repeat1 class="size-4" />
 				{:else}
 					<Repeat class="size-4" />
 				{/if}
-			</Toggle>
+			</button>
 		</div>
 
-		{#if hasTimeline}
-			<div class="max-[640px]:hidden" style="display: grid; grid-template-columns: 40px 1fr 40px; align-items: center; gap: 6px; width: calc(100% + 40px); margin-left: -20px; margin-right: -20px;">
-				<span class="text-right text-xs tabular-nums text-muted-foreground">{formatTime(player.state.position_ms)}</span>
-				<WaveformScrubber
-					peaks={showWaveform ? waveform?.peaks ?? null : null}
-					valueMs={player.state.position_ms}
-					durationMs={player.state.duration_ms}
-					interactive={canSeek}
-					onCommit={handleSeekCommit}
-				/>
-				<span class="text-xs tabular-nums text-muted-foreground">{formatTime(player.state.duration_ms)}</span>
-			</div>
-		{:else if isRadio}
-			<div class="flex w-full min-w-0 max-w-[360px] items-center justify-center text-xs text-muted-foreground max-[640px]:hidden">
+		{#if isRadio}
+			<div class="flex h-4 items-center text-xs text-muted-foreground">
 				{#if stage === 'idle'}
 					<span class="font-medium uppercase tracking-[0.18em]">Live radio</span>
 				{:else}
 					<ConnectionStatus
-						playback={player.state}
+						playback={s}
 						long
 						onRetry={() => void player.retryStation()}
 						class={stage === 'playing' ? 'font-medium uppercase tracking-[0.18em]' : ''}
 					/>
 				{/if}
 			</div>
-		{:else if player.state.is_buffering}
-			<div class="flex w-full items-center justify-center text-xs text-muted-foreground max-[640px]:hidden">
-				<ConnectionStatus playback={player.state} />
-			</div>
-		{:else if hasCurrentItem}
-			<div class="flex w-full items-center justify-center gap-2 text-xs text-muted-foreground max-[640px]:hidden">
-				<span>Playback active</span>
-				<span class="text-[10px] uppercase tracking-[0.14em]">Seeking unavailable</span>
-			</div>
 		{:else}
-			<div class="flex w-full items-center justify-center text-xs text-muted-foreground max-[640px]:hidden">
-				Select something to play
+			<div class="w-full max-w-2xl">
+				<SeekBar
+					recordingId={s.current_recording_id}
+					positionMs={s.position_ms}
+					durationMs={s.duration_ms || track?.duration_ms || 0}
+					playing={s.is_playing && !s.is_buffering}
+					enabled={hasItem && s.can_seek && !s.is_buffering}
+					onseek={(ms) => void player.seek(ms)}
+				/>
 			</div>
 		{/if}
 	</div>
 
-	<!-- Right: volume -->
-	<div class="flex shrink-0 items-center justify-end gap-2">
-		<Button variant="ghost" size="icon" class="size-8 max-[640px]:hidden" onclick={toggleMute}>
-			{#if player.state.volume === 0}
-				<VolumeX class="size-4" />
-			{:else}
-				<Volume2 class="size-4" />
-			{/if}
-		</Button>
-		<Slider
-			value={[player.state.volume * 100]}
-			max={100}
-			step={1}
-			class="w-28 max-[640px]:hidden"
-			onValueChange={handleVolumeChange}
-		/>
-		<Button
-			variant="ghost"
-			size="icon"
-			class="size-8"
+	<!-- Volume, queue, visualizer -->
+	<div class="flex items-center justify-end gap-1.5">
+		<button
+			class="ctl"
+			class:on={visualizer.active}
+			aria-label="Visualizer"
 			title="Visualizer"
 			onclick={() => visualizer.toggle()}
 		>
 			<Sparkles class="size-4" />
-		</Button>
-		<Button
-			variant="ghost"
-			size="icon"
-			class="size-8"
-			title="Up Next queue"
-			aria-label="Up Next queue"
-			onclick={() => (showQueue = true)}
+		</button>
+		<button
+			class="ctl"
+			class:on={queueOpen}
+			aria-label="Queue"
+			aria-pressed={queueOpen}
+			title="Queue"
+			onclick={() => (queueOpen = !queueOpen)}
 		>
 			<ListMusic class="size-4" />
-		</Button>
+		</button>
+		<button class="ctl" aria-label={shownVolume === 0 ? 'Unmute' : 'Mute'} onclick={toggleMute}>
+			{#if shownVolume === 0}
+				<VolumeX class="size-4" />
+			{:else if shownVolume < 0.5}
+				<Volume1 class="size-4" />
+			{:else}
+				<Volume2 class="size-4" />
+			{/if}
+		</button>
+		<input
+			type="range"
+			min="0"
+			max="1"
+			step="0.01"
+			value={shownVolume}
+			aria-label="Volume"
+			class="volume w-28"
+			style="--fill: {shownVolume * 100}%"
+			oninput={(e) => setVolume(Number(e.currentTarget.value))}
+			onwheel={wheelVolume}
+		/>
 	</div>
-</div>
+</footer>
 
-<QueueSheet bind:open={showQueue} onOpenChange={(open) => { showQueue = open; }} />
+<QueuePanel bind:open={queueOpen} />
+
+<style>
+	.ctl {
+		display: flex;
+		width: 2rem;
+		height: 2rem;
+		align-items: center;
+		justify-content: center;
+		border-radius: 9999px;
+		color: oklch(0.72 0 0);
+		transition: color 120ms;
+	}
+	.ctl:hover:not(:disabled) {
+		color: oklch(0.98 0 0);
+	}
+	.ctl:disabled {
+		opacity: 0.35;
+	}
+	.ctl.on {
+		color: var(--color-primary);
+	}
+	.volume {
+		appearance: none;
+		height: 4px;
+		border-radius: 9999px;
+		background: linear-gradient(
+			to right,
+			oklch(0.95 0 0) var(--fill),
+			oklch(1 0 0 / 0.15) var(--fill)
+		);
+		cursor: pointer;
+	}
+	.volume:hover {
+		background: linear-gradient(
+			to right,
+			var(--color-primary) var(--fill),
+			oklch(1 0 0 / 0.15) var(--fill)
+		);
+	}
+	.volume::-webkit-slider-thumb {
+		appearance: none;
+		width: 12px;
+		height: 12px;
+		border-radius: 50%;
+		background: white;
+		opacity: 0;
+		transition: opacity 120ms;
+	}
+	.volume:hover::-webkit-slider-thumb,
+	.volume:focus-visible::-webkit-slider-thumb {
+		opacity: 1;
+	}
+</style>

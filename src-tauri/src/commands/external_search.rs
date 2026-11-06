@@ -1070,15 +1070,7 @@ pub fn play_external(
     )?;
     let entry =
         crate::commands::playback::build_queue_entry(&db, &sidecar, &recording_id, Some(&cache))?;
-    let session_id = engine.start_queue(vec![entry], 0);
-    crate::commands::playback::spawn_deterministic_continuation(
-        db.inner(),
-        sidecar.inner(),
-        engine.inner(),
-        cache.inner(),
-        session_id,
-        recording_id.clone(),
-    );
+    engine.start_queue(vec![entry], 0);
     Ok(recording_id)
 }
 
@@ -1151,14 +1143,6 @@ pub fn play_external_context(
 
     let session_id = engine.start_queue(vec![entry], 0);
     if tail.is_empty() {
-        crate::commands::playback::spawn_deterministic_continuation(
-            db.inner(),
-            sidecar.inner(),
-            engine.inner(),
-            cache.inner(),
-            session_id,
-            recording_id.clone(),
-        );
         return Ok(recording_id);
     }
 
@@ -1167,7 +1151,6 @@ pub fn play_external_context(
     let worker_engine = engine.inner().clone();
     let worker_cache = cache.inner().clone();
     let worker_session_id = session_id.clone();
-    let worker_anchor_recording_id = recording_id.clone();
 
     if let Err(error) = std::thread::Builder::new()
         .name("external-up-next".to_string())
@@ -1216,14 +1199,6 @@ pub fn play_external_context(
             }
 
             if appended == 0 && worker_engine.queue_session_is_current(&worker_session_id) {
-                crate::commands::playback::spawn_deterministic_continuation(
-                    &worker_db,
-                    &worker_sidecar,
-                    &worker_engine,
-                    &worker_cache,
-                    worker_session_id,
-                    worker_anchor_recording_id,
-                );
             }
         })
     {
@@ -1231,14 +1206,6 @@ pub fn play_external_context(
         // failure should degrade continuation, not make the UI claim playback
         // failed after audio has started.
         log::warn!("Failed to start external Up Next worker: {error}");
-        crate::commands::playback::spawn_deterministic_continuation(
-            db.inner(),
-            sidecar.inner(),
-            engine.inner(),
-            cache.inner(),
-            session_id,
-            recording_id.clone(),
-        );
     }
 
     Ok(recording_id)

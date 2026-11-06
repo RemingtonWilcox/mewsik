@@ -151,11 +151,7 @@ async function installUpdaterRuntime(page: Page, scenario: UpdateScenario) {
 					case 'get_all_artists':
 					case 'get_all_albums':
 					case 'get_playlists':
-					case 'get_daily_mix':
-					case 'get_recently_played':
 						return [];
-					case 'get_play_stats':
-						return { total_plays: 0, total_time_ms: 0, unique_tracks: 0 };
 					case 'get_download_location':
 						return {
 							directory: 'C:\\Users\\listener\\Music\\Mewsik',
@@ -204,7 +200,7 @@ async function updateCommands(page: Page) {
 test('a packaged launch checks once and offers a nonblocking update action', async ({ page }) => {
 	await installUpdaterRuntime(page, 'available');
 	await page.goto('/');
-	await expect(page.getByRole('heading', { name: 'mewsik' })).toBeVisible({ timeout: 15_000 });
+	await expect(page.getByRole('heading', { name: 'Library' })).toBeVisible({ timeout: 15_000 });
 
 	await expect.poll(() => updateCommands(page), { timeout: 15_000 }).toEqual([
 		'get_release_runtime_info',

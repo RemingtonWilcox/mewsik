@@ -4,7 +4,7 @@ use lofty::probe::Probe;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const AUDIO_EXTENSIONS: &[&str] = &[
@@ -15,7 +15,13 @@ pub struct ScanResult {
     pub total_files: u32,
     pub new_tracks: u32,
     pub updated_tracks: u32,
+    pub removed_tracks: u32,
     pub errors: Vec<String>,
+}
+
+/// Where extracted cover images are cached.
+pub fn covers_dir() -> PathBuf {
+    crate::config::AppConfig::data_dir().join("covers")
 }
 
 pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
@@ -23,8 +29,16 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
         total_files: 0,
         new_tracks: 0,
         updated_tracks: 0,
+        removed_tracks: 0,
         errors: Vec::new(),
     };
+    // An unplugged drive or a typo must not look like "every file was deleted".
+    if !Path::new(dir_path).is_dir() {
+        result.errors.push(format!("{dir_path}: folder not found"));
+        return result;
+    }
+    let covers = covers_dir();
+    let _ = fs::create_dir_all(&covers);
 
     for entry in WalkDir::new(dir_path)
         .follow_links(true)
@@ -51,9 +65,18 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
         result.total_files += 1;
         let path_str = path.to_string_lossy().to_string();
 
-        // Check if already scanned by path
-        if let Ok(Some(_)) = queries::find_source_by_path(db, &path_str) {
-            continue; // Already in library
+        // Already known: only fill in cover art that was never looked for.
+        if let Ok(Some(existing)) = queries::find_source_by_path(db, &path_str) {
+            backfill_cover(db, &existing.recording_id, path, &covers);
+            if !existing.is_available {
+                let _ = queries::set_track_source_file_availability(db, &path_str, true);
+                let conn = db.lock();
+                let _ = conn.execute(
+                    "UPDATE recordings SET is_in_library = 1 WHERE id = ?1",
+                    rusqlite::params![existing.recording_id],
+                );
+            }
+            continue;
         }
 
         // Compute content hash
@@ -67,13 +90,22 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
             }
         };
 
-        // Check if known by hash (moved/renamed file)
-        if let Ok(Some(existing)) = queries::find_source_by_hash(db, &content_hash) {
+        // Known by hash and the old file is gone: it was moved or renamed.
+        // (The hash covers only the first 64 KB, which for tagged files is
+        // often just the cover image, so a live old path means a different
+        // song from the same release, not a move.)
+        if let Ok(Some(existing)) = queries::find_source_by_hash(db, &content_hash)
+            .map(|found| found.filter(|s| s.file_path.as_deref().is_some_and(|p| !Path::new(p).exists())))
+        {
             // Update file path for the moved file
             let conn = db.lock();
             let _ = conn.execute(
-                "UPDATE track_sources SET file_path = ?1, updated_at = ?2 WHERE id = ?3",
+                "UPDATE track_sources SET file_path = ?1, is_available = 1, updated_at = ?2 WHERE id = ?3",
                 rusqlite::params![path_str, queries::now(), existing.id],
+            );
+            let _ = conn.execute(
+                "UPDATE recordings SET is_in_library = 1 WHERE id = ?1",
+                rusqlite::params![existing.recording_id],
             );
             result.updated_tracks += 1;
             continue;
@@ -172,7 +204,7 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
                     duration_ms: meta.duration_ms,
                     year: meta.year,
                     genre: meta.genre.clone(),
-                    cover_art_path: None,
+                    cover_art_path: extract_cover(path, &covers).or(Some(String::new())),
                     cover_art_url: None,
                     loudness_lufs: None,
                     musicbrainz_id: None,
@@ -241,10 +273,117 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
         }
     }
 
+    result.removed_tracks = prune_missing(db, dir_path);
+    fill_album_covers(db);
+
     // Rebuild all search indexes after scan
     let _ = queries::rebuild_all_search_indexes(db);
 
     result
+}
+
+/// Saves the file's embedded front cover (or first picture) into `covers`,
+/// named by content so a whole album shares one image. Returns its path.
+fn extract_cover(path: &Path, covers: &Path) -> Option<String> {
+    use lofty::picture::{MimeType, PictureType};
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let picture = tagged
+        .tags()
+        .iter()
+        .flat_map(|tag| tag.pictures())
+        .min_by_key(|pic| if pic.pic_type() == PictureType::CoverFront { 0 } else { 1 })?;
+    let data = picture.data();
+    if data.len() < 64 {
+        return None;
+    }
+    let extension = match picture.mime_type() {
+        Some(MimeType::Png) => "png",
+        Some(MimeType::Gif) => "gif",
+        Some(MimeType::Bmp) => "bmp",
+        _ => "jpg",
+    };
+    let digest = Sha256::digest(data);
+    let name: String = digest.iter().take(10).map(|b| format!("{b:02x}")).collect();
+    let target = covers.join(format!("{name}.{extension}"));
+    if !target.exists() {
+        fs::write(&target, data).ok()?;
+    }
+    Some(target.to_string_lossy().to_string())
+}
+
+/// Known tracks scanned before covers existed have `cover_art_path` NULL;
+/// look once and store "" when the file has no picture.
+fn backfill_cover(db: &DbPool, recording_id: &str, path: &Path, covers: &Path) {
+    let missing = {
+        let conn = db.lock();
+        conn.query_row(
+            "SELECT cover_art_path IS NULL FROM recordings WHERE id = ?1",
+            rusqlite::params![recording_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    };
+    if !missing {
+        return;
+    }
+    let cover = extract_cover(path, covers).unwrap_or_default();
+    let conn = db.lock();
+    let _ = conn.execute(
+        "UPDATE recordings SET cover_art_path = ?1 WHERE id = ?2",
+        rusqlite::params![cover, recording_id],
+    );
+}
+
+/// Albums take the cover of their first track that has one.
+fn fill_album_covers(db: &DbPool) {
+    let conn = db.lock();
+    let _ = conn.execute(
+        "UPDATE albums SET cover_art_path = (
+             SELECT r.cover_art_path FROM album_tracks t JOIN recordings r ON r.id = t.recording_id
+             WHERE t.album_id = albums.id AND r.cover_art_path <> ''
+             ORDER BY t.disc_number, t.track_number LIMIT 1)
+         WHERE cover_art_path IS NULL OR cover_art_path = ''",
+        [],
+    );
+}
+
+/// Files under `dir_path` that no longer exist are marked unavailable, and
+/// recordings left without any available source leave the library. Returns
+/// how many recordings were removed.
+fn prune_missing(db: &DbPool, dir_path: &str) -> u32 {
+    let prefix = Path::new(dir_path).to_string_lossy().to_lowercase();
+    let gone: Vec<String> = {
+        let conn = db.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT file_path FROM track_sources WHERE file_path IS NOT NULL AND is_available = 1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return 0,
+        };
+        let paths = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        paths
+            .into_iter()
+            .filter(|p| p.to_lowercase().starts_with(&prefix) && !Path::new(p).exists())
+            .collect()
+    };
+    for path in &gone {
+        let _ = queries::set_track_source_file_availability(db, path, false);
+    }
+    if gone.is_empty() {
+        return 0;
+    }
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE recordings SET is_in_library = 0
+         WHERE is_in_library = 1
+           AND NOT EXISTS (SELECT 1 FROM track_sources t WHERE t.recording_id = recordings.id AND t.is_available = 1)",
+        [],
+    )
+    .map(|n| n as u32)
+    .unwrap_or(0)
 }
 
 struct TrackMetadata {
@@ -330,5 +469,27 @@ fn make_sort_name(name: &str) -> String {
         format!("{}, A", &name[2..])
     } else {
         name.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// `MEWSIK_PROBE_DB=<copy> MEWSIK_PROBE_DIR=<folder> cargo test scan_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn scan_probe() {
+        let (Ok(db), Ok(dir)) = (std::env::var("MEWSIK_PROBE_DB"), std::env::var("MEWSIK_PROBE_DIR")) else { return };
+        let db = crate::db::init_db(std::path::Path::new(&db)).unwrap();
+        for pass in 0..2 {
+            let started = std::time::Instant::now();
+            let r = super::scan_directory(&db, &dir);
+            println!("pass {pass}: {:?} files={} new={} moved={} removed={} errors={}",
+                started.elapsed(), r.total_files, r.new_tracks, r.updated_tracks, r.removed_tracks, r.errors.len());
+            for e in r.errors.iter().take(5) { println!("  {e}"); }
+        }
+        let conn = db.lock();
+        let (n, with): (i64, i64) = conn.query_row(
+            "SELECT count(*), sum(cover_art_path <> '') FROM recordings WHERE is_in_library = 1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        println!("library {n}, with cover {with}");
     }
 }

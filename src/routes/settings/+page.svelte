@@ -62,7 +62,6 @@
 			libraryPaths = paths;
 			providerRunning = running;
 			downloadLocation = location;
-			await library.loadAll();
 			settingsError = '';
 		} catch (error) {
 			settingsError = `Could not load settings${error ? `: ${error}` : ''}`;
@@ -104,35 +103,23 @@
 
 	async function scanAll() {
 		if (libraryPaths.length === 0 || scanning) return;
-
 		scanning = true;
-		const summary: ScanSummary = {
-			folders: 0,
-			newTracks: 0,
-			updatedTracks: 0,
-			errors: []
-		};
-
-		for (const path of libraryPaths) {
-			try {
-				const result = await api.scanLibrary(path);
-				summary.folders += 1;
-				summary.newTracks += result.new_tracks;
-				summary.updatedTracks += result.updated_tracks;
-				summary.errors.push(...result.errors.map((error) => `${path}: ${error}`));
-			} catch (error) {
-				summary.errors.push(`${path}: ${error}`);
-			}
-		}
-
 		try {
-			await library.loadAll();
-			lastScan = summary;
-			if (summary.errors.length > 0) {
-				toast.warning(`Scan finished with ${summary.errors.length} issue${summary.errors.length === 1 ? '' : 's'}`);
+			const result = await library.scan();
+			if (!result) return;
+			lastScan = {
+				folders: libraryPaths.length,
+				newTracks: result.new_tracks,
+				updatedTracks: result.updated_tracks,
+				errors: result.errors
+			};
+			if (result.errors.length > 0) {
+				toast.warning(`Scan finished with ${result.errors.length} issue${result.errors.length === 1 ? '' : 's'}`);
 			} else {
-				toast.success(`Library updated: ${summary.newTracks} new, ${summary.updatedTracks} changed`);
+				toast.success(`Library updated: ${result.new_tracks} new, ${result.removed_tracks} removed`);
 			}
+		} catch (error) {
+			toast.error(`Scan failed: ${error}`);
 		} finally {
 			scanning = false;
 		}

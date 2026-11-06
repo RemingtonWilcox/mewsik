@@ -202,6 +202,7 @@ export type ConnectionStage =
 export interface PlaybackWaveform {
 	recording_id: string;
 	peaks: number[];
+	rms: number[];
 	source: string;
 }
 

@@ -4,12 +4,12 @@ use crate::db::DbPool;
 use tauri::State;
 
 #[tauri::command]
-pub fn get_playlists(db: State<'_, DbPool>) -> Result<Vec<Playlist>, String> {
+pub async fn get_playlists(db: State<'_, DbPool>) -> Result<Vec<Playlist>, String> {
     queries::get_playlists(&db).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn create_playlist(
+pub async fn create_playlist(
     db: State<'_, DbPool>,
     name: String,
     description: Option<String>,
@@ -30,12 +30,12 @@ pub fn create_playlist(
 }
 
 #[tauri::command]
-pub fn delete_playlist(db: State<'_, DbPool>, playlist_id: String) -> Result<(), String> {
+pub async fn delete_playlist(db: State<'_, DbPool>, playlist_id: String) -> Result<(), String> {
     queries::delete_playlist(&db, &playlist_id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn add_to_playlist(
+pub async fn add_to_playlist(
     db: State<'_, DbPool>,
     playlist_id: String,
     recording_id: String,
@@ -44,7 +44,7 @@ pub fn add_to_playlist(
 }
 
 #[tauri::command]
-pub fn remove_from_playlist(
+pub async fn remove_from_playlist(
     db: State<'_, DbPool>,
     playlist_track_id: String,
 ) -> Result<(), String> {
@@ -52,7 +52,7 @@ pub fn remove_from_playlist(
 }
 
 #[tauri::command]
-pub fn get_playlist_tracks(
+pub async fn get_playlist_tracks(
     db: State<'_, DbPool>,
     playlist_id: String,
 ) -> Result<Vec<LibraryTrack>, String> {
@@ -60,7 +60,7 @@ pub fn get_playlist_tracks(
 }
 
 #[tauri::command]
-pub fn reorder_playlist_track(
+pub async fn reorder_playlist_track(
     db: State<'_, DbPool>,
     playlist_id: String,
     track_id: String,
@@ -71,7 +71,7 @@ pub fn reorder_playlist_track(
 }
 
 #[tauri::command]
-pub fn update_playlist(
+pub async fn update_playlist(
     db: State<'_, DbPool>,
     playlist_id: String,
     name: Option<String>,

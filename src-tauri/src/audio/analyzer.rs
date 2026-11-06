@@ -166,6 +166,13 @@ impl<S: Source<Item = i16>> Source for TappedSource<S> {
     fn total_duration(&self) -> Option<Duration> {
         self.inner.total_duration()
     }
+    // Without this rodio's default refuses every seek on a tapped source.
+    fn try_seek(&mut self, pos: Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(pos)?;
+        self.channel_idx = 0;
+        self.accumulator = 0.0;
+        Ok(())
+    }
 }
 
 // Autocorrelation BPM estimation on the onset-flux envelope. Scans lag values

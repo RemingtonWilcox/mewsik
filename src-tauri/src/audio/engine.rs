@@ -1,4 +1,5 @@
 use super::analyzer::{self, TappedSource};
+use super::decoder::{extension_for_mime, AudioDecoder};
 use super::http_stream;
 use super::queue::{new_queue_session_id, PlayQueue, QueueEntry, RepeatMode};
 use crate::db::{
@@ -8,25 +9,15 @@ use crate::db::{
 };
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
-use rodio::{buffer::SamplesBuffer, Decoder, OutputStream, Sink, Source};
+use rodio::{OutputStream, Sink, Source};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Cursor};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use symphonia::core::audio::SampleBuffer as SymphoniaSampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
-use symphonia::core::io::MediaSourceStream;
-use symphonia::core::meta::MetadataOptions;
-use symphonia::core::probe::Hint;
 use tauri::AppHandle;
 
 pub enum AudioCommand {
-    PlayFile(String, String), // recording_id, file_path
-    PlayEntry(QueueEntry),
     PlayFetchedRemote(QueueEntry, Vec<u8>, u64, u64),
     PlayPreparedRemote(QueueEntry, Box<dyn Source<Item = i16> + Send>, u64, u64),
     PlayUrl(String, String, String), // station_id, url, name
@@ -100,9 +91,7 @@ pub enum AudioCommand {
 fn command_invalidates_queue_owner(command: &AudioCommand) -> bool {
     matches!(
         command,
-        AudioCommand::PlayFile(..)
-            | AudioCommand::PlayEntry(..)
-            | AudioCommand::PlayUrl(..)
+        AudioCommand::PlayUrl(..)
             | AudioCommand::Stop
             | AudioCommand::StopForError(..)
             | AudioCommand::SetQueue(..)
@@ -637,17 +626,33 @@ impl AudioEngine {
 
         let worker = std::thread::Builder::new()
             .name("audio-engine".to_string())
-            .spawn(move || {
-                Self::run_loop(
-                    cmd_rx,
-                    loop_cmd_tx,
-                    event_tx,
-                    state_clone,
-                    queue_snapshot_clone,
-                    queue_owner_session_clone,
-                    db,
-                    app_handle_clone,
-                );
+            .spawn(move || loop {
+                // A panic anywhere in playback must not leave the app mute
+                // for the rest of the session: log it and restart the loop
+                // with a fresh output. Commands queued meanwhile still arrive.
+                let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Self::run_loop(
+                        cmd_rx.clone(),
+                        loop_cmd_tx.clone(),
+                        event_tx.clone(),
+                        Arc::clone(&state_clone),
+                        Arc::clone(&queue_snapshot_clone),
+                        Arc::clone(&queue_owner_session_clone),
+                        db.clone(),
+                        Arc::clone(&app_handle_clone),
+                    );
+                }));
+                if run.is_ok() {
+                    break;
+                }
+                log::error!("audio engine panicked; restarting");
+                {
+                    let mut s = state_clone.lock();
+                    s.is_playing = false;
+                    s.is_buffering = false;
+                    s.set_connection_stage(ConnectionStage::Idle);
+                }
+                std::thread::sleep(Duration::from_millis(200));
             })
             .expect("failed to spawn audio engine thread");
 
@@ -686,9 +691,7 @@ impl AudioEngine {
     pub fn send(&self, cmd: AudioCommand) {
         if matches!(
             &cmd,
-            AudioCommand::PlayFile(..)
-                | AudioCommand::PlayEntry(..)
-                | AudioCommand::PlayUrl(..)
+            AudioCommand::PlayUrl(..)
                 | AudioCommand::Stop
                 | AudioCommand::StopForError(..)
                 | AudioCommand::Next
@@ -868,128 +871,14 @@ impl AudioEngine {
         })
     }
 
-    fn should_decode_with_symphonia(entry: &QueueEntry) -> bool {
-        if entry.source == "youtube" {
-            return true;
-        }
-
-        matches!(
-            Self::normalized_stream_mime(entry).as_deref(),
-            Some("audio/webm") | Some("video/webm")
-        )
-    }
-
-    fn symphonia_extension_hint(entry: &QueueEntry) -> Option<&'static str> {
-        match Self::normalized_stream_mime(entry).as_deref() {
-            Some("audio/webm") | Some("video/webm") => Some("webm"),
-            Some("audio/mp4") | Some("audio/x-m4a") | Some("video/mp4") => Some("mp4"),
-            Some("audio/mpeg") => Some("mp3"),
-            _ => None,
-        }
-    }
-
-    fn decode_audio_bytes_with_symphonia(
-        entry: &QueueEntry,
-        bytes: Vec<u8>,
-    ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
-        let media_source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
-        let mut hint = Hint::new();
-        if let Some(extension) = Self::symphonia_extension_hint(entry) {
-            hint.with_extension(extension);
-        }
-
-        let probed = symphonia::default::get_probe()
-            .format(
-                &hint,
-                media_source,
-                &FormatOptions::default(),
-                &MetadataOptions::default(),
-            )
-            .map_err(|err| format!("Failed to probe audio: {}", err))?;
-
-        let mut format = probed.format;
-        let track = format
-            .default_track()
-            .ok_or_else(|| "No audio track found in fetched stream".to_string())?;
-        let track_id = track.id;
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .map_err(|err| format!("Failed to create decoder: {}", err))?;
-
-        let mut sample_rate: Option<u32> = None;
-        let mut channels: Option<u16> = None;
-        let mut samples: Vec<i16> = Vec::new();
-
-        loop {
-            let packet = match format.next_packet() {
-                Ok(packet) => packet,
-                Err(SymphoniaError::IoError(err))
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(SymphoniaError::ResetRequired) => {
-                    return Err("Decoder reset is not supported for fetched audio".to_string());
-                }
-                Err(err) => return Err(format!("Failed to read audio packet: {}", err)),
-            };
-
-            if packet.track_id() != track_id {
-                continue;
-            }
-
-            let decoded = match decoder.decode(&packet) {
-                Ok(decoded) => decoded,
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(SymphoniaError::IoError(err))
-                    if err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    break;
-                }
-                Err(SymphoniaError::ResetRequired) => {
-                    return Err("Decoder reset is not supported for fetched audio".to_string());
-                }
-                Err(err) => return Err(format!("Failed to decode fetched audio: {}", err)),
-            };
-
-            let spec = *decoded.spec();
-            sample_rate.get_or_insert(spec.rate);
-            channels.get_or_insert(spec.channels.count() as u16);
-
-            let mut sample_buf = SymphoniaSampleBuffer::<i16>::new(decoded.capacity() as u64, spec);
-            sample_buf.copy_interleaved_ref(decoded);
-            samples.extend_from_slice(sample_buf.samples());
-        }
-
-        let sample_rate =
-            sample_rate.ok_or_else(|| "Fetched audio produced no samples".to_string())?;
-        let channels = channels.ok_or_else(|| "Fetched audio produced no channels".to_string())?;
-
-        Ok(Box::new(SamplesBuffer::new(channels, sample_rate, samples)))
-    }
-
-    fn decode_audio_bytes_with_rodio(
-        bytes: Vec<u8>,
-    ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
-        let reader = BufReader::new(Cursor::new(bytes));
-        let decoder =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Decoder::new(reader)))
-                .map_err(|_| "Decode error: rodio decoder panicked".to_string())?
-                .map_err(|err| format!("Decode error: {}", err))?;
-        Ok(Box::new(decoder))
-    }
-
     fn decode_fetched_audio(
         entry: &QueueEntry,
         bytes: Vec<u8>,
     ) -> Result<(Box<dyn Source<Item = i16> + Send>, bool), String> {
-        let source = if Self::should_decode_with_symphonia(entry) {
-            Self::decode_audio_bytes_with_symphonia(entry, bytes)?
-        } else {
-            Self::decode_audio_bytes_with_rodio(bytes)?
-        };
-
-        Ok((source, true))
+        let hint = extension_for_mime(entry.stream_mime_type.as_deref())
+            .or_else(|| (entry.source == "youtube").then_some("webm"));
+        let source = AudioDecoder::from_media(Box::new(Cursor::new(bytes)), hint)?;
+        Ok((Box::new(source), true))
     }
 
     fn start_remote_playback(
@@ -1215,9 +1104,7 @@ impl AudioEngine {
 
         if let Some(path) = entry.file_path.as_ref() {
             *awaiting_source = false;
-            let file = File::open(path).map_err(|e| format!("File open error: {}", e))?;
-            let reader = BufReader::new(file);
-            let source = Decoder::new(reader).map_err(|e| format!("Decode error: {}", e))?;
+            let source = AudioDecoder::open_path(std::path::Path::new(path))?;
             sink.pause();
             sink.append(TappedSource::new(source, tap_tx.clone()));
         } else if let Some(url) = entry.source_url.as_ref() {
@@ -1486,114 +1373,6 @@ impl AudioEngine {
                 }
             }
             match received {
-                Ok(AudioCommand::PlayFile(recording_id, path)) => {
-                    Self::reset_playback_session(
-                        &sink,
-                        &playback_session,
-                        &db,
-                        &mut position_offset_ms,
-                        &mut current_position_reports_relative,
-                        &mut active_play,
-                        awaiting_source,
-                        PlayEndReason::SourceChanged,
-                    );
-                    awaiting_source = false;
-                    desired_playing = true;
-                    match File::open(&path) {
-                        Ok(file) => {
-                            let reader = BufReader::new(file);
-                            match Decoder::new(reader) {
-                                Ok(source) => {
-                                    sink.stop();
-                                    sink.pause();
-                                    sink.append(TappedSource::new(source, tap_tx.clone()));
-                                    position_offset_ms = 0;
-                                    current_position_reports_relative = false;
-
-                                    // Get recording info from DB
-                                    let rec = db::queries::get_recording(&db, &recording_id)
-                                        .ok()
-                                        .flatten();
-                                    let artist = {
-                                        let conn = db.lock();
-                                        conn.query_row(
-                                            "SELECT a.name FROM recording_artists ra JOIN artists a ON a.id = ra.artist_id WHERE ra.recording_id = ?1 AND ra.role = 'primary' LIMIT 1",
-                                            rusqlite::params![&recording_id],
-                                            |row| row.get::<_, String>(0),
-                                        ).ok()
-                                    };
-
-                                    let track_duration_ms =
-                                        rec.as_ref().and_then(|recording| recording.duration_ms);
-
-                                    // Record play history when audible playback starts.
-                                    active_play = Self::begin_active_play(
-                                        &db,
-                                        Some(&recording_id),
-                                        Some("local"),
-                                        None,
-                                        track_duration_ms,
-                                        false,
-                                    );
-                                    sink.play();
-                                    if let Some(play) = active_play.as_mut() {
-                                        play.set_listening(true);
-                                    }
-                                    playback_kind = PlaybackKind::Queue;
-
-                                    let mut s = state.lock();
-                                    s.is_playing = true;
-                                    s.is_buffering = false;
-                                    s.set_connection_stage(ConnectionStage::Playing);
-                                    s.can_seek = true;
-                                    s.current_recording_id = Some(recording_id);
-                                    s.current_station_id = None;
-                                    s.current_title = rec.as_ref().map(|r| r.title.clone());
-                                    s.current_artist = artist;
-                                    s.current_album_art = rec.as_ref().and_then(|r| {
-                                        r.cover_art_path.clone().or(r.cover_art_url.clone())
-                                    });
-                                    s.current_source_url = None;
-                                    s.position_ms = 0;
-                                    s.duration_ms = track_duration_ms.unwrap_or(0) as u64;
-                                    s.source = Some("local".to_string());
-                                    let state_clone = s.clone();
-                                    drop(s);
-                                    emit_state_changed(&event_tx, state_clone);
-                                }
-                                Err(e) => {
-                                    let _ = event_tx
-                                        .send(AudioEvent::Error(format!("Decode error: {}", e)));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ =
-                                event_tx.send(AudioEvent::Error(format!("File open error: {}", e)));
-                        }
-                    }
-                }
-                Ok(AudioCommand::PlayEntry(entry)) => {
-                    if let Err(err) = Self::play_queue_entry(
-                        &sink,
-                        &tap_tx,
-                        &entry,
-                        &cmd_tx,
-                        &event_tx,
-                        &state,
-                        &db,
-                        &playback_session,
-                        &mut position_offset_ms,
-                        &mut current_position_reports_relative,
-                        &mut active_play,
-                        &mut playback_kind,
-                        &mut awaiting_source,
-                        &mut desired_playing,
-                        PlayEndReason::QueueChanged,
-                    ) {
-                        let _ = event_tx.send(AudioEvent::Error(err));
-                    }
-                }
                 Ok(AudioCommand::PlayFetchedRemote(
                     entry,
                     bytes,

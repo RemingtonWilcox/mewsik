@@ -91,26 +91,123 @@
     border: 2px solid white !important;
   }
 
-  /* Library table - force cells to respect column widths */
-  .table-fixed td,
-  .table-fixed th {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+  input,
+  textarea,
+  [contenteditable] {
+    user-select: text;
+  }
+}
+
+@layer components {
+  /* Shared right-click / "more" menu */
+  .menu-surface {
+    border-radius: 0.6rem;
+    border: 1px solid oklch(1 0 0 / 0.08);
+    background: oklch(0.2 0.004 285 / 0.98);
+    box-shadow: 0 18px 50px -12px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(0 0 0 / 0.4);
+    backdrop-filter: blur(16px);
+    animation: menu-in 90ms ease-out;
+  }
+  .menu-item {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 0.65rem;
+    padding: 0.42rem 0.75rem;
+    font-size: 0.85rem;
+    text-align: left;
+    color: oklch(0.9 0 0);
+    border-radius: 0.35rem;
+    margin: 0 0.3rem;
+    width: calc(100% - 0.6rem);
+  }
+  .menu-item:hover,
+  .menu-item:focus-visible {
+    background: oklch(1 0 0 / 0.08);
+    outline: none;
+  }
+  .menu-item > svg {
+    color: oklch(0.7 0 0);
+    flex-shrink: 0;
+  }
+  .menu-sep {
+    height: 1px;
+    margin: 0.35rem 0.6rem;
+    background: oklch(1 0 0 / 0.07);
+  }
+  @keyframes menu-in {
+    from {
+      opacity: 0;
+      transform: translateY(-3px) scale(0.98);
+    }
   }
 
-  /* Sidebar nav - no background on items, only active gets green */
-  [data-slot="sidebar-menu-button"] {
-    background-color: transparent !important;
-    color: oklch(0.7 0 0) !important;
+  /* Track rows */
+  .track-row {
+    contain: layout style;
   }
-  [data-slot="sidebar-menu-button"]:hover {
-    color: oklch(0.9 0 0) !important;
-    background-color: transparent !important;
+  .track-row:hover {
+    background: oklch(1 0 0 / 0.05);
   }
-  [data-slot="sidebar-menu-button"][data-active="true"] {
-    background-color: oklch(0.75 0.18 160 / 0.12) !important;
-    color: oklch(0.75 0.18 160) !important;
+  .track-row.is-selected {
+    background: oklch(1 0 0 / 0.1);
+  }
+  .track-row.is-current .track-title {
+    color: var(--color-primary);
+  }
+
+  /* Nav links in the sidebar */
+  .nav-link {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    border-radius: 0.45rem;
+    padding: 0.45rem 0.7rem;
+    font-size: 0.875rem;
+    color: oklch(0.72 0 0);
+    transition: color 120ms, background-color 120ms;
+  }
+  .nav-link:hover {
+    color: oklch(0.95 0 0);
+    background: oklch(1 0 0 / 0.04);
+  }
+  .nav-link[aria-current="page"] {
+    color: oklch(0.97 0 0);
+    background: oklch(1 0 0 / 0.08);
     font-weight: 500;
+  }
+
+  /* Tiny "now playing" bars */
+  .eq {
+    display: inline-flex;
+    align-items: flex-end;
+    gap: 2px;
+    height: 12px;
+  }
+  .eq > i {
+    width: 3px;
+    background: var(--color-primary);
+    border-radius: 1px;
+    animation: eq 0.9s ease-in-out infinite alternate;
+  }
+  .eq > i:nth-child(2) {
+    animation-delay: -0.3s;
+  }
+  .eq > i:nth-child(3) {
+    animation-delay: -0.6s;
+  }
+  @keyframes eq {
+    from {
+      height: 3px;
+    }
+    to {
+      height: 12px;
+    }
+  }
+
+  .tile-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr));
+    gap: 1.25rem 1rem;
   }
 }

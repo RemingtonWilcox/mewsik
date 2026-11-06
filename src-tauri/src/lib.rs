@@ -5,7 +5,6 @@ mod audio;
 mod commands;
 mod config;
 mod db;
-mod discovery;
 mod download;
 mod external_tools;
 mod keychain;
@@ -22,10 +21,6 @@ use commands::settings::ConfigState;
 #[cfg(not(test))]
 use config::AppConfig;
 #[cfg(not(test))]
-use discovery::sources::SourceConfig;
-#[cfg(not(test))]
-use discovery::v2::{DiscoveryFeedRuntime, SharedDiscoveryFeedRuntime};
-#[cfg(not(test))]
 use download::DownloadManager;
 #[cfg(not(test))]
 use parking_lot::Mutex;
@@ -40,6 +35,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cfg = AppConfig::load();
+    let startup_library_paths = cfg.library_paths.clone();
 
     // Ensure data directory exists
     let data_dir = AppConfig::data_dir();
@@ -75,10 +71,6 @@ pub fn run() {
     let stream_cache: StreamCache =
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let external_search_runtime = Arc::new(ExternalSearchRuntime::default());
-    let discovery_feed_runtime: SharedDiscoveryFeedRuntime = Arc::new(DiscoveryFeedRuntime::new(
-        db.clone(),
-        SourceConfig::from_env(),
-    ));
     let startup_db = db.clone();
 
     #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
@@ -118,6 +110,17 @@ pub fn run() {
             stations::scenes::spawn_startup_refresh(startup_db.clone());
             stations::scenes::spawn_daily_cache_health_sweep(startup_db.clone());
             engine_for_setup.set_app_handle(app.handle().clone());
+            // Pick up files added since the last launch (downloads, copies)
+            // without anyone pressing Scan.
+            let scan_db = startup_db.clone();
+            let scan_paths = startup_library_paths.clone();
+            let scan_app = app.handle().clone();
+            let _ = std::thread::Builder::new()
+                .name("startup-library-scan".to_string())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    commands::library::scan_all_blocking(&scan_db, &scan_paths, Some(&scan_app));
+                });
             Ok(())
         })
         .manage(db)
@@ -127,10 +130,10 @@ pub fn run() {
         .manage(downloads)
         .manage(stream_cache)
         .manage(external_search_runtime)
-        .manage(discovery_feed_runtime)
         .invoke_handler(tauri::generate_handler![
             // Library
             commands::library::scan_library,
+            commands::library::is_library_scanning,
             commands::library::get_library_tracks,
             commands::library::get_all_artists,
             commands::library::get_all_albums,
@@ -190,13 +193,6 @@ pub fn run() {
             commands::external_search::start_sidecar,
             commands::external_search::stop_sidecar,
             commands::external_search::sidecar_status,
-            // Discovery
-            commands::discovery::get_daily_mix,
-            commands::discovery::get_rediscover,
-            commands::discovery::get_play_stats,
-            commands::discovery::get_recently_played,
-            commands::discovery::get_search_discovery_feed,
-            commands::discovery::record_discovery_event,
             // Downloads
             commands::downloads::get_downloads,
             commands::downloads::refresh_download_files,
