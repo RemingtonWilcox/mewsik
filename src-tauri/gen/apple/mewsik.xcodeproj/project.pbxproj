@@ -20,7 +20,6 @@
 		7885B00C94A71997633D618E /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = B3994F65F65F0CB29F5D0200 /* LaunchScreen.storyboard */; };
 		7894B752D861C1FDD68CDDA3 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1DA34987D233AE6BB8893DE3 /* MetalKit.framework */; };
 		950C3B6ED2DF7F1766C50CB7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = CD556081AC031BC658A92DCB /* Assets.xcassets */; };
-		B76053DAB4D1E8A5E8FAA569 /* libapp.a in Resources */ = {isa = PBXBuildFile; fileRef = 4838816C0FBD6F1A827485A1 /* libapp.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -37,7 +36,6 @@
 		2AF52D54DB0AA069C3F3ED72 /* external_search.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = external_search.rs; sourceTree = "<group>"; };
 		3066C7AD22CCB487DE5A9504 /* http_stream.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = http_stream.rs; sourceTree = "<group>"; };
 		47AF3AA09E9FB8CBD394A3C4 /* sidecar_manager.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = sidecar_manager.rs; sourceTree = "<group>"; };
-		4838816C0FBD6F1A827485A1 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		4A7AC2FDEC8A3C30A4796F2D /* now_playing.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = now_playing.rs; sourceTree = "<group>"; };
 		4CFCD475CDFD56AC3FE8F0AF /* stream_cache.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = stream_cache.rs; sourceTree = "<group>"; };
 		51026424494E1D48F55BCA23 /* sidecar.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = sidecar.rs; sourceTree = "<group>"; };
@@ -187,14 +185,6 @@
 			path = db;
 			sourceTree = "<group>";
 		};
-		682D102626BAF1BA0CC331E9 /* debug */ = {
-			isa = PBXGroup;
-			children = (
-				4838816C0FBD6F1A827485A1 /* libapp.a */,
-			);
-			path = debug;
-			sourceTree = "<group>";
-		};
 		79ED4F052F1C29D9295CE057 /* src */ = {
 			isa = PBXGroup;
 			children = (
@@ -240,7 +230,6 @@
 		C2982D4A6B25AE29A6FB0E5D /* arm64 */ = {
 			isa = PBXGroup;
 			children = (
-				682D102626BAF1BA0CC331E9 /* debug */,
 			);
 			path = arm64;
 			sourceTree = "<group>";
@@ -362,7 +351,6 @@
 				950C3B6ED2DF7F1766C50CB7 /* Assets.xcassets in Resources */,
 				7885B00C94A71997633D618E /* LaunchScreen.storyboard in Resources */,
 				71099EEFABEA109A1ABCD10E /* assets in Resources */,
-				B76053DAB4D1E8A5E8FAA569 /* libapp.a in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
