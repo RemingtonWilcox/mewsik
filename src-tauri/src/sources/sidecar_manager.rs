@@ -80,7 +80,7 @@ impl SidecarManager {
             return Err("Search providers are shutting down for app exit".to_string());
         }
         reap_if_dead(&mut inner, &self.pending);
-        if inner.child.is_some() {
+        if inner.child.is_some() || super::web_providers::enabled() {
             return Ok(());
         }
 
@@ -244,6 +244,9 @@ impl SidecarManager {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        if super::web_providers::enabled() {
+            return super::web_providers::call(id, method, &params, CALL_TIMEOUT);
+        }
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id,
@@ -336,6 +339,9 @@ impl SidecarManager {
     }
 
     pub fn is_running(&self) -> bool {
+        if super::web_providers::enabled() {
+            return true;
+        }
         let mut inner = self.inner.lock();
         reap_if_dead(&mut inner, &self.pending);
         inner.child.is_some()

@@ -110,6 +110,7 @@ pub fn run() {
             stations::scenes::spawn_startup_refresh(startup_db.clone());
             stations::scenes::spawn_daily_cache_health_sweep(startup_db.clone());
             engine_for_setup.set_app_handle(app.handle().clone());
+            sources::web_providers::set_app_handle(app.handle().clone());
             // Pick up files added since the last launch (downloads, copies)
             // without anyone pressing Scan.
             let scan_db = startup_db.clone();
@@ -193,6 +194,9 @@ pub fn run() {
             commands::external_search::start_sidecar,
             commands::external_search::stop_sidecar,
             commands::external_search::sidecar_status,
+            sources::web_providers::providers_reply,
+            sources::web_providers::providers_eval,
+            sources::web_providers::native_fetch,
             // Downloads
             commands::downloads::get_downloads,
             commands::downloads::refresh_download_files,

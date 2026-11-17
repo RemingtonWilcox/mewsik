@@ -41,6 +41,7 @@ export class SoundCloudProvider {
   private healthy = true;
   private failCount = 0;
   private proxyBaseUrl: string | null = null;
+  private inlineHls = false;
 
   private getClient(): SoundCloud {
     if (!this.client) {
@@ -67,6 +68,14 @@ export class SoundCloudProvider {
 
   setProxyBaseUrl(proxyBaseUrl: string) {
     this.proxyBaseUrl = proxyBaseUrl;
+  }
+
+  /**
+   * Without the local proxy (the in-app providers on iPhone), hand HLS-only
+   * tracks to the app as `hls+<playlist url>`; the app joins the segments.
+   */
+  useInlineHls() {
+    this.inlineHls = true;
   }
 
   private unplayableReason(track: Track): string | null {
@@ -264,7 +273,7 @@ export class SoundCloudProvider {
         'hls',
       );
 
-      if (!hls || !this.proxyBaseUrl) {
+      if (!hls || (!this.proxyBaseUrl && !this.inlineHls)) {
         throw new Error(
           'This SoundCloud track does not expose a supported stream',
         );
@@ -273,6 +282,32 @@ export class SoundCloudProvider {
       const hlsMimeType = this.normalizeMimeType(hls);
       const hlsCodec = this.inferCodec(hls);
       const hlsSeekable = hlsMimeType === 'audio/mpeg';
+
+      if (!this.proxyBaseUrl) {
+        if (!hls.url) {
+          throw new Error('This SoundCloud track does not expose a supported stream');
+        }
+        const streamingData = await sc.getStreamingData({
+          transcodingUrl: hls.url,
+          trackAuthorization,
+        });
+        if (!streamingData?.url) {
+          throw new Error('SoundCloud did not return a playable stream URL');
+        }
+        this.markHealthy();
+        return {
+          url: `hls+${streamingData.url}`,
+          headers: {},
+          expires_at: Date.now() + 10 * 60 * 1_000,
+          mime_type: hlsMimeType,
+          codec: hlsCodec,
+          bitrate: parseBitrate(hls.preset ?? undefined) ?? 160_000,
+          duration_ms: durationMs,
+          // The app fetches the whole stream first, so it can seek.
+          is_seekable: true,
+          needs_refresh: true,
+        };
+      }
 
       this.markHealthy();
       return {

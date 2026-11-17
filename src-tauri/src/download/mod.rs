@@ -116,12 +116,31 @@ fn sanitize_filename(value: &str) -> String {
 }
 
 fn should_transcode_remote_to_mp3(entry: &QueueEntry) -> bool {
-    entry.file_path.is_none() && entry.source == "youtube" && entry.source_url.is_some()
+    // Phones cannot run ffmpeg; they keep YouTube's own AAC audio (.m4a).
+    !cfg!(any(target_os = "ios", target_os = "android"))
+        && entry.file_path.is_none()
+        && entry.source == "youtube"
+        && entry.source_url.is_some()
 }
 
 fn infer_extension(entry: &QueueEntry) -> String {
     if should_transcode_remote_to_mp3(entry) {
         return "mp3".to_string();
+    }
+    let mime_extension = || {
+        crate::audio::decoder::extension_for_mime(entry.stream_mime_type.as_deref())
+            .map(str::to_string)
+    };
+    if entry.file_path.is_none()
+        && (entry.source == "youtube"
+            || entry
+                .source_url
+                .as_deref()
+                .is_some_and(|url| crate::audio::http_stream::hls_playlist_url(url).is_some()))
+    {
+        if let Some(extension) = mime_extension() {
+            return extension;
+        }
     }
 
     if let Some(path) = entry.file_path.as_deref() {
@@ -378,6 +397,17 @@ fn fetch_remote_file(
     destination: &Path,
     cancel_token: &AtomicBool,
 ) -> Result<(), DownloadError> {
+    if crate::audio::http_stream::hls_playlist_url(url).is_some() {
+        let bytes = crate::audio::http_stream::fetch_http_audio_bytes(url, headers)?;
+        if cancelled(cancel_token) {
+            return Err(DownloadError::Cancelled);
+        }
+        std::fs::write(destination, bytes).map_err(|e| e.to_string())?;
+        queries::complete_download(db, download_id, &destination.to_string_lossy())
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()

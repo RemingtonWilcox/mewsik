@@ -856,7 +856,9 @@ fn run_external_search_batch(
     }
 }
 
-#[tauri::command]
+// Async: on iPhone the providers answer through the web view, which
+// must not wait on a blocked main thread.
+#[tauri::command(async)]
 pub fn search_external(
     db: State<'_, DbPool>,
     sidecar: State<'_, Arc<SidecarManager>>,
@@ -898,7 +900,9 @@ pub fn search_external(
     })
 }
 
-#[tauri::command]
+// Async: on iPhone the providers answer through the web view, which
+// must not wait on a blocked main thread.
+#[tauri::command(async)]
 pub fn search_all_sources(
     app: tauri::AppHandle,
     db: State<'_, DbPool>,
@@ -1045,7 +1049,9 @@ pub fn ensure_external_recording(
     )
 }
 
-#[tauri::command]
+// Async: on iPhone the providers answer through the web view, which
+// must not wait on a blocked main thread.
+#[tauri::command(async)]
 pub fn play_external(
     sidecar: State<'_, Arc<SidecarManager>>,
     db: State<'_, DbPool>,
@@ -1110,7 +1116,9 @@ fn external_context_tail(
 /// build the rest of Up Next. Queue ownership no longer belongs to the Search
 /// page, so navigating elsewhere cannot cancel continuation. The queue session
 /// guard rejects late work after the user starts a different context.
-#[tauri::command]
+// Async: on iPhone the providers answer through the web view, which
+// must not wait on a blocked main thread.
+#[tauri::command(async)]
 pub fn play_external_context(
     sidecar: State<'_, Arc<SidecarManager>>,
     db: State<'_, DbPool>,
@@ -1198,8 +1206,7 @@ pub fn play_external_context(
                 }
             }
 
-            if appended == 0 && worker_engine.queue_session_is_current(&worker_session_id) {
-            }
+            if appended == 0 && worker_engine.queue_session_is_current(&worker_session_id) {}
         })
     {
         // The selected track is already queued and playable. A worker-launch
@@ -1211,7 +1218,9 @@ pub fn play_external_context(
     Ok(recording_id)
 }
 
-#[tauri::command]
+// Async: on iPhone the providers answer through the web view, which
+// must not wait on a blocked main thread.
+#[tauri::command(async)]
 pub fn start_sidecar(sidecar: State<'_, Arc<SidecarManager>>) -> Result<(), String> {
     sidecar.start()
 }

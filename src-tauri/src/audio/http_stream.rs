@@ -927,6 +927,67 @@ fn spawn_ffmpeg_transcode_worker(
     Ok(())
 }
 
+/// Marks an HLS playlist handed over by the in-app SoundCloud provider (on
+/// the desktop the sidecar's local proxy joins HLS streams instead). The
+/// audio is the playlist's segments, after any init segment, end to end.
+pub const HLS_PREFIX: &str = "hls+";
+
+pub fn hls_playlist_url(url: &str) -> Option<&str> {
+    url.strip_prefix(HLS_PREFIX)
+}
+
+/// The media URLs of an HLS playlist in play order: init segment first.
+fn hls_segment_urls(playlist_url: &reqwest::Url, playlist: &str) -> Vec<reqwest::Url> {
+    let mut init = Vec::new();
+    let mut segments = Vec::new();
+    for line in playlist.lines().map(str::trim) {
+        if let Some(map) = line.strip_prefix("#EXT-X-MAP:") {
+            if let Some(uri) = map
+                .split("URI=\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+            {
+                init.extend(playlist_url.join(uri).ok());
+            }
+        } else if !line.is_empty() && !line.starts_with('#') {
+            segments.extend(playlist_url.join(line).ok());
+        }
+    }
+    init.extend(segments);
+    init
+}
+
+fn fetch_hls_bytes(
+    client: &reqwest::blocking::Client,
+    playlist_url: &str,
+    headers: &HashMap<String, String>,
+) -> Result<Vec<u8>, String> {
+    let mut url = reqwest::Url::parse(playlist_url).map_err(|e| format!("Bad HLS URL: {e}"))?;
+    let mut urls = Vec::new();
+    // A master playlist lists other playlists; follow the first.
+    for _ in 0..2 {
+        let text = open_http_response(client, url.as_str(), headers, false, None)?
+            .text()
+            .map_err(|e| format!("Failed to read HLS playlist: {e}"))?;
+        urls = hls_segment_urls(&url, &text);
+        match urls.first() {
+            Some(first) if first.path().ends_with(".m3u8") => url = first.clone(),
+            _ => break,
+        }
+    }
+    if urls.is_empty() {
+        return Err("HLS playlist contained no audio".to_string());
+    }
+    let mut bytes = Vec::new();
+    for segment in urls {
+        let chunk = open_http_response(client, segment.as_str(), headers, false, None)?
+            .bytes()
+            .map_err(|e| format!("Failed to read HLS segment: {e}"))?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 pub fn fetch_http_audio_bytes(
     url: &str,
     headers: &HashMap<String, String>,
@@ -935,6 +996,10 @@ pub fn fetch_http_audio_bytes(
         .timeout(Duration::from_secs(120))
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    if let Some(playlist) = hls_playlist_url(url) {
+        return fetch_hls_bytes(&client, playlist, headers);
+    }
 
     if !should_use_ranged_fetch(url) {
         let response = open_http_response(&client, url, headers, false, None)?;
@@ -1232,6 +1297,9 @@ pub fn prepare_http_audio_source(
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<Box<dyn Source<Item = i16> + Send>, String> {
+    if hls_playlist_url(&url).is_some() {
+        return Err("HLS streams play from a full fetch".to_string());
+    }
     let (writer, reader) = create_unlinked_stream_file()?;
     let shared = Arc::new(SharedBufferedFile::new(reader));
 
@@ -1314,6 +1382,70 @@ pub fn prepare_ffmpeg_audio_source(
 
 #[cfg(test)]
 mod tests {
+    /// Fetches and decodes resolved provider streams. Set MEWSIK_STREAM_FILES
+    /// to `;`-separated JSON files, each a provider `resolve_stream` result.
+    #[test]
+    #[ignore]
+    fn resolved_streams_decode() {
+        use rodio::Source;
+        let files = std::env::var("MEWSIK_STREAM_FILES").unwrap_or_default();
+        for file in files.split(';').filter(|f| !f.is_empty()) {
+            let info: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
+            let url = info["url"].as_str().unwrap();
+            let headers: HashMap<String, String> =
+                serde_json::from_value(info["headers"].clone()).unwrap_or_default();
+            let started = std::time::Instant::now();
+            let bytes = super::fetch_http_audio_bytes(url, &headers).unwrap();
+            let hint = crate::audio::decoder::extension_for_mime(info["mime_type"].as_str());
+            let decoder = crate::audio::decoder::AudioDecoder::from_media(
+                Box::new(std::io::Cursor::new(bytes.clone())),
+                hint,
+            )
+            .unwrap();
+            let rate = decoder.sample_rate();
+            let channels = decoder.channels();
+            let samples = decoder.count();
+            let seconds = samples as f64 / rate as f64 / channels as f64;
+            println!(
+                "{file}: {} KB in {:?}, {rate} Hz x{channels}, {seconds:.1}s decoded",
+                bytes.len() / 1024,
+                started.elapsed()
+            );
+            assert!(seconds > 30.0);
+        }
+    }
+
+    #[test]
+    fn hls_playlists_list_init_then_segments() {
+        let base = reqwest::Url::parse("https://cf-hls.example.com/a/playlist.m3u8?x=1").unwrap();
+        let text = "#EXTM3U
+#EXT-X-MAP:URI=\"init.mp4\"
+#EXTINF:10,
+seg1.m4s
+#EXTINF:10,
+https://other.example.com/seg2.m4s
+#EXT-X-ENDLIST
+";
+        let urls: Vec<String> = super::hls_segment_urls(&base, text)
+            .into_iter()
+            .map(|u| u.to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://cf-hls.example.com/a/init.mp4",
+                "https://cf-hls.example.com/a/seg1.m4s",
+                "https://other.example.com/seg2.m4s",
+            ]
+        );
+        assert_eq!(
+            super::hls_playlist_url("hls+https://x/p.m3u8"),
+            Some("https://x/p.m3u8")
+        );
+        assert_eq!(super::hls_playlist_url("https://x/p.m3u8"), None);
+    }
+
     use super::*;
 
     #[test]

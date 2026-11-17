@@ -51,12 +51,16 @@ export class YouTubeProvider {
   private failCount = 0;
   private searchPageCache = new Map<string, { pages: any[]; cachedAt: number }>();
 
+  /** `fetchImpl` replaces the global fetch (the in-app providers use the app's own). */
+  constructor(private readonly fetchImpl?: typeof fetch) {}
+
   private async getClient(): Promise<Innertube> {
     if (!this.yt) {
       this.yt = await Innertube.create({
         lang: 'en',
         location: 'US',
         retrieve_player: true,
+        ...(this.fetchImpl ? { fetch: this.fetchImpl } : {}),
       });
     }
     return this.yt;

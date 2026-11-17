@@ -544,3 +544,34 @@ test('songs heard on stations are listed to find again', async ({ page }) => {
 	await expect(rows).toHaveCount(1);
 	await expect(rows.first()).toContainText('Mr Right On');
 });
+
+test.describe('on a phone', () => {
+	test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+
+	test('the Library tab leads to heard songs, downloads and playlists', async ({ page }) => {
+		await installPlaybackMock(page, { playback: radioWithSong });
+		await page.goto('/library');
+
+		const shortcuts = page.locator('[data-mobile-shortcuts]');
+		await expect(shortcuts.getByRole('link', { name: 'Heard on radio' })).toBeVisible();
+		await expect(shortcuts.getByRole('link', { name: 'Downloads' })).toBeVisible();
+		await expect(shortcuts.getByRole('link', { name: 'Continuity Playlist' })).toBeVisible();
+		await shortcuts.getByRole('link', { name: 'Heard on radio' }).click();
+		await expect(page).toHaveURL(/\/heard$/);
+		await expect(page.getByRole('button', { name: 'Library' })).toHaveAttribute('aria-current', 'page');
+	});
+
+	test('a tap plays a song and its menu button is showing', async ({ page }) => {
+		await installPlaybackMock(page);
+		await page.goto('/library');
+
+		const row = page.getByRole('row').filter({ hasText: 'Context Two' });
+		await expect(row.getByRole('button', { name: 'More' })).toBeVisible();
+		await expect(page.getByRole('grid').getByText('Album', { exact: true })).toHaveCount(0);
+		await row.getByText('Context Two').tap();
+		await expect
+			.poll(async () => (await playbackInvocations(page)).map((call) => call.command))
+			.toContain('play_tracks_from');
+		await page.screenshot({ path: 'test-results/mobile-library.png' });
+	});
+});
