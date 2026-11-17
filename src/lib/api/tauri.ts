@@ -9,6 +9,7 @@ import type {
 	SearchResult,
 	Station,
 	StationHealthResult,
+	StationSong,
 	QueueSnapshot,
 	Download
 } from '$lib/types';
@@ -496,6 +497,12 @@ export const saveStation = (
 	});
 
 export const getFavoriteStations = () => safeInvoke<Station[]>('get_favorite_stations', undefined, []);
+
+/** Songs heard on stations, newest first. */
+export const getStationSongs = (limit = 1000) =>
+	safeInvoke<StationSong[]>('get_station_songs', { limit }, []);
+
+export const deleteStationSong = (id: string) => invoke<void>('delete_station_song', { id });
 
 /** iOS-only: seed the local DB from the bundled desktop favorites JSON. Returns # added. */
 export const seedFavoriteStationsFromBundle = () =>

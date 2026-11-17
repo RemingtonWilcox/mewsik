@@ -26,7 +26,8 @@
 	};
 
 	let input = $state<HTMLInputElement | null>(null);
-	let query = $state(saved.query || page.url.searchParams.get('q') || '');
+	// A ?q= link (from "Heard on radio", say) wins over the last search.
+	let query = $state(page.url.searchParams.get('q') || saved.query || '');
 	let online = $state<ExternalSearchResult[]>(saved.online);
 	let onlineQuery = $state(saved.onlineQuery);
 	let searching = $state(false);

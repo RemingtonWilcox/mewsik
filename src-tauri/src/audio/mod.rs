@@ -3,9 +3,11 @@ pub mod decoder;
 pub mod engine;
 pub mod ensemble;
 pub mod http_stream;
+pub mod icy;
 #[cfg(target_os = "ios")]
 pub mod now_playing;
 pub mod queue;
+pub mod song_sense;
 // Only the iOS lock screen uses the Rust cleaner; the web UI has its own.
 #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 pub mod station_names;

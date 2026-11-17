@@ -15,6 +15,9 @@ use ulid::Ulid;
 
 const GOOGLEVIDEO_RANGE_CHUNK_BYTES: u64 = 1024 * 1024;
 
+/// Called from the download thread with each new in-band stream title.
+pub type TitleCallback = Box<dyn FnMut(String) + Send + 'static>;
+
 #[derive(Default)]
 struct FfmpegTracker {
     quiescing: bool,
@@ -583,6 +586,7 @@ fn spawn_download_worker(
     is_live: bool,
     event_tx: Sender<AudioEvent>,
     label: String,
+    mut on_title: Option<TitleCallback>,
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name(if is_live {
@@ -656,7 +660,7 @@ fn spawn_download_worker(
                         range,
                     )
                 };
-                let mut response = match response_result {
+                let mut response: Box<dyn std::io::Read> = match response_result {
                     Ok(response) => {
                         let headers = response.headers();
                         let header_text =
@@ -665,7 +669,23 @@ fn spawn_download_worker(
                             header_text("icy-br"),
                             header_text("ice-audio-info"),
                         ));
-                        response
+                        let metaint = is_live
+                            .then(|| crate::audio::icy::parse_metaint(header_text("icy-metaint")))
+                            .flatten();
+                        match (metaint, on_title.take()) {
+                            (Some(metaint), Some(callback)) => Box::new(
+                                crate::audio::icy::IcyReader::new(response, metaint, callback),
+                            ),
+                            (Some(metaint), None) => Box::new(crate::audio::icy::IcyReader::new(
+                                response,
+                                metaint,
+                                |_| {},
+                            )),
+                            (None, callback) => {
+                                on_title = callback;
+                                Box::new(response)
+                            }
+                        }
                     }
                     Err(err) => {
                         shared.fail(err.clone());
@@ -1225,6 +1245,7 @@ pub fn prepare_http_audio_source(
         false,
         event_tx,
         label,
+        None,
     )?;
 
     prepare_buffered_decoder(shared, initial_buffer_bytes)
@@ -1240,6 +1261,7 @@ pub fn prepare_live_audio_source(
     bitrate_hint_kbps: Option<u32>,
     started: Instant,
     on_connected: impl FnOnce(),
+    on_title: TitleCallback,
     event_tx: Sender<AudioEvent>,
     label: String,
 ) -> Result<(Box<dyn Source<Item = i16> + Send>, LiveStartReport), String> {
@@ -1256,6 +1278,7 @@ pub fn prepare_live_audio_source(
         true,
         event_tx,
         label,
+        Some(on_title),
     )?;
 
     prepare_live_decoder(shared, bitrate_hint_kbps, started, on_connected)
@@ -1440,6 +1463,57 @@ mod tests {
     /// `MEWSIK_LIVE_URLS=url1,url2 cargo test live_start_latency -- --ignored --nocapture`
     /// Prints when the old fixed 16 KiB threshold and the new bitrate-sized
     /// threshold were reached on the same connection.
+    /// Plays a few seconds of each `MEWSIK_LIVE_URLS` station with in-band
+    /// titles on, and checks titles arrive and the audio still decodes.
+    #[test]
+    #[ignore]
+    fn live_stream_titles() {
+        let urls = std::env::var("MEWSIK_LIVE_URLS").unwrap_or_default();
+        for url in urls.split(',').map(str::trim).filter(|url| !url.is_empty()) {
+            let titles = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = Arc::clone(&titles);
+            let (event_tx, _event_rx) = crossbeam_channel::unbounded();
+            let (mut source, report) = prepare_live_audio_source(
+                url.to_string(),
+                Arc::new(AtomicU64::new(1)),
+                1,
+                None,
+                Instant::now(),
+                || {},
+                Box::new(move |title| seen.lock().push(title)),
+                event_tx,
+                "title probe".to_string(),
+            )
+            .expect("station starts");
+            let rate = source.sample_rate() as usize * source.channels() as usize;
+            let mut loud = 0usize;
+            let mut jumps = 0usize;
+            let channels = source.channels() as usize;
+            let mut last = vec![0i32; channels];
+            for i in 0..rate * 6 {
+                let Some(sample) = source.next() else { break };
+                let sample = sample as i32;
+                if sample.abs() > 200 {
+                    loud += 1;
+                }
+                // A metadata block decoded as audio shows up as a hard click
+                // within one channel.
+                let channel = i % channels;
+                if i >= channels && (sample - last[channel]).abs() > 30_000 {
+                    jumps += 1;
+                }
+                last[channel] = sample;
+            }
+            println!(
+                "{url}: titles {:?} | audible {:.0}% | clicks {jumps} | {report}",
+                titles.lock(),
+                100.0 * loud as f64 / (rate * 6) as f64
+            );
+            assert!(!titles.lock().is_empty(), "{url} sent no title");
+            assert!(loud > rate, "{url} decoded mostly silence");
+        }
+    }
+
     #[test]
     #[ignore]
     fn live_start_latency() {
@@ -1460,6 +1534,7 @@ mod tests {
                 true,
                 event_tx,
                 "latency probe".to_string(),
+                None,
             )
             .expect("download worker");
 

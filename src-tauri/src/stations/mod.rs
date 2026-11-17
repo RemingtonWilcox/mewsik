@@ -7,3 +7,4 @@ pub mod health;
 pub(crate) mod network;
 pub mod probe;
 pub mod scenes;
+pub mod songs;

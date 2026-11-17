@@ -315,6 +315,7 @@ mod play_request_tests {
                 app_handle: Arc::new(Mutex::new(None)),
                 play_request_gate: PlayRequestGate::default(),
                 worker: Mutex::new(None),
+                db: crate::db::init_memory_db().expect("memory db"),
             }),
             cmd_rx,
         )
@@ -593,10 +594,12 @@ pub struct AudioEngine {
     app_handle: Arc<Mutex<Option<AppHandle>>>,
     play_request_gate: PlayRequestGate,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    db: DbPool,
 }
 
 impl AudioEngine {
     pub fn new(db: DbPool) -> Self {
+        let state_db = db.clone();
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         // The UI reads PlaybackState by polling, so nothing else consumes
@@ -665,6 +668,7 @@ impl AudioEngine {
             app_handle,
             play_request_gate: PlayRequestGate::default(),
             worker: Mutex::new(Some(worker)),
+            db: state_db,
         }
     }
 
@@ -742,7 +746,9 @@ impl AudioEngine {
     }
 
     pub fn get_state(&self) -> PlaybackState {
-        self.state.lock().clone()
+        let mut state = self.state.lock().clone();
+        crate::stations::songs::sync_state(&self.db, &mut state);
+        state
     }
 
     pub fn get_queue(&self) -> QueueSnapshot {
@@ -1531,6 +1537,7 @@ impl AudioEngine {
                         let station_id = station_id.clone();
                         let name = name.clone();
                         let db = db.clone();
+                        let title_state = Arc::clone(&state);
                         std::thread::Builder::new()
                             .name("radio-stream-prepare".to_string())
                             .spawn(move || {
@@ -1542,6 +1549,15 @@ impl AudioEngine {
                                     .flatten()
                                     .and_then(|station| station.bitrate)
                                     .and_then(|kbps| u32::try_from(kbps).ok());
+                                let on_title = crate::stations::songs::title_callback(
+                                    db.clone(),
+                                    Arc::clone(&title_state),
+                                    Arc::clone(&playback_session),
+                                    session_id,
+                                    station_id.clone(),
+                                    name.clone(),
+                                    url.clone(),
+                                );
                                 match http_stream::prepare_live_audio_source(
                                     url.clone(),
                                     Arc::clone(&playback_session),
@@ -1552,6 +1568,7 @@ impl AudioEngine {
                                         let _ = connected_tx
                                             .send(AudioCommand::RadioConnected(session_id));
                                     },
+                                    on_title,
                                     event_tx.clone(),
                                     format!("Station {}", name),
                                 ) {
@@ -1604,6 +1621,11 @@ impl AudioEngine {
                         s.is_buffering = true;
                         s.can_seek = false;
                         s.current_recording_id = None;
+                        // A reconnect to the same station keeps its song;
+                        // anything else starts with none.
+                        if s.current_station_id.as_deref() != Some(station_id.as_str()) {
+                            s.stream = None;
+                        }
                         s.current_station_id = Some(station_id.clone());
                         s.current_title = Some(name);
                         match reconnect_attempt {

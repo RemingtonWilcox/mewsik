@@ -220,6 +220,28 @@ pub struct PlaybackState {
     pub reconnect_max: u32,
     /// Short reason while `connection_stage` is `Failed`.
     pub connection_error: Option<String>,
+    /// What the station says is playing right now, if it says.
+    #[serde(default)]
+    pub stream: Option<StreamNowPlaying>,
+}
+
+/// The song a station is playing, from its in-band stream title, plus tempo
+/// and key: published by the station where it does that, else measured.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct StreamNowPlaying {
+    /// The raw title, e.g. "Goupil. - MAKE 'EM BACKUP".
+    pub title: String,
+    pub artist: Option<String>,
+    pub track: Option<String>,
+    pub started_at: String,
+    pub bpm: Option<f64>,
+    pub musical_key: Option<String>,
+    /// "station" when the station published tempo and key, "measured" when
+    /// mewsik worked them out from the audio.
+    pub tempo_source: Option<String>,
+    pub artwork_url: Option<String>,
+    /// Row in `station_songs`.
+    pub log_id: Option<String>,
 }
 
 impl PlaybackState {
@@ -258,6 +280,7 @@ impl Default for PlaybackState {
             reconnect_attempt: 0,
             reconnect_max: 0,
             connection_error: None,
+            stream: None,
         }
     }
 }
@@ -286,4 +309,21 @@ pub struct QueueSnapshot {
     pub now_playing: Option<QueueItem>,
     /// Literal future playback order. History is never included.
     pub upcoming: Vec<QueueItem>,
+}
+
+/// A song heard on a station, as its stream title announced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StationSong {
+    pub id: String,
+    pub station_id: Option<String>,
+    pub station_name: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub track: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub bpm: Option<f64>,
+    pub musical_key: Option<String>,
+    pub tempo_source: Option<String>,
+    pub artwork_url: Option<String>,
 }
