@@ -1,4 +1,9 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect as baseExpect, test, type Page } from '@playwright/test';
+
+// The Settings page renders after the whole app shell, which can take more
+// than the default 5 s on a cold CI runner; the update card itself answers
+// at once, so a longer wait only absorbs page-load time.
+const expect = baseExpect.configure({ timeout: 15_000 });
 
 type UpdateScenario =
 	| 'available'
