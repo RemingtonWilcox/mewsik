@@ -1,4 +1,7 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect as baseExpect, test, type Page } from '@playwright/test';
+
+// The CI runner's first page load can take several seconds.
+const expect = baseExpect.configure({ timeout: 15_000 });
 
 interface PlaybackMockOptions {
 	initialShuffle?: boolean;
