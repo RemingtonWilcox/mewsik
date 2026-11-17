@@ -51,10 +51,24 @@
 	const stage = $derived(connectionStage(s));
 	const track = $derived(s.current_recording_id ? library.trackById(s.current_recording_id) : undefined);
 	const title = $derived(displayTitle(s));
+	// What the station says is playing, when it says.
+	const song = $derived(isRadio ? (s.stream ?? null) : null);
 	const artist = $derived(
 		isRadio
-			? (connectionMessage(s) ?? (stage === 'playing' ? 'Live radio' : 'Radio'))
+			? (connectionMessage(s) ??
+					(song
+						? [song.artist, title].filter(Boolean).join(' · ')
+						: stage === 'playing'
+							? 'Live radio'
+							: 'Radio'))
 			: (s.current_artist ?? '')
+	);
+	const tempo = $derived(
+		song && (song.bpm || song.musical_key)
+			? [song.bpm ? `${Math.round(song.bpm)} BPM` : null, song.musical_key]
+					.filter(Boolean)
+					.join(' · ')
+			: null
 	);
 	const shownVolume = $derived(volume ?? s.volume);
 	const busy = $derived(s.is_buffering && !isRadio);
@@ -95,7 +109,7 @@
 		{#if isRadio}
 			<StationArt
 				name={title}
-				src={s.current_album_art}
+				src={song?.artwork_url ?? s.current_album_art}
 				class="size-14 rounded-md"
 				monogramClass="text-base"
 			/>
@@ -119,6 +133,13 @@
 						href="/albums/{track.album_id}"
 						class="block truncate text-sm font-medium hover:underline"
 						title={title ?? undefined}>{title}</a
+					>
+				{:else if song}
+					<a
+						href="/search?q={encodeURIComponent(song.title)}"
+						class="block truncate text-sm font-medium hover:underline"
+						title="Find “{song.title}”"
+						data-stream-title>{song.track ?? song.title}</a
 					>
 				{:else}
 					<p class="truncate text-sm font-medium" title={title ?? undefined}>{title}</p>
@@ -201,6 +222,16 @@
 						onRetry={() => void player.retryStation()}
 						class={stage === 'playing' ? 'font-medium uppercase tracking-[0.18em]' : ''}
 					/>
+				{/if}
+				{#if tempo && stage === 'playing'}
+					<span
+						class="ml-3 rounded-sm bg-white/[0.06] px-1.5 py-px text-[10px] font-medium tabular-nums text-foreground/80"
+						title={song?.tempo_source === 'station'
+							? 'Published by the station'
+							: 'Measured by mewsik from the audio'}
+						data-stream-tempo
+						>{song?.tempo_source === 'measured' ? '≈ ' : ''}{tempo}</span
+					>
 				{/if}
 			</div>
 		{:else}

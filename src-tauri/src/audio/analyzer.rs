@@ -495,6 +495,7 @@ impl FrameAnalyzer {
             self.bpm_check_counter = 0;
             let new_period = estimate_beat_period(&self.flux_hist, EMIT_HZ as f32);
             if new_period > 0.0 {
+                crate::audio::song_sense::push_tempo((EMIT_HZ as f32) * 60.0 / new_period);
                 self.beat_period_frames = if self.beat_period_frames > 0.0 {
                     self.beat_period_frames * 0.7 + new_period * 0.3
                 } else {
@@ -537,6 +538,7 @@ impl FrameAnalyzer {
             // Strength: how much the dominant pitch exceeds a flat distribution.
             // Flat = 1/12; we map (max - 1/12) into 0..1 with a generous scale.
             let strength = ((max_val - 1.0 / 12.0) * 6.0).clamp(0.0, 1.0);
+            crate::audio::song_sense::push_chroma(&chroma, strength * rms.min(1.0));
             (max_idx as f32 / 12.0, strength)
         } else {
             (0.0, 0.0)

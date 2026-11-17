@@ -204,6 +204,39 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 						};
 					case 'get_queue':
 						return queueSnapshot;
+					case 'get_station_songs':
+						return [
+							{
+								id: 'song-now',
+								station_id: 'station-1',
+								station_name: 'BADRADIO',
+								title: 'ROLAND JONES - DEMONZ',
+								artist: 'ROLAND JONES',
+								track: 'DEMONZ',
+								started_at: new Date().toISOString(),
+								ended_at: null,
+								bpm: 130,
+								musical_key: 'Cm',
+								tempo_source: 'station',
+								artwork_url: null
+							},
+							{
+								id: 'song-before',
+								station_id: 'station-2',
+								station_name: 'Bassdrive',
+								title: 'Calibre - Mr Right On',
+								artist: 'Calibre',
+								track: 'Mr Right On',
+								started_at: new Date(Date.now() - 600_000).toISOString(),
+								ended_at: new Date(Date.now() - 300_000).toISOString(),
+								bpm: 174,
+								musical_key: null,
+								tempo_source: 'measured',
+								artwork_url: null
+							}
+						];
+					case 'delete_station_song':
+						return null;
 					case 'play_queue_entry':
 					case 'remove_queue_entry':
 					case 'clear_queue':
@@ -460,4 +493,54 @@ test('radio player names the connection stage and offers Retry when the station 
 				}
 			}
 		]);
+});
+
+const radioWithSong = {
+	is_playing: true,
+	source: 'radio',
+	current_station_id: 'station-1',
+	current_title: 'BADRADIO',
+	current_source_url: 'https://s2.radio.co/s2b2b68744/listen',
+	connection_stage: 'playing',
+	stream: {
+		title: 'ROLAND JONES - DEMONZ',
+		artist: 'ROLAND JONES',
+		track: 'DEMONZ',
+		started_at: new Date().toISOString(),
+		bpm: 130,
+		musical_key: 'Cm',
+		tempo_source: 'station',
+		artwork_url: null,
+		log_id: 'song-now'
+	}
+};
+
+test('a station shows the song it is playing, with tempo and key', async ({ page }) => {
+	await installPlaybackMock(page, { playback: radioWithSong });
+	await page.goto('/library');
+
+	const bar = page.locator('[data-player-bar]');
+	await expect(bar.locator('[data-stream-title]')).toHaveText('DEMONZ');
+	await expect(bar.locator('[data-player-subtitle]')).toHaveText('ROLAND JONES · BADRADIO');
+	await expect(bar.locator('[data-stream-tempo]')).toHaveText('130 BPM · Cm');
+
+	// The title finds the song to save or download.
+	await bar.locator('[data-stream-title]').click();
+	await expect(page).toHaveURL(/\/search\?q=ROLAND/);
+	await expect(page.getByRole('textbox').first()).toHaveValue('ROLAND JONES - DEMONZ');
+});
+
+test('songs heard on stations are listed to find again', async ({ page }) => {
+	await installPlaybackMock(page, { playback: radioWithSong });
+	await page.goto('/heard');
+
+	const rows = page.locator('[data-station-song]');
+	await expect(rows).toHaveCount(2);
+	await expect(rows.first()).toContainText('DEMONZ');
+	await expect(rows.first()).toContainText('Now');
+	await expect(rows.nth(1)).toContainText('≈ 174 BPM');
+
+	await page.getByPlaceholder('Filter songs or stations').fill('bassdrive');
+	await expect(rows).toHaveCount(1);
+	await expect(rows.first()).toContainText('Mr Right On');
 });

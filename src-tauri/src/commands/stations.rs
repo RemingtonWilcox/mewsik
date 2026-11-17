@@ -532,6 +532,20 @@ pub async fn verify_station_urls(urls: Vec<String>) -> Result<Vec<StationHealthR
     verify_station_urls_inner(urls).await
 }
 
+/// Songs heard on stations, newest first.
+#[tauri::command]
+pub fn get_station_songs(
+    db: State<'_, DbPool>,
+    limit: Option<i64>,
+) -> Result<Vec<crate::db::models::StationSong>, String> {
+    queries::list_station_songs(&db, limit.unwrap_or(1000)).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_station_song(db: State<'_, DbPool>, id: String) -> Result<(), String> {
+    queries::delete_station_song(&db, &id).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn toggle_station_favorite(db: State<'_, DbPool>, station_id: String) -> Result<bool, String> {
     queries::toggle_station_favorite(&db, &station_id).map_err(|e| e.to_string())

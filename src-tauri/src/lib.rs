@@ -218,6 +218,8 @@ pub fn run() {
             commands::stations::verify_favorite_stations,
             commands::stations::verify_station_urls,
             commands::stations::toggle_station_favorite,
+            commands::stations::get_station_songs,
+            commands::stations::delete_station_song,
             commands::stations::play_station,
             commands::stations::play_station_search_result,
             commands::stations::seed_favorite_stations_from_bundle,

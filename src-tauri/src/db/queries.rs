@@ -2007,3 +2007,134 @@ mod play_history_tests {
         assert_eq!(completed, 1);
     }
 }
+
+// ── Station songs ──
+
+/// Starts a station-song row and returns its id.
+pub fn start_station_song(
+    db: &DbPool,
+    station_id: Option<&str>,
+    station_name: &str,
+    title: &str,
+    artist: Option<&str>,
+    track: Option<&str>,
+) -> Result<String, rusqlite::Error> {
+    let id = new_id();
+    db.lock().execute(
+        "INSERT INTO station_songs (id, station_id, station_name, title, artist, track, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id, station_id, station_name, title, artist, track, now()],
+    )?;
+    Ok(id)
+}
+
+/// Fills in tempo, key or artwork; values already set by the station win
+/// over measured ones, so a measured value never overwrites a published one.
+pub fn update_station_song_details(
+    db: &DbPool,
+    id: &str,
+    bpm: Option<f64>,
+    musical_key: Option<&str>,
+    tempo_source: Option<&str>,
+    artwork_url: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    db.lock().execute(
+        "UPDATE station_songs SET
+             bpm = CASE WHEN tempo_source = 'station' THEN bpm ELSE COALESCE(?2, bpm) END,
+             musical_key = CASE WHEN tempo_source = 'station' THEN musical_key ELSE COALESCE(?3, musical_key) END,
+             tempo_source = CASE WHEN tempo_source = 'station' THEN tempo_source ELSE COALESCE(?4, tempo_source) END,
+             artwork_url = COALESCE(?5, artwork_url)
+         WHERE id = ?1",
+        params![id, bpm, musical_key, tempo_source, artwork_url],
+    )?;
+    Ok(())
+}
+
+pub fn end_station_song(db: &DbPool, id: &str) -> Result<(), rusqlite::Error> {
+    db.lock().execute(
+        "UPDATE station_songs SET ended_at = ?2 WHERE id = ?1 AND ended_at IS NULL",
+        params![id, now()],
+    )?;
+    Ok(())
+}
+
+pub fn list_station_songs(db: &DbPool, limit: i64) -> Result<Vec<StationSong>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT id, station_id, station_name, title, artist, track, started_at, ended_at,
+                bpm, musical_key, tempo_source, artwork_url
+         FROM station_songs ORDER BY started_at DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit.clamp(1, 5000)], |row| {
+        Ok(StationSong {
+            id: row.get(0)?,
+            station_id: row.get(1)?,
+            station_name: row.get(2)?,
+            title: row.get(3)?,
+            artist: row.get(4)?,
+            track: row.get(5)?,
+            started_at: row.get(6)?,
+            ended_at: row.get(7)?,
+            bpm: row.get(8)?,
+            musical_key: row.get(9)?,
+            tempo_source: row.get(10)?,
+            artwork_url: row.get(11)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub fn delete_station_song(db: &DbPool, id: &str) -> Result<(), rusqlite::Error> {
+    db.lock()
+        .execute("DELETE FROM station_songs WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Continues this station's latest row when it is the same title and ended
+/// less than `within_secs` ago (a reconnect or a short pause), so the song is
+/// not logged twice. Returns the row id when it did.
+pub fn reopen_station_song(
+    db: &DbPool,
+    station_id: &str,
+    title: &str,
+    within_secs: i64,
+) -> Result<Option<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let latest: Option<(String, String, Option<String>)> = conn
+        .query_row(
+            "SELECT id, title, ended_at FROM station_songs
+             WHERE station_id = ?1 ORDER BY started_at DESC LIMIT 1",
+            params![station_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map(Some)
+        .or_else(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(other),
+        })?;
+    let Some((id, latest_title, ended_at)) = latest else {
+        return Ok(None);
+    };
+    if latest_title != title {
+        return Ok(None);
+    }
+    let recent = match ended_at {
+        None => true,
+        Some(ended) => chrono::DateTime::parse_from_rfc3339(&ended)
+            .map(|ended| {
+                chrono::Utc::now()
+                    .signed_duration_since(ended)
+                    .num_seconds()
+                    <= within_secs
+            })
+            .unwrap_or(false),
+    };
+    if !recent {
+        return Ok(None);
+    }
+    conn.execute(
+        "UPDATE station_songs SET ended_at = NULL WHERE id = ?1",
+        params![id],
+    )?;
+    Ok(Some(id))
+}

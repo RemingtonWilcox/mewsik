@@ -189,6 +189,38 @@ export interface PlaybackState {
 	reconnect_max?: number;
 	/** Short reason while the stage is `failed`. */
 	connection_error?: string | null;
+	/** The song a station says it is playing. Optional: older runtimes omit it. */
+	stream?: StreamNowPlaying | null;
+}
+
+/** A station's current song, from its stream title. */
+export interface StreamNowPlaying {
+	title: string;
+	artist: string | null;
+	track: string | null;
+	started_at: string;
+	bpm: number | null;
+	musical_key: string | null;
+	/** `station` when the station published tempo and key, `measured` when mewsik heard them. */
+	tempo_source: 'station' | 'measured' | null;
+	artwork_url: string | null;
+	log_id: string | null;
+}
+
+/** A song heard on a station, kept so it can be found again. */
+export interface StationSong {
+	id: string;
+	station_id: string | null;
+	station_name: string;
+	title: string;
+	artist: string | null;
+	track: string | null;
+	started_at: string;
+	ended_at: string | null;
+	bpm: number | null;
+	musical_key: string | null;
+	tempo_source: 'station' | 'measured' | null;
+	artwork_url: string | null;
 }
 
 export type ConnectionStage =

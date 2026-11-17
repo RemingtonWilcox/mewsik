@@ -9,6 +9,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_006,
     MIGRATION_007,
     MIGRATION_008,
+    MIGRATION_009,
 ];
 
 const MIGRATION_001: &str = r#"
@@ -392,6 +393,27 @@ CREATE TABLE IF NOT EXISTS scene_refresh (
 );
 "#;
 
+const MIGRATION_009: &str = r#"
+-- Songs heard on stations: one row per stream title, so a song heard on
+-- the radio can be found again later. BPM and key are what the station
+-- published or, failing that, what the analyzer measured.
+CREATE TABLE IF NOT EXISTS station_songs (
+    id            TEXT PRIMARY KEY,
+    station_id    TEXT,
+    station_name  TEXT NOT NULL,
+    title         TEXT NOT NULL,
+    artist        TEXT,
+    track         TEXT,
+    started_at    TEXT NOT NULL,
+    ended_at      TEXT,
+    bpm           REAL,
+    musical_key   TEXT,
+    tempo_source  TEXT,
+    artwork_url   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_station_songs_started ON station_songs(started_at);
+"#;
+
 pub(crate) fn latest_version() -> i64 {
     MIGRATIONS.len() as i64
 }
@@ -450,7 +472,7 @@ fn apply_migration(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_migration, run_migrations, MIGRATIONS};
+    use super::{apply_migration, latest_version, run_migrations, MIGRATIONS};
     use rusqlite::{params, Connection};
 
     #[test]
@@ -539,7 +561,7 @@ mod tests {
         let version: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, latest_version());
     }
 
     #[test]

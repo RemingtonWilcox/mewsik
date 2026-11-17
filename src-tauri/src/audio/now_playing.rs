@@ -117,12 +117,30 @@ pub fn update(state: &PlaybackState) {
     } else {
         raw_title
     };
+    // A station that names its song shows the song, with the station as album.
+    let stream = state.stream.as_ref().filter(|_| is_live);
+    let (display_title, display_artist, display_album) = match stream {
+        Some(song) => (
+            song.track.clone().unwrap_or_else(|| song.title.clone()),
+            song.artist.clone().unwrap_or_default(),
+            display_title,
+        ),
+        None => (
+            display_title,
+            state.current_artist.clone().unwrap_or_default(),
+            String::new(),
+        ),
+    };
     let title = CString::new(display_title).unwrap_or_default();
-    let artist = CString::new(state.current_artist.clone().unwrap_or_default()).unwrap_or_default();
-    // PlaybackState doesn't carry album separately; pass empty.
-    let album = CString::new("").unwrap_or_default();
-    let artwork_url =
-        CString::new(state.current_album_art.clone().unwrap_or_default()).unwrap_or_default();
+    let artist = CString::new(display_artist).unwrap_or_default();
+    let album = CString::new(display_album).unwrap_or_default();
+    let artwork_url = CString::new(
+        stream
+            .and_then(|song| song.artwork_url.clone())
+            .or_else(|| state.current_album_art.clone())
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default();
 
     unsafe {
         mewsik_now_playing_update(

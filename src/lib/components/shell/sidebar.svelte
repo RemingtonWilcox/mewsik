@@ -5,7 +5,7 @@
 	import Logo from '$lib/components/logo.svelte';
 	import { usePlaylists } from '$lib/state/playlists.svelte';
 	import { useActiveDownloads } from '$lib/state/downloads.svelte';
-	import { Library, Search, Radio, Download, Settings, Plus, ListMusic } from '@lucide/svelte';
+	import { Library, Search, Radio, History, Download, Settings, Plus, ListMusic } from '@lucide/svelte';
 
 	const playlists = usePlaylists();
 	const downloads = useActiveDownloads();
@@ -14,6 +14,7 @@
 		{ href: '/library', label: 'Library', icon: Library },
 		{ href: '/search', label: 'Search', icon: Search },
 		{ href: '/stations', label: 'Stations', icon: Radio },
+		{ href: '/heard', label: 'Heard on radio', icon: History },
 		{ href: '/downloads', label: 'Downloads', icon: Download },
 		{ href: '/settings', label: 'Settings', icon: Settings }
 	];

@@ -311,7 +311,8 @@ pub(crate) fn open_blocking_public_stream(
         let mut request = client
             .get(current_url.clone())
             .header("User-Agent", concat!("mewsik/", env!("CARGO_PKG_VERSION")))
-            .header("Icy-MetaData", "0");
+            // Ask for in-band song titles; the download worker strips them.
+            .header("Icy-MetaData", "1");
         for (key, value) in headers {
             request = request.header(key, value);
         }
