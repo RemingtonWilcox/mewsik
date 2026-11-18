@@ -197,7 +197,12 @@
 							<ConnectionStatus playback={player.state} />
 						</div>
 					{:else}
+						<!-- data-vaul-no-drag: a drag here scrubs the song instead of
+						     pulling the sheet down. The padding is a bigger touch target. -->
 						<div
+							data-vaul-no-drag
+							data-seek-bar
+							class="-my-3 py-3"
 							onpointerdowncapture={() => {
 								if (!canSeek) return;
 								dragMs = player.state.position_ms;

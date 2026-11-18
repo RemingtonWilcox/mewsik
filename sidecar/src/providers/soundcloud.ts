@@ -98,6 +98,16 @@ export class SoundCloudProvider {
       return 'SoundCloud only exposes a short preview for this track';
     }
 
+    // Many label releases come only as DRM-encrypted HLS
+    // (cbc-/ctr-encrypted-hls) for SoundCloud's own players. Those can't be
+    // played here, so they stay out of search.
+    if (
+      transcodings.length > 0 &&
+      !transcodings.some((t) => t.protocol === 'progressive' || t.protocol === 'hls')
+    ) {
+      return 'SoundCloud only streams this track to its own app';
+    }
+
     const full = track.durations.full;
     const playback = track.durations.playback;
     if (
@@ -175,7 +185,8 @@ export class SoundCloudProvider {
       const sc = this.getClient();
       const limit = 40;
 
-      let collection = await sc.search(query, { type: 'track', limit: limit * (page + 1) });
+      // Page n is the nth continuation of 40-track pages.
+      let collection = await sc.search(query, { type: 'track', limit });
 
       // Advance through pages using continuation when page > 0
       for (let i = 0; i < page; i++) {
