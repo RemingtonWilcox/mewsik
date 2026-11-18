@@ -15,11 +15,14 @@
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import * as api from '$lib/api/tauri';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import type { Download as DownloadItem } from '$lib/types';
 	import { toast } from 'svelte-sonner';
 
 	let downloads = $state<DownloadItem[]>([]);
 	let downloadLocation = $state<api.DownloadLocationInfo | null>(null);
+	// A phone has no folder to show or change; songs stay inside the app.
+	const phone = new IsMobile();
 	let loading = $state(true);
 	// This is deliberately not reactive. A reactive in-flight guard read from a
 	// $effect can retrigger that effect on every request and create a fetch loop.
@@ -146,7 +149,9 @@
 	<div class="flex items-center justify-between">
 		<div>
 			<h1 class="text-2xl font-bold">Downloads</h1>
-			<p class="text-sm text-muted-foreground">Saved tracks and active download jobs.</p>
+			<p class="text-sm text-muted-foreground">
+				{phone.current ? 'Saved on this iPhone. They play without a connection.' : 'Saved tracks and active download jobs.'}
+			</p>
 		</div>
 		<Button
 			variant="outline"
@@ -159,7 +164,7 @@
 		</Button>
 	</div>
 
-	{#if downloadLocation}
+	{#if downloadLocation && !phone.current}
 		<div class="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-xs">
 			<FolderOpen class="size-3.5 shrink-0 text-primary" />
 			<span class="text-muted-foreground">New downloads save to</span>
@@ -227,7 +232,7 @@
 
 					<!-- Actions -->
 					<div class="flex shrink-0 items-center gap-1">
-						{#if isDone && item.file_path}
+						{#if isDone && item.file_path && !phone.current}
 							<Button
 								variant="ghost"
 								size="sm"

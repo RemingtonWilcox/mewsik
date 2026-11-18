@@ -50,6 +50,9 @@ targets:
         # Background audio playback (lock screen, AirPods controls).
         UIBackgroundModes:
           - audio
+        # Downloads live in Documents/Mewsik; these show it in the Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
