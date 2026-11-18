@@ -8,7 +8,9 @@
 	import { onMount } from 'svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 
-	const ROW = 52;
+	const DESKTOP_ROW = 52;
+	// Phone rows are taller: bigger artwork and a comfortable tap target.
+	const PHONE_ROW = 64;
 	const OVERSCAN = 12;
 
 	let {
@@ -36,6 +38,7 @@
 	// Phones have no room for the album column.
 	const narrow = new IsMobile();
 	const albumColumn = $derived(showAlbum && !narrow.current);
+	const ROW = $derived(narrow.current ? PHONE_ROW : DESKTOP_ROW);
 	// A tap on a touch screen plays the song; a mouse click selects it.
 	let lastPointer = 'mouse';
 
@@ -163,7 +166,9 @@
 	}
 
 	const columns = $derived(
-		albumColumn
+		narrow.current
+			? 'grid-template-columns: 3rem minmax(0,1fr) 2.5rem'
+			: albumColumn
 			? 'grid-template-columns: 2.75rem minmax(0,1.4fr) minmax(0,1fr) 4.5rem 2.25rem'
 			: 'grid-template-columns: 2.75rem minmax(0,1fr) 4.5rem 2.25rem'
 	);
@@ -180,6 +185,7 @@
 		onkeydown={onKey}
 	>
 		<div
+			class:hidden={narrow.current}
 			class="sticky top-0 z-10 grid items-center gap-3 border-b border-border/60 bg-background/95 px-3 py-2 text-xs font-medium uppercase tracking-wider text-muted-foreground backdrop-blur"
 			style={columns}
 		>
@@ -218,6 +224,30 @@
 						openMenu(index, e.clientX, e.clientY);
 					}}
 				>
+					{#if narrow.current}
+						<div class="relative size-12">
+							{#if numbered || !showCover}
+								<span class="flex size-12 items-center justify-center text-[15px] tabular-nums text-muted-foreground">
+									{numbered ? (track.playlist_position ?? index + 1) : index + 1}
+								</span>
+							{:else}
+								<Cover src={track.cover_art_path || track.cover_art_url} name={track.album_title || track.title} class="size-12 rounded-md" />
+							{/if}
+							{#if isCurrent}
+								<span class="absolute inset-0 flex items-center justify-center rounded-md bg-black/45" aria-hidden="true">
+									{#if isPlaying}
+										<span class="eq"><i></i><i></i><i></i></span>
+									{:else}
+										<Play class="size-4 fill-current text-white" />
+									{/if}
+								</span>
+							{/if}
+						</div>
+						<div class="min-w-0">
+							<p class="track-title truncate text-[16px] leading-snug" title={track.title}>{track.title}</p>
+							<p class="truncate text-[14px] leading-snug text-muted-foreground">{track.artist_name}</p>
+						</div>
+					{:else}
 					<button
 						class="relative flex size-8 items-center justify-center justify-self-center text-sm tabular-nums text-muted-foreground"
 						aria-label={isPlaying ? 'Pause' : 'Play'}
@@ -274,9 +304,10 @@
 					<span class="text-right text-sm tabular-nums text-muted-foreground">
 						{formatDuration(track.duration_ms)}
 					</span>
+					{/if}
 
 					<button
-						class="flex size-8 items-center justify-center rounded-md text-muted-foreground opacity-0 hover:bg-white/10 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100"
+						class="flex size-8 items-center justify-center justify-self-end rounded-md text-muted-foreground opacity-0 hover:bg-white/10 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100"
 						aria-label="More"
 						onclick={(e) => {
 							e.stopPropagation();

@@ -18,7 +18,11 @@ use tauri::{Emitter, State};
 
 const SEARCH_RESULTS_CACHE_TTL: Duration = Duration::from_secs(90);
 const MAX_SEARCH_CACHE_ENTRIES: usize = 24;
-const EXTERNAL_SEARCH_SOURCES: [&str; 3] = ["youtube", "soundcloud", "bandcamp"];
+// Streams resolved ahead of a tap for each provider's top results, so they
+// start without waiting on the provider.
+const PRERESOLVE_COUNT: usize = 4;
+// Bandcamp is left out: its search needs a browser-obtained cookie now.
+const EXTERNAL_SEARCH_SOURCES: [&str; 2] = ["youtube", "soundcloud"];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalSearchResult {
@@ -523,9 +527,15 @@ fn spawn_preresolve_for_results(
     results: &[ExternalSearchResult],
     limit: usize,
 ) {
+    // `limit` per provider: Search shows one provider's list at a time.
+    let mut taken: HashMap<&str, usize> = HashMap::new();
     let targets: Vec<(String, String)> = results
         .iter()
-        .take(limit)
+        .filter(|result| {
+            let count = taken.entry(result.source.as_str()).or_default();
+            *count += 1;
+            *count <= limit
+        })
         .map(|result| (result.source.clone(), result.source_id.clone()))
         .collect();
 
@@ -931,7 +941,7 @@ pub fn search_all_sources(
             Arc::clone(search_runtime.inner()),
             generation,
             &cached_results,
-            5,
+            PRERESOLVE_COUNT,
         );
         return Ok(ExternalSearchResponse {
             items: cached_results,
@@ -1017,7 +1027,7 @@ pub fn search_all_sources(
         Arc::clone(search_runtime.inner()),
         generation,
         &ranked,
-        5,
+        PRERESOLVE_COUNT,
     );
 
     Ok(ExternalSearchResponse {

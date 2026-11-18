@@ -6,6 +6,11 @@
 	import { usePlaylists } from '$lib/state/playlists.svelte';
 	import { useTrackMenu } from '$lib/state/track-menu.svelte';
 	import { Play, ListStart, ListEnd, Disc3, User, Plus, ListMusic, Download } from '@lucide/svelte';
+	import Cover from './cover.svelte';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+
+	// On a phone the menu is an action sheet from the bottom of the screen.
+	const phone = new IsMobile();
 
 	const menu = useTrackMenu();
 	const player = usePlayer();
@@ -20,7 +25,7 @@
 
 	// Keep the menu inside the window.
 	$effect(() => {
-		if (!current || !element) return;
+		if (!current || !element || phone.current) return;
 		const { innerWidth, innerHeight } = window;
 		const rect = element.getBoundingClientRect();
 		position = {
@@ -78,24 +83,7 @@
 	onresize={() => menu.close()}
 />
 
-{#if current}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div
-		class="fixed inset-0 z-[90]"
-		onpointerdown={() => menu.close()}
-		oncontextmenu={(e) => {
-			e.preventDefault();
-			menu.close();
-		}}
-	></div>
-	<div
-		bind:this={element}
-		role="menu"
-		tabindex="-1"
-		class="menu-surface fixed z-[91] w-60 py-1.5"
-		style:left="{position.left || current.x}px"
-		style:top="{position.top || current.y}px"
-	>
+{#snippet actions()}
 		{#if count > 1}
 			<p class="px-3 pb-1 pt-0.5 text-xs text-muted-foreground">{count} songs</p>
 		{/if}
@@ -153,7 +141,7 @@
 			</button>
 		{/if}
 
-		{#if current.extras.length > 0}
+		{#if current && current.extras.length > 0}
 			<div class="menu-sep"></div>
 			{#each current.extras as extra}
 				<button
@@ -164,5 +152,95 @@
 				</button>
 			{/each}
 		{/if}
+{/snippet}
+
+{#if current && phone.current}
+	<!-- svelte-ignore a11y_no_static_element_interactions, a11y_click_events_have_key_events -->
+	<div class="sheet-backdrop fixed inset-0 z-[90] bg-black/50" onclick={() => menu.close()}></div>
+	<div
+		role="menu"
+		tabindex="-1"
+		class="sheet fixed inset-x-2 z-[91] flex max-h-[80vh] flex-col gap-2"
+		style="bottom: calc(env(safe-area-inset-bottom) + 0.5rem)"
+	>
+		<div class="phone-menu flex min-h-0 flex-col overflow-hidden rounded-2xl bg-[oklch(0.22_0.004_285)]">
+			{#if single}
+				<div class="flex items-center gap-3 border-b border-white/10 px-4 py-3">
+					<Cover src={single.cover_art_path || single.cover_art_url} name={single.album_title || single.title} class="size-12 rounded-md" />
+					<div class="min-w-0">
+						<p class="truncate text-[16px] font-semibold">{single.title}</p>
+						<p class="truncate text-[14px] text-muted-foreground">{single.artist_name}</p>
+					</div>
+				</div>
+			{/if}
+			<div class="overflow-y-auto py-1">
+				{@render actions()}
+			</div>
+		</div>
+		<button
+			class="h-14 shrink-0 rounded-2xl bg-[oklch(0.22_0.004_285)] text-[17px] font-semibold text-primary active:bg-[oklch(0.27_0.004_285)]"
+			onclick={() => menu.close()}>Cancel</button
+		>
+	</div>
+{:else if current}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div
+		class="fixed inset-0 z-[90]"
+		onpointerdown={() => menu.close()}
+		oncontextmenu={(e) => {
+			e.preventDefault();
+			menu.close();
+		}}
+	></div>
+	<div
+		bind:this={element}
+		role="menu"
+		tabindex="-1"
+		class="menu-surface fixed z-[91] w-60 py-1.5"
+		style:left="{position.left || current.x}px"
+		style:top="{position.top || current.y}px"
+	>
+		{@render actions()}
 	</div>
 {/if}
+
+<style>
+	.sheet {
+		animation: sheet-up 220ms cubic-bezier(0.2, 0.9, 0.3, 1);
+	}
+	.sheet-backdrop {
+		animation: fade-in 200ms ease-out;
+	}
+	@keyframes sheet-up {
+		from {
+			transform: translateY(100%);
+		}
+	}
+	@keyframes fade-in {
+		from {
+			opacity: 0;
+		}
+	}
+	/* Big rows on the phone. */
+	.phone-menu :global(.menu-item) {
+		margin: 0;
+		width: 100%;
+		border-radius: 0;
+		gap: 0.9rem;
+		padding: 0.8rem 1.1rem;
+		font-size: 1rem;
+	}
+	.phone-menu :global(.menu-item:active) {
+		background: oklch(1 0 0 / 0.07);
+	}
+	.phone-menu :global(.menu-item > svg) {
+		width: 1.25rem;
+		height: 1.25rem;
+	}
+	.phone-menu :global(.menu-sep) {
+		margin: 0.25rem 0;
+	}
+	.phone-menu :global(.max-h-48) {
+		max-height: none;
+	}
+</style>

@@ -211,3 +211,125 @@
     gap: 1.25rem 1rem;
   }
 }
+
+/* iPhone: system font, no grey tap flash or long-press callout, and press
+   feedback where a mouse would get hover. */
+@supports (-webkit-touch-callout: none) {
+  :root {
+    --font-sans: -apple-system, "SF Pro Text", system-ui, sans-serif;
+  }
+  body {
+    font-family: var(--font-sans);
+  }
+}
+
+@media (pointer: coarse) {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    -webkit-touch-callout: none;
+  }
+  .track-row:hover {
+    background: transparent;
+  }
+  .track-row:active {
+    background: oklch(1 0 0 / 0.07);
+  }
+}
+
+@layer components {
+  .press {
+    transition: transform 120ms ease, opacity 120ms ease, background-color 120ms ease;
+  }
+  .press:active {
+    transform: scale(0.97);
+    opacity: 0.85;
+  }
+
+  /* iOS grouped list: rounded inset group of rows with hairline separators. */
+  .ios-group {
+    overflow: hidden;
+    border-radius: 0.85rem;
+    background: oklch(0.2 0.004 285);
+  }
+  .ios-group > * + * {
+    border-top: 0.5px solid oklch(1 0 0 / 0.09);
+  }
+  .ios-row {
+    display: flex;
+    min-height: 2.9rem;
+    width: 100%;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 1rem;
+    text-align: left;
+    font-size: 1rem;
+  }
+  .ios-row:active {
+    background: oklch(1 0 0 / 0.06);
+  }
+  .ios-caption {
+    padding: 0 1rem 0.4rem;
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--color-muted-foreground);
+  }
+  .ios-footnote {
+    padding: 0.45rem 1rem 0;
+    font-size: 0.8rem;
+    line-height: 1.35;
+    color: var(--color-muted-foreground);
+  }
+
+  /* Segmented control */
+  .segmented {
+    display: flex;
+    border-radius: 0.6rem;
+    background: oklch(1 0 0 / 0.08);
+    padding: 2px;
+  }
+  .segmented > button,
+  .segmented > a {
+    flex: 1;
+    border-radius: 0.5rem;
+    padding: 0.35rem 0.5rem;
+    text-align: center;
+    font-size: 0.85rem;
+    font-weight: 500;
+    color: oklch(0.8 0 0);
+    transition: background-color 150ms;
+  }
+  .segmented > [aria-pressed="true"],
+  .segmented > [aria-current="page"] {
+    background: oklch(0.36 0.004 285);
+    color: oklch(0.98 0 0);
+    box-shadow: 0 1px 3px oklch(0 0 0 / 0.3);
+  }
+}
+
+@layer components {
+  /* A row of tiles that scrolls sideways (phone search). */
+  .shelf {
+    display: grid;
+    grid-auto-flow: column;
+    grid-auto-columns: 7.5rem;
+    gap: 0.25rem;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    margin: 0 -1rem;
+    padding: 0 0.5rem;
+  }
+  .shelf > * {
+    scroll-snap-align: start;
+  }
+}
+
+/* Search fields draw their own clear button. */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}

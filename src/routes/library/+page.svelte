@@ -6,7 +6,7 @@
 	import Tile from '$lib/components/tracks/tile.svelte';
 	import { fold, formatTotal, plural } from '$lib/media';
 	import { toast } from 'svelte-sonner';
-	import { Play, Shuffle, RefreshCw, Search, X } from '@lucide/svelte';
+	import { Play, Shuffle, RefreshCw, Search, X, Settings, ArrowUpDown } from '@lucide/svelte';
 	import type { LibraryTrack } from '$lib/types';
 	import MobileShortcuts from '$lib/components/mobile/mobile-shortcuts.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
@@ -96,6 +96,97 @@
 </script>
 
 <div class="flex flex-col gap-5">
+	{#if isMobile.current}
+		<header class="flex flex-col gap-4">
+			<div class="flex items-center justify-between">
+				<div>
+					<h1 class="text-[34px] font-bold leading-tight tracking-tight">Library</h1>
+					{#if library.loaded && library.tracks.length}
+						<p class="text-[15px] text-muted-foreground">
+							{plural(library.tracks.length, 'song')} · {formatTotal(totalMs)}
+						</p>
+					{/if}
+				</div>
+				<a
+					href="/settings"
+					class="press flex size-10 items-center justify-center rounded-full bg-white/[0.08] text-foreground"
+					aria-label="Settings"
+				>
+					<Settings class="size-5" />
+				</a>
+			</div>
+			{#if songs.length}
+				<div class="grid grid-cols-2 gap-3">
+					<button
+						class="press flex h-12 items-center justify-center gap-2 rounded-xl bg-white/[0.08] text-[17px] font-semibold text-primary"
+						onclick={() => playList(songs)}
+					>
+						<Play class="size-5 fill-current" /> Play
+					</button>
+					<button
+						class="press flex h-12 items-center justify-center gap-2 rounded-xl bg-white/[0.08] text-[17px] font-semibold text-primary"
+						onclick={() => playList(songs, true)}
+					>
+						<Shuffle class="size-5" /> Shuffle
+					</button>
+				</div>
+			{/if}
+		</header>
+
+		<MobileShortcuts />
+
+		<div class="flex flex-col gap-3">
+			<nav class="segmented" aria-label="Library view">
+				{#each tabs as tab (tab.id)}
+					<a
+						href={tab.id === 'songs' ? '/library' : `/library?view=${tab.id}`}
+						data-sveltekit-replacestate
+						data-sveltekit-noscroll
+						aria-current={view === tab.id ? 'page' : undefined}
+					>
+						{tab.label}
+					</a>
+				{/each}
+			</nav>
+			<div class="flex items-center gap-2">
+				<div class="relative flex-1">
+					<Search class="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+					<input
+						bind:value={query}
+						placeholder="Find in library"
+						class="h-10 w-full rounded-xl bg-white/[0.08] pl-9 pr-8 text-base outline-none placeholder:text-muted-foreground"
+					/>
+					{#if query}
+						<button
+							class="absolute right-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+							aria-label="Clear filter"
+							onclick={() => (query = '')}
+						>
+							<X class="size-4" />
+						</button>
+					{/if}
+				</div>
+				{#if view === 'songs'}
+					<label class="relative flex h-10 items-center rounded-xl bg-white/[0.08] px-3 text-sm text-muted-foreground">
+						<ArrowUpDown class="size-4" />
+						<span class="sr-only">Sort songs</span>
+						<select bind:value={sort} aria-label="Sort songs" class="absolute inset-0 opacity-0">
+							<option value="added">Recently added</option>
+							<option value="title">Title</option>
+							<option value="artist">Artist</option>
+							<option value="album">Album</option>
+						</select>
+					</label>
+				{/if}
+			</div>
+		</div>
+
+		{#if library.error}
+			<p class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+				{library.error}
+			</p>
+		{/if}
+	{:else}
 	<header class="flex flex-wrap items-end justify-between gap-4">
 		<div>
 			<h1 class="text-3xl font-bold tracking-tight">Library</h1>
@@ -131,10 +222,6 @@
 			</button>
 		</div>
 	</header>
-
-	{#if isMobile.current}
-		<MobileShortcuts />
-	{/if}
 
 	{#if library.error}
 		<p class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -192,6 +279,8 @@
 		{/if}
 	</div>
 
+	{/if}
+
 	{#if !library.loaded}
 		<div class="space-y-2">
 			{#each Array(8) as _, i (i)}
@@ -202,8 +291,12 @@
 		<div class="rounded-xl border border-dashed border-white/10 px-6 py-16 text-center">
 			<p class="text-lg font-medium">Your library is empty</p>
 			<p class="mt-1 text-sm text-muted-foreground">
-				Add a music folder in <a href="/settings" class="underline">Settings</a>, or find songs in
-				<a href="/search" class="underline">Search</a>.
+				{#if isMobile.current}
+					Find songs in <a href="/search" class="underline">Search</a> and add them with +.
+				{:else}
+					Add a music folder in <a href="/settings" class="underline">Settings</a>, or find songs in
+					<a href="/search" class="underline">Search</a>.
+				{/if}
 			</p>
 		</div>
 	{:else if view === 'songs'}
