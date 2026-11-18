@@ -4,7 +4,7 @@
   "version": "0.3.0",
   "type": "module",
   "scripts": {
-    "build": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\" && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.cjs",
+    "build": "node -e \"require('fs').mkdirSync('dist',{recursive:true})\" && esbuild src/index.ts --bundle --platform=node --target=node20 --format=cjs --outfile=dist/index.cjs && node build-web.mjs",
     "typecheck": "tsc --noEmit",
     "start": "node dist/index.cjs"
   },

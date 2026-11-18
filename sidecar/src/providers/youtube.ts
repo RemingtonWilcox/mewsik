@@ -8,6 +8,18 @@ const YOUTUBE_STREAM_HEADERS: Record<string, string> = {
   'Sec-Fetch-Mode': 'navigate',
 };
 
+// YouTube's Apple Vision Pro app, as yt-dlp describes it.
+const VISIONOS_CLIENT = {
+  clientName: 'VISIONOS',
+  clientVersion: '1.02',
+  deviceMake: 'Apple',
+  deviceModel: 'RealityDevice17,1',
+  userAgent:
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15',
+  osName: 'visionOS',
+  osVersion: '26.5.23O471',
+};
+
 interface SearchResult {
   source: string;
   source_id: string;
@@ -164,9 +176,100 @@ export class YouTubeProvider {
     }
   }
 
+  /**
+   * Asks for the stream as YouTube's Apple Vision Pro app. Since late October
+   * 2026 YouTube cuts the other app clients' streams off after 1 MB unless a
+   * proof-of-origin token is sent; this client still gets whole streams
+   * without one (it is yt-dlp's default token-free client too).
+   */
+  private visitor: { data: string; fetchedAt: number } | null = null;
+
+  /**
+   * The visitor ID youtube.com hands a new visitor. Read from the page like
+   * yt-dlp does: the web build of youtubei.js makes one up locally, and
+   * YouTube serves only the first megabyte of streams asked for with that.
+   */
+  private async visitorData(yt: Innertube): Promise<string | undefined> {
+    if (this.visitor && Date.now() - this.visitor.fetchedAt < 60 * 60 * 1000) {
+      return this.visitor.data;
+    }
+    try {
+      const doFetch = this.fetchImpl ?? fetch;
+      const page = await (
+        await doFetch('https://www.youtube.com/', {
+          headers: { 'User-Agent': VISIONOS_CLIENT.userAgent, 'Accept-Language': 'en-US,en;q=0.9' },
+        })
+      ).text();
+      const data = page.match(/"VISITOR_DATA":"([^"]+)"/)?.[1];
+      if (data) {
+        this.visitor = { data, fetchedAt: Date.now() };
+        return data;
+      }
+    } catch (err) {
+      console.error(`could not read YouTube visitor data: ${err}`);
+    }
+    return (yt.session.context.client as { visitorData?: string }).visitorData;
+  }
+
+  private async resolveVisionOs(yt: Innertube, sourceId: string): Promise<StreamInfo> {
+    const visitorData = await this.visitorData(yt);
+    const client = { ...VISIONOS_CLIENT, hl: 'en', gl: 'US', ...(visitorData ? { visitorData } : {}) };
+    const doFetch = this.fetchImpl ?? fetch;
+    const response = await doFetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': VISIONOS_CLIENT.userAgent,
+        'X-YouTube-Client-Name': '101',
+        'X-YouTube-Client-Version': VISIONOS_CLIENT.clientVersion,
+        Origin: 'https://www.youtube.com',
+        ...(visitorData ? { 'X-Goog-Visitor-Id': visitorData } : {}),
+      },
+      body: JSON.stringify({ context: { client }, videoId: sourceId, contentCheckOk: true, racyCheckOk: true }),
+    });
+    if (!response.ok) {
+      throw new Error(`YouTube player request failed: HTTP ${response.status}`);
+    }
+    const player = (await response.json()) as any;
+    const status = player?.playabilityStatus;
+    if (status?.status !== 'OK') {
+      throw new Error(status?.reason || `YouTube says ${status?.status ?? 'unplayable'}`);
+    }
+    const formats = ((player.streamingData?.adaptiveFormats ?? []) as any[]).filter(
+      (f) => typeof f.url === 'string' && String(f.mimeType).startsWith('audio/mp4'),
+    );
+    // AAC-LC (itag 140) decodes everywhere; otherwise the highest bitrate.
+    formats.sort((a, b) => Number(b.itag === 140) - Number(a.itag === 140) || (b.bitrate ?? 0) - (a.bitrate ?? 0));
+    const format = formats[0];
+    if (!format) {
+      throw new Error('YouTube returned no playable audio for this video');
+    }
+    const durationMs = Number(format.approxDurationMs) || null;
+    return {
+      url: format.url,
+      headers: { 'User-Agent': VISIONOS_CLIENT.userAgent },
+      expires_at: inferExpiry(format.url) ?? Date.now() + 6 * 60 * 60 * 1000,
+      mime_type: 'audio/mp4',
+      codec: extractCodec(format.mimeType) ?? null,
+      bitrate: format.averageBitrate ?? format.bitrate ?? null,
+      duration_ms: durationMs,
+      is_seekable: false,
+      needs_refresh: true,
+    };
+  }
+
   async resolveStream(sourceId: string): Promise<StreamInfo> {
     try {
       const yt = await this.getClient();
+
+      try {
+        const stream = await this.resolveVisionOs(yt, sourceId);
+        this.failCount = 0;
+        this.healthy = true;
+        return stream;
+      } catch (err) {
+        console.error(`visionOS stream lookup failed, trying other clients: ${err}`);
+      }
 
       const format = await yt.getStreamingData(sourceId, {
         client: 'ANDROID_VR',
