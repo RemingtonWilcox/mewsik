@@ -31,3 +31,4 @@ src-tauri/tauri.release.generated.conf.json
 # Vite
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+static/web-providers.js

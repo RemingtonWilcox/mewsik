@@ -21,7 +21,11 @@
 			label: 'Library',
 			href: '/library',
 			icon: Library,
-			match: (p) => p === '/library' || p === '/' || p.startsWith('/playlists')
+			match: (p) =>
+				p === '/' ||
+				['/library', '/playlists', '/albums', '/artists', '/heard', '/downloads'].some((root) =>
+					p.startsWith(root)
+				)
 		},
 		{ label: 'Search', href: '/search', icon: Search, match: (p) => p.startsWith('/search') },
 		{

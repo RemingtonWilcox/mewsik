@@ -19,20 +19,7 @@ import { Platform } from 'youtubei.js';
 import { YouTubeProvider } from './providers/youtube.js';
 import { SoundCloudProvider } from './providers/soundcloud.js';
 import { BandcampProvider } from './providers/bandcamp.js';
-
-interface JsonRpcRequest {
-  jsonrpc: string;
-  id: number | string;
-  method: string;
-  params?: Record<string, unknown>;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: string;
-  id: number | string | null;
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-}
+import { callProvider, RpcError, type JsonRpcRequest, type JsonRpcResponse } from './rpc.js';
 
 const providers = {
   youtube: new YouTubeProvider(),
@@ -60,36 +47,12 @@ const proxyServer = http.createServer(async (req, res) => {
 
 async function handleRequest(request: JsonRpcRequest): Promise<JsonRpcResponse> {
   const { id, method, params } = request;
-
   try {
-    const [providerName, action] = method.split('.');
-    const provider = providers[providerName as keyof typeof providers];
-
-    if (!provider) {
-      return { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown provider: ${providerName}` } };
-    }
-
-    let result: unknown;
-
-    switch (action) {
-      case 'search':
-        result = await provider.search(params?.query as string, (params?.page as number) ?? 0);
-        break;
-      case 'resolve_stream':
-        result = await provider.resolveStream(params?.source_id as string);
-        break;
-      case 'get_metadata':
-        result = await provider.getMetadata(params?.source_id as string);
-        break;
-      case 'is_healthy':
-        result = provider.isHealthy();
-        break;
-      default:
-        return { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown method: ${action}` } };
-    }
-
-    return { jsonrpc: '2.0', id, result };
+    return { jsonrpc: '2.0', id, result: await callProvider(providers, method, params) };
   } catch (err) {
+    if (err instanceof RpcError) {
+      return { jsonrpc: '2.0', id, error: { code: err.code, message: err.message } };
+    }
     const message = err instanceof Error ? err.message : String(err);
     return { jsonrpc: '2.0', id, error: { code: -32000, message } };
   }

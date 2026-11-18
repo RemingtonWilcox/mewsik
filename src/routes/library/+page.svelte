@@ -8,6 +8,10 @@
 	import { toast } from 'svelte-sonner';
 	import { Play, Shuffle, RefreshCw, Search, X } from '@lucide/svelte';
 	import type { LibraryTrack } from '$lib/types';
+	import MobileShortcuts from '$lib/components/mobile/mobile-shortcuts.svelte';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+
+	const isMobile = new IsMobile();
 
 	const library = useLibrary();
 	const player = usePlayer();
@@ -127,6 +131,10 @@
 			</button>
 		</div>
 	</header>
+
+	{#if isMobile.current}
+		<MobileShortcuts />
+	{/if}
 
 	{#if library.error}
 		<p class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">

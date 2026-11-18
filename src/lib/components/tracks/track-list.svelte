@@ -6,6 +6,7 @@
 	import Cover from './cover.svelte';
 	import { Play, Pause, Ellipsis, Clock3 } from '@lucide/svelte';
 	import { onMount } from 'svelte';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 
 	const ROW = 52;
 	const OVERSCAN = 12;
@@ -32,6 +33,11 @@
 
 	const player = usePlayer();
 	const menu = useTrackMenu();
+	// Phones have no room for the album column.
+	const narrow = new IsMobile();
+	const albumColumn = $derived(showAlbum && !narrow.current);
+	// A tap on a touch screen plays the song; a mouse click selects it.
+	let lastPointer = 'mouse';
 
 	let listEl = $state<HTMLDivElement | null>(null);
 	let scrollTop = $state(0);
@@ -157,7 +163,7 @@
 	}
 
 	const columns = $derived(
-		showAlbum
+		albumColumn
 			? 'grid-template-columns: 2.75rem minmax(0,1.4fr) minmax(0,1fr) 4.5rem 2.25rem'
 			: 'grid-template-columns: 2.75rem minmax(0,1fr) 4.5rem 2.25rem'
 	);
@@ -179,7 +185,7 @@
 		>
 			<span class="text-center">#</span>
 			<span>Title</span>
-			{#if showAlbum}<span>Album</span>{/if}
+			{#if albumColumn}<span>Album</span>{/if}
 			<span class="flex justify-end"><Clock3 class="size-3.5" /></span>
 			<span></span>
 		</div>
@@ -198,7 +204,14 @@
 					class:is-selected={selected.has(index)}
 					class:is-current={isCurrent}
 					style="{columns}; top: {index * ROW}px; height: {ROW}px"
-					onclick={(e) => select(index, e)}
+					onpointerdown={(e) => (lastPointer = e.pointerType)}
+					onclick={(e) => {
+						if (lastPointer === 'touch') {
+							if (!isCurrent) play(index);
+						} else {
+							select(index, e);
+						}
+					}}
 					ondblclick={() => play(index)}
 					oncontextmenu={(e) => {
 						e.preventDefault();
@@ -245,7 +258,7 @@
 						</div>
 					</div>
 
-					{#if showAlbum}
+					{#if albumColumn}
 						{#if track.album_id}
 							<a
 								href="/albums/{track.album_id}"
@@ -263,7 +276,7 @@
 					</span>
 
 					<button
-						class="flex size-8 items-center justify-center rounded-md text-muted-foreground opacity-0 hover:bg-white/10 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+						class="flex size-8 items-center justify-center rounded-md text-muted-foreground opacity-0 hover:bg-white/10 hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100"
 						aria-label="More"
 						onclick={(e) => {
 							e.stopPropagation();
