@@ -53,6 +53,7 @@
       },
       "nsis": {
         "installMode": "currentUser",
+        "installerHooks": "nsis/hooks.nsh",
         "languages": [
           "English"
         ],
