@@ -988,6 +988,7 @@
 				<StationArt
 					name={cleanStationName(station.name)}
 					src={station.favicon}
+					logo={api.stationLogoKeyForPick(station)}
 					class="size-12 rounded-lg border border-white/10"
 					monogramClass="text-base"
 				/>
@@ -1078,6 +1079,7 @@
 					<StationArt
 						name={cleanStationName(heroPick.station.name)}
 						src={heroPick.station.favicon}
+							logo={api.stationLogoKeyForPick(heroPick.station)}
 						class="size-14 rounded-xl border border-white/10 lg:hidden"
 						monogramClass="text-lg"
 					/>
@@ -1129,6 +1131,7 @@
 					<StationArt
 						name={cleanStationName(heroPick.station.name)}
 						src={heroPick.station.favicon}
+							logo={api.stationLogoKeyForPick(heroPick.station)}
 						class="size-12 rounded-lg border border-white/10"
 						monogramClass="text-lg"
 					/>

@@ -423,7 +423,8 @@
 	saved: boolean,
 	onplay: () => void,
 	onsave: () => void,
-	dim = false
+	dim = false,
+	logo: api.StationLogoKey | null = null
 )}
 	{@const name = cleanStationName(station.name)}
 	<div class="station-row flex h-16 min-w-0 items-center gap-3" class:opacity-50={dim} data-station-row>
@@ -433,7 +434,7 @@
 			aria-label={active ? `Stop ${name}` : `Play ${name}`}
 		>
 			<span class="relative shrink-0">
-				<StationArt {name} identity={station.stationuuid || station.url} class="size-12 rounded-lg" monogramClass="text-sm" />
+				<StationArt {name} identity={station.stationuuid || station.url} logo={logo ?? api.stationLogoKeyForPick(station)} class="size-12 rounded-lg" monogramClass="text-sm" />
 				{#if active}
 					<span class="absolute inset-0 flex items-center justify-center rounded-lg bg-black/55 text-primary">
 						{#if player.state.is_buffering}
@@ -581,7 +582,7 @@
 					<div class="pointer-events-none absolute inset-0 bg-gradient-to-br {featuredCollection?.accent ?? 'from-primary/25 via-primary/5 to-transparent'}"></div>
 					<p class="relative text-[12px] font-semibold uppercase tracking-wide text-primary">Today’s pick</p>
 					<div class="relative mt-2 flex items-center gap-3">
-						<StationArt name={featuredName} identity={featured.stationuuid} class="size-16 rounded-xl" monogramClass="text-lg" />
+						<StationArt name={featuredName} identity={featured.stationuuid} logo={api.stationLogoKeyForPick(featured)} class="size-16 rounded-xl" monogramClass="text-lg" />
 						<div class="min-w-0">
 							<h2 class="truncate text-[22px] font-bold leading-tight tracking-tight">{featuredName}</h2>
 							<p class="truncate text-[13px] text-muted-foreground">{pickLine(featured)}</p>
@@ -714,7 +715,8 @@
 								true,
 								() => playFavorite(station),
 								() => unsave(station),
-								station.fail_count >= 3
+								station.fail_count >= 3,
+								api.stationLogoKeyForSaved(station)
 							)}
 						{/each}
 					</div>
