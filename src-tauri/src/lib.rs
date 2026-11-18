@@ -219,6 +219,7 @@ pub fn run() {
             commands::stations::get_radio_station_details,
             commands::stations::save_station,
             commands::stations::get_favorite_stations,
+            commands::stations::get_station_logo,
             commands::stations::verify_favorite_stations,
             commands::stations::verify_station_urls,
             commands::stations::toggle_station_favorite,

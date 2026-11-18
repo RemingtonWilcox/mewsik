@@ -1819,6 +1819,31 @@ pub fn last_station_play_end_reason(
     }
 }
 
+/// The directory favicon cached for a station, server side only (the logo
+/// cache fetches it; the WebView never sees the remote URL). `None` when the
+/// station is not in the scene cache; `Some(None)` when it is but the
+/// directory listed no favicon.
+pub fn get_scene_station_favicon(
+    db: &DbPool,
+    station_uuid: &str,
+) -> Result<Option<Option<String>>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT favicon FROM scene_stations WHERE station_uuid = ?1
+         ORDER BY CASE WHEN favicon IS NULL OR trim(favicon) = '' THEN 1 ELSE 0 END
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![station_uuid], |row| row.get::<_, Option<String>>(0))?;
+    match rows.next() {
+        Some(favicon) => Ok(Some(
+            favicon?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        )),
+        None => Ok(None),
+    }
+}
+
 pub fn delete_scene_station_by_uuid(
     db: &DbPool,
     station_uuid: &str,
