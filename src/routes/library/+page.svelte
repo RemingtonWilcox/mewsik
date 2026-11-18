@@ -167,10 +167,10 @@
 					{/if}
 				</div>
 				{#if view === 'songs'}
-					<label class="relative flex h-10 items-center rounded-xl bg-white/[0.08] px-3 text-sm text-muted-foreground">
+					<label class="relative flex h-10 items-center overflow-hidden rounded-xl bg-white/[0.08] px-3 text-sm text-muted-foreground">
 						<ArrowUpDown class="size-4" />
 						<span class="sr-only">Sort songs</span>
-						<select bind:value={sort} aria-label="Sort songs" class="absolute inset-0 opacity-0">
+						<select bind:value={sort} aria-label="Sort songs" class="absolute inset-0 size-full appearance-none opacity-0">
 							<option value="added">Recently added</option>
 							<option value="title">Title</option>
 							<option value="artist">Artist</option>
