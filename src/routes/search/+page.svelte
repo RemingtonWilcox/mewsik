@@ -41,6 +41,11 @@
 	let savedKeys = $state(new Set<string>());
 	let downloadedKeys = $state(new Set<string>());
 	let request = 0;
+	// Pages after the first, per provider, loaded as the list scrolls.
+	let nextPage = $state<Record<SearchSource, number>>({ soundcloud: 1, youtube: 1 });
+	let exhausted = $state<Record<SearchSource, boolean>>({ soundcloud: false, youtube: false });
+	let loadingMore = $state(false);
+	let moreSentinel = $state<HTMLDivElement | null>(null);
 	let timer: ReturnType<typeof setTimeout> | undefined;
 
 	const clean = $derived(query.trim().replace(/\s+/g, ' '));
@@ -119,6 +124,8 @@
 		const id = ++request;
 		online = [];
 		onlineQuery = text;
+		nextPage = { soundcloud: 1, youtube: 1 };
+		exhausted = { soundcloud: false, youtube: false };
 		failed = [];
 		onlineError = '';
 		searching = true;
@@ -143,6 +150,41 @@
 			}
 		}
 	}
+
+	async function loadMore() {
+		const source = saved.source;
+		const text = onlineQuery;
+		if (loadingMore || searching || exhausted[source] || !text || text !== clean) return;
+		loadingMore = true;
+		const id = request;
+		try {
+			const page = await api.searchExternal(text, source, nextPage[source]);
+			if (id !== request) return;
+			const before = online.length;
+			online = merge(online, page.items ?? []);
+			nextPage = { ...nextPage, [source]: nextPage[source] + 1 };
+			if (!page.has_more || online.length === before) exhausted = { ...exhausted, [source]: true };
+			saved.online = online;
+		} catch {
+			if (id === request) exhausted = { ...exhausted, [source]: true };
+		} finally {
+			loadingMore = false;
+		}
+	}
+
+	// Near the bottom of the list, fetch the next page.
+	$effect(() => {
+		const sentinel = moreSentinel;
+		if (!sentinel) return;
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries.some((e) => e.isIntersecting)) void loadMore();
+			},
+			{ rootMargin: '600px 0px' }
+		);
+		observer.observe(sentinel);
+		return () => observer.disconnect();
+	});
 
 	function clear() {
 		query = '';
@@ -503,9 +545,13 @@
 						{/if}
 					{/each}
 				</div>
-				{#if !phone.current}
-					<p class="mt-2 px-3 text-xs text-muted-foreground">{plural(shown.length, 'result')}</p>
-				{/if}
+				<div bind:this={moreSentinel} class="flex h-14 items-center justify-center text-xs text-muted-foreground">
+					{#if loadingMore}
+						<LoaderCircle class="size-5 animate-spin" />
+					{:else if exhausted[saved.source]}
+						{plural(shown.length, 'result')}
+					{/if}
+				</div>
 			{/if}
 		</section>
 	{/if}
