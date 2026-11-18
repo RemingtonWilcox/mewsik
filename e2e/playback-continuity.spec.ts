@@ -694,6 +694,22 @@ test.describe('on a phone', () => {
 		await expect.poll(seeks).toBe(1);
 		await page.waitForTimeout(800);
 		expect(await seeks()).toBe(1);
+
+		// A drag scrubs: the sheet stays put and one seek lands near the end.
+		await page.mouse.move(box.x + box.width * 0.2, box.y + box.height / 2);
+		await page.mouse.down();
+		for (const f of [0.35, 0.5, 0.65, 0.8]) {
+			await page.mouse.move(box.x + box.width * f, box.y + box.height / 2, { steps: 4 });
+		}
+		await page.mouse.up();
+		await expect.poll(seeks).toBe(2);
+		const last = await page.evaluate(() =>
+			((window as any).__PLAYBACK_INVOCATIONS__ as { command: string; args: { positionMs?: number } }[])
+				.filter((c) => c.command === 'seek')
+				.at(-1)
+		);
+		expect(JSON.stringify(last)).toMatch(/2[2-5]\d{4}/);
+		await expect(page.getByText('Playing from YouTube')).toBeVisible();
 	});
 });
 
