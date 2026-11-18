@@ -56,7 +56,12 @@ impl AudioDecoder {
             ..Default::default()
         };
         let probed = symphonia::default::get_probe()
-            .format(&probe_hint, stream, &format_options, &MetadataOptions::default())
+            .format(
+                &probe_hint,
+                stream,
+                &format_options,
+                &MetadataOptions::default(),
+            )
             .map_err(|e| format!("Unsupported audio file: {e}"))?;
         let format = probed.format;
 
@@ -213,7 +218,8 @@ impl Source for AudioDecoder {
                     let landed = time_to_duration(base.calc_time(seeked.actual_ts));
                     if self.decode_next() && target > landed {
                         let skip_frames = ((target - landed).as_secs_f64()
-                            * f64::from(self.sample_rate)) as usize;
+                            * f64::from(self.sample_rate))
+                            as usize;
                         let skip = (skip_frames * self.channels as usize).min(self.samples.len());
                         self.cursor = skip - skip % self.channels.max(1) as usize;
                     }
@@ -275,7 +281,10 @@ mod tests {
     fn spikes(out: Vec<i16>) -> (usize, f32) {
         let left: Vec<f32> = out.iter().step_by(2).map(|s| *s as f32).collect();
         // Second difference: smooth audio is small, a click is a spike.
-        let d2: Vec<f32> = left.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).collect();
+        let d2: Vec<f32> = left
+            .windows(3)
+            .map(|w| (w[0] - 2.0 * w[1] + w[2]).abs())
+            .collect();
         let mean = d2.iter().sum::<f32>() / d2.len() as f32;
         (d2.iter().filter(|v| **v > mean * 12.0).count(), mean)
     }
@@ -286,14 +295,19 @@ mod tests {
     #[test]
     #[ignore]
     fn resample_click_probe() {
-        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
+        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else {
+            return;
+        };
         for p in files.split(';') {
             let n = 48_000 * 2 * 15;
             let open = || AudioDecoder::open_path(Path::new(p)).expect("open");
-            let old: Vec<i16> = UniformSourceIterator::<_, i16>::new(PacketFramed(open(), 2048), 2, 48_000)
+            let old: Vec<i16> =
+                UniformSourceIterator::<_, i16>::new(PacketFramed(open(), 2048), 2, 48_000)
+                    .take(n)
+                    .collect();
+            let new: Vec<i16> = UniformSourceIterator::<_, i16>::new(open(), 2, 48_000)
                 .take(n)
                 .collect();
-            let new: Vec<i16> = UniformSourceIterator::<_, i16>::new(open(), 2, 48_000).take(n).collect();
             println!("old {:?}  new {:?}  {p}", spikes(old), spikes(new));
         }
     }

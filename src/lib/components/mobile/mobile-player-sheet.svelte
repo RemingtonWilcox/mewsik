@@ -9,7 +9,6 @@
 	} from '$lib/state/player.svelte';
 	import StationArt from '$lib/components/station-art.svelte';
 	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
-	import { Slider } from '$lib/components/ui/slider';
 	import {
 		Play,
 		Pause,
@@ -75,21 +74,106 @@
 		menu.open({ x: 0, y: 0, tracks: [track], play: () => {}, extras: [] });
 	}
 
-	// The slider reports every position update as a change, not only the
-	// listener's drags; seeking on those re-buffered the song every second.
-	// Seek once, when a drag is let go.
-	let dragging = $state(false);
-	let dragMs = $state(0);
-	let sliderValue = $derived([dragging ? dragMs : player.state.position_ms]);
+	// The scrubber: the whole strip (not just a small thumb) can be grabbed,
+	// it follows the finger, and it seeks once when let go. While playing, the
+	// fill runs on its own clock between the engine's position reports.
+	let scrubber = $state<HTMLDivElement | null>(null);
+	let dragRatio = $state<number | null>(null);
+	let dragPointer: number | null = null;
+	// After a seek, hold the bar at the target until the engine catches up.
+	let pendingSeek = $state<{ ms: number; at: number } | null>(null);
+	let shown = $state(0);
+	let anchorPos = 0;
+	let anchorAt = 0;
 
-	function onSeekDrag(values: number[]) {
-		if (dragging && typeof values[0] === 'number') dragMs = values[0];
+	let playing = $derived(player.state.is_playing && !player.state.is_buffering);
+	let durationMs = $derived(player.state.duration_ms || 0);
+
+	// A new song starts from a clean slate: no leftover drag or seek target.
+	// (A derived only signals when the id itself changes, not on every
+	// position report.)
+	let recordingId = $derived(player.state.current_recording_id);
+	$effect(() => {
+		void recordingId;
+		dragRatio = null;
+		dragPointer = null;
+		pendingSeek = null;
+	});
+
+	$effect(() => {
+		const pos = player.state.position_ms;
+		const now = performance.now();
+		if (pendingSeek) {
+			const landed = Math.abs(pos - pendingSeek.ms) < 2500;
+			if (!landed && now - pendingSeek.at < 4000) return;
+			pendingSeek = null;
+		}
+		// Small disagreements are poll jitter; only re-anchor on a real jump.
+		if (playing && Math.abs(pos - (anchorPos + (now - anchorAt))) < 400) return;
+		anchorPos = pos;
+		anchorAt = now;
+		shown = pos;
+	});
+
+	$effect(() => {
+		if (!playing || durationMs <= 0 || pendingSeek) return;
+		let frame = 0;
+		const tick = (now: number) => {
+			shown = Math.min(durationMs, anchorPos + (now - anchorAt));
+			frame = requestAnimationFrame(tick);
+		};
+		frame = requestAnimationFrame(tick);
+		return () => cancelAnimationFrame(frame);
+	});
+
+	let positionShown = $derived(
+		dragRatio !== null
+			? dragRatio * durationMs
+			: pendingSeek
+				? pendingSeek.ms
+				: Math.min(shown, durationMs || shown)
+	);
+	let fraction = $derived(durationMs > 0 ? Math.max(0, Math.min(1, positionShown / durationMs)) : 0);
+
+	function ratioAt(clientX: number) {
+		if (!scrubber) return 0;
+		const rect = scrubber.getBoundingClientRect();
+		return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
 	}
 
-	function onSeekCommit(values: number[]) {
-		const ms = values[0];
-		dragging = false;
-		if (canSeek && typeof ms === 'number') void player.seek(ms);
+	function scrubDown(event: PointerEvent) {
+		if (!canSeek || dragPointer !== null) return;
+		event.preventDefault();
+		event.stopPropagation();
+		dragPointer = event.pointerId;
+		scrubber?.setPointerCapture(event.pointerId);
+		dragRatio = ratioAt(event.clientX);
+	}
+
+	function scrubMove(event: PointerEvent) {
+		if (event.pointerId !== dragPointer) return;
+		event.preventDefault();
+		dragRatio = ratioAt(event.clientX);
+	}
+
+	function scrubUp(event: PointerEvent) {
+		if (event.pointerId !== dragPointer) return;
+		const ratio = ratioAt(event.clientX);
+		dragPointer = null;
+		dragRatio = null;
+		if (!canSeek) return;
+		const ms = Math.round(ratio * durationMs);
+		pendingSeek = { ms, at: performance.now() };
+		anchorPos = ms;
+		anchorAt = performance.now();
+		shown = ms;
+		void player.seek(ms);
+	}
+
+	function scrubCancel(event: PointerEvent) {
+		if (event.pointerId !== dragPointer) return;
+		dragPointer = null;
+		dragRatio = null;
 	}
 </script>
 
@@ -200,26 +284,40 @@
 						<!-- data-vaul-no-drag: a drag here scrubs the song instead of
 						     pulling the sheet down. The padding is a bigger touch target. -->
 						<div
+							bind:this={scrubber}
 							data-vaul-no-drag
 							data-seek-bar
-							class="-my-3 py-3"
-							onpointerdowncapture={() => {
-								if (!canSeek) return;
-								dragMs = player.state.position_ms;
-								dragging = true;
-							}}
+							role="slider"
+							tabindex="-1"
+							aria-label="Song position"
+							aria-valuemin={0}
+							aria-valuemax={Math.round(durationMs / 1000)}
+							aria-valuenow={Math.round(positionShown / 1000)}
+							aria-disabled={!canSeek}
+							class="group relative -my-4 flex h-11 touch-none items-center select-none"
+							onpointerdown={scrubDown}
+							onpointermove={scrubMove}
+							onpointerup={scrubUp}
+							onpointercancel={scrubCancel}
+							onlostpointercapture={scrubCancel}
 						>
-							<Slider
-								value={sliderValue}
-								max={player.state.duration_ms || 1}
-								step={1000}
-								disabled={!canSeek}
-								onValueChange={onSeekDrag}
-								onValueCommit={onSeekCommit}
-							/>
+							<div
+								class="relative w-full overflow-hidden rounded-full bg-foreground/20 transition-[height] duration-150 {dragRatio !==
+								null
+									? 'h-2.5'
+									: 'h-1.5'}"
+							>
+								<div
+									data-seek-fill
+									class="absolute inset-y-0 left-0 rounded-full {canSeek
+										? 'bg-foreground/90'
+										: 'bg-foreground/40'}"
+									style="width: {fraction * 100}%"
+								></div>
+							</div>
 						</div>
 						<div class="flex justify-between text-[11px] tabular-nums text-muted-foreground">
-							<span>{formatTime(dragging ? dragMs : player.state.position_ms)}</span>
+							<span>{formatTime(positionShown)}</span>
 							<span>{formatTime(player.state.duration_ms)}</span>
 						</div>
 					{/if}

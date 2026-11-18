@@ -2138,3 +2138,21 @@ pub fn reopen_station_song(
     )?;
     Ok(Some(id))
 }
+
+/// Points a track source at a file's new location (for example after iOS
+/// moves the app container on reinstall). A clash with an existing row for the
+/// new path is left alone; download sync recreates the managed source.
+pub fn move_track_source_file_path(
+    db: &DbPool,
+    old_path: &str,
+    new_path: &str,
+) -> Result<(), rusqlite::Error> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE OR IGNORE track_sources
+         SET file_path = ?1, is_available = 1, updated_at = ?2
+         WHERE file_path = ?3",
+        params![new_path, now(), old_path],
+    )?;
+    Ok(())
+}

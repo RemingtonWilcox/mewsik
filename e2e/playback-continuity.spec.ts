@@ -688,7 +688,7 @@ test.describe('on a phone', () => {
 		}
 		expect(await seeks()).toBe(0);
 
-		const track = page.locator('[data-slot="slider-track"]');
+		const track = page.locator('[data-seek-bar]');
 		const box = (await track.boundingBox())!;
 		await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
 		await expect.poll(seeks).toBe(1);
@@ -710,6 +710,15 @@ test.describe('on a phone', () => {
 		);
 		expect(JSON.stringify(last)).toMatch(/2[2-5]\d{4}/);
 		await expect(page.getByText('Playing from YouTube')).toBeVisible();
+
+		// A new song starts the bar from zero, not from the last drag.
+		await page.evaluate(() =>
+			(window as any).__SET_PLAYBACK__({ current_recording_id: 'rec-next', position_ms: 0 })
+		);
+		await expect(page.getByRole('slider', { name: 'Song position' })).toHaveAttribute(
+			'aria-valuenow',
+			'0'
+		);
 	});
 });
 

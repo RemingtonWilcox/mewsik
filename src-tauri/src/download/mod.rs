@@ -694,6 +694,25 @@ pub fn sync_completed_download_sources(db: &DbPool) -> Result<(), String> {
     Ok(())
 }
 
+/// iOS gives the app a new container folder
+/// (`.../Data/Application/<UUID>/`) whenever it is reinstalled, so stored
+/// absolute paths point at a folder that no longer exists. Re-root such a path
+/// under the current home folder and return it when the file is there.
+fn relocated_container_path(stored: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let moved = rebase_container_path(stored, &home)?;
+    Path::new(&moved).is_file().then_some(moved)
+}
+
+fn rebase_container_path(stored: &str, home: &str) -> Option<String> {
+    const MARKER: &str = "/Data/Application/";
+    let after = &stored[stored.find(MARKER)? + MARKER.len()..];
+    let (_uuid, inside) = after.split_once('/')?;
+    let home = home.trim_end_matches('/');
+    let moved = format!("{home}/{inside}");
+    (moved != stored).then_some(moved)
+}
+
 pub fn reconcile_download_files(db: &DbPool) -> Result<(), String> {
     let downloads = queries::get_downloads(db).map_err(|e| e.to_string())?;
     for download in downloads {
@@ -704,6 +723,23 @@ pub fn reconcile_download_files(db: &DbPool) -> Result<(), String> {
         let Some(file_path) = download.file_path.as_deref() else {
             continue;
         };
+
+        if !Path::new(file_path).is_file() {
+            if let Some(moved) = relocated_container_path(file_path) {
+                queries::move_track_source_file_path(db, file_path, &moved)
+                    .map_err(|e| e.to_string())?;
+                queries::complete_download(db, &download.id, &moved).map_err(|e| e.to_string())?;
+                if let Some(recording_id) = download.recording_id.as_deref() {
+                    let _ = upsert_download_source(
+                        db,
+                        recording_id,
+                        &download.source,
+                        Path::new(&moved),
+                    );
+                }
+                continue;
+            }
+        }
 
         if Path::new(file_path).is_file() {
             if download.status == "missing" {
@@ -907,6 +943,24 @@ pub fn get_all_downloads(db: &DbPool) -> Result<Vec<Download>, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reinstalled_ios_container_paths_are_rebased() {
+        let stored =
+            "/private/var/mobile/Containers/Data/Application/OLD-UUID/Documents/Mewsik/song.m4a";
+        assert_eq!(
+            super::rebase_container_path(
+                stored,
+                "/private/var/mobile/Containers/Data/Application/NEW-UUID/"
+            )
+            .as_deref(),
+            Some("/private/var/mobile/Containers/Data/Application/NEW-UUID/Documents/Mewsik/song.m4a")
+        );
+        assert_eq!(
+            super::rebase_container_path("C:/Music/song.mp3", "/home"),
+            None
+        );
+    }
+
     use super::{
         infer_extension, prepare_download_directory, queue_download_for_entry,
         reconcile_download_files, reserve_unique_output_path,

@@ -207,7 +207,10 @@ pub async fn delete_download(
 }
 
 #[tauri::command]
-pub async fn reveal_download_path(db: State<'_, DbPool>, download_id: String) -> Result<(), String> {
+pub async fn reveal_download_path(
+    db: State<'_, DbPool>,
+    download_id: String,
+) -> Result<(), String> {
     let file_path = resolve_completed_download_path(&db, &download_id)?;
     let containing_folder = file_path
         .parent()

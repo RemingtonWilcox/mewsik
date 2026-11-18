@@ -1,8 +1,8 @@
+use crate::commands::settings::ConfigState;
 use crate::db::models::*;
 use crate::db::queries;
 use crate::db::DbPool;
 use crate::metadata::scanner;
-use crate::commands::settings::ConfigState;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, State};
@@ -20,7 +20,11 @@ static SCAN_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Scans every library folder. Only one scan runs at a time; a second call
 /// while one is running returns `None`. Emits `library:changed` when done.
-pub fn scan_all_blocking(db: &DbPool, paths: &[String], app: Option<&AppHandle>) -> Option<ScanResult> {
+pub fn scan_all_blocking(
+    db: &DbPool,
+    paths: &[String],
+    app: Option<&AppHandle>,
+) -> Option<ScanResult> {
     if SCAN_RUNNING.swap(true, Ordering::SeqCst) {
         return None;
     }
@@ -39,7 +43,11 @@ pub fn scan_all_blocking(db: &DbPool, paths: &[String], app: Option<&AppHandle>)
     }
     log::info!(
         "library scan: {} files, {} new, {} moved, {} removed, {} errors",
-        total.total_files, total.new_tracks, total.updated_tracks, total.removed_tracks, total.errors.len()
+        total.total_files,
+        total.new_tracks,
+        total.updated_tracks,
+        total.removed_tracks,
+        total.errors.len()
     );
     Some(total)
 }
@@ -79,7 +87,10 @@ pub async fn get_all_albums(db: State<'_, DbPool>) -> Result<Vec<Album>, String>
 }
 
 #[tauri::command]
-pub async fn get_artist(db: State<'_, DbPool>, artist_id: String) -> Result<Option<Artist>, String> {
+pub async fn get_artist(
+    db: State<'_, DbPool>,
+    artist_id: String,
+) -> Result<Option<Artist>, String> {
     queries::get_artist(&db, &artist_id).map_err(|e| e.to_string())
 }
 
@@ -187,6 +198,9 @@ pub async fn save_to_library(db: State<'_, DbPool>, recording_id: String) -> Res
 }
 
 #[tauri::command]
-pub async fn remove_from_library(db: State<'_, DbPool>, recording_id: String) -> Result<(), String> {
+pub async fn remove_from_library(
+    db: State<'_, DbPool>,
+    recording_id: String,
+) -> Result<(), String> {
     queries::set_in_library(&db, &recording_id, false).map_err(|e| e.to_string())
 }
