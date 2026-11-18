@@ -68,6 +68,11 @@ The NSIS installer installs for the current user without elevation. Downgrades a
 
 Tauri's uninstall checkbox clears interface/WebView preferences and cache derived from the bundle identifier; its text explicitly says the SQLite library and downloaded music are preserved. Core JSON config also remains in private data, while browser-backed preferences such as visualizer choices can be cleared. Do not add an installer hook that silently deletes or moves user-owned data.
 
+`src-tauri/nsis/hooks.nsh` runs before every install and uninstall. Tauri's own check only closes `mewsik.exe`; the hook also closes any process still holding `bin
+ode.exe` or `binfmpeg.exe` in that install folder (an orphaned sidecar or radio decoder after a force-close). Without it a silent install skips those locked files and still exits 0. Restart Manager matches exact paths, so other `node.exe` processes are untouched, and an interactive run still asks before closing an open mewsik.
+
+To check a local install, run `pwsh scripts/verify-nsis-install.ps1`. Do not hash-compare the installed `mewsik.exe` with `src-tauri/target/release/mewsik.exe`: the bundler stamps the copy it packs with its bundle type (`__TAURI_BUNDLE_TYPE_VAR_NSS`), so a correct install always differs from the cargo output by those 3 bytes. Never copy `target/release/mewsik.exe` over an install either, because the updater reads that stamp to pick the `windows-x86_64-nsis` manifest entry.
+
 Public Windows drafts use Azure Artifact Signing through Tauri's `bundle.windows.signCommand`. Tauri signs the application executable and installer while bundling, before updater signatures and `latest.json` are produced. The guarded workflow has no unsigned fallback. A deliberately unsigned private build must be built locally, labeled unmistakably, and never published through the stable updater feed.
 
 ### Provider features
