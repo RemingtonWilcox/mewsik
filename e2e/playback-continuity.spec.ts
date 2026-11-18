@@ -608,7 +608,8 @@ test.describe('on a phone', () => {
 					...[...document.querySelectorAll<HTMLElement>('body *')].filter(
 						(el) =>
 							/auto|scroll/.test(getComputedStyle(el).overflowX) &&
-							!el.classList.contains('station-rail')
+							!el.classList.contains('station-rail') &&
+							!el.hasAttribute('data-rail')
 					)
 				];
 				const culprits = scrollers

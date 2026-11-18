@@ -8,6 +8,7 @@ use crate::stations::health::{
     build_station_health_client, try_heal_station, verify_favorite_stations_inner,
     verify_station_urls_inner, StationHealthResult,
 };
+use crate::stations::logos;
 use crate::stations::network::{parse_public_http_url, validate_public_http_url};
 use crate::stations::probe::{
     cached_playable_url, forget_playable_url, probe_station_stream_for_playback,
@@ -517,6 +518,21 @@ pub fn get_favorite_stations(db: State<'_, DbPool>) -> Result<Vec<Station>, Stri
         station.favicon_url = None;
     }
     Ok(stations)
+}
+
+/// A station's logo as a `data:` URL, or `None` to show the generated tile.
+/// The caller names the station (radio-browser UUID and/or saved station
+/// id); the backend fetches and caches the favicon URL it already holds, so
+/// the WebView never loads or even sees the remote image host.
+#[tauri::command]
+pub async fn get_station_logo(
+    db: State<'_, DbPool>,
+    station_uuid: Option<String>,
+    station_id: Option<String>,
+) -> Result<Option<String>, String> {
+    let db = db.inner().clone();
+    let cache_dir = crate::config::AppConfig::data_dir().join(logos::LOGO_CACHE_DIR);
+    logos::get_station_logo(&db, &cache_dir, station_uuid, station_id).await
 }
 
 #[tauri::command]

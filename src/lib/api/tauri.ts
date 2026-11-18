@@ -498,6 +498,31 @@ export const saveStation = (
 
 export const getFavoriteStations = () => safeInvoke<Station[]>('get_favorite_stations', undefined, []);
 
+/** Names a station for the backend logo cache. The backend resolves the
+ *  favicon URL it already holds; the WebView never sees the remote URL. */
+export interface StationLogoKey {
+	/** radio-browser `stationuuid` (discovery picks, search results). */
+	stationUuid?: string | null;
+	/** Saved station id (favorites, history). */
+	stationId?: string | null;
+}
+
+export const stationLogoKeyForPick = (
+	station: Pick<RadioBrowserStation, 'stationuuid'>
+): StationLogoKey => ({ stationUuid: station.stationuuid || null });
+
+export const stationLogoKeyForSaved = (station: Pick<Station, 'id'>): StationLogoKey => ({
+	stationId: station.id
+});
+
+/** The station's cached logo as a `data:` URL, or null for the monogram. */
+export const getStationLogo = (key: StationLogoKey) =>
+	safeInvoke<string | null>(
+		'get_station_logo',
+		{ stationUuid: key.stationUuid || null, stationId: key.stationId || null },
+		null
+	);
+
 /** Songs heard on stations, newest first. */
 export const getStationSongs = (limit = 1000) =>
 	safeInvoke<StationSong[]>('get_station_songs', { limit }, []);

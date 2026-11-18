@@ -238,3 +238,37 @@ test.describe('station discovery flow', () => {
 		expect(invocation?.args.tags).toEqual(['hip hop', 'hiphop', 'hip-hop', 'rap']);
 	});
 });
+
+test.describe('stations on a phone', () => {
+	test.use({ viewport: { width: 428, height: 926 }, hasTouch: true });
+
+	test('a new listener gets a pick, genres, and a heart that saves', async ({ page }) => {
+		await installStationRuntime(page);
+		await page.goto('/stations');
+
+		await expect(page.getByText('Today’s pick')).toBeVisible();
+		await expect(page.getByRole('heading', { name: 'Genres' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Directory' })).toHaveCount(0);
+
+		// A genre opens its own page and Back returns.
+		await page.getByRole('button', { name: /^Hip-hop/ }).first().click();
+		await expect(page.getByRole('heading', { name: 'Hip-hop', level: 1 })).toBeVisible();
+		await page.getByRole('button', { name: 'Stations' }).first().click();
+		await expect(page.getByRole('heading', { name: 'Genres' })).toBeVisible();
+
+		// Saving goes through the heart; the empty Saved tab says how.
+		await page.getByRole('button', { name: /^Saved/ }).click();
+		await expect(page.getByText('No saved stations yet')).toBeVisible();
+		await page.getByRole('button', { name: 'Discover' }).click();
+		await page.getByRole('button', { name: /^Save Golden Era Radio/ }).first().click();
+		await expect
+			.poll(() =>
+				page.evaluate(() =>
+					((window as any).__STATION_INVOCATIONS__ as { command: string }[]).some(
+						(call) => call.command === 'save_station'
+					)
+				)
+			)
+			.toBe(true);
+	});
+});
