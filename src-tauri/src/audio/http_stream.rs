@@ -1006,7 +1006,12 @@ fn fetch_ranges_in_parallel(
 ) -> Result<Vec<u8>, String> {
     let ranges: Vec<(u64, u64)> = (0..total)
         .step_by(GOOGLEVIDEO_RANGE_CHUNK_BYTES as usize)
-        .map(|start| (start, (start + GOOGLEVIDEO_RANGE_CHUNK_BYTES - 1).min(total - 1)))
+        .map(|start| {
+            (
+                start,
+                (start + GOOGLEVIDEO_RANGE_CHUNK_BYTES - 1).min(total - 1),
+            )
+        })
         .collect();
     let next = AtomicU64::new(0);
     let parts: Vec<Mutex<Option<Result<Vec<u8>, String>>>> =

@@ -94,9 +94,13 @@ pub fn scan_directory(db: &DbPool, dir_path: &str) -> ScanResult {
         // (The hash covers only the first 64 KB, which for tagged files is
         // often just the cover image, so a live old path means a different
         // song from the same release, not a move.)
-        if let Ok(Some(existing)) = queries::find_source_by_hash(db, &content_hash)
-            .map(|found| found.filter(|s| s.file_path.as_deref().is_some_and(|p| !Path::new(p).exists())))
-        {
+        if let Ok(Some(existing)) = queries::find_source_by_hash(db, &content_hash).map(|found| {
+            found.filter(|s| {
+                s.file_path
+                    .as_deref()
+                    .is_some_and(|p| !Path::new(p).exists())
+            })
+        }) {
             // Update file path for the moved file
             let conn = db.lock();
             let _ = conn.execute(
@@ -291,7 +295,13 @@ fn extract_cover(path: &Path, covers: &Path) -> Option<String> {
         .tags()
         .iter()
         .flat_map(|tag| tag.pictures())
-        .min_by_key(|pic| if pic.pic_type() == PictureType::CoverFront { 0 } else { 1 })?;
+        .min_by_key(|pic| {
+            if pic.pic_type() == PictureType::CoverFront {
+                0
+            } else {
+                1
+            }
+        })?;
     let data = picture.data();
     if data.len() < 64 {
         return None;
@@ -478,14 +488,28 @@ mod tests {
     #[test]
     #[ignore]
     fn scan_probe() {
-        let (Ok(db), Ok(dir)) = (std::env::var("MEWSIK_PROBE_DB"), std::env::var("MEWSIK_PROBE_DIR")) else { return };
+        let (Ok(db), Ok(dir)) = (
+            std::env::var("MEWSIK_PROBE_DB"),
+            std::env::var("MEWSIK_PROBE_DIR"),
+        ) else {
+            return;
+        };
         let db = crate::db::init_db(std::path::Path::new(&db)).unwrap();
         for pass in 0..2 {
             let started = std::time::Instant::now();
             let r = super::scan_directory(&db, &dir);
-            println!("pass {pass}: {:?} files={} new={} moved={} removed={} errors={}",
-                started.elapsed(), r.total_files, r.new_tracks, r.updated_tracks, r.removed_tracks, r.errors.len());
-            for e in r.errors.iter().take(5) { println!("  {e}"); }
+            println!(
+                "pass {pass}: {:?} files={} new={} moved={} removed={} errors={}",
+                started.elapsed(),
+                r.total_files,
+                r.new_tracks,
+                r.updated_tracks,
+                r.removed_tracks,
+                r.errors.len()
+            );
+            for e in r.errors.iter().take(5) {
+                println!("  {e}");
+            }
         }
         let conn = db.lock();
         let (n, with): (i64, i64) = conn.query_row(

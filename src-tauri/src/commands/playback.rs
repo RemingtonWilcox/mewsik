@@ -1,3 +1,4 @@
+use crate::audio::decoder::AudioDecoder;
 use crate::audio::engine::{AudioCommand, AudioEngine};
 use crate::audio::queue::{QueueEntry, RepeatMode};
 use crate::db::models::{PlaybackState, QueueSnapshot};
@@ -5,11 +6,10 @@ use crate::db::{queries, DbPool};
 use crate::download;
 use crate::sources::stream_cache::StreamCache;
 use crate::sources::SidecarManager;
+use parking_lot::Mutex;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use crate::audio::decoder::AudioDecoder;
-use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -116,11 +116,17 @@ fn bin_waveform(windows: &[(f32, f32)], bins: usize) -> (Vec<f32>, Vec<f32>) {
     if windows.is_empty() || bins == 0 {
         return (peaks, vec![0.0; bins]);
     }
-    let max_peak = windows.iter().map(|w| w.0).fold(0.0_f32, f32::max).max(1e-6);
+    let max_peak = windows
+        .iter()
+        .map(|w| w.0)
+        .fold(0.0_f32, f32::max)
+        .max(1e-6);
     let rms = (0..bins)
         .map(|i| {
             let start = i * windows.len() / bins;
-            let end = ((i + 1) * windows.len() / bins).max(start + 1).min(windows.len());
+            let end = ((i + 1) * windows.len() / bins)
+                .max(start + 1)
+                .min(windows.len());
             let slice = &windows[start..end];
             let mean = slice.iter().map(|w| w.1 * w.1).sum::<f32>() / slice.len() as f32;
             (mean.sqrt() / max_peak).sqrt().clamp(0.0, 1.0)
@@ -620,12 +626,15 @@ mod tests {
     #[ignore]
     fn waveform_timing_probe() {
         use super::*;
-        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else { return };
+        let Ok(files) = std::env::var("MEWSIK_PROBE_FILES") else {
+            return;
+        };
         for p in files.split(';') {
             let started = std::time::Instant::now();
             let mut decoder = AudioDecoder::open_path(Path::new(p)).expect("open");
             let opened = started.elapsed();
-            rodio::Source::try_seek(&mut decoder, std::time::Duration::from_secs(60)).expect("seek");
+            rodio::Source::try_seek(&mut decoder, std::time::Duration::from_secs(60))
+                .expect("seek");
             let seeked = started.elapsed() - opened;
             let started = std::time::Instant::now();
             let (peaks, rms) = &*generate_waveform(Path::new(p), 600).expect("waveform");
@@ -643,28 +652,43 @@ mod tests {
     #[ignore]
     fn real_library_decode_probe() {
         use super::*;
-        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else {
+            return;
+        };
         let db = crate::db::init_db(Path::new(&path)).expect("open db");
         let tracks = queries::get_library_tracks(&db).expect("tracks");
         let mut failures = std::collections::BTreeMap::<String, usize>::new();
         let mut first = std::collections::BTreeMap::<String, String>::new();
         std::panic::set_hook(Box::new(|_| {}));
         for t in &tracks {
-            let Some(p) = t.local_file_path.clone() else { continue };
+            let Some(p) = t.local_file_path.clone() else {
+                continue;
+            };
             let result = std::panic::catch_unwind(|| {
                 let mut d = crate::audio::decoder::AudioDecoder::open_path(Path::new(&p))?;
                 // pull a second of audio and seek, like playback does
-                for _ in 0..88_200 { if d.next().is_none() { break; } }
-                rodio::Source::try_seek(&mut d, std::time::Duration::from_secs(30)).map_err(|e| e.to_string())?;
-                d.next().map(|_| ()).ok_or_else(|| "no audio after seek".to_string())
+                for _ in 0..88_200 {
+                    if d.next().is_none() {
+                        break;
+                    }
+                }
+                rodio::Source::try_seek(&mut d, std::time::Duration::from_secs(30))
+                    .map_err(|e| e.to_string())?;
+                d.next()
+                    .map(|_| ())
+                    .ok_or_else(|| "no audio after seek".to_string())
             });
             let err = match result {
                 Ok(Ok(())) => continue,
                 Ok(Err(e)) => e,
                 Err(_) => "panic".to_string(),
             };
-            let dir = Path::new(&p).components().rev().nth(2)
-                .map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
+            let dir = Path::new(&p)
+                .components()
+                .rev()
+                .nth(2)
+                .map(|c| c.as_os_str().to_string_lossy().to_string())
+                .unwrap_or_default();
             let key = format!("{dir} | {err}");
             *failures.entry(key.clone()).or_default() += 1;
             first.entry(key).or_insert(p);
@@ -682,7 +706,9 @@ mod tests {
     #[ignore]
     fn real_library_play_probe() {
         use super::*;
-        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else { return };
+        let Ok(path) = std::env::var("MEWSIK_PROBE_DB") else {
+            return;
+        };
         let db = crate::db::init_db(Path::new(&path)).expect("open db");
         let tracks = queries::get_library_tracks(&db).expect("tracks");
         let ids: Vec<String> = tracks.iter().map(|t| t.id.clone()).collect();
@@ -702,7 +728,10 @@ mod tests {
 
         let engine = AudioEngine::new(db.clone());
         let start = 5.min(entries.len().saturating_sub(1));
-        println!("starting at {:?}", entries.get(start).map(|e| (&e.title, &e.file_path)));
+        println!(
+            "starting at {:?}",
+            entries.get(start).map(|e| (&e.title, &e.file_path))
+        );
         engine.start_queue(entries, start);
         for step in 0..30 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -710,7 +739,12 @@ mod tests {
             if step % 5 == 0 || s.is_playing {
                 println!(
                     "t={}ms playing={} buffering={} pos={} title={:?} stage={:?}",
-                    (step + 1) * 100, s.is_playing, s.is_buffering, s.position_ms, s.current_title, s.connection_stage
+                    (step + 1) * 100,
+                    s.is_playing,
+                    s.is_buffering,
+                    s.position_ms,
+                    s.current_title,
+                    s.connection_stage
                 );
             }
         }
