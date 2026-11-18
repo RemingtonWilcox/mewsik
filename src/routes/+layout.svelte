@@ -12,7 +12,6 @@
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 	import { page } from '$app/state';
 	import { goto, afterNavigate } from '$app/navigation';
-	import { ModeWatcher } from 'mode-watcher';
 	import { onMount } from 'svelte';
 	import { startProvidersBridge } from '$lib/providers-bridge';
 
@@ -68,8 +67,6 @@
 		}
 	}
 </script>
-
-<ModeWatcher />
 
 <svelte:window onkeydown={onKey} />
 

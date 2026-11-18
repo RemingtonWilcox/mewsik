@@ -137,7 +137,7 @@ The product surfaces were rebuilt around explicit jobs instead of overlapping da
 - Curated and favorite cards show only local connection health. Directory cards show one metric matching the active ranking (starts, change, votes, or bitrate) rather than a wall of ambiguous telemetry.
 - Directory probes are capped to 12 visible streams, bulk detail lookup is capped to 100 IDs, saved results use a passive **Saved** label, and **Check stations** stays actionable while reporting its latest result separately.
 - Directory pagination carries a raw Radio Browser cursor across filtered HLS rows, so an unplayable stream can neither hide **Load more** nor cause overlaps between pages.
-- Settings is now a real library and appearance surface: track/artist/album summary, native folder picker, removable saved folders, resilient scan-all behavior, Light/Dark/System controls, and a collapsed provider-repair section for exceptional search failures.
+- Settings is now a real library surface: track/artist/album summary, native folder picker, removable saved folders, resilient scan-all behavior, and a collapsed provider-repair section for exceptional search failures.
 - Newly added library paths must be existing directories; an already-saved disconnected drive can remain visible and removable rather than bricking settings startup.
 - Library path identity is case-insensitive on Windows and case-sensitive on Unix targets, preserving valid case-distinct folders without allowing a differently cased nonexistent path to bypass validation.
 
