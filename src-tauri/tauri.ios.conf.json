@@ -1,4 +1,9 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "identifier": "app.mewsik.ios"
+  "identifier": "app.mewsik.ios",
+  "bundle": {
+    "resources": {
+      "resources/bin/": null
+    }
+  }
 }
