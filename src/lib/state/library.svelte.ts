@@ -1,4 +1,5 @@
 import type { LibraryTrack } from '$lib/types';
+import { onDownloadFinished } from '$lib/state/downloads.svelte';
 import * as api from '$lib/api/tauri';
 import { toast } from 'svelte-sonner';
 
@@ -98,6 +99,8 @@ function start() {
 	if (started) return;
 	started = true;
 	void refresh();
+	// A finished download is added to the library by the engine; show it.
+	onDownloadFinished(() => void refresh());
 	void api.isLibraryScanning().then((running) => (scanning = running));
 	void api.listenLibraryChanged((summary) => {
 		scanning = false;

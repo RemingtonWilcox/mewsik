@@ -589,6 +589,40 @@ test.describe('on a phone', () => {
 		await expect(page.getByRole('link', { name: 'Library', exact: true })).toHaveAttribute('aria-current', 'page');
 	});
 
+	test('no page scrolls sideways', async ({ page }) => {
+		await installPlaybackMock(page, { playback: radioWithSong });
+		for (const path of ['/library', '/stations', '/search', '/settings', '/downloads', '/heard']) {
+			await page.goto(path);
+			await page.waitForTimeout(600);
+			// Long names must truncate, not widen the page.
+			await page.evaluate(() => {
+				for (const el of document.querySelectorAll('[role="row"] .truncate')) {
+					el.textContent = 'Travis Scott - SICKO MODE (Official Music Video) ft. Drake '.repeat(2);
+				}
+			});
+			const wide = await page.evaluate(() => {
+				// The page itself, or any scrolling panel inside it, must not be
+				// wider than it looks (iOS lets you drag those sideways).
+				const scrollers = [
+					document.documentElement,
+					...[...document.querySelectorAll<HTMLElement>('body *')].filter(
+						(el) =>
+							/auto|scroll/.test(getComputedStyle(el).overflowX) &&
+							!el.classList.contains('station-rail')
+					)
+				];
+				const culprits = scrollers
+					.filter((el) => el.scrollWidth > el.clientWidth + 1)
+					.map(
+						(el) =>
+							`${el.tagName.toLowerCase()}.${String(el.className).slice(0, 60)} ${el.scrollWidth}>${el.clientWidth}`
+					);
+				return { scroll: culprits.length, width: 0, culprits };
+			});
+			expect(wide.scroll, `${path} ${wide.culprits.join(' | ')}`).toBeLessThanOrEqual(wide.width);
+		}
+	});
+
 	test('a tap plays a song and its menu button is showing', async ({ page }) => {
 		await installPlaybackMock(page);
 		await page.goto('/library');

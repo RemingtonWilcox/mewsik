@@ -88,7 +88,7 @@
 		>
 			<UpdateNotice />
 			<Sidebar />
-			<main bind:this={scroller} data-scroll-root class="min-w-0 flex-1 overflow-y-auto">
+			<main bind:this={scroller} data-scroll-root class="min-w-0 flex-1 overflow-x-hidden overflow-y-auto">
 				<div class="mx-auto w-full max-w-[1400px] px-8 pb-10 pt-6">
 					{@render children()}
 				</div>
