@@ -521,6 +521,11 @@ fn create_unlinked_stream_file() -> Result<(File, File), String> {
     Ok((writer, reader))
 }
 
+/// YouTube's media hosts, which want range requests.
+pub fn is_googlevideo_url(url: &str) -> bool {
+    should_use_ranged_fetch(url)
+}
+
 fn should_use_ranged_fetch(url: &str) -> bool {
     reqwest::Url::parse(url)
         .ok()
