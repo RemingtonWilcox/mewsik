@@ -4,6 +4,7 @@
 
 pub mod directory;
 pub mod health;
+pub mod logos;
 pub(crate) mod network;
 pub mod probe;
 pub mod scenes;

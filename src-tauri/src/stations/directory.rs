@@ -71,6 +71,41 @@ pub(crate) async fn radio_browser_get(path_and_query: &str) -> Option<reqwest::R
     None
 }
 
+/// Lowercase a radio-browser station UUID, or `None` when it is not one.
+pub(crate) fn normalize_station_uuid(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let bytes = normalized.as_bytes();
+    let valid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    valid.then_some(normalized)
+}
+
+#[derive(Debug, Deserialize)]
+struct RadioBrowserFaviconStation {
+    favicon: Option<String>,
+}
+
+/// The directory's favicon URL for a station, for the backend logo cache
+/// only. `Err(())` when no directory mirror answered, so the caller does not
+/// remember a miss caused by being offline.
+pub(crate) async fn lookup_station_favicon_by_uuid(uuid: &str) -> Result<Option<String>, ()> {
+    let path = format!("/json/stations/byuuid/{}", urlencoding::encode(uuid));
+    let response = radio_browser_get(&path).await.ok_or(())?;
+    let stations = response
+        .json::<Vec<RadioBrowserFaviconStation>>()
+        .await
+        .map_err(|_| ())?;
+    Ok(stations
+        .into_iter()
+        .next()
+        .and_then(|station| station.favicon)
+        .map(|favicon| favicon.trim().to_string())
+        .filter(|favicon| !favicon.is_empty()))
+}
+
 #[derive(Debug, Deserialize)]
 struct RadioBrowserUuidStation {
     url: Option<String>,
