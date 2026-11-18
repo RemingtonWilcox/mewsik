@@ -75,12 +75,21 @@
 		menu.open({ x: 0, y: 0, tracks: [track], play: () => {}, extras: [] });
 	}
 
-	function onSeekChange(values: number[]) {
-		if (!canSeek) return;
+	// The slider reports every position update as a change, not only the
+	// listener's drags; seeking on those re-buffered the song every second.
+	// Seek once, when a drag is let go.
+	let dragging = $state(false);
+	let dragMs = $state(0);
+	let sliderValue = $derived([dragging ? dragMs : player.state.position_ms]);
+
+	function onSeekDrag(values: number[]) {
+		if (dragging && typeof values[0] === 'number') dragMs = values[0];
+	}
+
+	function onSeekCommit(values: number[]) {
 		const ms = values[0];
-		if (typeof ms === 'number') {
-			void player.seek(ms);
-		}
+		dragging = false;
+		if (canSeek && typeof ms === 'number') void player.seek(ms);
 	}
 </script>
 
@@ -188,15 +197,24 @@
 							<ConnectionStatus playback={player.state} />
 						</div>
 					{:else}
-						<Slider
-							value={[player.state.position_ms]}
-							max={player.state.duration_ms || 1}
-							step={1000}
-							disabled={!canSeek}
-							onValueChange={onSeekChange}
-						/>
+						<div
+							onpointerdowncapture={() => {
+								if (!canSeek) return;
+								dragMs = player.state.position_ms;
+								dragging = true;
+							}}
+						>
+							<Slider
+								value={sliderValue}
+								max={player.state.duration_ms || 1}
+								step={1000}
+								disabled={!canSeek}
+								onValueChange={onSeekDrag}
+								onValueCommit={onSeekCommit}
+							/>
+						</div>
 						<div class="flex justify-between text-[11px] tabular-nums text-muted-foreground">
-							<span>{formatTime(player.state.position_ms)}</span>
+							<span>{formatTime(dragging ? dragMs : player.state.position_ms)}</span>
 							<span>{formatTime(player.state.duration_ms)}</span>
 						</div>
 					{/if}

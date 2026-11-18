@@ -397,7 +397,12 @@ fn fetch_remote_file(
     destination: &Path,
     cancel_token: &AtomicBool,
 ) -> Result<(), DownloadError> {
-    if crate::audio::http_stream::hls_playlist_url(url).is_some() {
+    // SoundCloud HLS playlists are stitched together, and YouTube throttles
+    // one long request to a crawl (and it then timed out), so both are
+    // fetched the way playback fetches them: in ranges, several at once.
+    if crate::audio::http_stream::hls_playlist_url(url).is_some()
+        || crate::audio::http_stream::is_googlevideo_url(url)
+    {
         let bytes = crate::audio::http_stream::fetch_http_audio_bytes(url, headers)?;
         if cancelled(cancel_token) {
             return Err(DownloadError::Cancelled);

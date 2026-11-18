@@ -656,4 +656,44 @@ test.describe('on a phone', () => {
 		await expect(page.getByText('App updates')).toHaveCount(0);
 		await page.screenshot({ path: 'test-results/phone-settings.png' });
 	});
+
+	test('opening Now Playing leaves the song alone; a tap on the bar seeks once', async ({ page }) => {
+		await installPlaybackMock(page, {
+			playback: {
+				is_playing: true,
+				can_seek: true,
+				source: 'youtube',
+				current_recording_id: 'track-2',
+				current_title: 'Context Two',
+				current_artist: 'Artist Two',
+				position_ms: 10_000,
+				duration_ms: 300_000
+			}
+		});
+		await page.goto('/library');
+		const seeks = () =>
+			page.evaluate(
+				() =>
+					((window as any).__PLAYBACK_INVOCATIONS__ as { command: string }[]).filter(
+						(c) => c.command === 'seek'
+					).length
+			);
+
+		await page.getByRole('button', { name: 'Pause' }).first().waitFor();
+		await page.getByText('Context Two').last().tap();
+		await expect(page.getByText('Playing from YouTube')).toBeVisible();
+		for (const position of [11_000, 12_000, 13_000, 14_000]) {
+			await page.evaluate((ms) => (window as any).__SET_PLAYBACK__({ position_ms: ms }), position);
+			await page.waitForTimeout(300);
+		}
+		expect(await seeks()).toBe(0);
+
+		const track = page.locator('[data-slot="slider-track"]');
+		const box = (await track.boundingBox())!;
+		await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+		await expect.poll(seeks).toBe(1);
+		await page.waitForTimeout(800);
+		expect(await seeks()).toBe(1);
+	});
 });
+
