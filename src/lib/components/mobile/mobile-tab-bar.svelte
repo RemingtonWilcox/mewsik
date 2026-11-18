@@ -1,7 +1,6 @@
 <script lang="ts">
-	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { Radio, Library, Search, Settings } from '@lucide/svelte';
+	import { Radio, Library, Search } from '@lucide/svelte';
 
 	type Tab = {
 		label: string;
@@ -10,6 +9,8 @@
 		match: (path: string) => boolean;
 	};
 
+	// Settings lives behind the gear on the Library page, like most iPhone
+	// music apps; it isn't somewhere you go every day.
 	const tabs: Tab[] = [
 		{
 			label: 'Stations',
@@ -23,33 +24,27 @@
 			icon: Library,
 			match: (p) =>
 				p === '/' ||
-				['/library', '/playlists', '/albums', '/artists', '/heard', '/downloads'].some((root) =>
-					p.startsWith(root)
+				['/library', '/playlists', '/albums', '/artists', '/heard', '/downloads', '/settings'].some(
+					(root) => p.startsWith(root)
 				)
 		},
-		{ label: 'Search', href: '/search', icon: Search, match: (p) => p.startsWith('/search') },
-		{
-			label: 'Settings',
-			href: '/settings',
-			icon: Settings,
-			match: (p) => p.startsWith('/settings')
-		}
+		{ label: 'Search', href: '/search', icon: Search, match: (p) => p.startsWith('/search') }
 	];
 </script>
 
 <nav class="flex w-full">
-	{#each tabs as tab}
+	{#each tabs as tab (tab.href)}
 		{@const active = tab.match(page.url.pathname)}
-		<button
-			class="flex flex-1 flex-col items-center justify-center gap-1 py-1.5 text-[10px] font-medium transition-colors {active
+		<a
+			href={tab.href}
+			class="flex h-[50px] flex-1 flex-col items-center justify-center gap-[3px] text-[10px] font-medium tracking-tight transition-colors {active
 				? 'text-primary'
-				: 'text-muted-foreground hover:text-foreground'}"
-			onclick={() => goto(tab.href)}
+				: 'text-muted-foreground'}"
 			aria-label={tab.label}
 			aria-current={active ? 'page' : undefined}
 		>
-			<tab.icon class="size-6" strokeWidth={active ? 2.4 : 2} />
+			<tab.icon class="size-[25px]" strokeWidth={active ? 2.3 : 1.8} />
 			<span class="leading-none">{tab.label}</span>
-		</button>
+		</a>
 	{/each}
 </nav>

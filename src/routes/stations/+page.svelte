@@ -904,8 +904,8 @@
 <div class="mx-auto flex w-full max-w-[1440px] min-w-0 flex-col gap-8 pb-6">
 	<header class="flex items-center justify-between gap-4">
 		<div>
-			<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-primary/80">Live radio</p>
-			<h1 class="text-2xl font-bold tracking-tight sm:text-3xl">Stations</h1>
+			<p class="mb-1 hidden text-[11px] font-semibold uppercase tracking-[0.22em] text-primary/80 sm:block">Live radio</p>
+			<h1 class="text-[34px] font-bold leading-tight tracking-tight sm:text-3xl">Stations</h1>
 		</div>
 		<div class="flex min-w-0 items-center gap-3">
 			{#if scanSummary}
@@ -927,7 +927,7 @@
 				{:else}
 					<RefreshCw class="size-4 shrink-0" />
 				{/if}
-				<span class="ml-2">{verifyingStations ? 'Checking…' : 'Check stations'}</span>
+				<span class="ml-2 hidden sm:inline">{verifyingStations ? 'Checking…' : 'Check stations'}</span>
 			</Button>
 		</div>
 	</header>
@@ -1089,7 +1089,7 @@
 				</div>
 				<p class="mt-2 max-w-xl text-sm leading-6 text-white/62">{heroPick.reason}</p>
 				<p class="mt-1 text-xs text-white/40">{stationMeta(heroPick.station)}</p>
-				<div class="mt-4 flex flex-col gap-2 min-[420px]:flex-row">
+				<div class="mt-4 flex flex-col gap-2 sm:flex-row">
 					<Button
 						class="h-11 rounded-full px-5"
 						onclick={() => playSearchResult(heroPick.station)}
@@ -1100,15 +1100,17 @@
 							{:else}
 								<Square class="mr-2 size-4 fill-current" />
 							{/if}
-							Stop {heroName}
+							<span class="sm:hidden">Stop</span>
+							<span class="hidden sm:inline">Stop {heroName}</span>
 						{:else}
 							<Play class="mr-2 size-4 fill-current" />
-							Play {heroName}
+							<span class="sm:hidden">Play</span>
+							<span class="hidden sm:inline">Play {heroName}</span>
 						{/if}
 					</Button>
 					<Button
 						variant="outline"
-						class="h-11 rounded-full border-white/15 bg-white/5 px-5 text-white hover:bg-white/10 hover:text-white"
+						class="hidden h-11 rounded-full border-white/15 bg-white/5 px-5 text-white hover:bg-white/10 hover:text-white sm:inline-flex"
 						onclick={browseDirectory}
 					>
 						Search every station
@@ -1170,7 +1172,7 @@
 					{:else}
 						<RefreshCw class="size-4 shrink-0" />
 					{/if}
-					<span class="ml-2">{feedRefreshing ? 'Refreshing…' : 'Refresh'}</span>
+					<span class="ml-2 hidden sm:inline">{feedRefreshing ? 'Refreshing…' : 'Refresh'}</span>
 				</Button>
 			</div>
 		</div>

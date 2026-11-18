@@ -24,6 +24,10 @@
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
 	import { setMode, userPrefersMode } from 'mode-watcher';
+	import MobileSettings from '$lib/components/mobile/mobile-settings.svelte';
+	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
+
+	const isMobile = new IsMobile();
 
 	type ThemePreference = 'light' | 'dark' | 'system';
 	type ScanSummary = {
@@ -216,6 +220,9 @@
 	}
 </script>
 
+{#if isMobile.current}
+<MobileSettings />
+{:else}
 <div class="flex max-w-3xl flex-col gap-6 pb-8">
 	<div>
 		<h1 class="text-2xl font-bold">Settings</h1>
@@ -543,3 +550,4 @@
 		</div>
 	</details>
 </div>
+{/if}
