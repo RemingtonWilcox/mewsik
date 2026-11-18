@@ -988,6 +988,65 @@ fn fetch_hls_bytes(
     Ok(bytes)
 }
 
+/// Range requests at once when a whole YouTube file is fetched. One request
+/// at a time paid a round trip per megabyte, which made some songs take
+/// several seconds to start on the phone.
+const PARALLEL_RANGE_FETCHES: usize = 4;
+
+fn fetch_ranges_in_parallel(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    headers: &HashMap<String, String>,
+    total: u64,
+) -> Result<Vec<u8>, String> {
+    let ranges: Vec<(u64, u64)> = (0..total)
+        .step_by(GOOGLEVIDEO_RANGE_CHUNK_BYTES as usize)
+        .map(|start| (start, (start + GOOGLEVIDEO_RANGE_CHUNK_BYTES - 1).min(total - 1)))
+        .collect();
+    let next = AtomicU64::new(0);
+    let parts: Vec<Mutex<Option<Result<Vec<u8>, String>>>> =
+        ranges.iter().map(|_| Mutex::new(None)).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..PARALLEL_RANGE_FETCHES.min(ranges.len()) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::SeqCst) as usize;
+                let Some(&(start, end)) = ranges.get(index) else {
+                    break;
+                };
+                let part = open_http_response(client, url, headers, false, Some((start, end)))
+                    .and_then(|response| {
+                        response
+                            .bytes()
+                            .map(|bytes| bytes.to_vec())
+                            .map_err(|e| format!("Failed to read remote audio: {}", e))
+                    });
+                let failed = part.is_err();
+                *parts[index].lock() = Some(part);
+                if failed {
+                    // Stop handing out ranges; the others finish and exit.
+                    next.store(ranges.len() as u64, Ordering::SeqCst);
+                }
+            });
+        }
+    });
+
+    let mut bytes = Vec::with_capacity(total as usize);
+    for (part, &(start, end)) in parts.into_iter().zip(&ranges) {
+        let chunk = part
+            .into_inner()
+            .unwrap_or_else(|| Err("A range of the stream was never fetched".to_string()))?;
+        if chunk.len() as u64 != end - start + 1 {
+            return Err(format!(
+                "Stream range {start}-{end} came back with {} bytes",
+                chunk.len()
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 pub fn fetch_http_audio_bytes(
     url: &str,
     headers: &HashMap<String, String>,
@@ -1009,8 +1068,12 @@ pub fn fetch_http_audio_bytes(
             .map_err(|e| format!("Failed to read remote audio: {}", e));
     }
 
-    let mut bytes = Vec::new();
     let total_hint = content_length_hint_from_url(url);
+    if let Some(total) = total_hint.filter(|total| *total > GOOGLEVIDEO_RANGE_CHUNK_BYTES) {
+        return fetch_ranges_in_parallel(&client, url, headers, total);
+    }
+
+    let mut bytes = Vec::new();
     let mut next_offset = 0u64;
 
     loop {
@@ -1397,6 +1460,7 @@ mod tests {
                 serde_json::from_value(info["headers"].clone()).unwrap_or_default();
             let started = std::time::Instant::now();
             let bytes = super::fetch_http_audio_bytes(url, &headers).unwrap();
+            println!("{file}: fetched in {:?}", started.elapsed());
             let hint = crate::audio::decoder::extension_for_mime(info["mime_type"].as_str());
             let decoder = crate::audio::decoder::AudioDecoder::from_media(
                 Box::new(std::io::Cursor::new(bytes.clone())),

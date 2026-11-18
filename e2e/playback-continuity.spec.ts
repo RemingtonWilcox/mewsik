@@ -6,10 +6,11 @@ const expect = baseExpect.configure({ timeout: 15_000 });
 interface PlaybackMockOptions {
 	initialShuffle?: boolean;
 	playback?: Record<string, unknown>;
+	online?: Record<string, unknown>[];
 }
 
 async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}) {
-	await page.addInitScript(({ initialShuffle, playback }) => {
+	await page.addInitScript(({ initialShuffle, playback, online }) => {
 		type Invocation = { command: string; args: Record<string, unknown> };
 		const runtimeWindow = window as Window & {
 			__PLAYBACK_INVOCATIONS__?: Invocation[];
@@ -186,7 +187,11 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 					case 'get_album_tracks':
 						return tracks;
 					case 'search_all_sources':
-						return { items: [], failed_sources: [] };
+						return { items: online, failed_sources: [] };
+					case 'ensure_external_recording':
+						return `rec-${args.sourceId}`;
+					case 'play_external_context':
+						return 'entry-1';
 					case 'is_library_scanning':
 						return false;
 					case 'search_library':
@@ -259,7 +264,11 @@ async function installPlaybackMock(page: Page, options: PlaybackMockOptions = {}
 		(window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ = {
 			unregisterListener: () => undefined
 		};
-	}, { initialShuffle: options.initialShuffle ?? false, playback: options.playback ?? {} });
+	}, {
+		initialShuffle: options.initialShuffle ?? false,
+		playback: options.playback ?? {},
+		online: options.online ?? []
+	});
 }
 
 async function playbackInvocations(page: Page) {
@@ -271,7 +280,7 @@ async function playbackInvocations(page: Page) {
 			}>;
 		}).__PLAYBACK_INVOCATIONS__ ?? [];
 		return invocations.filter(({ command }) =>
-			command === 'play_tracks_from' || command === 'set_shuffle'
+			command === 'play_tracks_from' || command === 'set_shuffle' || command === 'play_external_context'
 		);
 	});
 }
@@ -530,7 +539,7 @@ test('a station shows the song it is playing, with tempo and key', async ({ page
 	// The title finds the song to save or download.
 	await bar.locator('[data-stream-title]').click();
 	await expect(page).toHaveURL(/\/search\?q=ROLAND/);
-	await expect(page.getByRole('textbox').first()).toHaveValue('ROLAND JONES - DEMONZ');
+	await expect(page.getByRole('searchbox')).toHaveValue('ROLAND JONES - DEMONZ');
 });
 
 test('songs heard on stations are listed to find again', async ({ page }) => {
@@ -548,8 +557,24 @@ test('songs heard on stations are listed to find again', async ({ page }) => {
 	await expect(rows.first()).toContainText('Mr Right On');
 });
 
+const onlineResult = (source: string, id: string, title: string, artist: string) => ({
+	source,
+	source_id: id,
+	title,
+	artist,
+	album: null,
+	duration_ms: 312_000,
+	cover_art_url: null,
+	source_url: null,
+	play_count: 1000,
+	is_saved: false,
+	is_downloaded: false,
+	recording_id: null
+});
+
 test.describe('on a phone', () => {
-	test.use({ viewport: { width: 390, height: 844 }, hasTouch: true });
+	// iPhone 13 Pro Max
+	test.use({ viewport: { width: 428, height: 926 }, hasTouch: true });
 
 	test('the Library tab leads to heard songs, downloads and playlists', async ({ page }) => {
 		await installPlaybackMock(page, { playback: radioWithSong });
@@ -561,7 +586,7 @@ test.describe('on a phone', () => {
 		await expect(shortcuts.getByRole('link', { name: 'Continuity Playlist' })).toBeVisible();
 		await shortcuts.getByRole('link', { name: 'Heard on radio' }).click();
 		await expect(page).toHaveURL(/\/heard$/);
-		await expect(page.getByRole('button', { name: 'Library' })).toHaveAttribute('aria-current', 'page');
+		await expect(page.getByRole('link', { name: 'Library', exact: true })).toHaveAttribute('aria-current', 'page');
 	});
 
 	test('a tap plays a song and its menu button is showing', async ({ page }) => {
@@ -576,5 +601,59 @@ test.describe('on a phone', () => {
 			.poll(async () => (await playbackInvocations(page)).map((call) => call.command))
 			.toContain('play_tracks_from');
 		await page.screenshot({ path: 'test-results/mobile-library.png' });
+	});
+
+	test('search names every song and switches between SoundCloud and YouTube', async ({ page }) => {
+		await installPlaybackMock(page, {
+			online: [
+				onlineResult('youtube', 'yt1', 'SICKO MODE ft. Drake', 'Travis Scott'),
+				onlineResult('soundcloud', 'sc1', 'SICKO MODE', 'Travis Scott'),
+				onlineResult('youtube', 'yt2', 'SICKO MODE (Skrillex Remix)', 'Travis Scott'),
+				onlineResult('soundcloud', 'sc2', 'Sicko Mode (sped up)', 'nightcore kid')
+			]
+		});
+		await page.goto('/search?q=sicko%20mode');
+
+		const results = page.locator('[data-online-results] > [role="button"]');
+		await expect(results).toHaveCount(2);
+		await expect(results.first()).toContainText('SICKO MODE');
+		await expect(results.first()).toContainText('Travis Scott');
+		await page.screenshot({ path: 'test-results/phone-search.png' });
+
+		await page.getByRole('button', { name: /YouTube/ }).tap();
+		await expect(results.first()).toContainText('SICKO MODE ft. Drake');
+		await results.nth(1).getByText('Skrillex Remix').tap();
+		await expect
+			.poll(async () => (await playbackInvocations(page)).filter((c) => c.command === 'play_external_context'))
+			.toEqual([
+				expect.objectContaining({
+					args: expect.objectContaining({
+						startIndex: 1,
+						items: [expect.objectContaining({ source_id: 'yt1' }), expect.objectContaining({ source_id: 'yt2' })]
+					})
+				})
+			]);
+
+		await results.first().getByRole('button', { name: 'More' }).tap();
+		const sheet = page.getByRole('menu');
+		await expect(sheet.getByRole('button', { name: 'Play next' })).toBeVisible();
+		await expect(sheet.getByRole('button', { name: 'Add to library' })).toBeVisible();
+		await page.waitForTimeout(400);
+		await page.screenshot({ path: 'test-results/phone-search-menu.png' });
+		await sheet.getByRole('button', { name: 'Cancel' }).tap();
+		await expect(sheet).toHaveCount(0);
+	});
+
+	test('settings sit behind the Library gear and only show phone settings', async ({ page }) => {
+		await installPlaybackMock(page);
+		await page.goto('/library');
+		await expect(page.getByText('Context Two')).toBeVisible();
+		await page.screenshot({ path: 'test-results/phone-library.png' });
+		await page.getByRole('link', { name: 'Settings' }).tap();
+		await expect(page).toHaveURL(/\/settings$/);
+		await expect(page.getByText('Downloaded songs')).toBeVisible();
+		await expect(page.getByText('Music library')).toHaveCount(0);
+		await expect(page.getByText('App updates')).toHaveCount(0);
+		await page.screenshot({ path: 'test-results/phone-settings.png' });
 	});
 });

@@ -1,4 +1,5 @@
 import { Innertube } from 'youtubei.js';
+import { tidyVideoTitle } from './titles.js';
 
 const YOUTUBE_STREAM_HEADERS: Record<string, string> = {
   'User-Agent':
@@ -97,8 +98,10 @@ export class YouTubeProvider {
           return {
             source: 'youtube',
             source_id: videoId,
-            title: video.title?.toString?.() || 'Unknown',
-            artist: video.author?.name || video.byline_text?.toString?.() || 'Unknown',
+            ...tidyVideoTitle(
+              video.title?.toString?.() || 'Unknown',
+              video.author?.name || video.byline_text?.toString?.() || 'Unknown'
+            ),
             album: null,
             duration_ms:
               typeof video.duration?.seconds === 'number'

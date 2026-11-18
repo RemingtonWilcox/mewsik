@@ -7,7 +7,6 @@ import { Platform } from 'youtubei.js/web';
 import { invoke, nativeFetch } from './web/native-fetch.js';
 import { YouTubeProvider } from './providers/youtube.js';
 import { SoundCloudProvider } from './providers/soundcloud.js';
-import { BandcampProvider } from './providers/bandcamp.js';
 import { callProvider } from './rpc.js';
 
 // YouTube's signature and `n` functions must be evaluated, and the page's
@@ -22,7 +21,6 @@ soundcloud.useInlineHls();
 const providers = {
   youtube: new YouTubeProvider(nativeFetch),
   soundcloud,
-  bandcamp: new BandcampProvider(),
 };
 
 (globalThis as unknown as { __mewsikProviders: unknown }).__mewsikProviders = {
