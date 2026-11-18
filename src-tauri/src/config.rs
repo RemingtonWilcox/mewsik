@@ -80,6 +80,16 @@ impl AppConfig {
 
     pub fn default_download_dir() -> PathBuf {
         let user_dirs = UserDirs::new();
+        // An iPhone app may only write inside its own container's folders;
+        // "Music" there is off limits. Documents is writable and shows up
+        // in the Files app.
+        if cfg!(any(target_os = "ios", target_os = "android")) {
+            return user_dirs
+                .as_ref()
+                .and_then(UserDirs::document_dir)
+                .map(|documents| documents.join("Mewsik"))
+                .unwrap_or_else(|| Self::data_dir().join("downloads"));
+        }
         preferred_download_dir(
             user_dirs.as_ref().and_then(UserDirs::audio_dir),
             user_dirs.as_ref().and_then(UserDirs::download_dir),
