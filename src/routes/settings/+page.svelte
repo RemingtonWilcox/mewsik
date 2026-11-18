@@ -10,26 +10,21 @@
 		Download,
 		FolderOpen,
 		HardDrive,
-		Laptop,
 		LoaderCircle,
-		Moon,
 		RefreshCw,
 		RotateCcw,
 		Rocket,
 		Search,
 		ShieldCheck,
-		Sun,
 		TriangleAlert,
 		X
 	} from '@lucide/svelte';
 	import { onMount } from 'svelte';
-	import { setMode, userPrefersMode } from 'mode-watcher';
 	import MobileSettings from '$lib/components/mobile/mobile-settings.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
 
 	const isMobile = new IsMobile();
 
-	type ThemePreference = 'light' | 'dark' | 'system';
 	type ScanSummary = {
 		folders: number;
 		newTracks: number;
@@ -214,10 +209,6 @@
 			providerLoading = false;
 		}
 	}
-
-	function chooseTheme(preference: ThemePreference) {
-		setMode(preference);
-	}
 </script>
 
 {#if isMobile.current}
@@ -226,7 +217,7 @@
 <div class="flex max-w-3xl flex-col gap-6 pb-8">
 	<div>
 		<h1 class="text-2xl font-bold">Settings</h1>
-		<p class="mt-1 text-sm text-muted-foreground">Your library, appearance, and a small set of useful repair tools.</p>
+		<p class="mt-1 text-sm text-muted-foreground">Your library, updates, and a small set of useful repair tools.</p>
 	</div>
 
 	{#if settingsError}
@@ -501,31 +492,6 @@
 			<p class="px-1 text-[11px] leading-relaxed text-muted-foreground">
 				Release updates are verified before installation. Your library database, settings, playlists, and downloaded music stay outside the app installation and are not replaced.
 			</p>
-		</CardContent>
-	</Card>
-
-	<Card>
-		<CardHeader>
-			<CardTitle>Appearance</CardTitle>
-			<CardDescription>Use a fixed theme or follow Windows automatically.</CardDescription>
-		</CardHeader>
-		<CardContent>
-			<div class="grid grid-cols-3 gap-2" role="group" aria-label="Theme">
-				{#each [
-					{ value: 'light' as const, label: 'Light', icon: Sun },
-					{ value: 'dark' as const, label: 'Dark', icon: Moon },
-					{ value: 'system' as const, label: 'System', icon: Laptop }
-				] as option}
-					<button
-						type="button"
-						class={`flex items-center justify-center gap-2 rounded-lg border px-3 py-3 text-sm transition-colors ${userPrefersMode.current === option.value ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground'}`}
-						onclick={() => chooseTheme(option.value)}
-						aria-pressed={userPrefersMode.current === option.value}
-					>
-						<option.icon class="size-4" /> {option.label}
-					</button>
-				{/each}
-			</div>
 		</CardContent>
 	</Card>
 
