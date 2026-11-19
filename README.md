@@ -80,7 +80,7 @@ Grab the latest build from the [Releases page](https://github.com/RemingtonWilco
 | **macOS 13.5+** (Apple Silicon) | `mewsik_<version>_aarch64.dmg` | Drag mewsik to Applications. It's signed but not yet notarized, so the first time, right-click the app and choose **Open**. |
 | **iPhone** | [TestFlight beta](https://testflight.apple.com/join/5GCnVzzR) | Install the TestFlight app, then open the link on your phone. |
 
-There's no in-app updater yet; download new versions from the Releases page. Your library, settings and downloads are kept when you install over an older version.
+From 0.4.2 on, the desktop app updates itself: it tells you when a new version is out, and Settings → App updates installs it and restarts. On iPhone, TestFlight installs new builds (mewsik shows a banner when one is out). Your library, settings and downloads are kept across updates.
 
 ## Build from source
 

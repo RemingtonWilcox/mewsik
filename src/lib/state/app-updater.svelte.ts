@@ -31,6 +31,15 @@ interface ReleaseRuntimeInfo {
 	architecture: string;
 }
 
+interface LatestRelease {
+	version: string;
+	pubDate: string | null;
+}
+
+// iPhone builds reach testers through TestFlight after Apple's beta review,
+// which usually clears within a day of the GitHub release.
+const TESTFLIGHT_REVIEW_GRACE_MS = 24 * 60 * 60 * 1000;
+
 interface DownloadJobStatus {
 	status: string;
 }
@@ -51,6 +60,7 @@ let downloadedBytes = $state(0);
 let totalBytes = $state<number | null>(null);
 let noticeDismissed = $state(false);
 let updaterRuntimeReady = $state(false);
+let viaTestFlight = $state(false);
 let launchCheckStarted = false;
 let pendingUpdate: Update | null = null;
 let updatePackageDownloaded = false;
@@ -110,6 +120,13 @@ async function inspectReleaseRuntime(): Promise<ReleaseRuntimeInfo | null> {
 		try {
 			const info = await invoke<ReleaseRuntimeInfo>('get_release_runtime_info');
 			currentVersion = info.appVersion || currentVersion;
+			if (info.platform === 'ios') {
+				// The phone can't update itself; it points people at TestFlight.
+				viaTestFlight = true;
+				updaterRuntimeReady = true;
+				unavailableReason = null;
+				return info;
+			}
 			if (!info.updaterConfigured || !info.updateChannel) {
 				status = 'unavailable';
 				unavailableReason = 'configuration';
@@ -157,6 +174,11 @@ async function performCheck() {
 	await releasePendingUpdate();
 	availableUpdate = null;
 
+	if (viaTestFlight) {
+		await checkTestFlight();
+		return;
+	}
+
 	try {
 		const update = await check({ timeout: 15_000 });
 		if (!update) {
@@ -191,6 +213,55 @@ async function performCheck() {
 
 		status = 'error';
 		errorMessage = 'Could not reach the update service. Check your connection and try again.';
+	}
+}
+
+function versionParts(version: string): number[] {
+	return version
+		.replace(/^v/, '')
+		.split(/[.+-]/)
+		.slice(0, 3)
+		.map((part) => Number.parseInt(part, 10) || 0);
+}
+
+export function isNewerVersion(candidate: string, current: string): boolean {
+	const a = versionParts(candidate);
+	const b = versionParts(current);
+	for (let i = 0; i < 3; i += 1) {
+		if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0);
+	}
+	return false;
+}
+
+async function checkTestFlight() {
+	try {
+		const latest = await invoke<LatestRelease>('get_latest_release');
+		const published = latest.pubDate ? Date.parse(latest.pubDate) : Number.NaN;
+		const reviewed =
+			Number.isFinite(published) && Date.now() - published >= TESTFLIGHT_REVIEW_GRACE_MS;
+		if (!isNewerVersion(latest.version, currentVersion) || !reviewed) {
+			status = 'current';
+			return;
+		}
+		availableUpdate = {
+			version: latest.version,
+			currentVersion,
+			date: latest.pubDate,
+			body: null
+		};
+		noticeDismissed = false;
+		status = 'available';
+	} catch {
+		// Offline or no feed yet: say nothing on the phone.
+		status = 'current';
+	}
+}
+
+async function openTestFlight() {
+	try {
+		await invoke('open_testflight');
+	} catch {
+		errorMessage = 'Open the TestFlight app to update mewsik.';
 	}
 }
 
@@ -347,6 +418,9 @@ export function useAppUpdater() {
 			if (!totalBytes || totalBytes <= 0) return null;
 			return Math.min(100, Math.round((downloadedBytes / totalBytes) * 100));
 		},
+		get viaTestFlight() {
+			return viaTestFlight;
+		},
 		get showNotice() {
 			return status === 'available' && availableUpdate !== null && !noticeDismissed;
 		},
@@ -360,6 +434,7 @@ export function useAppUpdater() {
 		startLaunchCheck,
 		checkNow: performCheck,
 		installAndRestart,
+		openTestFlight,
 		restartApp,
 		dismissNotice() {
 			noticeDismissed = true;

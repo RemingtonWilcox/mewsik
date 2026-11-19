@@ -69,3 +69,46 @@ pub fn prepare_update_install(
         active_downloads: 0,
     })
 }
+
+/// The public feed every release publishes (also the desktop updater endpoint).
+const LATEST_RELEASE_FEED: &str =
+    "https://github.com/RemingtonWilcox/mewsik/releases/latest/download/latest.json";
+/// Public TestFlight link; iPhone builds update there, never in-app.
+const TESTFLIGHT_URL: &str = "https://testflight.apple.com/join/5GCnVzzR";
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LatestRelease {
+    version: String,
+    #[serde(alias = "pub_date")]
+    pub_date: Option<String>,
+}
+
+/// Reads the newest published version from the release feed. The iPhone app
+/// uses it to point people at TestFlight; desktop uses the updater plugin.
+#[tauri::command]
+pub async fn get_latest_release() -> Result<LatestRelease, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(concat!("mewsik/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    client
+        .get(LATEST_RELEASE_FEED)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json::<LatestRelease>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Opens the public TestFlight page (the TestFlight app on an iPhone).
+#[tauri::command]
+pub fn open_testflight(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(TESTFLIGHT_URL, None::<&str>)
+        .map_err(|e| e.to_string())
+}

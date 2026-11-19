@@ -76,6 +76,7 @@ pub fn run() {
     #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(
             tauri_plugin_log::Builder::default()
                 .level(log::LevelFilter::Info)
@@ -180,6 +181,8 @@ pub fn run() {
             commands::settings::get_library_paths,
             commands::release::get_release_runtime_info,
             commands::release::prepare_update_install,
+            commands::release::get_latest_release,
+            commands::release::open_testflight,
             // Smart playlists
             commands::smart_playlists::create_smart_playlist,
             commands::smart_playlists::evaluate_smart_playlist,
