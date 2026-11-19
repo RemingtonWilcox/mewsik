@@ -83,12 +83,10 @@ pub fn run() {
                 .build(),
         );
 
-    // Drag, process restart and the updater have no mobile implementation.
+    // Process restart and the updater have no mobile implementation.
     #[cfg(not(any(target_os = "ios", target_os = "android")))]
     {
-        builder = builder
-            .plugin(tauri_plugin_drag::init())
-            .plugin(tauri_plugin_process::init());
+        builder = builder.plugin(tauri_plugin_process::init());
 
         // A local/source build intentionally has no updater key or endpoint.
         // The updater plugin treats a missing config as an initialization

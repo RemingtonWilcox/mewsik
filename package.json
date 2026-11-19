@@ -64,7 +64,6 @@
     ]
   },
   "dependencies": {
-    "@crabnebula/tauri-plugin-drag": "2.1.0",
     "@lucide/svelte": "^1.74.0",
     "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-dialog": "^2.8.4",
