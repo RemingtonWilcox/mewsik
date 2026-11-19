@@ -1,4 +1,4 @@
-import { Innertube } from 'youtubei.js';
+import { Innertube, Log } from 'youtubei.js';
 import { tidyVideoTitle } from './titles.js';
 
 const YOUTUBE_STREAM_HEADERS: Record<string, string> = {
@@ -69,6 +69,9 @@ export class YouTubeProvider {
 
   private async getClient(): Promise<Innertube> {
     if (!this.yt) {
+      // youtubei.js warns on every view-model it can't type-check (dozens per
+      // search in the newer layout); real failures still throw.
+      Log.setLevel(Log.Level.ERROR);
       this.yt = await Innertube.create({
         lang: 'en',
         location: 'US',
@@ -91,7 +94,11 @@ export class YouTubeProvider {
       }
 
       const items = dedupeSearchResults(
-        (results.videos as any[]).map((video) => {
+        // `videos` is grouped by node type, so shelf items ("People also
+        // watched", GridVideo) come before LockupView results; keep the real
+        // results first.
+        [...(results.videos as any[])].sort((a, b) => Number(isShelfItem(a)) - Number(isShelfItem(b))).map((video) => {
+          if (video.type === 'LockupView') return mapLockupView(video);
           const videoId = video.video_id || video.id;
           if (!videoId) return null;
 
@@ -340,6 +347,51 @@ export class YouTubeProvider {
       genre: null,
     };
   }
+}
+
+/**
+ * Maps a search result in YouTube's newer layout. Since November 2026 some
+ * visitors get search results as `lockupViewModel` items instead of
+ * `videoRenderer`, with no `video_id`, `author` or `length_text`.
+ * Byline row: [channel (avatar stack), views ("1.2M"), age ("2y ago")].
+ */
+function mapLockupView(lockup: any): SearchResult | null {
+  const videoId: string | undefined = lockup.content_id;
+  if (!videoId || (lockup.content_type !== 'VIDEO' && lockup.content_type !== 'MOVIE')) return null;
+
+  const meta = lockup.metadata;
+  const rows: any[] = meta?.metadata?.metadata_rows ?? [];
+  const byline: any[] = rows.find((row) => row?.metadata_parts?.length)?.metadata_parts ?? [];
+  const texts = byline.map((part) => part?.text?.toString?.() as string | undefined).filter(Boolean) as string[];
+
+  const channelFromLabel = String(meta?.image?.a11y_label ?? '').replace(/^Go to channel\s*/i, '').trim();
+  const artist =
+    byline.map((part) => part?.avatar_stack?.text?.toString?.()).find(Boolean) ||
+    channelFromLabel ||
+    texts.find((text) => !isCountText(text) && !/\bago$/i.test(text)) ||
+    'Unknown';
+
+  const seconds = lockup.duration?.seconds;
+  const thumbnails: any[] = lockup.content_image?.image ?? lockup.content_image?.primary_thumbnail?.image ?? [];
+
+  return {
+    source: 'youtube',
+    source_id: videoId,
+    ...tidyVideoTitle(meta?.title?.toString?.() || 'Unknown', artist),
+    album: null,
+    duration_ms: typeof seconds === 'number' && seconds > 0 ? seconds * 1000 : null,
+    cover_art_url: thumbnails[0]?.url || null,
+    source_url: `https://www.youtube.com/watch?v=${videoId}`,
+    play_count: parseCountText(texts.find(isCountText)),
+  };
+}
+
+function isShelfItem(video: any): boolean {
+  return video?.type !== 'Video' && video?.type !== 'LockupView';
+}
+
+function isCountText(text: string): boolean {
+  return /^[\d.,]+\s*[KMBT]?(\s*(views?|plays?))?$/i.test(text.trim());
 }
 
 function parseDuration(text: string | undefined): number | null {
