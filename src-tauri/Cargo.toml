@@ -54,11 +54,10 @@ boa_engine = { version = "0.22", default-features = false }
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
-# Desktop-only deps. tray-icon pulls in desktop-only crates, and the drag,
+# Desktop-only deps. tray-icon pulls in desktop-only crates, and the
 # process and updater plugins have no mobile implementation.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 tauri = { version = "2.11", features = ["tray-icon", "protocol-asset"] }
-tauri-plugin-drag = "2.1.0"
 tauri-plugin-process = "=2.4.0"
 tauri-plugin-updater = "=2.14.1"
 
