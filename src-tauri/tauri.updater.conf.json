@@ -1,0 +1,13 @@
+{
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ3QTNFNDNFNTA4OUE4RTEKUldUaHFJbFFQdVNqUi9qVlRWSGZTc0x2ZkJ2anE3RzdXdnlQQ0EzbkJzS1UzT3NMaTMwK1lnV1IK",
+      "endpoints": [
+        "https://github.com/RemingtonWilcox/mewsik/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

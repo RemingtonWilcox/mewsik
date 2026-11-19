@@ -1,13 +1,12 @@
 <script lang="ts">
-	// Settings on the phone: only what applies there. Music folders, the
-	// download folder and app updates are desktop things (the App Store or
-	// a new build updates the phone).
+	// Settings on the phone: only what applies there. Music folders and the
+	// download folder are desktop things; TestFlight updates the phone.
 	import { onMount } from 'svelte';
 	import * as api from '$lib/api/tauri';
 	import type { Download } from '$lib/types';
 	import { useSearchState, type SearchSource } from '$lib/state/search.svelte';
 	import { useAppUpdater } from '$lib/state/app-updater.svelte';
-	import { ChevronRight, Download as DownloadIcon, History, Check } from '@lucide/svelte';
+	import { ArrowUpRight, ChevronRight, Download as DownloadIcon, History, Check } from '@lucide/svelte';
 
 	const search = useSearchState();
 	const updater = useAppUpdater();
@@ -74,6 +73,13 @@
 				<span class="flex-1">Version</span>
 				<span class="text-muted-foreground tabular-nums">{updater.currentVersion}</span>
 			</div>
+			{#if updater.viaTestFlight && updater.availableUpdate}
+				<button class="ios-row" onclick={() => updater.openTestFlight()}>
+					<span class="flex-1">Update to {updater.availableUpdate.version}</span>
+					<span class="text-muted-foreground">TestFlight</span>
+					<ArrowUpRight class="size-4 text-primary" />
+				</button>
+			{/if}
 		</div>
 	</section>
 </div>

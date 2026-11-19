@@ -14,7 +14,9 @@ type UpdateScenario =
 	| 'active-download'
 	| 'download-started-mid-update'
 	| 'atomic-download-race'
-	| 'install-error';
+	| 'install-error'
+	| 'ios-reviewed'
+	| 'ios-just-published';
 
 async function installUpdaterRuntime(page: Page, scenario: UpdateScenario) {
 	await page.addInitScript(({ scenario }) => {
@@ -68,8 +70,8 @@ async function installUpdaterRuntime(page: Page, scenario: UpdateScenario) {
 							appVersion: '0.1.0',
 							updateChannel: scenario === 'unconfigured' ? null : 'stable',
 							updaterConfigured: scenario !== 'unconfigured',
-							platform: 'windows',
-							architecture: 'x86_64'
+							platform: scenario.startsWith('ios') ? 'ios' : 'windows',
+							architecture: scenario.startsWith('ios') ? 'aarch64' : 'x86_64'
 						};
 					case 'plugin:updater|check':
 						if (scenario === 'network-error') throw new Error('network timed out');
@@ -117,6 +119,15 @@ async function installUpdaterRuntime(page: Page, scenario: UpdateScenario) {
 						});
 						return 73;
 					}
+					case 'get_latest_release': {
+						const hoursAgo = scenario === 'ios-reviewed' ? 48 : 1;
+						return {
+							version: '0.2.0',
+							pubDate: new Date(Date.now() - hoursAgo * 3_600_000).toISOString()
+						};
+					}
+					case 'open_testflight':
+						return null;
 					case 'prepare_update_install':
 						if (scenario === 'atomic-download-race' && !forceDownloadsIdle) {
 							return { ready: false, activeDownloads: 1 };
@@ -435,4 +446,37 @@ test('the browser development preview keeps update controls inert', async ({ pag
 	const updateCard = page.getByTestId('app-updates');
 	await expect(updateCard.getByText('Update checks are available in installed releases')).toBeVisible();
 	await expect(updateCard.getByRole('button', { name: 'Release builds only' })).toBeDisabled();
+});
+
+test('the iPhone app points a reviewed release at TestFlight and never runs the desktop updater', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await installUpdaterRuntime(page, 'ios-reviewed');
+	await page.goto('/');
+
+	const banner = page.getByTestId('testflight-update-banner');
+	await expect(banner).toContainText('mewsik 0.2.0 is out');
+	await banner.getByRole('button', { name: /Update in TestFlight/ }).click();
+
+	const commands = await page.evaluate(() =>
+		((window as Window & { __UPDATE_INVOCATIONS__?: Array<{ command: string }> })
+			.__UPDATE_INVOCATIONS__ ?? []).map(({ command }) => command)
+	);
+	expect(commands).toContain('open_testflight');
+	expect(commands.some((command) => command.startsWith('plugin:updater|'))).toBe(false);
+});
+
+test('the iPhone app waits out TestFlight review before announcing a release', async ({ page }) => {
+	await page.setViewportSize({ width: 390, height: 844 });
+	await installUpdaterRuntime(page, 'ios-just-published');
+	await page.goto('/');
+
+	await expect
+		.poll(() =>
+			page.evaluate(() =>
+				((window as Window & { __UPDATE_INVOCATIONS__?: Array<{ command: string }> })
+					.__UPDATE_INVOCATIONS__ ?? []).some(({ command }) => command === 'get_latest_release')
+			)
+		)
+		.toBe(true);
+	await expect(page.getByTestId('testflight-update-banner')).toHaveCount(0);
 });

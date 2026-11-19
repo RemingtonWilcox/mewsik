@@ -12,6 +12,19 @@ Normal local builds deliberately have no updater endpoint or public key. They re
 - GitHub Pages is enabled and the credential-free discovery snapshot is live. YouTube and Last.fm intentionally remain `unavailable`: keys are absent, activation switches are off, and their data is excluded from mewsik-derived shelves until the policy gates below pass.
 - No distributable Mac build is current. A fresh clean Apple Silicon release checkout now passes dependency, Svelte, sidecar, runtime-resource, and Rust checks with the pinned toolchains. The Mac mini still lacks the Developer ID Application identity/private key and the `mewsik-notary` Keychain profile; the MacBook that may hold the signing identity was unreachable during the audit.
 
+## How a release ships today (since 0.4.2)
+
+This is the path actually in use; the Azure-signed GitHub workflow described further down is not, because no Azure Artifact Signing account exists.
+
+1. Bump the version in `package.json`, `sidecar/package.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/gen/apple/mewsik_iOS/Info.plist` through a release PR.
+2. Windows: `scripts\build-nsis.cmd release`. The `release` argument compiles in `MEWSIK_UPDATE_CHANNEL=stable` and `src-tauri/tauri.updater.conf.json` (the public updater key and the feed URL), which turns the in-app updater on. A plain `build-nsis.cmd` makes a build without updates.
+3. Mac and iPhone on the MacBook: build the Mac app the same way (`MEWSIK_UPDATE_CHANNEL=stable pnpm tauri build --bundles app --no-sign --config src-tauri/tauri.updater.conf.json`), Developer ID sign node, ffmpeg, the binary and the app, then make both the DMG and the update package `mewsik_<version>_aarch64.app.tar.gz` (`COPYFILE_DISABLE=1 tar -czf ... -C <bundle/macos> mewsik.app`) from that signed app. iPhone builds never set the channel.
+4. On this PC: `pwsh scripts/make-update-feed.ps1 -Version <v> -Dir <folder with the setup.exe and app.tar.gz> -Notes <notes.md>`. It unlocks the updater key from `Documents\Mewsik Release Keys` (DPAPI, this Windows account only), signs both packages, checks each signature against the key the apps trust, and writes `latest.json`.
+5. Publish the GitHub release with the setup.exe, DMG, ipa, app.tar.gz, both `.sig` files and `latest.json`. Installed desktop apps read `releases/latest/download/latest.json`, so the release must be marked Latest and not a prerelease.
+6. Submit the TestFlight build to the Public group. The iPhone app announces a new GitHub release only once it is 24 hours old, so Apple's beta review has normally cleared by then.
+
+Windows installers are still unsigned (SmartScreen warns on first install) and the Mac app is not notarized. Updates install fine either way: the updater checks its own signature, and a package it downloads carries no quarantine flag.
+
 ## Supported release targets
 
 | Target | Build host | Artifact | Current minimum |
