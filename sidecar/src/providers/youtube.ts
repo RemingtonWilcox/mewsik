@@ -1,5 +1,8 @@
 import { Innertube, Log } from 'youtubei.js';
-import { tidyVideoTitle } from './titles.js';
+import { extractSearchPage, type RawSearchPage, type SearchResult } from './youtube-search.js';
+
+/** The "Videos" search filter, as youtubei.js and yt-dlp send it. */
+const VIDEO_SEARCH_PARAMS = 'EgIQAQ%3D%3D';
 
 const YOUTUBE_STREAM_HEADERS: Record<string, string> = {
   'User-Agent':
@@ -20,18 +23,6 @@ const VISIONOS_CLIENT = {
   osName: 'visionOS',
   osVersion: '26.5.23O471',
 };
-
-interface SearchResult {
-  source: string;
-  source_id: string;
-  title: string;
-  artist: string;
-  album: string | null;
-  duration_ms: number | null;
-  cover_art_url: string | null;
-  source_url: string | null;
-  play_count: number | null;
-}
 
 interface StreamInfo {
   url: string;
@@ -62,7 +53,7 @@ export class YouTubeProvider {
   private yt: Innertube | null = null;
   private healthy = true;
   private failCount = 0;
-  private searchPageCache = new Map<string, { pages: any[]; cachedAt: number }>();
+  private searchPageCache = new Map<string, { pages: RawSearchPage[]; cachedAt: number }>();
 
   /** `fetchImpl` replaces the global fetch (the in-app providers use the app's own). */
   constructor(private readonly fetchImpl?: typeof fetch) {}
@@ -70,7 +61,7 @@ export class YouTubeProvider {
   private async getClient(): Promise<Innertube> {
     if (!this.yt) {
       // youtubei.js warns on every view-model it can't type-check (dozens per
-      // search in the newer layout); real failures still throw.
+      // page in YouTube's newer layouts); real failures still throw.
       Log.setLevel(Log.Level.ERROR);
       this.yt = await Innertube.create({
         lang: 'en',
@@ -89,42 +80,12 @@ export class YouTubeProvider {
   async search(query: string, page: number): Promise<{ items: SearchResult[]; has_more: boolean }> {
     try {
       const results = await this.getVideoSearchPage(query, page);
+      this.failCount = 0;
+      this.healthy = true;
       if (!results) {
         return { items: [], has_more: false };
       }
-
-      const items = dedupeSearchResults(
-        // `videos` is grouped by node type, so shelf items ("People also
-        // watched", GridVideo) come before LockupView results; keep the real
-        // results first.
-        [...(results.videos as any[])].sort((a, b) => Number(isShelfItem(a)) - Number(isShelfItem(b))).map((video) => {
-          if (video.type === 'LockupView') return mapLockupView(video);
-          const videoId = video.video_id || video.id;
-          if (!videoId) return null;
-
-          return {
-            source: 'youtube',
-            source_id: videoId,
-            ...tidyVideoTitle(
-              video.title?.toString?.() || 'Unknown',
-              video.author?.name || video.byline_text?.toString?.() || 'Unknown'
-            ),
-            album: null,
-            duration_ms:
-              typeof video.duration?.seconds === 'number'
-                ? video.duration.seconds * 1000
-                : parseDuration(video.length_text?.toString?.() || video.duration?.text),
-            cover_art_url: video.best_thumbnail?.url || video.thumbnails?.[0]?.url || null,
-            source_url: `https://www.youtube.com/watch?v=${videoId}`,
-            play_count: parseCountText(video.view_count?.toString?.() || video.short_view_count?.toString?.()),
-          } satisfies SearchResult;
-        })
-      );
-
-      this.failCount = 0;
-      this.healthy = true;
-
-      return { items, has_more: results.has_continuation };
+      return { items: results.items, has_more: !!results.continuation };
     } catch (err) {
       this.failCount++;
       if (this.failCount >= 3) this.healthy = false;
@@ -132,28 +93,41 @@ export class YouTubeProvider {
     }
   }
 
-  private async getVideoSearchPage(query: string, page: number): Promise<any | null> {
-    const yt = await this.getClient();
+  private async getVideoSearchPage(query: string, page: number): Promise<RawSearchPage | null> {
     const cacheKey = normalizeSearchKey(query);
     let cachedPages = this.getCachedSearchPages(cacheKey);
     if (!cachedPages) {
-      cachedPages = [await yt.search(query, { type: 'video' })];
+      cachedPages = [await this.fetchSearchPage({ query, params: VIDEO_SEARCH_PARAMS }, query)];
       this.setCachedSearchPages(cacheKey, cachedPages);
     }
 
     while (cachedPages.length <= page) {
-      const current = cachedPages[cachedPages.length - 1];
-      if (!current?.has_continuation) {
+      const continuation = cachedPages[cachedPages.length - 1]?.continuation;
+      if (!continuation) {
         return null;
       }
-      cachedPages.push(await current.getContinuation());
+      cachedPages.push(await this.fetchSearchPage({ continuation }, query));
       this.setCachedSearchPages(cacheKey, cachedPages);
     }
 
     return cachedPages[page] ?? null;
   }
 
-  private getCachedSearchPages(queryKey: string): any[] | null {
+  /** One raw /search request, read by youtube-search.ts rather than youtubei.js's parser. */
+  private async fetchSearchPage(body: Record<string, string>, query: string): Promise<RawSearchPage> {
+    const yt = await this.getClient();
+    const response = await yt.actions.execute('/search', body);
+    const page = extractSearchPage(response.data);
+    if (!page.items.length && !body.continuation) {
+      // Usually a real "no results"; if YouTube changed its layout again,
+      // these keys say where the results moved to.
+      const keys = Object.keys((response.data ?? {}) as object).join(', ');
+      console.error(`YouTube search for "${query}" read no videos (response keys: ${keys})`);
+    }
+    return page;
+  }
+
+  private getCachedSearchPages(queryKey: string): RawSearchPage[] | null {
     const entry = this.searchPageCache.get(queryKey);
     if (!entry) return null;
     if (Date.now() - entry.cachedAt > YouTubeProvider.SEARCH_CACHE_TTL_MS) {
@@ -169,7 +143,7 @@ export class YouTubeProvider {
     return entry.pages;
   }
 
-  private setCachedSearchPages(queryKey: string, pages: any[]): void {
+  private setCachedSearchPages(queryKey: string, pages: RawSearchPage[]): void {
     if (this.searchPageCache.has(queryKey)) {
       this.searchPageCache.delete(queryKey);
     }
@@ -349,101 +323,8 @@ export class YouTubeProvider {
   }
 }
 
-/**
- * Maps a search result in YouTube's newer layout. Since November 2026 some
- * visitors get search results as `lockupViewModel` items instead of
- * `videoRenderer`, with no `video_id`, `author` or `length_text`.
- * Byline row: [channel (avatar stack), views ("1.2M"), age ("2y ago")].
- */
-function mapLockupView(lockup: any): SearchResult | null {
-  const videoId: string | undefined = lockup.content_id;
-  if (!videoId || (lockup.content_type !== 'VIDEO' && lockup.content_type !== 'MOVIE')) return null;
-
-  const meta = lockup.metadata;
-  const rows: any[] = meta?.metadata?.metadata_rows ?? [];
-  const byline: any[] = rows.find((row) => row?.metadata_parts?.length)?.metadata_parts ?? [];
-  const texts = byline.map((part) => part?.text?.toString?.() as string | undefined).filter(Boolean) as string[];
-
-  const channelFromLabel = String(meta?.image?.a11y_label ?? '').replace(/^Go to channel\s*/i, '').trim();
-  const artist =
-    byline.map((part) => part?.avatar_stack?.text?.toString?.()).find(Boolean) ||
-    channelFromLabel ||
-    texts.find((text) => !isCountText(text) && !/\bago$/i.test(text)) ||
-    'Unknown';
-
-  const seconds = lockup.duration?.seconds;
-  const thumbnails: any[] = lockup.content_image?.image ?? lockup.content_image?.primary_thumbnail?.image ?? [];
-
-  return {
-    source: 'youtube',
-    source_id: videoId,
-    ...tidyVideoTitle(meta?.title?.toString?.() || 'Unknown', artist),
-    album: null,
-    duration_ms: typeof seconds === 'number' && seconds > 0 ? seconds * 1000 : null,
-    cover_art_url: thumbnails[0]?.url || null,
-    source_url: `https://www.youtube.com/watch?v=${videoId}`,
-    play_count: parseCountText(texts.find(isCountText)),
-  };
-}
-
-function isShelfItem(video: any): boolean {
-  return video?.type !== 'Video' && video?.type !== 'LockupView';
-}
-
-function isCountText(text: string): boolean {
-  return /^[\d.,]+\s*[KMBT]?(\s*(views?|plays?))?$/i.test(text.trim());
-}
-
-function parseDuration(text: string | undefined): number | null {
-  if (!text) return null;
-  const parts = text.split(':').map(Number);
-  if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000;
-  if (parts.length === 3) return (parts[0] * 3600 + parts[1] * 60 + parts[2]) * 1000;
-  return null;
-}
-
 function normalizeSearchKey(query: string): string {
   return query.trim().toLowerCase();
-}
-
-function dedupeSearchResults(results: Array<SearchResult | null>): SearchResult[] {
-  const seen = new Set<string>();
-  const deduped: SearchResult[] = [];
-
-  for (const result of results) {
-    if (!result) continue;
-    if (seen.has(result.source_id)) continue;
-    seen.add(result.source_id);
-    deduped.push(result);
-  }
-
-  return deduped;
-}
-
-function parseCountText(text: string | undefined): number | null {
-  if (!text) return null;
-  const match = text
-    .replace(/,/g, '')
-    .match(/(\d+(?:\.\d+)?)\s*([KMBT])?\s*(?:plays|play|views|view)?/i);
-
-  if (!match) return null;
-
-  const value = Number(match[1]);
-  if (!Number.isFinite(value)) return null;
-
-  const multiplier = match[2]?.toUpperCase();
-  switch (multiplier) {
-    case 'K':
-      return Math.round(value * 1_000);
-    case 'M':
-      return Math.round(value * 1_000_000);
-    case 'B':
-      return Math.round(value * 1_000_000_000);
-    case 'T':
-      return Math.round(value * 1_000_000_000_000);
-    default:
-      return Math.round(value);
-  }
 }
 
 /**
