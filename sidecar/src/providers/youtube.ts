@@ -1,5 +1,6 @@
 import { Innertube, Log } from 'youtubei.js';
 import { extractSearchPage, type RawSearchPage, type SearchResult } from './youtube-search.js';
+import { extractTrending } from './youtube-trending.js';
 
 /** The "Videos" search filter, as youtubei.js and yt-dlp send it. */
 const VIDEO_SEARCH_PARAMS = 'EgIQAQ%3D%3D';
@@ -54,6 +55,7 @@ export class YouTubeProvider {
   private healthy = true;
   private failCount = 0;
   private searchPageCache = new Map<string, { pages: RawSearchPage[]; cachedAt: number }>();
+  private trendingCache: { items: SearchResult[]; cachedAt: number } | null = null;
 
   /** `fetchImpl` replaces the global fetch (the in-app providers use the app's own). */
   constructor(private readonly fetchImpl?: typeof fetch) {}
@@ -91,6 +93,23 @@ export class YouTubeProvider {
       if (this.failCount >= 3) this.healthy = false;
       throw err;
     }
+  }
+
+  /** YouTube Music's Trending songs, fetched at most every half hour. */
+  async trending(): Promise<{ items: SearchResult[] }> {
+    if (this.trendingCache && Date.now() - this.trendingCache.cachedAt < 30 * 60 * 1000) {
+      return { items: this.trendingCache.items };
+    }
+    const yt = await this.getClient();
+    const response = await yt.actions.execute('/browse', { browseId: 'FEmusic_explore', client: 'YTMUSIC' });
+    const items = extractTrending(response.data);
+    if (!items.length) {
+      const keys = Object.keys((response.data ?? {}) as object).join(', ');
+      console.error(`YouTube Music Explore had no Trending songs (response keys: ${keys})`);
+    } else {
+      this.trendingCache = { items, cachedAt: Date.now() };
+    }
+    return { items };
   }
 
   private async getVideoSearchPage(query: string, page: number): Promise<RawSearchPage | null> {

@@ -220,6 +220,7 @@ pub fn run() {
             commands::smart_playlists::evaluate_smart_playlist,
             // External search
             commands::external_search::search_external,
+            commands::external_search::trending_tracks,
             commands::external_search::search_all_sources,
             commands::external_search::ensure_external_recording,
             commands::external_search::play_external,

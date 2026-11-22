@@ -866,6 +866,21 @@ fn run_external_search_batch(
     }
 }
 
+/// YouTube Music's Trending songs, for the empty Search screen.
+// Async: on iPhone the providers answer through the web view.
+#[tauri::command(async)]
+pub fn trending_tracks(
+    db: State<'_, DbPool>,
+    sidecar: State<'_, Arc<SidecarManager>>,
+) -> Result<Vec<ExternalSearchResult>, String> {
+    sidecar.start()?;
+    let result = sidecar.call("youtube.trending", json!({}))?;
+    let items: Vec<ExternalSearchResult> =
+        serde_json::from_value(result.get("items").cloned().unwrap_or(json!([])))
+            .map_err(|error| format!("YouTube returned an invalid trending list: {error}"))?;
+    Ok(enrich_external_results(&db, items))
+}
+
 // Async: on iPhone the providers answer through the web view, which
 // must not wait on a blocked main thread.
 #[tauri::command(async)]

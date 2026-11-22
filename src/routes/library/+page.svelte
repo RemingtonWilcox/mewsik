@@ -6,7 +6,8 @@
 	import Tile from '$lib/components/tracks/tile.svelte';
 	import { fold, formatTotal, plural } from '$lib/media';
 	import { toast } from 'svelte-sonner';
-	import { Play, Shuffle, RefreshCw, Search, X, Settings, ArrowUpDown } from '@lucide/svelte';
+	import { Play, Shuffle, RefreshCw, Search, X, Settings, ArrowUpDown, FolderOpen, Radio, LoaderCircle } from '@lucide/svelte';
+	import * as api from '$lib/api/tauri';
 	import type { LibraryTrack } from '$lib/types';
 	import MobileShortcuts from '$lib/components/mobile/mobile-shortcuts.svelte';
 	import { IsMobile } from '$lib/hooks/is-mobile.svelte';
@@ -92,6 +93,25 @@
 		{ id: 'albums', label: 'Albums' },
 		{ id: 'artists', label: 'Artists' }
 	];
+	// A new library starts from a folder of music the user already has.
+	let addingFolder = $state(false);
+	async function addMusicFolder() {
+		if (addingFolder) return;
+		addingFolder = true;
+		try {
+			const path = await api.pickFolder();
+			if (!path) return;
+			const paths = await api.getLibraryPaths();
+			if (!paths.includes(path)) await api.updateLibraryPaths([...paths, path]);
+			const result = await library.scan();
+			if (result) toast.success(`Found ${plural(result.new_tracks, 'song')}`);
+		} catch (error) {
+			toast.error(`Couldn't add that folder: ${error}`);
+		} finally {
+			addingFolder = false;
+		}
+	}
+
 	const counts = $derived({ songs: songs.length, albums: albums.length, artists: artists.length });
 </script>
 
@@ -288,16 +308,32 @@
 			{/each}
 		</div>
 	{:else if library.tracks.length === 0}
-		<div class="rounded-xl border border-dashed border-white/10 px-6 py-16 text-center">
-			<p class="text-lg font-medium">Your library is empty</p>
-			<p class="mt-1 text-sm text-muted-foreground">
-				{#if isMobile.current}
-					Find songs in <a href="/search" class="underline">Search</a> and add them with +.
-				{:else}
-					Add a music folder in <a href="/settings" class="underline">Settings</a>, or find songs in
-					<a href="/search" class="underline">Search</a>.
+		<div class="py-4" data-testid="library-empty">
+			<p class="text-xl font-semibold">Start your library</p>
+			<p class="mt-1 text-sm text-muted-foreground">Songs you add, download or import show up here.</p>
+			<div class="mt-5 grid gap-3 {isMobile.current ? '' : 'max-w-4xl sm:grid-cols-3'}">
+				<a href="/search" class="start-card">
+					<Search class="size-5 text-primary" />
+					<span class="font-medium">Find any song</span>
+					<span class="text-sm text-muted-foreground">Search YouTube and SoundCloud, then tap + to keep it.</span>
+				</a>
+				<a href="/stations" class="start-card">
+					<Radio class="size-5 text-primary" />
+					<span class="font-medium">Turn on the radio</span>
+					<span class="text-sm text-muted-foreground">Over 50,000 live stations from around the world.</span>
+				</a>
+				{#if !isMobile.current}
+					<button class="start-card text-left" onclick={addMusicFolder} disabled={addingFolder}>
+						{#if addingFolder}
+							<LoaderCircle class="size-5 animate-spin text-primary" />
+						{:else}
+							<FolderOpen class="size-5 text-primary" />
+						{/if}
+						<span class="font-medium">{addingFolder ? 'Adding your music…' : 'Add your music folder'}</span>
+						<span class="text-sm text-muted-foreground">Point at the folder where your music files live.</span>
+					</button>
 				{/if}
-			</p>
+			</div>
 		</div>
 	{:else if view === 'songs'}
 		<TrackList tracks={songs} emptyText="No songs match “{query}”." />
@@ -334,3 +370,19 @@
 		</div>
 	{/if}
 </div>
+
+<style>
+	.start-card {
+		display: flex;
+		flex-direction: column;
+		gap: 0.375rem;
+		border-radius: 0.75rem;
+		border: 1px solid rgb(255 255 255 / 0.08);
+		background: rgb(255 255 255 / 0.03);
+		padding: 1.25rem;
+		transition: background-color 150ms;
+	}
+	.start-card:hover {
+		background: rgb(255 255 255 / 0.06);
+	}
+</style>

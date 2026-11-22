@@ -1,3 +1,11 @@
+<script lang="ts" module>
+	import type { ExternalSearchResult as Result, RadioBrowserStation } from '$lib/api/tauri';
+
+	// The empty screen's lists load once per launch and survive leaving the page.
+	let trendingCache: Result[] | null = null;
+	let stationsCache: RadioBrowserStation[] | null = null;
+</script>
+
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -15,7 +23,11 @@
 	import Tile from '$lib/components/tracks/tile.svelte';
 	import Cover from '$lib/components/tracks/cover.svelte';
 	import { fold, formatDuration, plural } from '$lib/media';
-	import { Search, X, Play, Pause, Plus, Check, Download, LoaderCircle, Ellipsis, ArrowDownToLine } from '@lucide/svelte';
+	import StationArt from '$lib/components/station-art.svelte';
+	import { cleanStationName } from '$lib/radio/names';
+	import { isMusicStation } from '$lib/radio/display';
+	import { playDirectoryStation, stationLabel } from '$lib/radio/play-directory';
+	import { Search, X, Play, Pause, Plus, Check, Download, LoaderCircle, Ellipsis, ArrowDownToLine, Dices } from '@lucide/svelte';
 
 	const library = useLibrary();
 	const player = usePlayer();
@@ -47,6 +59,11 @@
 	let loadingMore = $state(false);
 	let moreSentinel = $state<HTMLDivElement | null>(null);
 	let timer: ReturnType<typeof setTimeout> | undefined;
+	let trending = $state<ExternalSearchResult[]>(trendingCache ?? []);
+	let popularStations = $state<RadioBrowserStation[]>(stationsCache ?? []);
+	let stationBusy = $state<string | null>(null);
+	// Directory station -> the library station it plays as.
+	let stationIds = $state<Record<string, string>>({});
 
 	const clean = $derived(query.trim().replace(/\s+/g, ' '));
 	const words = $derived(fold(clean).split(' ').filter(Boolean));
@@ -82,12 +99,67 @@
 			online = event.results ?? online;
 		});
 		if (clean.length >= 2 && clean !== onlineQuery) void searchOnline(clean);
+		void loadEmptyScreen();
 		return () => {
 			clearTimeout(timer);
 			void offPartial.then((off) => off());
 			void offComplete.then((off) => off());
 		};
 	});
+
+	/** Trending songs and popular stations for the empty screen. Failures stay
+	 *  quiet: the section just doesn't show. */
+	async function loadEmptyScreen() {
+		if (!stationsCache) {
+			void api
+				.browseRadioStations('popular', 0, 40)
+				.then((page) => {
+					stationsCache = page.items.filter(isMusicStation).slice(0, 12);
+					popularStations = stationsCache;
+				})
+				.catch(() => {});
+		}
+		if (!trendingCache) {
+			try {
+				await api.startSidecar();
+				const items = await api.trendingTracks();
+				if (items.length) trendingCache = items;
+				trending = items;
+			} catch {
+				// Offline or YouTube changed something; search still works.
+			}
+		}
+	}
+
+	async function playStation(station: RadioBrowserStation) {
+		const id = station.stationuuid || station.url;
+		if (stationBusy) return;
+		stationBusy = id;
+		try {
+			stationIds = { ...stationIds, [id]: await playDirectoryStation(station) };
+		} catch (error) {
+			if (!String(error).includes('superseded')) {
+				toast.error(`${cleanStationName(station.name)} isn't playing right now`);
+			}
+		} finally {
+			stationBusy = null;
+		}
+	}
+
+	/** Throw a dart at the whole radio directory and play whatever answers. */
+	async function playRandomStation() {
+		if (stationBusy) return;
+		stationBusy = 'random';
+		try {
+			const station = await api.randomStation();
+			toast(stationLabel(station));
+			await playDirectoryStation(station);
+		} catch (error) {
+			if (!String(error).includes('superseded')) toast.error(String(error));
+		} finally {
+			stationBusy = null;
+		}
+	}
 
 	const key = (r: ExternalSearchResult) => `${r.source}:${r.source_id}`;
 
@@ -230,10 +302,9 @@
 			(player.state.current_title === r.title && player.state.current_artist === r.artist);
 	}
 
-	function playOnline(index: number) {
-		const r = shown[index];
+	function playOnline(index: number, list: ExternalSearchResult[] = shown) {
+		const r = list[index];
 		if (isCurrent(r)) return void player.togglePlay();
-		const list = shown;
 		void task(r, 'play', async () => {
 			// The rest of the results queue up behind it.
 			await api.playExternalContext(list, index);
@@ -242,7 +313,13 @@
 
 	// The song menu (play next, queue, playlists, download) works on
 	// library recordings, so the result gets one first.
-	async function openMenu(r: ExternalSearchResult, index: number, x: number, y: number) {
+	async function openMenu(
+		r: ExternalSearchResult,
+		index: number,
+		x: number,
+		y: number,
+		list: ExternalSearchResult[] = shown
+	) {
 		try {
 			const id = await recordingFor(r);
 			const track: LibraryTrack = {
@@ -266,7 +343,7 @@
 				x,
 				y,
 				tracks: [track],
-				play: () => playOnline(index),
+				play: () => playOnline(index, list),
 				extras: inLibrary ? [] : [{ label: 'Add to library', run: () => save(r) }]
 			});
 		} catch (error) {
@@ -291,6 +368,128 @@
 		});
 	}
 </script>
+
+{#snippet row(r: ExternalSearchResult, index: number, list: ExternalSearchResult[])}
+		{@const current = isCurrent(r)}
+		{@const pending = busy[key(r)]}
+		{@const inLibrary = r.is_saved || savedKeys.has(key(r))}
+		{@const downloaded = r.is_downloaded || downloadedKeys.has(key(r))}
+		{#if phone.current}
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<div
+				role="button"
+				tabindex="0"
+				class="track-row -mx-2 flex h-16 items-center gap-3 rounded-lg px-2"
+				class:is-current={current}
+				onclick={() => playOnline(index, list)}
+			>
+				<div class="relative size-12 shrink-0">
+					<Cover src={r.cover_art_url} name={r.title} class="size-12 rounded-md" />
+					{#if pending === 'play' || current}
+						<span class="absolute inset-0 flex items-center justify-center rounded-md bg-black/45" aria-hidden="true">
+							{#if pending === 'play'}
+								<LoaderCircle class="size-5 animate-spin text-white" />
+							{:else if player.state.is_playing}
+								<span class="eq"><i></i><i></i><i></i></span>
+							{:else}
+								<Play class="size-4 fill-current text-white" />
+							{/if}
+						</span>
+					{/if}
+				</div>
+				<div class="min-w-0 flex-1">
+					<p class="track-title truncate text-[16px] leading-snug">{r.title}</p>
+					<p class="flex items-center gap-1 text-[14px] leading-snug text-muted-foreground">
+						{#if downloaded}<ArrowDownToLine class="size-3.5 shrink-0 text-primary" aria-label="Downloaded" />{/if}
+						<span class="truncate">{r.artist}</span>
+						{#if r.duration_ms}<span class="shrink-0">· {formatDuration(r.duration_ms)}</span>{/if}
+					</p>
+				</div>
+				{#if inLibrary}
+					<Check class="size-4 shrink-0 text-primary" aria-label="In your library" />
+				{/if}
+				<button
+					class="flex size-10 shrink-0 items-center justify-center rounded-full text-muted-foreground active:bg-white/10"
+					aria-label="More"
+					onclick={(e) => {
+						e.stopPropagation();
+						void openMenu(r, index, 0, 0, list);
+					}}
+				>
+					{#if pending === 'save' || pending === 'download'}
+						<LoaderCircle class="size-5 animate-spin" />
+					{:else}
+						<Ellipsis class="size-5" />
+					{/if}
+				</button>
+			</div>
+		{:else}
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div
+				class="track-row group grid h-[52px] grid-cols-[2.75rem_minmax(0,1fr)_4rem_6rem] items-center gap-3 rounded-md px-3"
+				class:is-current={current}
+				ondblclick={() => playOnline(index, list)}
+				oncontextmenu={(e) => {
+					e.preventDefault();
+					void openMenu(r, index, e.clientX, e.clientY, list);
+				}}
+			>
+				<button
+					class="flex size-8 items-center justify-center justify-self-center text-muted-foreground hover:text-foreground"
+					aria-label={current && player.state.is_playing ? 'Pause' : 'Play'}
+					onclick={() => playOnline(index, list)}
+				>
+					{#if pending === 'play'}
+						<LoaderCircle class="size-4 animate-spin" />
+					{:else if current && player.state.is_playing}
+						<Pause class="size-4 fill-current text-primary" />
+					{:else}
+						<Play class="size-4 fill-current" />
+					{/if}
+				</button>
+				<div class="flex min-w-0 items-center gap-3">
+					<Cover src={r.cover_art_url} name={r.title} class="size-9 rounded" />
+					<div class="min-w-0">
+						<p class="track-title truncate text-sm font-medium" title={r.title}>{r.title}</p>
+						<p class="truncate text-xs text-muted-foreground">{r.artist}</p>
+					</div>
+				</div>
+				<span class="text-right text-sm tabular-nums text-muted-foreground">{formatDuration(r.duration_ms)}</span>
+				<div class="flex items-center justify-end gap-1">
+					<button
+						class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
+						title={inLibrary ? 'In your library' : 'Add to library'}
+						aria-label={inLibrary ? 'In your library' : 'Add to library'}
+						disabled={inLibrary || Boolean(pending)}
+						onclick={() => save(r)}
+					>
+						{#if pending === 'save'}
+							<LoaderCircle class="size-4 animate-spin" />
+						{:else if inLibrary}
+							<Check class="size-4 text-primary" />
+						{:else}
+							<Plus class="size-4" />
+						{/if}
+					</button>
+					<button
+						class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
+						title={downloaded ? 'Downloaded' : 'Download'}
+						aria-label={downloaded ? 'Downloaded' : 'Download'}
+						disabled={downloaded || Boolean(pending)}
+						onclick={() => download(r)}
+					>
+						{#if pending === 'download'}
+							<LoaderCircle class="size-4 animate-spin" />
+						{:else if downloaded}
+							<Check class="size-4 text-primary" />
+						{:else}
+							<Download class="size-4" />
+						{/if}
+					</button>
+				</div>
+			</div>
+		{/if}
+{/snippet}
 
 <div class="flex flex-col {phone.current ? 'gap-6' : 'gap-8'}">
 	<h1 class={phone.current ? '-mb-3 text-[34px] font-bold leading-tight tracking-tight' : '-mb-4 text-3xl font-bold tracking-tight'}>Search</h1>
@@ -330,10 +529,85 @@
 	</div>
 
 	{#if !clean}
-		<p class="text-sm text-muted-foreground">
-			Type to search your library. Online results from SoundCloud and YouTube show up below;
-			press {phone.current ? 'Search' : 'Enter'} to search right away.
+		<p class="-mt-2 text-sm text-muted-foreground">
+			Search your library, YouTube and SoundCloud.
 		</p>
+
+		<section data-testid="popular-stations">
+			<div class="mb-3 flex items-center gap-3">
+				<h2 class="text-lg font-bold">Popular radio</h2>
+				<button
+					class="ml-auto flex items-center gap-2 rounded-full border border-white/10 px-3 py-1.5 text-xs font-medium hover:bg-white/5 disabled:opacity-60"
+					onclick={playRandomStation}
+					disabled={stationBusy === 'random'}
+					title="Play a random station from anywhere in the world"
+					data-testid="search-random-station"
+				>
+					{#if stationBusy === 'random'}
+						<LoaderCircle class="size-3.5 animate-spin text-primary" />
+					{:else}
+						<Dices class="size-3.5" />
+					{/if}
+					{stationBusy === 'random' ? 'Finding one…' : 'Random station'}
+				</button>
+			</div>
+			{#if popularStations.length}
+				<div class="-mx-2 flex snap-x gap-1 overflow-x-auto px-0 pb-2 [scrollbar-width:none]">
+					{#each popularStations as station (station.stationuuid || station.url)}
+						{@const id = station.stationuuid || station.url}
+						{@const live = Boolean(player.state.current_station_id) && (stationIds[id] === player.state.current_station_id || player.state.current_source_url === station.url)}
+						<button
+							class="group w-28 shrink-0 snap-start rounded-lg p-2 text-left hover:bg-white/5 sm:w-32"
+							onclick={() => void playStation(station)}
+							title={station.country ? `${cleanStationName(station.name)} · ${station.country}` : cleanStationName(station.name)}
+						>
+							<div class="relative">
+								<StationArt
+									name={station.name}
+									identity={station.stationuuid}
+									src={station.favicon}
+									class="aspect-square w-full rounded-md shadow-md"
+									monogramClass="text-2xl"
+								/>
+								{#if stationBusy === id || live}
+									<span class="absolute inset-0 flex items-center justify-center rounded-md bg-black/45">
+										{#if stationBusy === id}
+											<LoaderCircle class="size-6 animate-spin text-white" />
+										{:else}
+											<span class="eq"><i></i><i></i><i></i></span>
+										{/if}
+									</span>
+								{/if}
+							</div>
+							<p class="mt-2 truncate text-sm font-medium" class:text-primary={live}>{cleanStationName(station.name)}</p>
+							<p class="truncate text-xs text-muted-foreground">{station.country || 'Radio'}</p>
+						</button>
+					{/each}
+				</div>
+			{:else}
+				<div class="flex gap-3">
+					{#each Array(phone.current ? 3 : 6) as _, i (i)}
+						<div class="w-28 shrink-0 p-2 sm:w-32">
+							<div class="aspect-square w-full animate-pulse rounded-md bg-white/[0.06]"></div>
+							<div class="mt-2 h-3.5 w-3/4 animate-pulse rounded bg-white/[0.06]"></div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</section>
+
+		{#if trending.length}
+			<section data-testid="trending">
+				<h2 class="mb-3 text-lg font-bold">
+					Trending now <span class="text-sm font-normal text-muted-foreground">on YouTube</span>
+				</h2>
+				<div class="flex flex-col">
+					{#each trending as r, index (key(r))}
+						{@render row(r, index, trending)}
+					{/each}
+				</div>
+			</section>
+		{/if}
 	{:else}
 		{#if artists.length || albums.length}
 			<section>
@@ -424,125 +698,7 @@
 				{/if}
 				<div class="flex flex-col" data-online-results>
 					{#each shown as r, index (key(r))}
-						{@const current = isCurrent(r)}
-						{@const pending = busy[key(r)]}
-						{@const inLibrary = r.is_saved || savedKeys.has(key(r))}
-						{@const downloaded = r.is_downloaded || downloadedKeys.has(key(r))}
-						{#if phone.current}
-							<!-- svelte-ignore a11y_click_events_have_key_events -->
-							<div
-								role="button"
-								tabindex="0"
-								class="track-row -mx-2 flex h-16 items-center gap-3 rounded-lg px-2"
-								class:is-current={current}
-								onclick={() => playOnline(index)}
-							>
-								<div class="relative size-12 shrink-0">
-									<Cover src={r.cover_art_url} name={r.title} class="size-12 rounded-md" />
-									{#if pending === 'play' || current}
-										<span class="absolute inset-0 flex items-center justify-center rounded-md bg-black/45" aria-hidden="true">
-											{#if pending === 'play'}
-												<LoaderCircle class="size-5 animate-spin text-white" />
-											{:else if player.state.is_playing}
-												<span class="eq"><i></i><i></i><i></i></span>
-											{:else}
-												<Play class="size-4 fill-current text-white" />
-											{/if}
-										</span>
-									{/if}
-								</div>
-								<div class="min-w-0 flex-1">
-									<p class="track-title truncate text-[16px] leading-snug">{r.title}</p>
-									<p class="flex items-center gap-1 text-[14px] leading-snug text-muted-foreground">
-										{#if downloaded}<ArrowDownToLine class="size-3.5 shrink-0 text-primary" aria-label="Downloaded" />{/if}
-										<span class="truncate">{r.artist}</span>
-										{#if r.duration_ms}<span class="shrink-0">· {formatDuration(r.duration_ms)}</span>{/if}
-									</p>
-								</div>
-								{#if inLibrary}
-									<Check class="size-4 shrink-0 text-primary" aria-label="In your library" />
-								{/if}
-								<button
-									class="flex size-10 shrink-0 items-center justify-center rounded-full text-muted-foreground active:bg-white/10"
-									aria-label="More"
-									onclick={(e) => {
-										e.stopPropagation();
-										void openMenu(r, index, 0, 0);
-									}}
-								>
-									{#if pending === 'save' || pending === 'download'}
-										<LoaderCircle class="size-5 animate-spin" />
-									{:else}
-										<Ellipsis class="size-5" />
-									{/if}
-								</button>
-							</div>
-						{:else}
-							<!-- svelte-ignore a11y_no_static_element_interactions -->
-							<div
-								class="track-row group grid h-[52px] grid-cols-[2.75rem_minmax(0,1fr)_4rem_6rem] items-center gap-3 rounded-md px-3"
-								class:is-current={current}
-								ondblclick={() => playOnline(index)}
-								oncontextmenu={(e) => {
-									e.preventDefault();
-									void openMenu(r, index, e.clientX, e.clientY);
-								}}
-							>
-								<button
-									class="flex size-8 items-center justify-center justify-self-center text-muted-foreground hover:text-foreground"
-									aria-label={current && player.state.is_playing ? 'Pause' : 'Play'}
-									onclick={() => playOnline(index)}
-								>
-									{#if pending === 'play'}
-										<LoaderCircle class="size-4 animate-spin" />
-									{:else if current && player.state.is_playing}
-										<Pause class="size-4 fill-current text-primary" />
-									{:else}
-										<Play class="size-4 fill-current" />
-									{/if}
-								</button>
-								<div class="flex min-w-0 items-center gap-3">
-									<Cover src={r.cover_art_url} name={r.title} class="size-9 rounded" />
-									<div class="min-w-0">
-										<p class="track-title truncate text-sm font-medium" title={r.title}>{r.title}</p>
-										<p class="truncate text-xs text-muted-foreground">{r.artist}</p>
-									</div>
-								</div>
-								<span class="text-right text-sm tabular-nums text-muted-foreground">{formatDuration(r.duration_ms)}</span>
-								<div class="flex items-center justify-end gap-1">
-									<button
-										class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
-										title={inLibrary ? 'In your library' : 'Add to library'}
-										aria-label={inLibrary ? 'In your library' : 'Add to library'}
-										disabled={inLibrary || Boolean(pending)}
-										onclick={() => save(r)}
-									>
-										{#if pending === 'save'}
-											<LoaderCircle class="size-4 animate-spin" />
-										{:else if inLibrary}
-											<Check class="size-4 text-primary" />
-										{:else}
-											<Plus class="size-4" />
-										{/if}
-									</button>
-									<button
-										class="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-white/10 hover:text-foreground disabled:opacity-100"
-										title={downloaded ? 'Downloaded' : 'Download'}
-										aria-label={downloaded ? 'Downloaded' : 'Download'}
-										disabled={downloaded || Boolean(pending)}
-										onclick={() => download(r)}
-									>
-										{#if pending === 'download'}
-											<LoaderCircle class="size-4 animate-spin" />
-										{:else if downloaded}
-											<Check class="size-4 text-primary" />
-										{:else}
-											<Download class="size-4" />
-										{/if}
-									</button>
-								</div>
-							</div>
-						{/if}
+						{@render row(r, index, shown)}
 					{/each}
 				</div>
 				<div bind:this={moreSentinel} class="flex h-14 items-center justify-center text-xs text-muted-foreground">

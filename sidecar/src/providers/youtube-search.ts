@@ -163,7 +163,7 @@ function result(
 }
 
 /** Text from any of YouTube's text shapes: string, simpleText, runs, content. */
-function text(value: any): string | null {
+export function text(value: any): string | null {
   if (typeof value === 'string') return value.trim() || null;
   if (!value || typeof value !== 'object') return null;
   const out =
@@ -181,7 +181,7 @@ function asArray(value: unknown): any[] {
   return Array.isArray(value) ? value : [];
 }
 
-function bestThumbnail(thumbnails: unknown): string | null {
+export function bestThumbnail(thumbnails: unknown): string | null {
   const list = asArray(thumbnails).filter((t) => typeof t?.url === 'string');
   if (!list.length) return null;
   const best = list.reduce((a, b) => ((b.width ?? 0) > (a.width ?? 0) ? b : a));

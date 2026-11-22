@@ -339,6 +339,9 @@ export const playExternal = (
 		coverArtUrl
 	});
 
+/** YouTube Music's Trending songs (about 20). */
+export const trendingTracks = () => invoke<ExternalSearchResult[]>('trending_tracks');
+
 export const playExternalContext = (items: ExternalSearchResult[], startIndex: number) =>
 	safeInvoke<string>('play_external_context', { items, startIndex });
 
