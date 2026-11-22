@@ -29,6 +29,7 @@ interface Provider {
   resolveStream(sourceId: string): Promise<unknown>;
   getMetadata(sourceId: string): Promise<unknown>;
   isHealthy(): boolean;
+  trending?(): Promise<unknown>;
 }
 
 /** Runs `provider.action` (for example `youtube.search`) with its params. */
@@ -51,6 +52,9 @@ export async function callProvider(
       return provider.getMetadata(params?.source_id as string);
     case 'is_healthy':
       return provider.isHealthy();
+    case 'trending':
+      if (!provider.trending) throw new RpcError(-32601, `${providerName} has no trending list`);
+      return provider.trending();
     default:
       throw new RpcError(-32601, `Unknown method: ${action}`);
   }
