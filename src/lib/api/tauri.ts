@@ -564,6 +564,14 @@ export const playStationSearchResult = (station: RadioBrowserStation) =>
 		stationuuid: station.stationuuid
 	});
 
+/** Writes the app log to Downloads (desktop) or the app's Files folder
+ *  (iPhone) and returns the file's path. Nothing is uploaded. */
+export const saveLogFile = () => invoke<string>('save_log_file');
+
+/** A station drawn at random from the whole directory whose stream answered
+ *  a probe just now. Pass it to `playStationSearchResult`. */
+export const randomStation = () => invoke<RadioBrowserStation>('random_station');
+
 // Station discovery (see docs/station-discovery-contract-2026-10-07.md)
 export type SceneFamily =
 	| 'workout'

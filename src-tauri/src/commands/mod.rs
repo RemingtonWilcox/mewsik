@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod diagnostics;
 pub mod downloads;
 pub mod external_search;
 pub mod library;

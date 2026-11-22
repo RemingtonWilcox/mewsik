@@ -9,7 +9,8 @@
 	import type { TrackMenuExtra } from '$lib/state/track-menu.svelte';
 	import { formatTotal, plural } from '$lib/media';
 	import { toast } from 'svelte-sonner';
-	import { Pencil, Trash2 } from '@lucide/svelte';
+	import { Pencil, Share, Trash2 } from '@lucide/svelte';
+	import { getPlaylistShareItems, playlistShareUrl, shareLink } from '$lib/share';
 	import { onMount, tick, untrack } from 'svelte';
 	import type { LibraryTrack } from '$lib/types';
 
@@ -76,6 +77,20 @@
 			}
 		}
 		if (page.url.searchParams.has('rename')) void goto(`/playlists/${id}`, { replaceState: true });
+	}
+
+	async function share() {
+		if (!playlist) return;
+		try {
+			const items = await getPlaylistShareItems(playlist.id);
+			if (items.length === 0) {
+				toast('Add some songs before sharing this playlist');
+				return;
+			}
+			await shareLink(await playlistShareUrl(playlist.name, items), playlist.name);
+		} catch (error) {
+			toast.error(`Couldn't make a link: ${error}`);
+		}
 	}
 
 	async function remove() {
@@ -164,6 +179,15 @@
 				{#if loaded}{plural(tracks.length, 'song')}{#if total}, {formatTotal(total)}{/if}{/if}
 			{/snippet}
 			{#snippet actions()}
+				<button
+					class="flex size-10 items-center justify-center rounded-full text-muted-foreground hover:bg-white/5 hover:text-foreground"
+					title="Share"
+					aria-label="Share playlist"
+					data-testid="share-playlist"
+					onclick={share}
+				>
+					<Share class="size-4" />
+				</button>
 				<button
 					class="flex size-10 items-center justify-center rounded-full text-muted-foreground hover:bg-white/5 hover:text-foreground"
 					title="Rename"

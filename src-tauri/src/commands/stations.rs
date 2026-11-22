@@ -11,8 +11,8 @@ use crate::stations::health::{
 use crate::stations::logos;
 use crate::stations::network::{parse_public_http_url, validate_public_http_url};
 use crate::stations::probe::{
-    cached_playable_url, forget_playable_url, probe_station_stream_for_playback,
-    url_looks_like_playlist,
+    cached_playable_url, forget_playable_url, probe_station_stream,
+    probe_station_stream_for_playback, url_looks_like_playlist,
 };
 use crate::stations::scenes::{
     self, SceneInfo, SceneRefreshSummary, StationDiscoveryFeed, StationPick,
@@ -762,6 +762,54 @@ pub async fn play_station_search_result(
     Ok(station.id)
 }
 
+/// Directory rows drawn per round of the random-station dart.
+const RANDOM_STATION_BATCH: usize = 12;
+/// Rounds before giving up (each probes a fresh random batch in parallel).
+const RANDOM_STATION_ROUNDS: usize = 4;
+
+/// One station picked uniformly at random from the whole directory (no
+/// ranking, no genre, no country weighting) that actually serves audio right
+/// now. Each round draws a fresh random batch and probes it in parallel; the
+/// first stream that answers wins. The returned station's `url` is the
+/// probed stream, so `play_station_search_result` starts from the cache.
+#[tauri::command]
+pub async fn random_station() -> Result<RadioBrowserStation, String> {
+    let client = build_station_health_client()?;
+    for _ in 0..RANDOM_STATION_ROUNDS {
+        // The directory caches identical queries, so the same URL deals the
+        // same "random" stations for a while. A throwaway nonce makes every
+        // draw a fresh one.
+        let path = format!(
+            "/json/stations/search?order=random&limit={RANDOM_STATION_BATCH}&hidebroken=true&nonce={}",
+            queries::new_id()
+        );
+        let resp = radio_browser_get(&path)
+            .await
+            .ok_or_else(|| "All radio directory servers are unreachable".to_string())?;
+        let batch = resp
+            .json::<Vec<RadioBrowserStation>>()
+            .await
+            .map_err(|e| format!("Failed to parse stations: {e}"))?;
+
+        let mut probes = tokio::task::JoinSet::new();
+        for station in prepare_directory_stations(batch, true) {
+            let client = client.clone();
+            probes.spawn(async move {
+                probe_station_stream(&client, &station.url)
+                    .await
+                    .map(|url| RadioBrowserStation { url, ..station })
+            });
+        }
+        while let Some(result) = probes.join_next().await {
+            if let Ok(Some(station)) = result {
+                probes.abort_all();
+                return Ok(station);
+            }
+        }
+    }
+    Err("Couldn't find a station that's on the air. Try again.".to_string())
+}
+
 // ── Station discovery (scenes) ──
 
 /// The cached discovery feed. Never blocks on the network: an empty cache
@@ -1097,4 +1145,10 @@ pub fn seed_favorite_stations_from_bundle(
         added += 1;
     }
     Ok(added)
+}
+
+/// One saved station by its local id (for sharing the one that's playing).
+#[tauri::command]
+pub fn get_station(db: State<'_, DbPool>, station_id: String) -> Result<Option<Station>, String> {
+    queries::get_station_by_id(&db, &station_id).map_err(|e| e.to_string())
 }

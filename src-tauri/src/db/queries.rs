@@ -2181,3 +2181,65 @@ pub fn move_track_source_file_path(
     )?;
     Ok(())
 }
+
+/// A playlist's songs as a share link carries them, in order. A song keeps
+/// one streaming id (YouTube, SoundCloud or Bandcamp) when it has one, so
+/// the recipient can play it without searching.
+pub fn get_playlist_share_items(
+    db: &DbPool,
+    playlist_id: &str,
+) -> Result<Vec<SharedTrack>, rusqlite::Error> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare(
+        "SELECT r.title, COALESCE(a.name, ''), r.duration_ms, ts.source, ts.source_id
+         FROM playlist_tracks pt
+         JOIN recordings r ON r.id = pt.recording_id
+         LEFT JOIN recording_artists ra ON ra.recording_id = r.id AND ra.role = 'primary' AND ra.position = 0
+         LEFT JOIN artists a ON a.id = ra.artist_id
+         LEFT JOIN track_sources ts ON ts.id = (
+             SELECT s.id FROM track_sources s
+             WHERE s.recording_id = r.id AND s.source IN ('youtube', 'soundcloud', 'bandcamp')
+               AND s.source_id IS NOT NULL AND s.source_id != ''
+             ORDER BY CASE s.source WHEN 'youtube' THEN 0 WHEN 'soundcloud' THEN 1 ELSE 2 END
+             LIMIT 1)
+         WHERE pt.playlist_id = ?1
+         ORDER BY pt.position",
+    )?;
+    let rows = stmt.query_map(params![playlist_id], |row| {
+        Ok(SharedTrack {
+            title: row.get(0)?,
+            artist: row.get(1)?,
+            duration_ms: row.get(2)?,
+            source: row.get(3)?,
+            source_id: row.get(4)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// A recording whose title and primary artist match, ignoring case and
+/// surrounding spaces. Prefers one that has a playable source.
+pub fn find_recording_by_title_artist(
+    db: &DbPool,
+    title: &str,
+    artist: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    let conn = db.lock();
+    let result = conn.query_row(
+        "SELECT r.id
+         FROM recordings r
+         LEFT JOIN recording_artists ra ON ra.recording_id = r.id AND ra.role = 'primary' AND ra.position = 0
+         LEFT JOIN artists a ON a.id = ra.artist_id
+         WHERE lower(trim(r.title)) = lower(trim(?1))
+           AND lower(trim(COALESCE(a.name, ''))) = lower(trim(?2))
+         ORDER BY EXISTS(SELECT 1 FROM track_sources ts WHERE ts.recording_id = r.id AND ts.is_available = 1 AND ts.file_path IS NOT NULL) DESC
+         LIMIT 1",
+        params![title, artist],
+        |row| row.get::<_, String>(0),
+    );
+    match result {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e),
+    }
+}

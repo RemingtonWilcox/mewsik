@@ -6,13 +6,35 @@
 	import type { Download } from '$lib/types';
 	import { useSearchState, type SearchSource } from '$lib/state/search.svelte';
 	import { useAppUpdater } from '$lib/state/app-updater.svelte';
-	import { ArrowUpRight, ChevronRight, Download as DownloadIcon, History, Check } from '@lucide/svelte';
+	import {
+		ArrowUpRight,
+		ChevronRight,
+		Download as DownloadIcon,
+		FileText,
+		History,
+		Check,
+		LoaderCircle
+	} from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
 
 	const search = useSearchState();
 	const updater = useAppUpdater();
 
 	let downloads = $state<Download[]>([]);
 	const saved = $derived(downloads.filter((d) => d.status === 'completed').length);
+	let savingLog = $state(false);
+
+	async function saveLog() {
+		savingLog = true;
+		try {
+			await api.saveLogFile();
+			toast.success('Log saved', { description: 'Files → On My iPhone → mewsik' });
+		} catch (error) {
+			toast.error(`Couldn't save the log: ${error}`);
+		} finally {
+			savingLog = false;
+		}
+	}
 
 	onMount(() => {
 		void api
@@ -80,6 +102,12 @@
 					<ArrowUpRight class="size-4 text-primary" />
 				</button>
 			{/if}
+			<button class="ios-row" onclick={saveLog} disabled={savingLog} data-testid="save-log">
+				<FileText class="size-5 text-primary" />
+				<span class="flex-1 text-left">Save log file</span>
+				{#if savingLog}<LoaderCircle class="size-4 animate-spin text-muted-foreground" />{/if}
+			</button>
 		</div>
+		<p class="ios-footnote">Something not working? Save the log, then send it from Files → On My iPhone → mewsik. It stays on your phone until you send it.</p>
 	</section>
 </div>
