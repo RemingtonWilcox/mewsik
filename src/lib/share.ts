@@ -1,10 +1,12 @@
 // Share links for stations and playlists.
 //
-// A link is https://remingtonwilcox.github.io/mewsik/open/#<data>. That page
-// (site/open/index.html) shows what was shared, offers downloads, and hands
-// the same data to the app as mewsik://station/<uuid> or
-// mewsik://playlist/<data>. Everything rides in the #fragment, which the
-// browser never sends to the server.
+// A station link is https://remingtonwilcox.github.io/mewsik/s/#<id>, where
+// <id> is the radio-browser UUID as 22 base64url characters; a playlist link
+// is .../mewsik/p/#<data>. The page behind both (site/open/index.html) shows
+// what was shared, offers downloads, and hands it to the app as
+// mewsik://station/<uuid> or mewsik://playlist/<data>. Everything rides in
+// the #fragment, which the browser never sends to the server. Older
+// .../open/#station=<uuid>&name=... links still work.
 //
 // A playlist travels inside the link itself: base64url of deflate-raw JSON
 // { v: 1, n: name, t: SharedTrack[] }. No account, no server copy.
@@ -12,7 +14,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'svelte-sonner';
 
-export const SHARE_PAGE = 'https://remingtonwilcox.github.io/mewsik/open/';
+const SITE = 'https://remingtonwilcox.github.io/mewsik/';
+/** The first share links (0.4.3) used this page with ?-style hash params. */
+export const SHARE_PAGE = `${SITE}open/`;
+const STATION_PAGE = `${SITE}s/`;
+const PLAYLIST_PAGE = `${SITE}p/`;
 
 /** One song as a share link carries it (`SharedTrack` in db/models.rs). */
 export interface SharedTrack {
@@ -35,15 +41,28 @@ export type AppLink =
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export function stationShareUrl(station: { uuid: string; name: string; country?: string | null }): string {
-	const params = new URLSearchParams({ station: station.uuid.toLowerCase(), name: station.name });
-	if (station.country?.trim()) params.set('where', station.country.trim());
-	return `${SHARE_PAGE}#${params.toString()}`;
+export function stationShareUrl(uuid: string): string {
+	return `${STATION_PAGE}#${compactUuid(uuid)}`;
 }
 
 export async function playlistShareUrl(name: string, tracks: SharedTrack[]): Promise<string> {
 	const data = await encodePlaylist({ v: 1, n: name, t: tracks });
-	return `${SHARE_PAGE}#playlist=${data}`;
+	return `${PLAYLIST_PAGE}#${data}`;
+}
+
+/** A UUID's 16 bytes as 22 base64url characters. */
+export function compactUuid(uuid: string): string {
+	const hex = uuid.replace(/-/g, '').toLowerCase();
+	let binary = '';
+	for (let i = 0; i < 32; i += 2) binary += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function expandUuid(id: string): string | null {
+	if (!/^[A-Za-z0-9_-]{22}$/.test(id)) return null;
+	const binary = atob(id.replace(/-/g, '+').replace(/_/g, '/') + '==');
+	const hex = Array.from(binary, (c) => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 export async function encodePlaylist(playlist: SharedPlaylist): Promise<string> {
@@ -97,6 +116,15 @@ export async function parseAppLink(raw: string): Promise<AppLink | null> {
 		}
 		return null;
 	}
+	const hash = url.hash.slice(1);
+	if (url.href.startsWith(STATION_PAGE)) {
+		const uuid = expandUuid(hash) ?? (UUID.test(hash) ? hash.toLowerCase() : null);
+		return uuid ? { kind: 'station', uuid } : null;
+	}
+	if (url.href.startsWith(PLAYLIST_PAGE) && hash) {
+		const playlist = await decodePlaylist(hash);
+		return playlist ? { kind: 'playlist', playlist } : null;
+	}
 	if (url.href.startsWith(SHARE_PAGE)) {
 		const params = new URLSearchParams(url.hash.slice(1));
 		const station = params.get('station');
@@ -135,7 +163,7 @@ export const getPlaylistShareItems = (playlistId: string) =>
 /** Share the saved station with this local id (the one that's playing). */
 export async function shareStation(stationId: string | null): Promise<void> {
 	const station = stationId
-		? await invoke<{ name: string; country: string | null; radio_browser_id: string | null } | null>(
+		? await invoke<{ name: string; radio_browser_id: string | null } | null>(
 				'get_station',
 				{ stationId }
 			).catch(() => null)
@@ -149,5 +177,5 @@ export async function shareStation(stationId: string | null): Promise<void> {
 	}
 	const { cleanStationName } = await import('$lib/radio/names');
 	const name = cleanStationName(station.name);
-	await shareLink(stationShareUrl({ uuid, name, country: station.country }), name);
+	await shareLink(stationShareUrl(uuid), name);
 }

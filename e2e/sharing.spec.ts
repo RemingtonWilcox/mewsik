@@ -79,21 +79,25 @@ test('share links round-trip stations and playlists', async ({ page }) => {
 			{ t: 'Ünïcode & spaces / slashes', a: '' }
 		];
 		const playlistUrl = await share.playlistShareUrl('Late night ✨', tracks);
-		const data = new URLSearchParams(new URL(playlistUrl).hash.slice(1)).get('playlist')!;
-		const stationUrl = share.stationShareUrl({ uuid: uuid.toUpperCase(), name: 'Radio Kakadu', country: 'Australia' });
+		const data = new URL(playlistUrl).hash.slice(1);
+		const stationUrl = share.stationShareUrl(uuid.toUpperCase());
 		return {
 			playlistUrl,
 			fromPage: await share.parseAppLink(playlistUrl),
 			fromApp: await share.parseAppLink(`mewsik://playlist/${data}`),
+			fromOldPage: await share.parseAppLink(`https://remingtonwilcox.github.io/mewsik/open/#playlist=${data}`),
 			stationUrl,
 			station: await share.parseAppLink(stationUrl),
 			stationApp: await share.parseAppLink(`mewsik://station/${uuid}`),
+			stationOld: await share.parseAppLink(
+				`https://remingtonwilcox.github.io/mewsik/open/#station=${uuid}&name=Radio+Kakadu&where=Australia`
+			),
 			junk: await share.parseAppLink('mewsik://playlist/not-a-playlist'),
 			other: await share.parseAppLink('https://example.com/#station=' + uuid)
 		};
 	}, RANDOM_UUID);
 
-	expect(result.playlistUrl.startsWith('https://remingtonwilcox.github.io/mewsik/open/#playlist=')).toBe(true);
+	expect(result.playlistUrl.startsWith('https://remingtonwilcox.github.io/mewsik/p/#')).toBe(true);
 	const expected = {
 		kind: 'playlist',
 		playlist: {
@@ -108,9 +112,12 @@ test('share links round-trip stations and playlists', async ({ page }) => {
 	};
 	expect(result.fromPage).toEqual(expected);
 	expect(result.fromApp).toEqual(expected);
-	expect(result.stationUrl).toContain(`station=${RANDOM_UUID}`);
+	expect(result.fromOldPage).toEqual(expected);
+	// Short: the UUID's 16 bytes as 22 characters.
+	expect(result.stationUrl).toMatch(/^https:\/\/remingtonwilcox\.github\.io\/mewsik\/s\/#[\w-]{22}$/);
 	expect(result.station).toEqual({ kind: 'station', uuid: RANDOM_UUID });
 	expect(result.stationApp).toEqual({ kind: 'station', uuid: RANDOM_UUID });
+	expect(result.stationOld).toEqual({ kind: 'station', uuid: RANDOM_UUID });
 	expect(result.junk).toBeNull();
 	expect(result.other).toBeNull();
 });
@@ -124,14 +131,54 @@ test('the share page shows the playlist and hands it to the app', async ({ page 
 			{ t: 'Kids', a: 'MGMT' }
 		]);
 	});
-	const html = readFileSync('site/open/index.html', 'utf8');
-	await page.route('https://remingtonwilcox.github.io/mewsik/open/**', (route) =>
-		route.fulfill({ contentType: 'text/html', body: html })
-	);
+	await serveSharePage(page);
 	await page.goto(url);
 	await expect(page.getByRole('heading', { name: 'Road trip' })).toBeVisible();
 	await expect(page.getByText('2 songs')).toBeVisible();
 	await expect(page.getByText('M83 – Midnight City')).toBeVisible();
 	const href = await page.getByRole('link', { name: 'Open in mewsik' }).getAttribute('href');
-	expect(href).toBe(`mewsik://playlist/${new URL(url).hash.split('=')[1]}`);
+	expect(href).toBe(`mewsik://playlist/${new URL(url).hash.slice(1)}`);
 });
+
+test('a short station link names the station and hands its UUID to the app', async ({ page }) => {
+	await page.goto('/');
+	const url = await page.evaluate(async (uuid) => {
+		const share = await import('/src/lib/share.ts');
+		return share.stationShareUrl(uuid);
+	}, RANDOM_UUID);
+	await serveSharePage(page);
+	await page.route('https://*.api.radio-browser.info/**', (route) =>
+		route.fulfill({
+			contentType: 'application/json',
+			headers: { 'access-control-allow-origin': '*' },
+			body: JSON.stringify([{ name: 'Radio Kakadu', country: 'Australia', tags: 'jazz,swing,blues' }])
+		})
+	);
+	await page.goto(url);
+	await expect(page.getByRole('heading', { name: 'Radio Kakadu' })).toBeVisible();
+	await expect(page.getByText('Australia · jazz, swing')).toBeVisible();
+	const href = await page.getByRole('link', { name: 'Open in mewsik' }).getAttribute('href');
+	expect(href).toBe(`mewsik://station/${RANDOM_UUID}`);
+});
+
+test('in Instagram the share page says to open the link in a browser', async ({ browser }) => {
+	const context = await browser.newContext({
+		userAgent:
+			'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram 350.0.0'
+	});
+	const page = await context.newPage();
+	await serveSharePage(page);
+	await page.goto(`https://remingtonwilcox.github.io/mewsik/s/#${'A'.repeat(22)}`);
+	await expect(page.getByText('Opened inside Instagram?')).toBeVisible();
+	await context.close();
+});
+
+/** Serve site/open/index.html at every share-page path, as Pages does. */
+async function serveSharePage(page: Page) {
+	const html = readFileSync('site/open/index.html', 'utf8');
+	await page.route(/^https:\/\/remingtonwilcox\.github\.io\/mewsik\/(open|s|p)\//, (route) =>
+		route.request().url().endsWith('.svg')
+			? route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg"/>' })
+			: route.fulfill({ contentType: 'text/html', body: html })
+	);
+}
