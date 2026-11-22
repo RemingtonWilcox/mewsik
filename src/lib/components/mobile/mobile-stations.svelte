@@ -24,6 +24,7 @@
 	import {
 		ChevronLeft,
 		ChevronRight,
+		Dices,
 		Heart,
 		LoaderCircle,
 		Play,
@@ -240,6 +241,23 @@
 	}
 
 	let playRequest = 0;
+	let spinning = $state(false);
+
+	/** Throw a dart at the whole directory and play whatever answers. */
+	async function playRandomStation() {
+		if (spinning) return;
+		spinning = true;
+		try {
+			const station = await api.randomStation();
+			const where = station.country?.trim();
+			toast(`${cleanStationName(station.name)}${where ? ` · ${where}` : ''}`);
+			await playPick(station);
+		} catch (error) {
+			toast.error(String(error));
+		} finally {
+			spinning = false;
+		}
+	}
 
 	async function playPick(station: RadioBrowserStation) {
 		const request = ++playRequest;
@@ -525,7 +543,23 @@
 			{#if !sceneDone}<div bind:this={sceneSentinel} class="h-px"></div>{/if}
 		</div>
 	{:else}
-		<h1 class="text-[34px] font-bold leading-tight tracking-tight">Stations</h1>
+		<div class="flex items-center justify-between gap-3">
+			<h1 class="text-[34px] font-bold leading-tight tracking-tight">Stations</h1>
+			<button
+				class="flex h-9 items-center gap-1.5 rounded-full bg-white/[0.08] px-3.5 text-[15px] font-medium active:bg-white/[0.14] disabled:opacity-60"
+				disabled={spinning}
+				onclick={playRandomStation}
+				aria-label="Random station"
+				data-testid="random-station"
+			>
+				{#if spinning}
+					<LoaderCircle class="size-4 animate-spin text-primary" />
+				{:else}
+					<Dices class="size-4" />
+				{/if}
+				Random
+			</button>
+		</div>
 
 		<div class="relative">
 			<Search class="pointer-events-none absolute left-3 top-1/2 size-[18px] -translate-y-1/2 text-muted-foreground" />

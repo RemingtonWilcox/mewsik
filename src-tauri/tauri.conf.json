@@ -70,5 +70,10 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "deep-link": {
+      "desktop": { "schemes": ["mewsik"] },
+      "mobile": [{ "scheme": ["mewsik"], "appLink": false }]
+    }
+  }
 }

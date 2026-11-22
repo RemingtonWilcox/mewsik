@@ -9,6 +9,7 @@
 	import { useLibrary } from '$lib/state/library.svelte';
 	import { useVisualizer } from '$lib/state/visualizer.svelte';
 	import StationArt from '$lib/components/station-art.svelte';
+	import { shareStation } from '$lib/share';
 	import ConnectionStatus from '$lib/components/player/connection-status.svelte';
 	import Cover from '$lib/components/tracks/cover.svelte';
 	import SeekBar from './seek-bar.svelte';
@@ -27,6 +28,7 @@
 		VolumeX,
 		ListMusic,
 		Sparkles,
+		Share,
 		LoaderCircle
 	} from '@lucide/svelte';
 
@@ -232,6 +234,17 @@
 						data-stream-tempo
 						>{song?.tempo_source === 'measured' ? '≈ ' : ''}{tempo}</span
 					>
+				{/if}
+				{#if s.current_station_id}
+					<button
+						class="ml-2 flex size-6 items-center justify-center rounded-full hover:bg-white/10 hover:text-foreground"
+						title="Share this station"
+						aria-label="Share this station"
+						data-testid="share-station"
+						onclick={() => void shareStation(s.current_station_id)}
+					>
+						<Share class="size-3.5" />
+					</button>
 				{/if}
 			</div>
 		{:else}

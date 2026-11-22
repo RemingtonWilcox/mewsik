@@ -327,3 +327,21 @@ pub struct StationSong {
     pub tempo_source: Option<String>,
     pub artwork_url: Option<String>,
 }
+
+/// One song in a shared playlist link. Only what another device needs to
+/// find the same song: never file paths or library ids.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedTrack {
+    #[serde(rename = "t")]
+    pub title: String,
+    #[serde(rename = "a", default)]
+    pub artist: String,
+    #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    /// A streaming source the recipient can play directly ("youtube",
+    /// "soundcloud", "bandcamp"), when the sender has one.
+    #[serde(rename = "s", default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(rename = "i", default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+}

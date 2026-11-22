@@ -20,8 +20,10 @@
 		ChevronDown,
 		Square,
 		RotateCw,
-		Ellipsis
+		Ellipsis,
+		Share
 	} from '@lucide/svelte';
+	import { shareStation } from '$lib/share';
 	import { useTrackMenu } from '$lib/state/track-menu.svelte';
 	import type { LibraryTrack } from '$lib/types';
 
@@ -257,6 +259,15 @@
 							onclick={openMenu}
 						>
 							<Ellipsis class="size-5" />
+						</button>
+					{:else if isRadio && player.state.current_station_id}
+						<button
+							class="flex size-9 shrink-0 items-center justify-center rounded-full bg-white/10 text-foreground active:bg-white/20"
+							aria-label="Share station"
+							data-testid="share-station"
+							onclick={() => void shareStation(player.state.current_station_id)}
+						>
+							<Share class="size-[18px]" />
 						</button>
 					{/if}
 				</div>

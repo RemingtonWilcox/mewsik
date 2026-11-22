@@ -14,6 +14,7 @@
 	import { goto, afterNavigate } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import { startProvidersBridge } from '$lib/providers-bridge';
+	import { startAppLinks } from '$lib/state/app-links.svelte';
 
 	let { children } = $props();
 	const visualizer = useVisualizer();
@@ -27,6 +28,7 @@
 	onMount(() => {
 		updater.startLaunchCheck();
 		startProvidersBridge();
+		void startAppLinks();
 	});
 
 	// Each page starts at the top.

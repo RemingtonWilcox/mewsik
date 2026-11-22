@@ -8,6 +8,7 @@
 	import {
 		CheckCircle2,
 		Download,
+		FileText,
 		FolderOpen,
 		HardDrive,
 		LoaderCircle,
@@ -44,6 +45,19 @@
 	let downloadLocationLoading = $state(false);
 	let settingsError = $state('');
 	let lastScan = $state<ScanSummary | null>(null);
+	let savingLog = $state(false);
+
+	async function saveLog() {
+		savingLog = true;
+		try {
+			const path = await api.saveLogFile();
+			toast.success('Log saved to Downloads', { description: path });
+		} catch (error) {
+			toast.error(`Couldn't save the log: ${error}`);
+		} finally {
+			savingLog = false;
+		}
+	}
 
 	onMount(() => {
 		void loadSettings();
@@ -351,6 +365,27 @@
 				{/if}
 			{/if}
 		</CardContent>
+	</Card>
+
+	<Card data-testid="save-log">
+		<CardHeader class="gap-1">
+			<div class="flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<CardTitle>Something not working?</CardTitle>
+					<CardDescription class="mt-1">
+						Save mewsik's log as a text file and attach it to your bug report. It stays on this computer until you send it.
+					</CardDescription>
+				</div>
+				<Button variant="outline" size="sm" onclick={saveLog} disabled={savingLog}>
+					{#if savingLog}
+						<LoaderCircle class="size-3.5 animate-spin" />
+					{:else}
+						<FileText class="size-3.5" />
+					{/if}
+					Save log file
+				</Button>
+			</div>
+		</CardHeader>
 	</Card>
 
 	<Card id="app-updates" data-testid="app-updates">

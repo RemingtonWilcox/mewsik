@@ -74,7 +74,26 @@ pub fn run() {
     let startup_db = db.clone();
 
     #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
-    let mut builder = tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Must be the first plugin. A second launch (double-clicking the app, or
+    // Windows/Linux opening a mewsik:// share link) hands its arguments to
+    // the running app, which raises its window; the deep-link feature turns
+    // the link into an open-url event there.
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    #[cfg_attr(any(target_os = "ios", target_os = "android"), allow(unused_mut))]
+    let mut builder = builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -104,6 +123,15 @@ pub fn run() {
 
     let app = builder
         .setup(move |app| {
+            // Installers register mewsik:// on Windows and Mac; a dev build
+            // registers itself so share links can be tested from source.
+            #[cfg(all(debug_assertions, any(windows, target_os = "linux")))]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register_all() {
+                    log::warn!("could not register mewsik:// links: {e}");
+                }
+            }
             external_tools::configure_runtime_resource_dir(app.path().resource_dir()?)?;
             stations::health::spawn_favorite_station_health_check(startup_db.clone());
             stations::scenes::spawn_startup_refresh(startup_db.clone());
@@ -173,6 +201,9 @@ pub fn run() {
             commands::playlists::get_playlist_tracks,
             commands::playlists::reorder_playlist_track,
             commands::playlists::update_playlist,
+            commands::playlists::get_playlist_share_items,
+            commands::playlists::match_shared_tracks,
+            commands::playlists::create_playlist_from_recordings,
             // Search
             commands::search::search_library,
             // Settings
@@ -183,6 +214,7 @@ pub fn run() {
             commands::release::prepare_update_install,
             commands::release::get_latest_release,
             commands::release::open_testflight,
+            commands::diagnostics::save_log_file,
             // Smart playlists
             commands::smart_playlists::create_smart_playlist,
             commands::smart_playlists::evaluate_smart_playlist,
@@ -214,6 +246,8 @@ pub fn run() {
             commands::analysis::request_track_analysis,
             // Stations
             commands::stations::search_radio_stations,
+            commands::stations::random_station,
+            commands::stations::get_station,
             commands::stations::search_radio_stations_advanced,
             commands::stations::search_radio_stations_by_tags,
             commands::stations::browse_radio_stations,

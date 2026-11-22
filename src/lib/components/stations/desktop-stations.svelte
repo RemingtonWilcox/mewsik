@@ -35,6 +35,7 @@
 		ArrowRight,
 		Check,
 		ChevronDown,
+		Dices,
 		Globe,
 		Guitar,
 		Headphones,
@@ -70,6 +71,7 @@
 	let stationHealthRequest = 0;
 	let stationPlayRequest = 0;
 	let verifyingStations = $state(false);
+	let spinning = $state(false);
 	let searchHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 	let discoverHealthByUrl = $state<Record<string, StationHealthResult['status']>>({});
 	let probedUrls = $state<Set<string>>(new Set());
@@ -590,6 +592,22 @@
 		}
 	}
 
+	/** Throw a dart at the whole directory and play whatever answers. */
+	async function playRandomStation() {
+		if (spinning) return;
+		spinning = true;
+		try {
+			const station = await api.randomStation();
+			const where = station.country?.trim();
+			toast(`${cleanStationName(station.name)}${where ? ` · ${where}` : ''}`);
+			await playSearchResult(station);
+		} catch (error) {
+			toast.error(String(error));
+		} finally {
+			spinning = false;
+		}
+	}
+
 	async function playFavorite(station: Station) {
 		const requestId = ++stationPlayRequest;
 		try {
@@ -906,6 +924,23 @@
 			<h1 class="text-[34px] font-bold leading-tight tracking-tight sm:text-3xl">Stations</h1>
 		</div>
 		<div class="flex min-w-0 items-center gap-3">
+			<Button
+				variant="outline"
+				size="sm"
+				class="h-10 shrink-0 rounded-full border-border/70 bg-card/60 px-3"
+				disabled={spinning}
+				onclick={playRandomStation}
+				title="Play a random station from anywhere in the world"
+				aria-label="Random station"
+				data-testid="random-station"
+			>
+				{#if spinning}
+					<LoaderCircle class="size-4 shrink-0 animate-spin text-primary" />
+				{:else}
+					<Dices class="size-4 shrink-0" />
+				{/if}
+				<span class="ml-2 hidden sm:inline">{spinning ? 'Finding one…' : 'Random station'}</span>
+			</Button>
 			{#if scanSummary}
 				<span class="hidden max-w-48 truncate text-right text-[11px] text-muted-foreground md:block" title={scanSummary}>
 					Last check: {scanSummary}

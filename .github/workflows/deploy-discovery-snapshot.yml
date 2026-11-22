@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/deploy-discovery-snapshot.yml
       - scripts/discovery-snapshot/**
+      - site/**
   schedule:
     - cron: '17 * * * *'
   workflow_dispatch:
@@ -53,6 +54,9 @@ jobs:
           MEWSIK_ENABLE_LASTFM_DISCOVERY: ${{ vars.MEWSIK_ENABLE_LASTFM_DISCOVERY }}
           MEWSIK_YOUTUBE_API_KEY: ${{ secrets.MEWSIK_YOUTUBE_API_KEY }}
           MEWSIK_LASTFM_API_KEY: ${{ secrets.MEWSIK_LASTFM_API_KEY }}
+
+      - name: Add the share-link page
+        run: cp -r site/. _site/
 
       - name: Upload the GitHub Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
