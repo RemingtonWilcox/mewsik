@@ -56,7 +56,12 @@ jobs:
           MEWSIK_LASTFM_API_KEY: ${{ secrets.MEWSIK_LASTFM_API_KEY }}
 
       - name: Add the share-link page
-        run: cp -r site/. _site/
+        # Short share links, /s/#<id> (station) and /p/#<data> (playlist), use the same page.
+        run: |
+          cp -r site/. _site/
+          mkdir -p _site/s _site/p
+          cp site/open/index.html _site/s/index.html
+          cp site/open/index.html _site/p/index.html
 
       - name: Upload the GitHub Pages artifact
         uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
